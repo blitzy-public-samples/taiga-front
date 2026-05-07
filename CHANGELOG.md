@@ -1,8 +1,11 @@
 # Changelog
 
-## 6.10.2 (unreleased)
+## 6.10.3 (unreleased)
 
 - ...
+
+## 6.10.2 (2026-05-07)
+- fix: add missing parentheses to isArchived call in tag component
 
 ## 6.10.1 (2026-05-06)
 - feat: restore issue voting
