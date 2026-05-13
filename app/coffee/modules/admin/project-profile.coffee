@@ -130,12 +130,14 @@ ProjectProfileDirective = ($repo, $confirm, $loading, $navurls, $location, proje
     link = ($scope, $el, $attrs) ->
         $ctrl = $el.controller()
 
-        form = $el.find("form").checksley({"onlyOneErrorElement": true})
         submit = debounce 2000, (event) =>
             event.preventDefault()
 
+            form = $el.find("form").checksley({"onlyOneErrorElement": true})
+
             return if not form.validate()
 
+            submitButton = $el.find("button[type=submit]")
             currentLoading = $loading()
                 .target(submitButton)
                 .start()
@@ -174,8 +176,6 @@ ProjectProfileDirective = ($repo, $confirm, $loading, $navurls, $location, proje
                 form.setErrors(data)
                 if data._error_message
                     $confirm.notify("error", data._error_message)
-
-        submitButton = $el.find(".submit-button")
 
         $el.on "submit", "form", submit
 
