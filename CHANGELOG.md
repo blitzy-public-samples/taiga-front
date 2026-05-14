@@ -1,8 +1,12 @@
 # Changelog
 
-## 6.10.3 (unreleased)
+## 6.10.4 (unreleased)
 
 - ...
+
+## 6.10.3 (2026-05-14)
+- fix: intermitent error when changing project name
+- fix: docker contrib tags pinned to the right version
 
 ## 6.10.2 (2026-05-07)
 - fix: add missing parentheses to isArchived call in tag component
