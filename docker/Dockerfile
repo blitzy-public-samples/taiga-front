@@ -27,15 +27,15 @@ RUN set -eux; \
     mkdir /taiga/dist/plugins; \
     cd /taiga/dist/plugins; \
     # Slack
-    wget https://github.com/taigaio/taiga-contrib-slack/archive/6.10.1.zip -O source.zip; \
+    wget https://github.com/taigaio/taiga-contrib-slack/archive/6.10.0.zip -O source.zip; \
     unzip -j source.zip "taiga-contrib-slack-6.10.1/front/dist/*" -d slack; \
     rm source.zip; \
     # Github
-    wget http://github.com/taigaio/taiga-contrib-github-auth/archive/6.10.1.zip -O source.zip; \
+    wget http://github.com/taigaio/taiga-contrib-github-auth/archive/6.10.0.zip -O source.zip; \
     unzip -j source.zip "taiga-contrib-github-auth-6.10.1/front/dist/*" -d github-auth; \
     rm source.zip; \
     # Gitlab
-    wget http://github.com/taigaio/taiga-contrib-gitlab-auth/archive/6.10.1.zip -O source.zip; \
+    wget http://github.com/taigaio/taiga-contrib-gitlab-auth/archive/6.10.0.zip -O source.zip; \
     unzip -j source.zip "taiga-contrib-gitlab-auth-6.10.1/front/dist/*" -d gitlab-auth; \
     rm source.zip; \
     cd /; \
