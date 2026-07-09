@@ -1,4 +1,5 @@
-*
-!docker/default.conf
-!docker/conf.json.template
-!docker/config_env_subst.sh
+node_modules
+dist
+tmp
+.git
+*.log
