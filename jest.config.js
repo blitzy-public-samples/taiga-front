@@ -78,8 +78,13 @@ module.exports = {
   // Register @testing-library/jest-dom matchers after the env is set up.
   setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
 
-  // Only co-located React component/unit tests are collected.
-  testMatch: ["<rootDir>/app/react/**/*.test.tsx"],
+  // Only co-located React component/unit tests are collected. Both `.test.ts`
+  // (pure-logic suites, e.g. the shared API facade) and `.test.tsx` (component
+  // suites that render JSX) are picked up.
+  testMatch: [
+    "<rootDir>/app/react/**/*.test.ts",
+    "<rootDir>/app/react/**/*.test.tsx",
+  ],
 
   // Module resolution order for imports without an explicit extension.
   moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json"],
@@ -102,6 +107,7 @@ module.exports = {
   // Coverage denominator: the new React implementation, minus non-logic files.
   collectCoverageFrom: [
     "app/react/**/*.{ts,tsx}",
+    "!app/react/**/*.test.ts",
     "!app/react/**/*.test.tsx",
     "!app/react/**/*.d.ts",
     "!app/react/index.tsx",

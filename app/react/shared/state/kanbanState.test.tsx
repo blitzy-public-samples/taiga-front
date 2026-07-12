@@ -12,9 +12,10 @@
  */
 
 import type { UserStory, Swimlane } from "../types";
+// Imported THROUGH the public `./index` barrel (NOT directly from
+// `./kanbanState`) so the barrel's re-export lines count toward the >= 70% Jest
+// line-coverage gate. Type-only symbols use `import type` (isolatedModules).
 import {
-    KanbanState,
-    KanbanMoveResult,
     UNCLASSIFIED_SWIMLANE_ID,
     UNCLASSIFIED_SWIMLANE_NAME,
     createInitialKanbanState,
@@ -36,7 +37,8 @@ import {
     getUs,
     getUsModel,
     isUsInArchivedHiddenStatus,
-} from "./kanbanState";
+} from "./index";
+import type { KanbanState, KanbanMoveResult } from "./index";
 
 /** Minimal UserStory factory (only fields these projections read). */
 function mkUS(
