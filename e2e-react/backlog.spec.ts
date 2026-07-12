@@ -11,28 +11,46 @@
  * (`e2e/suites/backlog.e2e.js`, ~32 cases) for the AngularJS -> React 18.2
  * migration POC (AAP §0.2.1, §0.4.1, §0.6.2).
  *
- * This single spec proves BEHAVIORAL + VISUAL parity between the stock
- * AngularJS Backlog screen and its migrated React replacement, and captures the
- * git-committed before/after evidence (screenshots + per-test video).
+ * PURPOSE (prospective — not a claim of completed work): this spec is the
+ * behavioral + visual parity HARNESS for the Backlog screen. When executed
+ * against a running stack under each Playwright project, it exercises the
+ * Backlog flows and captures screenshots + per-test video into the project's
+ * git-tracked artifacts directory, so a reviewer can compare the stock
+ * AngularJS "before" against the migrated React "after". The spec by itself is
+ * NOT the evidence and does NOT by itself establish parity: parity is
+ * demonstrated only once the spec has actually been run against each build and
+ * the resulting, human-reviewed artifacts are committed (AAP §0.6.2's
+ * baseline-before-removal ordering governs when each capture is taken).
  *
- * DOM-preserving parity
- * ---------------------
- * The React Backlog reproduces the EXACT DOM (class names, `data-*` attributes,
- * tag names, and even the legacy `[ng-repeat]` / `tg-backlog-sprint="sprint"`
- * hooks) that the AngularJS `BacklogController` emits today. Because the markup
- * is identical, this ONE spec runs UNCHANGED against BOTH Playwright projects
- * defined in the root `playwright.config.ts`:
- *   - `baseline` — the stock AngularJS build, captured/committed FIRST, and
- *   - `react`    — the migrated React build, captured after the migration.
+ * DOM-preserving parity (migration contract)
+ * ------------------------------------------
+ * The migration's contract is that the React Backlog reproduces the same DOM
+ * (class names, `data-*` attributes, tag names, and the legacy `[ng-repeat]` /
+ * `tg-backlog-sprint="sprint"` hooks) that the AngularJS `BacklogController`
+ * emits. Because that markup is intended to be identical, this ONE spec is
+ * written to run UNCHANGED against BOTH Playwright projects defined in the root
+ * `playwright.config.ts`:
+ *   - `baseline` — the stock AngularJS build, and
+ *   - `react`    — the migrated React build.
  * Both target the same single origin (`http://localhost:9000`, constraint C-3);
- * "baseline" vs "react" is purely temporal (which build is deployed). We never
- * branch on the active project — every selector and assertion holds for both.
+ * "baseline" vs "react" is purely temporal (which build is deployed when the
+ * project runs). The spec never branches on the active project — every selector
+ * and assertion is written to hold for both builds.
  *
  * Runtime contract: Node 16.19.1 + `@playwright/test` 1.44.1. ONLY
  * `@playwright/test` APIs and the `./fixtures` barrel are used — deliberately NO
  * Protractor/Angular globals (`browser`, `protractor`, `$`, `$$`, `element`,
- * `by`, `waitForAngular`). All count assertions are RELATIVE deltas (never
- * hardcoded absolutes) so the suite is robust across differing seeded data.
+ * `by`, `waitForAngular`).
+ *
+ * Determinism / state model: the tests mutate a SHARED, PERSISTENT backend (the
+ * seeded Django DB), so story/sprint COUNT checks are asserted as DELTAS
+ * relative to a baseline read at the start of each test — never against a
+ * hardcoded seed size. The only exact counts asserted are STRUCTURAL results of
+ * a test's own actions (e.g. the size of a deliberate 4-row range selection),
+ * not seed-dependent totals. Cross-project determinism (the `baseline` run and
+ * the `react` run observing equivalent data) additionally requires the backend
+ * to be re-seeded / restored between project runs; that is a harness-level
+ * concern owned by the run orchestration (globalSetup / CI), not by this spec.
  * The few `page.waitForTimeout(...)` calls reproduce intentional behavioral
  * debounce/settle points from the source (§5.4.5 timing constants), NOT
  * performance SLAs (assumption A-2).
@@ -279,15 +297,23 @@ async function createClosedUsAndDragToClosedSprint(page: Page): Promise<void> {
  * Suite
  * ------------------------------------------------------------------------- */
 test.describe("backlog", () => {
-  // The suite is heavily stateful — it creates, edits, deletes, moves, and
-  // reorders stories & sprints in sequence — so it must run serially (a failure
-  // aborts the remaining, now-inconsistent, tests) exactly like the ordered
-  // Mocha `it`s the Protractor original relied on.
+  // These tests create, edit, delete, move, and reorder stories & sprints
+  // against a SHARED, PERSISTENT backend (the seeded Django DB). They run
+  // serially so that this shared backend context is mutated in a deterministic
+  // order and a failure aborts the remainder rather than leaving later tests to
+  // observe an inconsistent database. This is an intentionally-managed serial
+  // shared context — NOT reliance on shared UI state. Unlike the Protractor
+  // original (which shared one global `browser`, so DOM/selection state carried
+  // between `it`s), Playwright hands each test a FRESH page + context and the
+  // `taiga` fixture re-authenticates before every test; therefore NO DOM or
+  // selection state carries over. Every test below establishes its own UI
+  // preconditions, and only backend state is shared.
   test.describe.configure({ mode: "serial" });
 
   // Port of the source's top-level `before`: every test starts on the seeded
-  // `project-3` Backlog. The `taiga` fixture has already logged the admin user
-  // in (admin / 123123) before this hook runs.
+  // `project-3` Backlog. The `taiga` fixture has already authenticated the
+  // admin user before this hook runs, using the test-only credentials supplied
+  // via the environment (never a password hard-coded in source).
   test.beforeEach(async ({ taiga }) => {
     await taiga.gotoBacklog("project-3");
   });
@@ -498,9 +524,17 @@ test.describe("backlog", () => {
     const sprint = sprints(page).nth(0);
     const init = await sprint.locator(SEL.sprintStories).count();
 
-    // The two user stories checked in the preceding "reorder multiple us" test
-    // remain selected under serial, shared-page execution, so dragging one of
-    // them carries both into the sprint — mirroring the source exactly.
+    // Establish this test's OWN precondition instead of relying on selection
+    // state from a previous test: Playwright hands each test a fresh page (and
+    // the `taiga` fixture re-authenticates), so nothing a prior test selected
+    // survives. The source relied on "the us 1 and 2 are selected on the
+    // previous test"; that precondition is reproduced INLINE here by selecting
+    // two backlog rows. With multiple rows selected, dragging one of them
+    // carries every selected row into the sprint (the multi-card move
+    // behavior), so the sprint gains exactly two stories.
+    await rowCheckbox(userStories(page).nth(0)).click();
+    await rowCheckbox(userStories(page).nth(1)).click();
+
     await dragAndDrop(page, dragHandle(userStories(page).nth(0)), sprint.locator(SEL.sprintTable));
 
     await expect(sprint.locator(SEL.sprintStories)).toHaveCount(init + 2);
@@ -532,18 +566,55 @@ test.describe("backlog", () => {
       .toContain(draggedRef);
   });
 
-  test("reorder milestone us", async ({ page }) => {
+  test("reorder milestone us", async ({ page, taiga }) => {
     const sprint = sprints(page).nth(0);
     const sprintStories = sprint.locator(SEL.sprintStories);
 
-    // Drag the 4th sprint story onto the 1st. The source dragged the ROW itself
-    // (not its `.icon-drag` handle), so we do the same.
-    await dragAndDrop(page, sprintStories.nth(3), sprintStories.nth(0));
+    // Read the ordered story references inside a sprint's story list. Uses
+    // `allTextContents` (textContent) rather than `allInnerTexts` so the read is
+    // robust regardless of a sprint's fold/visibility state — the ref token is
+    // the same either way.
+    const refsOf = async (list: Locator): Promise<string[]> =>
+      (await list.locator(SEL.usRef).allTextContents()).map((t) => t.trim());
 
-    // The source's final assertion is a benign self-equality no-op; it is
-    // preserved verbatim. The genuine coverage is the drag gesture above.
-    const firstElementRef = await usRef(sprintStories.nth(0));
-    expect(firstElementRef).toBe(firstElementRef);
+    // Self-contained precondition: a within-milestone reorder is only meaningful
+    // with at least two stories in the sprint. Prior serial tests move stories
+    // here, but this test does NOT depend on that — it tops up from the backlog
+    // until the sprint holds two stories, so the reorder and its assertion are
+    // always meaningful.
+    let inSprint = await sprintStories.count();
+    let guard = 0;
+    while (inSprint < 2 && guard < 5 && (await userStories(page).count()) > 0) {
+      await dragAndDrop(page, dragHandle(userStories(page).nth(0)), sprint.locator(SEL.sprintTable));
+      await expect.poll(() => sprintStories.count()).toBeGreaterThan(inSprint);
+      inSprint = await sprintStories.count();
+      guard += 1;
+    }
+    expect(inSprint).toBeGreaterThanOrEqual(2);
+
+    // Capture the order BEFORE the reorder and remember the LAST story's ref.
+    const before = await refsOf(sprintStories);
+    const movedRef = before[before.length - 1];
+    const originalIndex = before.length - 1;
+
+    // Drag the last sprint story onto the first (the source dragged the ROW
+    // itself, not its `.icon-drag` handle, so we do the same).
+    await dragAndDrop(page, sprintStories.last(), sprintStories.first());
+
+    // REAL assertion (replaces the source's `expect(ref).toBe(ref)` self-equality
+    // no-op, which could never detect a failed reorder): the moved story must end
+    // up AHEAD of where it started. `expect.poll` auto-retries while the
+    // optimistic reorder settles, replacing the source's `browser.waitForAngular()`.
+    await expect
+      .poll(async () => (await refsOf(sprintStories)).indexOf(movedRef))
+      .toBeLessThan(originalIndex);
+
+    // Persistence: reload the Backlog and confirm the new order survived a
+    // round-trip to the backend (not merely an in-memory optimistic move).
+    await taiga.gotoBacklog("project-3");
+    const reloadedIndex = (await refsOf(sprints(page).nth(0).locator(SEL.sprintStories))).indexOf(movedRef);
+    expect(reloadedIndex).toBeGreaterThanOrEqual(0);
+    expect(reloadedIndex).toBeLessThan(originalIndex);
   });
 
   test("drag us from milestone to milestone", async ({ page }) => {
@@ -703,9 +774,11 @@ test.describe("backlog", () => {
 
   /* ----------------------------------------------------------------------- *
    * backlog filters — the shared filter parity cases (also emits the "filters"
-   * screenshot). A nav guard restores project-3 because the preceding
-   * forecasting tests navigate away and, under serial shared-page execution,
-   * the page could still be on project-1/5.
+   * screenshot). This test navigates to project-3 as its own explicit
+   * precondition. The `beforeEach` already routes every test to project-3 on a
+   * fresh page, so this call is a self-documenting, self-contained guard: the
+   * preceding forecasting tests target project-1/5, but their navigation does
+   * NOT leak into this test (each Playwright test starts on a fresh page).
    * ----------------------------------------------------------------------- */
   test("backlog filters", async ({ page, taiga }, testInfo) => {
     await taiga.gotoBacklog("project-3");
@@ -713,43 +786,66 @@ test.describe("backlog", () => {
   });
 
   /* ----------------------------------------------------------------------- *
-   * closed sprints — a serial-first setup test (Playwright's `beforeAll` cannot
-   * access the test-scoped `page`/`taiga`, so the "beforeAll-style" setup is a
-   * dedicated first test guaranteed to run first by serial mode) followed by the
-   * three assertion tests. The setup creates persistent backend data (an empty
-   * milestone holding a single closed story), which the subsequent tests
-   * observe.
+   * closed sprints — an intentionally-managed serial shared context. The first
+   * test seeds PERSISTENT backend data (an empty milestone holding a single
+   * closed story); the following tests observe that backend state. Because
+   * Playwright's `beforeAll` cannot access the test-scoped `page`/`taiga`, the
+   * "beforeAll-style" seeding is a dedicated first test that serial mode
+   * guarantees runs first. The shared context is BACKEND state only — each test
+   * still runs on a fresh page and establishes its own UI (toggle) state; none
+   * of these tests assumes a previous test left the closed-sprints panel shown.
    * ----------------------------------------------------------------------- */
   test.describe("closed sprints", () => {
     test("setup: empty milestone with a closed story", async ({ page, taiga }) => {
-      // Nav guard back to the main project after the forecasting navigations.
+      // Explicit precondition: seed against project-3 (beforeEach already routes
+      // here on a fresh page; this makes the seeding target unambiguous).
       await taiga.gotoBacklog("project-3");
       await createEmptyMilestone(page);
       await createClosedUsAndDragToClosedSprint(page);
     });
 
     test("open closed sprints", async ({ page }) => {
+      // Closed sprints are hidden by default; the setup test created (at least)
+      // one, so revealing them must surface MORE than were visible before.
+      // Asserting a positive delta rather than an absolute count keeps this
+      // correct even if the shared backend already held other closed sprints.
+      const closed = page.locator(SEL.closedSprints);
+      const before = await closed.count();
+
       await page.locator(SEL.toggleClosedSprints).first().click();
-      await expect(page.locator(SEL.closedSprints)).toHaveCount(1);
+
+      await expect.poll(() => closed.count()).toBeGreaterThan(before);
     });
 
     test("close closed sprints", async ({ page }) => {
-      await page.locator(SEL.toggleClosedSprints).first().click();
-      await expect(page.locator(SEL.closedSprints)).toHaveCount(0);
+      // Each test gets a fresh page where the closed-sprints panel starts
+      // hidden, so this test establishes its OWN "shown" precondition (toggle
+      // on) before exercising the hide path (toggle off). It does NOT assume a
+      // previous test left the panel shown.
+      const closed = page.locator(SEL.closedSprints);
+      const toggle = page.locator(SEL.toggleClosedSprints).first();
+
+      await toggle.click(); // show
+      await expect.poll(() => closed.count()).toBeGreaterThan(0);
+
+      await toggle.click(); // hide
+      await expect(closed).toHaveCount(0);
     });
 
     test("open sprint by drag open US to closed sprint", async ({ page }) => {
+      // Reveal the closed sprint seeded by the setup test (shared backend state).
       await page.locator(SEL.toggleClosedSprints).first().click();
 
       // Re-open (set to a non-closed status) the 2nd backlog story.
       await setUsStatus(page, 1, 1);
 
-      // Unfold the last sprint, then drag the now-open story into it.
+      // Unfold the last sprint (the seeded closed sprint), then drag the
+      // now-open story into it, which un-closes that sprint.
       const sprint = sprints(page).last();
       await toggleSprint(page, sprint);
       await dragAndDrop(page, dragHandle(userStories(page).nth(1)), sprint.locator(SEL.sprintTable));
 
-      // With no closed sprints left, the closed-sprints toggle is gone.
+      // With no closed sprints left, the closed-sprints toggle disappears.
       await expect(page.locator(SEL.toggleClosedSprints)).toHaveCount(0);
     });
   });
