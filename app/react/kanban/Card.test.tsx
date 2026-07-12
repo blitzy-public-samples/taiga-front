@@ -715,3 +715,188 @@ describe("Card — defensive value states and partial-permission menu", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Tag colours — the `getTagColor` fallback (CardController.getTagColor). A tag
+// keeps its own colour; a null colour falls back to the shared default
+// `#A9AABC`. jsdom normalises inline hex colours to `rgb(...)`, and the
+// `@testing-library/jest-dom` `toHaveStyle` matcher parses either form, so the
+// assertions below are written against the source-of-truth hex literals.
+// ---------------------------------------------------------------------------
+describe("Card — tag colours (getTagColor fallback)", () => {
+  it("uses the tag's own colour and applies the #A9AABC fallback for a null colour", () => {
+    const story = makeStory({ tags: [["backend", "#e44057"], ["urgent", null]] });
+    const { container } = renderCard({ story, zoomLevel: 3, zoom: ZOOM3 });
+
+    const tags = container.querySelectorAll(".card-tags .card-tag");
+    expect(tags).toHaveLength(2);
+
+    // The coloured tag keeps its explicit backend colour (and shows its name at zoom 3).
+    expect(tags[0]).toHaveStyle({ backgroundColor: "#e44057" });
+    expect(tags[0]).toHaveTextContent("backend");
+
+    // The null-colour tag falls back to the default #A9AABC (== rgb(169, 170, 188)).
+    expect(tags[1]).toHaveStyle({ backgroundColor: "#A9AABC" });
+    expect(tags[1]).toHaveTextContent("urgent");
+    // Belt-and-braces: assert the exact jsdom-normalised inline style value too.
+    expect((tags[1] as HTMLElement).style.backgroundColor).toBe("rgb(169, 170, 188)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assigned-to preview counter — the "size-2" avatar preview rule. For four
+// assigned users only the first two avatars render and a `.extra-assigned`
+// chip reports the remaining count as `${count - 2}+` (i.e. "2+").
+// ---------------------------------------------------------------------------
+describe("Card — assigned-to preview counter (size-2 rule)", () => {
+  it("renders exactly two avatars and a '2+' counter for four assigned users", () => {
+    const { container } = renderCard({
+      story: makeStory({ assigned_users: [1, 2, 3, 4] }),
+      usersById: {
+        1: makeMember({ id: 1 }),
+        2: makeMember({ id: 2 }),
+        3: makeMember({ id: 3 }),
+        4: makeMember({ id: 4 }),
+      },
+    });
+
+    // Only the first two avatars render (the preview is capped for 4+ assignees).
+    expect(
+      container.querySelectorAll(".card-assigned-to .card-user-avatar img"),
+    ).toHaveLength(2);
+
+    // The overflow chip reports the remaining count: 4 - 2 => "2+".
+    const extra = container.querySelector(".extra-assigned");
+    expect(extra).toBeInTheDocument();
+    expect(extra).toHaveTextContent("2+");
+    expect(extra).toHaveAttribute("title", "More assigned users");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Additional branch coverage — defensive/negative branches that the primary
+// suites above do not otherwise reach (ref-not-visible, the optional
+// move-to-top action, mixed thumbnail/thumbnail-less slideshow images, and the
+// blocked-card lock indicator co-located with the .card-blocked modifier).
+// ---------------------------------------------------------------------------
+describe("Card — additional branch coverage", () => {
+  it("omits the .card-ref span when 'ref' is absent from the visible zoom set", () => {
+    // A synthetic zoom set that shows the subject but explicitly excludes 'ref'.
+    const { container } = renderCard({ zoomLevel: 1, zoom: ["subject", "assigned_to"] });
+
+    expect(container.querySelector(".card-ref")).toBeNull();
+    // The subject still renders because its feature IS present in the set.
+    expect(container.querySelector(".card-subject.e2e-title")).toHaveTextContent(
+      "Implement login",
+    );
+  });
+
+  it("omits the move-to-top action when no onClickMoveToTop handler is provided", () => {
+    const onClickEdit = jest.fn();
+    const onClickDelete = jest.fn();
+    const { container } = renderCard({
+      zoomLevel: 1,
+      zoom: ZOOM1,
+      onClickMoveToTop: undefined,
+      onClickEdit,
+      onClickDelete,
+    });
+
+    fireEvent.click(container.querySelector(".js-popup-button") as HTMLElement);
+    expect(container.querySelector(".card-actions-menu")).toBeInTheDocument();
+
+    // Edit + delete are present (permissions allow) but move-to-top is gated on
+    // the optional handler and must be absent.
+    expect(container.querySelector(".card-action-move-to-top")).toBeNull();
+    expect(container.querySelector(".card-action-edit")).toBeInTheDocument();
+    expect(container.querySelector(".card-action-delete")).toBeInTheDocument();
+  });
+
+  it("renders only the thumbnailed slideshow images, skipping thumbnail-less ones", () => {
+    const { container } = renderCard({
+      zoomLevel: 3,
+      zoom: ZOOM3,
+      story: makeStory({
+        images: [
+          { id: 1, thumbnail_card_url: "/thumb/1.png" },
+          { id: 2, thumbnail_card_url: null },
+          { id: 3, thumbnail_card_url: "/thumb/3.png" },
+        ],
+      }),
+    });
+
+    const slideshow = container.querySelector(".card-slideshow");
+    expect(slideshow).toBeInTheDocument();
+
+    // Only the two images that carry a thumbnail_card_url render an <img>.
+    const imgs = slideshow!.querySelectorAll("img");
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0]).toHaveAttribute("src", "/thumb/1.png");
+    expect(imgs[1]).toHaveAttribute("src", "/thumb/3.png");
+  });
+
+  it("shows the lock indicator and .card-blocked modifier together for a blocked story", () => {
+    // .card-lock lives inside .card-statistics-init, which is gated on
+    // visible('extra_info') (zoom >= 2); assert both facets at that zoom.
+    const { container } = renderCard({
+      zoomLevel: 2,
+      zoom: ZOOM2,
+      story: makeStory({ is_blocked: true }),
+    });
+
+    expect(container.querySelector(".card-inner")).toHaveClass("card-blocked");
+    const lock = container.querySelector(".card-lock");
+    expect(lock).toBeInTheDocument();
+    expect(lock!.querySelector("svg.icon.icon-lock use")).toHaveAttribute(
+      "xlink:href",
+      "#icon-lock",
+    );
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Defensive nullish-coalescing guards — Card.tsx reads every optional API
+// collection defensively (`?? []` / `?? 0`) because the hook's usMap holds RAW
+// stories that may omit these fields entirely. Rendering a story whose optional
+// arrays are `undefined` (not `[]`) at full zoom exercises those fallback
+// branches and proves the card never throws on a sparse payload.
+// ---------------------------------------------------------------------------
+describe("Card — defensive nullish guards for missing optional collections", () => {
+  it("renders at full zoom when tags/assigned_users/attachments/epics/tasks are all undefined", () => {
+    const { container, root } = renderCard({
+      zoomLevel: 3,
+      zoom: ZOOM3,
+      story: makeStory({
+        tags: undefined,
+        assigned_users: undefined,
+        attachments: undefined,
+        images: undefined,
+        epics: undefined,
+        tasks: undefined,
+        total_points: null,
+      }),
+    });
+
+    // The card renders without crashing on the sparse payload.
+    expect(root).toBeInTheDocument();
+    expect(container.querySelector(".card-inner")).toBeInTheDocument();
+
+    // No optional collections => none of their sub-blocks render.
+    expect(container.querySelector(".card-tags")).toBeNull();
+    expect(container.querySelector(".card-epics")).toBeNull();
+    expect(container.querySelector(".card-compact-epics")).toBeNull();
+    expect(container.querySelector(".card-tasks")).toBeNull();
+    expect(container.querySelector(".card-slideshow")).toBeNull();
+    expect(container.querySelector(".card-unfold")).toBeNull();
+
+    // With no assignee the not-assigned avatar still renders (count === 0).
+    expect(container.querySelector(".card-user-avatar.card-not-assigned")).toBeInTheDocument();
+    // The .card-inner must NOT gain the assigned-user modifier for an empty set.
+    expect(container.querySelector(".card-inner")).not.toHaveClass("with-assigned-user");
+
+    // Estimation falls back to the no-points placeholder.
+    expect(container.querySelector(".card-estimation")).toHaveTextContent("--");
+  });
+});
+

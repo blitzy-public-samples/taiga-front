@@ -762,3 +762,227 @@ describe("useKanbanStories — return surface completeness", () => {
         }
     });
 });
+
+
+/* -------------------------------------------------------------------------- */
+/* Explicit behavior-parity assertions.                                        */
+/*                                                                             */
+/* These complement the suites above by pinning down the exact request-param   */
+/* shaping (`loadUserstoriesParams`), the preserved zoom asymmetry + zoom       */
+/* rehydration, the trailing-debounce collapse of a WebSocket burst, the       */
+/* lightbox-deferred `projects.*` refresh, the immediate-then-debounced search  */
+/* reload, and the "no parallel authorization" invariant (constraint C-1: the   */
+/* backend is the single enforcement point, so the hook never client-side-      */
+/* blocks a move on missing permissions).                                       */
+/* -------------------------------------------------------------------------- */
+describe("useKanbanStories — request params + real-time + authz parity", () => {
+    test("initial listUserStories uses base params (archived excluded, empty q, no attachments at zoom 1)", async () => {
+        await renderLoaded();
+
+        // The very first list load is the mount effect's userstory fetch.
+        const firstArg = apiClient.listUserStories.mock.calls[0][0];
+        expect(firstArg).toMatchObject({ status__is_archived: false, q: "" });
+        // At the default zoom level (1) the attachment/task includes are absent.
+        expect(firstArg).not.toHaveProperty("include_attachments");
+        expect(firstArg).not.toHaveProperty("include_tasks");
+    });
+
+    test("handleDragEnd forwards the exact (project, status, swimlane, after, before, bulk) tuple", async () => {
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            result.current.handleDragEnd({
+                usList: [103],
+                statusId: 1,
+                swimlaneId: -1,
+                index: 0,
+                previousCard: null,
+                nextCard: 101,
+            });
+        });
+
+        await waitFor(() => expect(apiClient.bulkUpdateKanbanOrder).toHaveBeenCalledTimes(1));
+        const args = apiClient.bulkUpdateKanbanOrder.mock.calls[0];
+        expect(args[0]).toBe(PROJECT_ID); // project id
+        expect(args[1]).toBe(1); // status id
+        expect(args[2]).toBeNull(); // swimlane (-1 -> null)
+        expect(args[3]).toBeNull(); // after_userstory_id (previousCard === null)
+        expect(args[4]).toBe(101); // before_userstory_id (nextCard)
+        expect(args[5]).toEqual([103]); // bulk_userstories
+        // Optimistically re-homed into status 1, removed from status 2.
+        expect(result.current.usByStatus["1"]).toEqual(expect.arrayContaining([103]));
+        expect(result.current.usByStatus["2"] ?? []).not.toContain(103);
+    });
+
+    test("handleDragEnd sets movedUs then clears it after the success timeout", async () => {
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            result.current.handleDragEnd({
+                usList: [101],
+                statusId: 2,
+                swimlaneId: -1,
+                index: 0,
+                previousCard: null,
+                nextCard: 103,
+            });
+        });
+
+        // The moved highlight is set synchronously on the optimistic apply...
+        expect(result.current.movedUs).toContain(101);
+        // ...and cleared by the 300ms redraw:wip parity timeout on success.
+        await waitFor(() => expect(result.current.movedUs).toEqual([]));
+    });
+
+    test("handleDragEnd still calls the API when permissions are empty (no client-side authz)", async () => {
+        // No runtime project -> read-only fallback with my_permissions: [].
+        clearRuntimeProject();
+        const { result } = await renderLoaded();
+        expect(result.current.project?.my_permissions).toEqual([]);
+
+        await act(async () => {
+            result.current.handleDragEnd({
+                usList: [101],
+                statusId: 2,
+                swimlaneId: -1,
+                index: 0,
+                previousCard: null,
+                nextCard: 103,
+            });
+        });
+
+        // The hook never blocks on permissions — the backend is the enforcement point.
+        await waitFor(() => expect(apiClient.bulkUpdateKanbanOrder).toHaveBeenCalledTimes(1));
+    });
+
+    test("setZoom(3) reload sends include_attachments + include_tasks and exposes the cumulative view", async () => {
+        const { result } = await renderLoaded();
+        apiClient.listUserStories.mockClear();
+
+        await act(async () => {
+            result.current.setZoom(3);
+        });
+
+        await waitFor(() => expect(apiClient.listUserStories).toHaveBeenCalled());
+        const calls = apiClient.listUserStories.mock.calls;
+        const lastArg = calls[calls.length - 1][0];
+        expect(lastArg).toMatchObject({ include_attachments: 1, include_tasks: 1 });
+        expect(result.current.zoomLevel).toBe(3);
+        // Cumulative feature union of levels 0..3.
+        expect(result.current.zoom).toEqual(
+            expect.arrayContaining([
+                "assigned_to",
+                "subject",
+                "tags",
+                "related_tasks",
+                "attachments",
+            ]),
+        );
+    });
+
+    test("rehydrates the zoom level from localStorage on init", async () => {
+        window.localStorage.setItem("kanban_zoom", "2");
+        const { result } = await renderLoaded();
+
+        expect(result.current.zoomLevel).toBe(2);
+        // Level-2 cumulative view exposes the tags/extra_info/unfold features.
+        expect(result.current.zoom).toEqual(
+            expect.arrayContaining(["tags", "extra_info", "unfold"]),
+        );
+    });
+
+    test("changeQ sets filterQ immediately and reloads with q after the debounce", async () => {
+        const { result } = await renderLoaded();
+        apiClient.listUserStories.mockClear();
+
+        act(() => {
+            result.current.changeQ("bug");
+        });
+        // filterQ updates synchronously (drives the controlled search input).
+        expect(result.current.filterQ).toBe("bug");
+
+        // The reload is debounced (~100ms) and carries the query.
+        await waitFor(() => expect(apiClient.listUserStories).toHaveBeenCalled());
+        const calls = apiClient.listUserStories.mock.calls;
+        const lastArg = calls[calls.length - 1][0];
+        expect(lastArg).toMatchObject({ q: "bug" });
+    });
+
+    test("onUserStories replaceModel edits an existing story and adds a new one", async () => {
+        const { result } = await renderLoaded();
+        await waitFor(() => expect(mockedSubscribeToProject).toHaveBeenCalled());
+        const handlers = mockedSubscribeToProject.mock.calls[0][2];
+
+        apiClient.listUserStories.mockClear();
+        apiClient.listUserStories.mockImplementation(() =>
+            Promise.resolve([
+                { ...makeStory(101, 1, 1), subject: "US 101 EDITED" }, // existing -> replaceModel
+                makeStory(102, 1, 2),
+                makeStory(103, 2, 1),
+                makeStory(106, 2, 5), // brand new -> add
+            ]),
+        );
+
+        act(() => {
+            handlers.onUserStories({ pk: [101, 106] });
+        });
+
+        await waitFor(() => expect(result.current.usMap[106]).toBeDefined(), { timeout: 2000 });
+        expect(result.current.usMap[101]?.subject).toBe("US 101 EDITED");
+        expect(result.current.usByStatus["2"]).toEqual(expect.arrayContaining([106]));
+    });
+
+    test("a burst of onUserStories collapses into a single debounced refetch", async () => {
+        const { unmount } = await renderLoaded();
+        await waitFor(() => expect(mockedSubscribeToProject).toHaveBeenCalled());
+        const handlers = mockedSubscribeToProject.mock.calls[0][2];
+
+        apiClient.listUserStories.mockClear();
+        jest.useFakeTimers();
+        try {
+            // Math.random is stubbed to 0 in beforeEach, so the window is a fixed 700ms.
+            act(() => {
+                handlers.onUserStories({ pk: 1 });
+                handlers.onUserStories({ pk: 2 });
+                handlers.onUserStories({ pk: 3 });
+            });
+            await act(async () => {
+                jest.advanceTimersByTime(700);
+                await Promise.resolve();
+            });
+            // Trailing debounce: exactly ONE refetch for the whole burst.
+            expect(apiClient.listUserStories).toHaveBeenCalledTimes(1);
+        } finally {
+            unmount();
+            jest.useRealTimers();
+        }
+    });
+
+    test("onProjects refresh is deferred while a lightbox is open and flushed on close", async () => {
+        const { result } = await renderLoaded();
+        await waitFor(() => expect(mockedSubscribeToProject).toHaveBeenCalled());
+        const handlers = mockedSubscribeToProject.mock.calls[0][2];
+
+        // Open a lightbox so the incoming project refresh must be deferred.
+        act(() => {
+            result.current.addNewUs("standard", 1);
+        });
+
+        apiClient.getUserStoriesFilters.mockClear();
+        act(() => {
+            handlers.onProjects({ matches: "projects.userstorystatus" });
+        });
+
+        // Allow the ~700ms debounce to fire: it should only SET the pending flag,
+        // not refetch, because a lightbox is open.
+        await new Promise((r) => setTimeout(r, 800));
+        expect(apiClient.getUserStoriesFilters).not.toHaveBeenCalled();
+
+        // Closing the lightbox flushes the deferred refresh.
+        await act(async () => {
+            result.current.closeLightbox();
+        });
+        await waitFor(() => expect(apiClient.getUserStoriesFilters).toHaveBeenCalled());
+    });
+});
+
