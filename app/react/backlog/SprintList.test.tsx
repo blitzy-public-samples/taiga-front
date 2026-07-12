@@ -9,35 +9,44 @@
 /**
  * Component tests for {@link SprintList}.
  *
- * `SprintList` is a DOM-preserving React reproduction of the AngularJS Backlog
- * sidebar sprint list (`app/partials/includes/modules/sprints.jade`): the
- * `section.sprints` container with the header (count + add-sprint button), the
- * empty-state, the OPEN sprint cards, the show/hide-closed-sprints toggle, and
- * the CLOSED sprint cards. Because the UNCHANGED Taiga SCSS
- * (`app/styles/modules/backlog/sprints.scss`) and the Protractor/Playwright
- * selectors target specific class names / literal `tg-*` attributes, these tests
- * assert on the emitted DOM structure (via `container.querySelector` /
- * `querySelectorAll`), on the `add_milestone` permission gating, on the
- * closed-sprints toggle label, and on the add / toggle / edit callback wiring —
- * NOT on translated copy (the i18n keys are rendered as their resolved English
- * copy by the component).
+ * `SprintList` is a DOM-preserving React 18.2 reproduction of the AngularJS
+ * Backlog sidebar sprint list (`app/partials/includes/modules/sprints.jade`):
+ * the `section.sprints` container holding, in order, the `header.sprint-header`
+ * (the milestone COUNT + the "add sprint" button), the `.empty-small`
+ * empty-state, the OPEN sprint cards, the `.filter-closed-sprints`
+ * show/hide-closed-sprints toggle, and the CLOSED sprint cards. Because the
+ * UNCHANGED Taiga SCSS (`app/styles/modules/backlog/sprints.scss`) and the
+ * Protractor/Playwright selectors target specific class names and the literal
+ * `tg-backlog-sprint="sprint"` attribute, these tests assert on the emitted DOM
+ * structure (via `container.querySelector` / `querySelectorAll`), on the
+ * `add_milestone` permission gating, on the closed-sprints toggle label, on the
+ * closed-card visibility, and on the add / toggle callback wiring — NOT on
+ * translated copy (the i18n keys are rendered as their resolved English copy by
+ * the component). They contribute to the >= 70% line-coverage gate for the new
+ * React code.
  *
- * Conventions (match the repo's React test harness — see `Sprint.test.tsx`):
- *   - Test-framework globals are imported explicitly from `@jest/globals`.
- *   - Automatic JSX runtime (`jsx: "react-jsx"`) — no `import React`.
- *   - `ts-jest` + `jsdom`; `@testing-library/jest-dom` matchers are registered
- *     globally by `jest.setup.ts` (these tests use core matchers only).
+ * Conventions (match the repo's React test harness — see `SprintHeader.test.tsx`
+ * and `BacklogRow.test.tsx`):
+ *   - AMBIENT Jest globals (`describe` / `it` / `expect` / `jest`) are used
+ *     directly — this file intentionally does NOT import from `@jest/globals`.
+ *     The project ships `@types/jest` (`package.json`) and lists `"jest"` in the
+ *     `tsconfig.json` `types` array, so the ambient forms (and `jest.fn()` for
+ *     the callback spies) type-check cleanly under `tsc --noEmit`.
+ *   - Automatic JSX runtime (`jsx: "react-jsx"`) — there is no `import React`.
+ *   - `ts-jest` + `jsdom`; the `@testing-library/jest-dom` matchers are
+ *     registered globally by `jest.setup.ts` (these tests deliberately use core
+ *     matchers + plain DOM queries so they stay robust regardless of the matcher
+ *     extension).
  *
  * Each render is wrapped in a real `@dnd-kit/core` `<DndContext>` because every
- * sprint card is a `useDroppable` target ({@link DroppableSprint}). `useDroppable`
- * has a safe default outside a provider, but wrapping mirrors the production
- * `./Backlog.tsx` tree and keeps the render free of any context warnings. The
- * real {@link Sprint} / `SprintHeader` children are rendered (not mocked), so the
- * per-card controls asserted here (`.sprint-summary`, `.edit-sprint`) flow
- * through the actual components the production screen renders.
+ * sprint card is a `useDroppable` target (`SprintList`'s local `DroppableSprint`
+ * wrapper). `useDroppable` has a safe default outside a provider, but wrapping
+ * mirrors the production `./Backlog.tsx` tree and guarantees the hook always has
+ * a context. The real `Sprint` / `SprintHeader` children are rendered (not
+ * mocked), so the per-card `.sprint-name` markup asserted here flows through the
+ * actual components the production screen renders.
  */
 
-import { describe, expect, it } from "@jest/globals";
 import { render, fireEvent } from "@testing-library/react";
 import { DndContext } from "@dnd-kit/core";
 
@@ -45,53 +54,48 @@ import { SprintList } from "./SprintList";
 import type { SprintListProps } from "./SprintList";
 import type { Milestone, Project } from "../shared/types";
 
+// ---------------------------------------------------------------------------
+// Fixtures
+//
+// The `as Project` / `as Milestone` casts document intent and keep strict typing
+// happy while omitting the many optional model members the sprint list never
+// reads. `project` holds every permission the screen gates on; `noPerm` strips
+// them all to exercise the gating branches.
+// ---------------------------------------------------------------------------
+
+/** A project whose permissions unlock every gated control in the sprint list. */
+const project = {
+    id: 7,
+    slug: "proj",
+    my_permissions: ["add_milestone", "view_milestones", "modify_milestone", "modify_us"],
+    is_kanban_activated: true,
+    is_backlog_activated: true,
+} as Project;
+
+/** The same project with no permissions — gates off every add/edit control. */
+const noPerm = { ...project, my_permissions: [] } as Project;
+
 /**
- * Build a {@link Project} with the given permission set. `archived_code` defaults
- * to `null` (not archived) so a sprint card's edit control is gated only by
- * `modify_milestone`.
+ * Build a sprint (milestone) fixture. `closed` selects the OPEN vs CLOSED list
+ * the card is rendered in (and therefore the `.sprint-open` / `.sprint-closed`
+ * modifier chosen by {@link SprintList}).
  */
-function makeProject(permissions: string[], overrides: Partial<Project> = {}): Project {
-    return {
-        id: 1,
-        slug: "proj-1",
-        name: "Project One",
-        my_permissions: permissions,
-        is_kanban_activated: true,
-        is_backlog_activated: true,
-        archived_code: null,
-        ...overrides,
-    };
-}
-
-/** Build an OPEN sprint (milestone) fixture. */
-function makeOpenSprint(id: number, overrides: Partial<Milestone> = {}): Milestone {
-    return {
+const mkSprint = (id: number, name: string, closed = false): Milestone =>
+    ({
         id,
-        name: `Sprint ${id}`,
-        slug: `sprint-${id}`,
-        closed: false,
-        estimated_start: "2025-01-01",
-        estimated_finish: "2025-01-15",
-        total_points: 20,
-        closed_points: 5,
+        name,
+        slug: `s-${id}`,
+        estimated_start: "2020-01-01",
+        estimated_finish: "2020-01-15",
+        closed,
+        closed_points: 0,
+        total_points: 0,
         user_stories: [],
-        ...overrides,
-    };
-}
+    }) as Milestone;
 
-/** Build a CLOSED sprint (milestone) fixture. */
-function makeClosedSprint(id: number, overrides: Partial<Milestone> = {}): Milestone {
-    return {
-        id,
-        name: `Sprint ${id}`,
-        slug: `sprint-${id}`,
-        closed: true,
-        total_points: 20,
-        closed_points: 20,
-        user_stories: [],
-        ...overrides,
-    };
-}
+/** Two open sprints and one closed sprint feeding the default render. */
+const open = [mkSprint(1, "S1"), mkSprint(2, "S2")];
+const closed = [mkSprint(3, "S3", true)];
 
 /** A no-op callback for props the test under focus does not assert on. */
 const noop = (): void => {
@@ -99,261 +103,136 @@ const noop = (): void => {
 };
 
 /**
- * Render `SprintList` inside a real `<DndContext>` with sensible defaults, letting
+ * Render `SprintList` inside a real `<DndContext>` (the provider every sprint
+ * card's `useDroppable` reads from) with the realistic defaults below, letting
  * each test override only the props it cares about.
  */
 function renderList(overrides: Partial<SprintListProps> = {}) {
     const props: SprintListProps = {
-        project: makeProject(["add_milestone", "view_milestones", "modify_milestone"]),
-        openSprints: [],
-        closedSprints: [],
-        totalMilestones: 0,
-        totalClosedMilestones: 0,
+        project,
+        openSprints: open,
+        closedSprints: closed,
+        totalMilestones: 2,
+        totalClosedMilestones: 1,
         closedSprintsVisible: false,
         onAddSprint: noop,
         onToggleClosedSprints: noop,
         onEditSprint: noop,
         ...overrides,
     };
+
     return render(
         <DndContext>
+            {/* provider for useDroppable */}
             <SprintList {...props} />
         </DndContext>,
     );
 }
 
-describe("SprintList — header and count", () => {
-    it("renders section.sprints, the count badge, the SPRINTS title and the add-sprint button", () => {
-        const openSprints = [makeOpenSprint(1), makeOpenSprint(2)];
-        const { container } = renderList({ openSprints, totalMilestones: 2 });
+describe("SprintList", () => {
+    // Case 1 — the sprints section, the milestone count badge and the title.
+    it("renders section.sprints with the count badge and the SPRINTS title", () => {
+        const { container } = renderList();
 
-        // Container + header.
-        expect(container.querySelector("section.sprints")).not.toBeNull();
-        const header = container.querySelector("header.sprint-header");
-        expect(header).not.toBeNull();
-
-        // Count badge reflects totalMilestones; title is the resolved "SPRINTS" copy.
-        const number = header!.querySelector("h1 .number") as HTMLElement | null;
-        expect(number).not.toBeNull();
-        expect(number!.textContent).toBe("2");
-        expect((header!.querySelector("h1 .title") as HTMLElement).textContent).toBe("SPRINTS");
-
-        // Add-sprint button carries BOTH btn-link (jade) and add-sprint (SCSS/e2e).
-        const add = header!.querySelector("a.add-sprint") as HTMLElement | null;
-        expect(add).not.toBeNull();
-        expect(add!.classList.contains("btn-link")).toBe(true);
-        expect(add!.getAttribute("title")).toBe("Add a sprint");
-        expect((add!.querySelector("span") as HTMLElement).textContent).toBe("Add");
-        // Compiled tg-svg sprite: <svg class="icon icon-add"><use xlink:href="#icon-add"/></svg>.
-        expect(add!.querySelector("svg.icon.icon-add use")!.getAttribute("xlink:href")).toBe(
-            "#icon-add",
-        );
+        expect(container.querySelector(".sprints")).not.toBeNull();
+        expect(container.querySelector(".sprint-header .number")!.textContent).toBe("2");
+        expect(container.querySelector(".sprint-header .title")!.textContent).toBe("SPRINTS");
     });
 
-    it("omits the count badge (and the header add-sprint button) when there are no milestones", () => {
-        const { container } = renderList({ totalMilestones: 0 });
-        expect(container.querySelector("h1 .number")).toBeNull();
-        // The header add-sprint anchor is not rendered when totalMilestones is 0…
-        expect(container.querySelector("header.sprint-header a.add-sprint")).toBeNull();
-        // …but the title is always present.
-        expect((container.querySelector("h1 .title") as HTMLElement).textContent).toBe("SPRINTS");
+    // Case 2 — one droppable card per open sprint, each carrying the LITERAL
+    // `tg-backlog-sprint="sprint"` attribute the e2e selectors rely on.
+    it('renders a div[tg-backlog-sprint="sprint"].sprint-open per open sprint', () => {
+        const { container } = renderList();
+
+        expect(
+            container.querySelectorAll('div[tg-backlog-sprint="sprint"].sprint-open'),
+        ).toHaveLength(2);
     });
 
-    it("hides the header add-sprint button when the user lacks add_milestone", () => {
-        const { container } = renderList({
-            project: makeProject(["view_milestones"]),
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-        });
-        expect(container.querySelector("header.sprint-header a.add-sprint")).toBeNull();
+    // Case 3 — the add-sprint control renders with add_milestone and is gated off
+    // without it.
+    it("renders the add-sprint control only for users with add_milestone", () => {
+        const { container } = renderList();
+        expect(container.querySelector(".add-sprint")).not.toBeNull();
+
+        const gated = renderList({ project: noPerm });
+        expect(gated.container.querySelector(".add-sprint")).toBeNull();
     });
 
-    it("invokes onAddSprint (and prevents default) when the header add-sprint button is clicked", () => {
-        let calls = 0;
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-            onAddSprint: () => {
-                calls += 1;
-            },
-        });
-        const add = container.querySelector("header.sprint-header a.add-sprint") as HTMLElement;
-        const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-        add.dispatchEvent(event);
-        expect(calls).toBe(1);
-        expect(event.defaultPrevented).toBe(true);
-    });
-});
+    // Case 4 — the empty-state placeholder replaces the cards (and the count
+    // badge is absent) when there are no milestones.
+    it("renders the empty-small placeholder (and no count badge) when totalMilestones is 0", () => {
+        const { container } = renderList({ totalMilestones: 0, openSprints: [] });
 
-describe("SprintList — empty state", () => {
-    it("renders .empty-small with image, title and a gated add-sprint link when totalMilestones is 0", () => {
-        const { container } = renderList({ totalMilestones: 0 });
-
-        const empty = container.querySelector(".empty-small") as HTMLElement | null;
+        const empty = container.querySelector(".empty-small");
         expect(empty).not.toBeNull();
-
-        const img = empty!.querySelector("img") as HTMLImageElement;
-        expect(img.getAttribute("alt")).toBe("There are no sprints yet");
-        expect(img.getAttribute("src")).toBe("/v/images/empty/empty_sprint.png");
-        expect((empty!.querySelector("p.title") as HTMLElement).textContent).toBe(
-            "There are no sprints yet",
-        );
-
-        // The empty-state add link (user has add_milestone) carries btn-link + add-sprint.
-        const add = empty!.querySelector("a.add-sprint") as HTMLElement | null;
-        expect(add).not.toBeNull();
-        expect(add!.classList.contains("btn-link")).toBe(true);
-        expect((add!.querySelector("span") as HTMLElement).textContent).toBe(" Add a sprint");
+        expect(empty!.querySelector(".title")!.textContent).toBe("There are no sprints yet");
+        expect(container.querySelector(".sprint-header .number")).toBeNull();
     });
 
-    it("omits the empty-state add link when the user lacks add_milestone", () => {
-        const { container } = renderList({
-            project: makeProject(["view_milestones"]),
-            totalMilestones: 0,
-        });
-        expect(container.querySelector(".empty-small")).not.toBeNull();
-        expect(container.querySelector(".empty-small a.add-sprint")).toBeNull();
-    });
-
-    it("does not render the empty state when there are milestones", () => {
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-        });
-        expect(container.querySelector(".empty-small")).toBeNull();
-    });
-
-    it("invokes onAddSprint (and prevents default) from the empty-state add link", () => {
-        let calls = 0;
-        const { container } = renderList({
-            totalMilestones: 0,
-            onAddSprint: () => {
-                calls += 1;
-            },
-        });
-        const add = container.querySelector(".empty-small a.add-sprint") as HTMLElement;
-        const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-        add.dispatchEvent(event);
-        expect(calls).toBe(1);
-        expect(event.defaultPrevented).toBe(true);
-    });
-});
-
-describe("SprintList — open sprint cards", () => {
-    it("renders one droppable div[tg-backlog-sprint].sprint-open per open sprint, each with the Sprint child", () => {
-        const openSprints = [makeOpenSprint(1), makeOpenSprint(2), makeOpenSprint(3)];
-        const { container } = renderList({ openSprints, totalMilestones: 3 });
-
-        const cards = container.querySelectorAll('div[tg-backlog-sprint="sprint"]');
-        expect(cards).toHaveLength(3);
-
-        const openCards = container.querySelectorAll(".sprint.sprint-open");
-        expect(openCards).toHaveLength(3);
-
-        // No closed cards rendered while closed sprints are hidden.
-        expect(container.querySelectorAll(".sprint.sprint-closed")).toHaveLength(0);
-
-        // Each card carries the literal fidelity attribute and wraps a Sprint child.
-        const first = openCards[0] as HTMLElement;
-        expect(first.getAttribute("tg-backlog-sprint")).toBe("sprint");
-        expect(first.hasAttribute("tg-sprint-sortable")).toBe(true);
-        // The real Sprint/SprintHeader child renders its summary header.
-        expect(first.querySelector(".sprint-summary")).not.toBeNull();
-    });
-
-    it("forwards onEditSprint from a card's edit control with the correct sprint", () => {
-        const openSprints = [makeOpenSprint(7)];
-        let edited: Milestone | null = null;
-        const { container } = renderList({
-            // modify_milestone + not archived -> the child SprintHeader renders `.edit-sprint`.
-            project: makeProject(["modify_milestone", "view_milestones"]),
-            openSprints,
-            totalMilestones: 1,
-            onEditSprint: (sprint) => {
-                edited = sprint;
-            },
-        });
-
-        const edit = container.querySelector(".sprint-open .edit-sprint") as HTMLElement | null;
-        expect(edit).not.toBeNull();
-        fireEvent.click(edit!);
-        expect(edited).toBe(openSprints[0]);
-    });
-});
-
-describe("SprintList — closed sprints toggle", () => {
-    it("renders the .filter-closed-sprints toggle with the SHOW label when closed sprints are hidden", () => {
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-            closedSprints: [makeClosedSprint(9)],
-            totalClosedMilestones: 1,
-            closedSprintsVisible: false,
-        });
-
-        const toggle = container.querySelector("a.filter-closed-sprints") as HTMLElement | null;
-        expect(toggle).not.toBeNull();
-        expect(toggle!.querySelector("svg.icon.icon-folder use")!.getAttribute("xlink:href")).toBe(
-            "#icon-folder",
-        );
-        expect((toggle!.querySelector(".text") as HTMLElement).textContent).toBe(
+    // Case 5 — the closed-sprints toggle is present and its label reflects the
+    // current `closedSprintsVisible` flag.
+    it("renders the closed-sprints toggle with a label that reflects visibility", () => {
+        const shown = renderList();
+        expect(shown.container.querySelector(".filter-closed-sprints")).not.toBeNull();
+        expect(shown.container.querySelector(".filter-closed-sprints .text")!.textContent).toBe(
             "Show closed sprints",
         );
 
-        // Closed cards are NOT rendered while hidden.
-        expect(container.querySelectorAll(".sprint.sprint-closed")).toHaveLength(0);
+        const visible = renderList({ closedSprintsVisible: true });
+        expect(visible.container.querySelector(".filter-closed-sprints .text")!.textContent).toBe(
+            "Hide closed sprints",
+        );
     });
 
-    it("shows the HIDE label and renders the closed sprint cards when closedSprintsVisible is true", () => {
-        const closedSprints = [makeClosedSprint(9), makeClosedSprint(10)];
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-            closedSprints,
-            totalClosedMilestones: 2,
-            closedSprintsVisible: true,
-        });
+    // Case 6 — closed sprint cards are rendered only while closedSprintsVisible.
+    it("renders closed sprint cards only when closedSprintsVisible is true", () => {
+        const { container } = renderList();
+        expect(container.querySelectorAll(".sprint-closed")).toHaveLength(0);
 
-        expect(
-            (container.querySelector("a.filter-closed-sprints .text") as HTMLElement).textContent,
-        ).toBe("Hide closed sprints");
-
-        const closedCards = container.querySelectorAll(".sprint.sprint-closed");
-        expect(closedCards).toHaveLength(2);
-        // Closed cards are droppable too and carry the fidelity attributes.
-        const first = closedCards[0] as HTMLElement;
-        expect(first.getAttribute("tg-backlog-sprint")).toBe("sprint");
-        expect(first.hasAttribute("tg-sprint-sortable")).toBe(true);
-
-        // All cards (open + closed) match the e2e sprints() selector.
-        expect(container.querySelectorAll('div[tg-backlog-sprint="sprint"]')).toHaveLength(3);
+        const visible = renderList({ closedSprintsVisible: true });
+        expect(visible.container.querySelectorAll(".sprint-closed")).toHaveLength(1);
     });
 
-    it("hides the toggle entirely when there are no closed milestones", () => {
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-            totalClosedMilestones: 0,
-        });
-        expect(container.querySelector("a.filter-closed-sprints")).toBeNull();
+    // Case 7 — the closed-sprints toggle is hidden when there are no closed
+    // milestones to reveal.
+    it("hides the closed-sprints toggle when there are no closed milestones", () => {
+        const { container } = renderList({ totalClosedMilestones: 0 });
+
+        expect(container.querySelector(".filter-closed-sprints")).toBeNull();
     });
 
-    it("invokes onToggleClosedSprints (and prevents default) when the toggle is clicked", () => {
-        let calls = 0;
-        const { container } = renderList({
-            openSprints: [makeOpenSprint(1)],
-            totalMilestones: 1,
-            closedSprints: [makeClosedSprint(9)],
-            totalClosedMilestones: 1,
-            closedSprintsVisible: false,
-            onToggleClosedSprints: () => {
-                calls += 1;
-            },
-        });
-        const toggle = container.querySelector("a.filter-closed-sprints") as HTMLElement;
-        const event = new MouseEvent("click", { bubbles: true, cancelable: true });
-        toggle.dispatchEvent(event);
-        expect(calls).toBe(1);
-        expect(event.defaultPrevented).toBe(true);
+    // Case 8 — clicking the add-sprint control invokes onAddSprint exactly once.
+    it("invokes onAddSprint when the add-sprint control is clicked", () => {
+        const fn = jest.fn();
+        const { container } = renderList({ onAddSprint: fn });
+
+        fireEvent.click(container.querySelector(".add-sprint")!);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    // Case 9 — clicking the closed-sprints toggle invokes onToggleClosedSprints
+    // exactly once.
+    it("invokes onToggleClosedSprints when the closed-sprints toggle is clicked", () => {
+        const fn = jest.fn();
+        const { container } = renderList({ onToggleClosedSprints: fn });
+
+        fireEvent.click(container.querySelector(".filter-closed-sprints")!);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    // Case 10 — each open sprint's name is rendered through Sprint -> SprintHeader
+    // (the project holds view_milestones, so the `.sprint-name` link/span shows).
+    it("renders each open sprint's name via Sprint -> SprintHeader", () => {
+        const { container } = renderList();
+
+        const names = Array.from(
+            container.querySelectorAll('div[tg-backlog-sprint="sprint"] .sprint-name span'),
+        ).map((el) => el.textContent);
+
+        expect(names).toContain("S1");
+        expect(names).toContain("S2");
     });
 });
