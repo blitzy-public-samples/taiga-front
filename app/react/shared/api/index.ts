@@ -7,7 +7,14 @@
  */
 
 export { createApiClient } from "./client";
-export type { ApiClient, BulkStoryOrder, SavableEntity } from "./client";
+export type {
+    ApiClient,
+    BulkStoryOrder,
+    SavableEntity,
+    ProjectStats,
+    TagsColors,
+    UnassignedUserStoriesResult,
+} from "./client";
 export { ApiError } from "./http";
 export type { HttpMethod, HttpResponse, RequestOptions } from "./http";
 export { URL_TEMPLATES, resolveUrl, buildUrl } from "./urls";

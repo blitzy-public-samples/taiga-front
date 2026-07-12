@@ -13,6 +13,7 @@
  * `%s` placeholders are positional id substitutions (mirrors base/urls.coffee `format`).
  */
 export const URL_TEMPLATES = {
+    projects: "/projects",
     userstories: "/userstories",
     "userstories-filters": "/userstories/filters_data",
     "bulk-create-us": "/userstories/bulk_create",
@@ -24,6 +25,7 @@ export const URL_TEMPLATES = {
     "userstory-watch": "/userstories/%s/watch",
     "userstory-unwatch": "/userstories/%s/unwatch",
     "userstory-statuses": "/userstory-statuses",
+    swimlanes: "/swimlanes",
     milestones: "/milestones",
     "move-userstories-to-milestone": "/milestones/%s/move_userstories_to_sprint",
     resolver: "/resolver",

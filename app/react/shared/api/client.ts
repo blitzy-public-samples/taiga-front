@@ -12,6 +12,8 @@ import type {
     Milestone,
     SprintListResult,
     Status,
+    Project,
+    Swimlane,
 } from "../types";
 import { resolveUrl, buildUrl, type EndpointKey, type QueryParams } from "./urls";
 import { httpGet, httpPost, httpPatch, request, parseHeaderInt } from "./http";
@@ -30,6 +32,42 @@ export interface SavableEntity {
 }
 
 /**
+ * Project statistics returned by `GET /projects/{id}/stats` (mirrors the legacy
+ * `ProjectsResource.stats` -> `queryOneRaw`, which returns the raw JSON body).
+ * The point/milestone totals below are the fields the Backlog burndown summary and
+ * the Kanban stats read; the index signature preserves the remaining backend keys
+ * without over-constraining the frozen contract.
+ */
+export interface ProjectStats {
+    total_milestones?: number | null;
+    total_points?: number | null;
+    closed_points?: number | null;
+    defined_points?: number | null;
+    assigned_points?: number | null;
+    total_userstories?: number | null;
+    [key: string]: unknown;
+}
+
+/**
+ * Tag -> color map returned by `GET /projects/{id}/tags_colors` (mirrors the legacy
+ * `ProjectsResource.tagsColors`). Each value is a hex color or null (no color set).
+ */
+export type TagsColors = Record<string, string | null>;
+
+/**
+ * Result of the paginated unassigned-user-story listing, mirroring the legacy
+ * `UserstoriesResource.listUnassigned` (`queryMany` with `enablePagination`), which
+ * returns the story models plus the `x-pagination-*` headers. The Backlog uses
+ * `count` as the "total unassigned points/stories" figure.
+ */
+export interface UnassignedUserStoriesResult {
+    userStories: UserStory[];
+    count: number;
+    current: number;
+    paginatedBy: number;
+}
+
+/**
  * Thin call-through facade over the frozen `/api/v1/` REST surface. Mirrors the
  * request-shaping of `resources/{userstories,sprints}.coffee` +
  * `base/{repository,http,urls,model}.coffee` over the wire only (no AngularJS import).
@@ -44,6 +82,39 @@ export const createApiClient = (context: MountContext) => {
             const url = buildUrl(resolve("resolver"), { project: slug });
             const response = await httpGet<{ project: number }>(context, url);
             return response.data.project;
+        },
+
+        /**
+         * Full project-detail metadata by slug (mirrors ProjectsResource.getBySlug ->
+         * `queryOne("projects", "by_slug?slug=…")`): GET /projects/by_slug?slug=<slug>.
+         * The response carries activation flags, `my_permissions`, statuses, roles,
+         * points, members, and totals that the Kanban/Backlog hooks gate + render on.
+         */
+        getProjectBySlug: async (slug: string): Promise<Project> => {
+            const url = buildUrl(`${resolve("projects")}/by_slug`, { slug });
+            const response = await httpGet<Project>(context, url);
+            return response.data;
+        },
+
+        /** Project stats (mirrors ProjectsResource.stats): GET /projects/{id}/stats. */
+        getProjectStats: async (projectId: number): Promise<ProjectStats> => {
+            const url = `${resolve("projects")}/${projectId}/stats`;
+            const response = await httpGet<ProjectStats>(context, url);
+            return response.data;
+        },
+
+        /** Tag colors (mirrors ProjectsResource.tagsColors): GET /projects/{id}/tags_colors. */
+        getProjectTagsColors: async (projectId: number): Promise<TagsColors> => {
+            const url = `${resolve("projects")}/${projectId}/tags_colors`;
+            const response = await httpGet<TagsColors>(context, url);
+            return response.data;
+        },
+
+        /** Project swimlanes (mirrors SwimlanesResource.list): GET /swimlanes?project=<id>. */
+        listSwimlanes: async (projectId: number): Promise<Swimlane[]> => {
+            const url = buildUrl(resolve("swimlanes"), { project: projectId });
+            const response = await httpGet<Swimlane[]>(context, url);
+            return response.data;
         },
 
         getUserStory: async (
@@ -76,6 +147,35 @@ export const createApiClient = (context: MountContext) => {
             const url = buildUrl(resolve("userstories"), filters);
             const response = await httpGet<UserStory[]>(context, url);
             return response.data;
+        },
+
+        /**
+         * Paginated unassigned-user-story listing (mirrors UserstoriesResource.listUnassigned:
+         * `queryMany("userstories", {project, milestone:"null", …, page_size}, {enablePagination:true}, true)`).
+         * GET /userstories?project=<id>&milestone=null&page_size=<n> WITHOUT the
+         * `x-disable-pagination` header (via `enablePagination`), so the backend paginates
+         * and returns the `x-pagination-*` totals the Backlog reads. `current` defaults to
+         * 1 when the header is absent, matching `queryPaginated`'s `… or 1` fallback.
+         */
+        listUnassignedUserStories: async (
+            projectId: number,
+            filters: QueryParams = {},
+            pageSize?: number,
+        ): Promise<UnassignedUserStoriesResult> => {
+            const url = buildUrl(resolve("userstories"), {
+                project: projectId,
+                milestone: "null",
+                ...filters,
+                page_size: pageSize,
+            });
+            const response = await httpGet<UserStory[]>(context, url, { enablePagination: true });
+            const rawCurrent = response.headers.get("x-pagination-current");
+            return {
+                userStories: response.data,
+                count: parseHeaderInt(response.headers, "x-pagination-count"),
+                current: rawCurrent ? parseHeaderInt(response.headers, "x-pagination-current") : 1,
+                paginatedBy: parseHeaderInt(response.headers, "x-paginated-by"),
+            };
         },
 
         bulkCreateUserStories: async (

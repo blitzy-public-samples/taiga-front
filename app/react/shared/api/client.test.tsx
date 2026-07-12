@@ -516,3 +516,150 @@ describe("apiClient remaining actions", () => {
         expect(url).toBe(`${BASE}/milestones/30`);
     });
 });
+
+describe("apiClient project + swimlane + unassigned loaders", () => {
+    /** Read the plain headers object passed to the most recent fetch call. */
+    const lastHeaders = (): Record<string, string> => {
+        const { calls } = fetchMock.mock;
+        const [, requestInit] = calls[calls.length - 1] as [string, RequestInit];
+        return (requestInit.headers ?? {}) as Record<string, string>;
+    };
+
+    it("getProjectBySlug GETs /projects/by_slug?slug= and returns the project detail", async () => {
+        fetchMock.mockResolvedValueOnce(
+            makeResponse({
+                id: 7,
+                slug: "my-project",
+                my_permissions: ["view_us", "modify_us"],
+                is_kanban_activated: true,
+                is_backlog_activated: true,
+                us_statuses: [{ id: 1, name: "New" }],
+                members: [{ id: 3, full_name: "Ada" }],
+            }),
+        );
+        const api = createApiClient(context);
+
+        const project = await api.getProjectBySlug("my-project");
+
+        expect(project.id).toBe(7);
+        expect(project.is_kanban_activated).toBe(true);
+        expect(project.us_statuses).toHaveLength(1);
+        expect(project.members?.[0].full_name).toBe("Ada");
+        const { url, method } = lastCall();
+        expect(method).toBe("GET");
+        expect(url).toBe(`${BASE}/projects/by_slug?slug=my-project`);
+        // Parity with legacy queryOne: pagination is disabled on the metadata read.
+        expect(lastHeaders()["x-disable-pagination"]).toBe("1");
+    });
+
+    it("getProjectStats GETs /projects/{id}/stats and returns the raw totals", async () => {
+        fetchMock.mockResolvedValueOnce(
+            makeResponse({
+                total_milestones: 3,
+                total_points: 40,
+                closed_points: 12,
+                defined_points: 25,
+                assigned_points: 30,
+            }),
+        );
+        const api = createApiClient(context);
+
+        const stats = await api.getProjectStats(7);
+
+        expect(stats.total_points).toBe(40);
+        expect(stats.closed_points).toBe(12);
+        const { url, method } = lastCall();
+        expect(method).toBe("GET");
+        expect(url).toBe(`${BASE}/projects/7/stats`);
+    });
+
+    it("getProjectTagsColors GETs /projects/{id}/tags_colors and returns the tag->color map", async () => {
+        fetchMock.mockResolvedValueOnce(makeResponse({ frontend: "#729fcf", urgent: null }));
+        const api = createApiClient(context);
+
+        const colors = await api.getProjectTagsColors(7);
+
+        expect(colors).toEqual({ frontend: "#729fcf", urgent: null });
+        const { url, method } = lastCall();
+        expect(method).toBe("GET");
+        expect(url).toBe(`${BASE}/projects/7/tags_colors`);
+    });
+
+    it("listSwimlanes GETs /swimlanes?project= and returns the swimlane list", async () => {
+        fetchMock.mockResolvedValueOnce(
+            makeResponse([
+                { id: 1, name: "Default" },
+                { id: 2, name: "Bugs" },
+            ]),
+        );
+        const api = createApiClient(context);
+
+        const swimlanes = await api.listSwimlanes(7);
+
+        expect(swimlanes).toHaveLength(2);
+        expect(swimlanes[1].name).toBe("Bugs");
+        const { url, method } = lastCall();
+        expect(method).toBe("GET");
+        expect(url).toBe(`${BASE}/swimlanes?project=7`);
+        // Parity with legacy queryMany (no enablePagination): pagination disabled.
+        expect(lastHeaders()["x-disable-pagination"]).toBe("1");
+    });
+
+    it("listUnassignedUserStories GETs /userstories?project=&milestone=null&page_size= with pagination enabled", async () => {
+        fetchMock.mockResolvedValueOnce(
+            makeResponse([{ id: 10, status: 1, swimlane: null }], {
+                headers: {
+                    "x-pagination-count": "42",
+                    "x-pagination-current": "2",
+                    "x-paginated-by": "30",
+                },
+            }),
+        );
+        const api = createApiClient(context);
+
+        const result = await api.listUnassignedUserStories(7, {}, 30);
+
+        expect(result.userStories).toHaveLength(1);
+        expect(result.count).toBe(42);
+        expect(result.current).toBe(2);
+        expect(result.paginatedBy).toBe(30);
+
+        const { url, method } = lastCall();
+        expect(method).toBe("GET");
+        expect(url).toContain(`${BASE}/userstories?`);
+        expect(url).toContain("project=7");
+        expect(url).toContain("milestone=null");
+        expect(url).toContain("page_size=30");
+        // enablePagination => the x-disable-pagination header MUST NOT be sent.
+        expect(lastHeaders()["x-disable-pagination"]).toBeUndefined();
+    });
+
+    it("listUnassignedUserStories defaults current to 1 and count/paginatedBy to 0 when headers are absent", async () => {
+        fetchMock.mockResolvedValueOnce(makeResponse([]));
+        const api = createApiClient(context);
+
+        const result = await api.listUnassignedUserStories(7);
+
+        expect(result.userStories).toEqual([]);
+        expect(result.count).toBe(0);
+        expect(result.current).toBe(1);
+        expect(result.paginatedBy).toBe(0);
+        // page_size is omitted from the query when not provided.
+        expect(lastCall().url).not.toContain("page_size");
+    });
+
+    it("listUnassignedUserStories appends caller filters alongside project/milestone", async () => {
+        fetchMock.mockResolvedValueOnce(makeResponse([]));
+        const api = createApiClient(context);
+
+        await api.listUnassignedUserStories(7, { status: 3, tags: "urgent" }, 50);
+
+        const { url } = lastCall();
+        expect(url).toContain("project=7");
+        expect(url).toContain("milestone=null");
+        expect(url).toContain("status=3");
+        expect(url).toContain("tags=urgent");
+        expect(url).toContain("page_size=50");
+    });
+});
+

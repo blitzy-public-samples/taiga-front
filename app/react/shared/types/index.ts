@@ -18,5 +18,5 @@ export type {
     UserStoryEpic,
     TribeGig,
 } from "./userStory";
-export type { Project, Point, Role } from "./project";
+export type { Project, Point, Role, ProjectMember } from "./project";
 export type { Milestone, Sprint, SprintListResult } from "./milestone";
