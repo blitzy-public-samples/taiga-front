@@ -75,8 +75,24 @@ const resolveSessionId = (context: MountContext): string | null => {
 };
 
 /**
- * Build request headers, mirroring `base/http.coffee` + `app.coffee` defaultHeaders:
- * bearer + X-Session-Id on every request; Content-Type + Accept-Language on mutations.
+ * Build request headers, mirroring the frozen `base/http.coffee`
+ * `HttpService.headers()` + the `app.coffee` `$httpProvider` defaults, so the
+ * React reads/writes hit the wire byte-for-byte like the AngularJS client:
+ *
+ *  - `Authorization: Bearer <token>` + `X-Session-Id` on EVERY request.
+ *  - An explicit `Accept` of "application/json, text/plain" plus a wildcard on
+ *    EVERY request. AngularJS seeds this via
+ *    `$httpProvider.defaults.headers.common.Accept`, which applies to all verbs
+ *    (GET included), so it is sent on reads and writes alike.
+ *  - `Accept-Language: <language>` on EVERY request (GET included) when a
+ *    language is set. The frozen `HttpService.headers()` adds this
+ *    UNCONDITIONALLY and `HttpService.request()` merges it onto every verb, so
+ *    the backend content-negotiates (`Vary: Accept-Language`) identically for
+ *    reads as for mutations. It MUST NOT be gated behind the mutating methods.
+ *  - `Content-Type: application/json` ONLY on mutations (POST/PUT/PATCH/DELETE),
+ *    which are the only requests that carry a JSON body. This matches both the
+ *    per-verb `$httpProvider` split (get has no Content-Type) and the absence of
+ *    Content-Type in `HttpService.headers()`.
  */
 export const buildHeaders = (context: MountContext, method: HttpMethod): Record<string, string> => {
     const headers: Record<string, string> = {};
@@ -91,11 +107,18 @@ export const buildHeaders = (context: MountContext, method: HttpMethod): Record<
         headers["X-Session-Id"] = sessionId;
     }
 
+    // Accept + Accept-Language are sent on EVERY request (GET included) to mirror
+    // the frozen AngularJS client, whose `$httpProvider` common defaults and
+    // `HttpService.headers()` merge these onto every verb.
+    headers.Accept = "application/json, text/plain, */*";
+    if (context.language) {
+        headers["Accept-Language"] = context.language;
+    }
+
+    // Content-Type is set only for mutations, which are the requests that carry a
+    // JSON body (GET/HEAD-style reads never do).
     if (MUTATING.indexOf(method) !== -1) {
         headers["Content-Type"] = "application/json";
-        if (context.language) {
-            headers["Accept-Language"] = context.language;
-        }
     }
 
     return headers;

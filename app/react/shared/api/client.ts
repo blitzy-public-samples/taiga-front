@@ -319,7 +319,9 @@ export const createApiClient = (context: MountContext) => {
         /**
          * Dirty-field PATCH with optimistic concurrency (mirrors repository.save +
          * model.getAttrs): skip the request entirely when nothing is modified;
-         * PATCH sends only the changed attrs and ALWAYS includes `version`; PUT sends all.
+         * PATCH sends only the changed attrs and ALWAYS includes `version`; PUT
+         * sends the full entity MERGED WITH the modified attrs (mirroring
+         * `model.getAttrs(patch=false)` = `_.extend({}, attrs, modifiedAttrs)`).
          * The response body replaces local attrs (incl. the new `version`).
          */
         save: async <T extends SavableEntity>(
@@ -341,7 +343,12 @@ export const createApiClient = (context: MountContext) => {
                     payload.version = entity.version;
                 }
             } else {
-                payload = { ...entity };
+                // PUT mirrors the frozen `model.getAttrs(patch=false)` =
+                // `_.extend({}, @._attrs, @._modifiedAttrs)`: the full entity merged
+                // with the modified attrs (modified taking precedence). Merging
+                // `modifiedAttrs` is REQUIRED so the caller's intended change is sent
+                // rather than silently dropped by a bare `{ ...entity }` copy.
+                payload = { ...entity, ...modifiedAttrs };
             }
 
             const response = await request<Record<string, unknown>>(

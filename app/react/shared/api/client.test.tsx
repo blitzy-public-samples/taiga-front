@@ -419,17 +419,23 @@ describe("apiClient.save", () => {
         expect(body).not.toHaveProperty("version");
     });
 
-    it("PUTs all attrs when patch is false", async () => {
-        fetchMock.mockResolvedValueOnce(makeResponse({ id: 5, version: 4, subject: "new", status: 2 }));
+    it("PUTs the full entity MERGED WITH the modified attrs when patch is false", async () => {
+        // Mirrors the frozen `model.getAttrs(patch=false)` =
+        // `_.extend({}, @._attrs, @._modifiedAttrs)`: the modified attr must be
+        // merged OVER the original entity, not silently dropped. The entity's
+        // `subject` ("old") differs from the modified value ("PUT-CHANGED") so a
+        // bare `{ ...entity }` copy (the previous bug) would fail this assertion.
+        fetchMock.mockResolvedValueOnce(makeResponse({ id: 5, version: 4, subject: "PUT-CHANGED", status: 2 }));
         const api = createApiClient(context);
-        const entity = { id: 5, version: 3, subject: "new", status: 2 };
+        const entity = { id: 5, version: 3, subject: "old", status: 2 };
 
-        const result = await api.save("userstories", entity, { subject: "new" }, false);
+        const result = await api.save("userstories", entity, { subject: "PUT-CHANGED" }, false);
 
         const { method, body } = lastCall();
         expect(method).toBe("PUT");
-        expect(body).toEqual({ id: 5, version: 3, subject: "new", status: 2 });
+        expect(body).toEqual({ id: 5, version: 3, subject: "PUT-CHANGED", status: 2 });
         expect(result.version).toBe(4);
+        expect(result.subject).toBe("PUT-CHANGED");
     });
 
     it("does not skip when patch is false even if nothing is modified", async () => {
@@ -550,6 +556,13 @@ describe("apiClient project + swimlane + unassigned loaders", () => {
         expect(url).toBe(`${BASE}/projects/by_slug?slug=my-project`);
         // Parity with legacy queryOne: pagination is disabled on the metadata read.
         expect(lastHeaders()["x-disable-pagination"]).toBe("1");
+        // Frozen-contract header parity on reads (base/http.coffee headers() +
+        // $httpProvider common defaults merge onto every verb, GET included):
+        // the backend content-negotiates on Accept-Language (Vary: Accept-Language).
+        expect(lastHeaders()["Accept-Language"]).toBe("en");
+        expect(lastHeaders().Accept).toBe("application/json, text/plain, */*");
+        // GET carries no body, so no Content-Type is sent (matches the frozen client).
+        expect(lastHeaders()["Content-Type"]).toBeUndefined();
     });
 
     it("getProjectStats GETs /projects/{id}/stats and returns the raw totals", async () => {
