@@ -15,9 +15,10 @@ import type { Page } from '@playwright/test';
  * Taiga lightboxes (modals) toggle visibility purely through the `open` CSS
  * class on their `.lightbox` container. The legacy AngularJS screens and the
  * migrated React screens emit the *same* DOM and class names
- * (`.lightbox.open`, `.lightbox-generic-ask`, `.button-green`, `.button-red`,
- * `.close`), so this helper drives both the `baseline` (stock AngularJS) and
- * `react` Playwright projects completely unchanged.
+ * (`.lightbox.open`, `.lightbox-generic-ask`, `.lightbox-generic-delete`,
+ * `.button-green`, `.button-red`, `.js-confirm`, `.js-cancel`, `.close`), so
+ * this helper drives both the `baseline` (stock AngularJS) and `react`
+ * Playwright projects completely unchanged.
  *
  * The helper is written as a factory: it captures the {@link Page} once and
  * returns a set of nested async functions that can call one another
@@ -31,8 +32,11 @@ import type { Page } from '@playwright/test';
  * because that barrel re-exports `lightbox` from this very module.
  *
  * @param page - The Playwright {@link Page} the lightbox is rendered on.
- * @returns An object exposing `open`, `close`, `confirmOk`, `confirmCancel`
- *          and `exit`, matching the surface the Protractor helper provided.
+ * @returns An object exposing `open`, `close`, `confirmOk`, `confirmCancel`,
+ *          `confirmDelete` and `exit`. `confirmOk`/`confirmCancel` drive the
+ *          generic `.lightbox-generic-ask` dialog (matching the surface the
+ *          Protractor helper provided); `confirmDelete` drives the served
+ *          build's dedicated `.lightbox-generic-delete` deletion dialog.
  */
 export function lightbox(page: Page) {
     // Matches the legacy timing exactly: a 300ms CSS transition plus a 100ms
@@ -113,6 +117,29 @@ export function lightbox(page: Page) {
     }
 
     /**
+     * Confirm the "delete" dialog by clicking its DELETE button.
+     *
+     * The stock (and React) build routes destructive deletions through a
+     * DEDICATED `.lightbox-generic-delete` dialog — distinct from the generic
+     * `.lightbox-generic-ask` driven by `confirmOk`/`confirmCancel`. It exposes
+     * `.js-confirm` (the "DELETE" button) and `.js-cancel` controls rather than
+     * the `.button-green`/`.button-red` of the generic-ask dialog. Backlog
+     * user-story deletion and sprint deletion BOTH route through this dialog
+     * (verified live against the served build), so this helper opens
+     * `.lightbox-generic-delete`, clicks `.js-confirm`, and waits for it to
+     * close. The legacy Protractor helper only knew the generic-ask dialog; the
+     * served dist uses generic-delete for deletes, so this is the reconciled
+     * delete-confirmation surface.
+     */
+    async function confirmDelete(): Promise<void> {
+        const sel = '.lightbox-generic-delete';
+
+        await open(sel);
+        await page.locator(`${sel} .js-confirm`).click();
+        await close(sel);
+    }
+
+    /**
      * Dismiss a lightbox via its `.close` control.
      *
      * Port of `lightbox.exit`: clicks the first `.close` element inside the
@@ -125,5 +152,5 @@ export function lightbox(page: Page) {
         await close(selector);
     }
 
-    return { open, close, confirmOk, confirmCancel, exit };
+    return { open, close, confirmOk, confirmCancel, confirmDelete, exit };
 }

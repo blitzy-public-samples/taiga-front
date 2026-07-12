@@ -16,8 +16,10 @@
  *     `closeJoyride` helpers.
  *
  * It exports an EXTENDED `@playwright/test` `test` object that exposes a
- * `taiga` fixture. The fixture auto-logs-in (admin / 123123) before every test
- * and hands the test body a small navigation + screenshot harness. `expect` is
+ * `taiga` fixture. The fixture auto-logs-in as the seeded admin (password from
+ * the `TAIGA_ADMIN_PASSWORD` environment variable, never hard-coded) before
+ * every test and hands the test body a small navigation + screenshot harness.
+ * `expect` is
  * re-exported so specs import both `test` and `expect` from the single
  * `./fixtures` barrel (`index.ts`) consumed by `../kanban.spec.ts` and
  * `../backlog.spec.ts`.
@@ -87,8 +89,24 @@ function makeHarness(page: Page, testInfo: TestInfo): TaigaHarness {
         localStorage.setItem("e2e", "true");
       });
 
+      // Credentials come from the ENVIRONMENT, never hard-coded in source: the
+      // seeded admin account's password is supplied as `TAIGA_ADMIN_PASSWORD`
+      // (the same variable the Docker/setup flow uses to create the superuser).
+      // Fail loudly if it is missing so a mis-configured environment surfaces a
+      // clear error rather than an opaque 401/login-timeout downstream.
+      const username = "admin";
+      const password = process.env.TAIGA_ADMIN_PASSWORD;
+      if (!password) {
+        throw new Error(
+          "TAIGA_ADMIN_PASSWORD is not set. The e2e login fixture requires the " +
+            "admin password to be supplied via the environment (parity with the " +
+            "Docker superuser-creation flow); it is never hard-coded in source."
+        );
+      }
+
       // Drive the login form exactly as the Protractor onPrepare did
-      // (conf.e2e.js L127-135 / common.login L159-174): admin / 123123.
+      // (conf.e2e.js L127-135 / common.login L159-174), signing in as the
+      // seeded admin using the environment-provided password.
       //
       // HASHBANG FALLBACK: the primary path is the PLAIN route "/login" (what
       // the Protractor source used: `host + 'login'`). If, against the running
@@ -97,9 +115,13 @@ function makeHarness(page: Page, testInfo: TestInfo): TaigaHarness {
       // "/#!/login" — and apply the SAME form to gotoKanban/gotoBacklog for
       // consistency. Confirm against the live app; the plain path is primary.
       await page.goto("/login");
-      await page.fill('input[name="username"]', "admin");
-      await page.fill('input[name="password"]', "123123");
-      await page.locator(".submit-button").click();
+      await page.fill('input[name="username"]', username);
+      await page.fill('input[name="password"]', password);
+      // The shipped login control is `button[type="submit"].btn-small.full`
+      // (the legacy `.submit-button` class is not present on the served build);
+      // target the semantic submit button so the click resolves on both the
+      // stock-AngularJS and the React builds.
+      await page.locator('button[type="submit"]').click();
 
       // Wait until the app returns to the root after a successful login.
       // page.waitForURL's predicate receives a URL object in Playwright 1.44.
@@ -158,6 +180,46 @@ function makeHarness(page: Page, testInfo: TestInfo): TaigaHarness {
       // consistent across login / gotoKanban / gotoBacklog.
       await page.goto(`/project/${slug}/backlog`);
       await harness.waitLoader();
+
+      // RENDER-RACE GUARD. The backlog paints in two async waves AFTER the
+      // loader clears: first the backlog rows, then the sprint sidebar's
+      // `.milestone-us-item-row` stories — each fetched by a separately-settling
+      // XHR. Tests that read a backlog-row or sprint-story count at their start
+      // (a self-population loop, a reorder baseline, a drag delta) must not
+      // sample during that gap. Waiting for `networkidle` blocks until BOTH XHR
+      // waves have settled (verified: idle is reached ~1.2s post-navigation on
+      // this app, at which point the backlog rows AND the sprint stories have
+      // painted, and the WebSocket does not keep the network busy). This
+      // replaces a hand-rolled count-stability poll that watched ONLY the sprint
+      // stories and could FALSE-STABILISE at 0 when two consecutive samples both
+      // landed in the pre-render gap (two 0s look "stable"), letting a test
+      // proceed against an empty, still-loading backlog (observed: an empty
+      // `userStories()` skipped a self-population loop and a 0 sprint baseline
+      // failed a delta). Bounded + best-effort so a stray lingering request
+      // cannot wedge navigation.
+      try {
+        await page.waitForLoadState("networkidle", { timeout: 15000 });
+      } catch {
+        // Fall through: idle not reached within budget. The stability guard
+        // below still ensures the sprint sidebar has stopped mutating.
+      }
+
+      // Secondary guard: the sprint-story count is stable across two samples.
+      // After `networkidle` this reads the TRUE count (0 for a genuinely empty
+      // backlog, its real total otherwise), so it no longer false-stabilises.
+      // `-1` is a "not yet stable" sentinel that keeps the poll retrying until
+      // two consecutive reads agree.
+      await expect
+        .poll(
+          async () => {
+            const first = await page.locator(".milestone-us-item-row").count();
+            await page.waitForTimeout(250);
+            const second = await page.locator(".milestone-us-item-row").count();
+            return first === second ? second : -1;
+          },
+          { timeout: 15000 }
+        )
+        .not.toBe(-1);
     },
 
     async screenshot(name: string): Promise<void> {

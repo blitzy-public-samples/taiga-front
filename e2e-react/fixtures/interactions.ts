@@ -16,12 +16,17 @@
  * lightbox and are consumed by `../kanban.spec.ts` and `../backlog.spec.ts`
  * through the `./fixtures` barrel (`./index.ts`).
  *
- * Because the migrated React screens reproduce the exact same `.e2e-*`
- * tag-input DOM and the `tg-attachments-simple` attachment DOM that the
- * surviving AngularJS templates emit, every selector below is kept
- * byte-identical to the original Protractor helper. The result is that these
- * helpers exercise BOTH the `baseline` (stock AngularJS) and `react` builds
- * unchanged, which is exactly what the two-capture parity evidence requires.
+ * The migrated React screens reproduce the same shared-component DOM
+ * (`tg-tag-line-common` tag widget + `tg-attachments-simple` attachments) that
+ * the surviving AngularJS templates emit. `fillTags` therefore targets the
+ * widget's stable structural classes (`.add-tag-text`, `.tag-input`,
+ * `.tag-color`, `.color-selector-dropdown-list`, `tg-tag .icon-close`) rather
+ * than the `.e2e-*` instrumentation hooks, which the prebuilt served dist
+ * compiles out (the stable classes coexist with those hooks in the `.jade`
+ * source, so they hold for the `react` build too). `uploadAttachment` targets
+ * the `tg-attachments-simple` DOM directly. The result is that these helpers
+ * exercise BOTH the `baseline` (stock AngularJS) and `react` builds, which is
+ * exactly what the two-capture parity evidence requires.
  *
  * Runtime contract: Node 16.19.1 + @playwright/test 1.44.1. Only the
  * `@playwright/test` public API and Node's `path` module are used — there are
@@ -36,15 +41,20 @@ import type { Page } from "@playwright/test";
 /**
  * Populate the tag input inside the user-story lightbox.
  *
- * Port of `common-helper.tags()`. Reproduces the original click/type sequence
- * exactly:
- *   1. Reveal the tag input (`.e2e-show-tag-input`).
- *   2. Open the color selector (`.e2e-open-color-selector`) and pick the second
- *      swatch (`.e2e-color-dropdown li` index 1 — Protractor `get(1)`).
- *   3. Add a literal tag ("xxxyy") via the add-tag input, committed with Enter.
- *   4. Remove the last tag (`.e2e-delete-tag`) to leave the list in the
- *      original helper's post-condition.
- *   5. Type "a" one keystroke at a time so the tag autocomplete dropdown fires,
+ * Port of `common-helper.tags()`, reconciled to the shared `tg-tag-line-common`
+ * widget's shipped-DOM classes (the legacy `.e2e-*` tag hooks are compiled out
+ * of the served build, exactly as the card hooks are in Issue 8; the stable
+ * structural classes below coexist with those hooks in the `.jade` source, so
+ * they hold for both the `baseline` and `react` builds). Reproduces the
+ * original click/type sequence:
+ *   1. Reveal the tag input (`.tags-block .add-tag-text`, was `.e2e-show-tag-input`).
+ *   2. Type the literal tag ("xxxyy"), open the color selector
+ *      (`.tag-color`, was `.e2e-open-color-selector`) and pick the second swatch
+ *      (`.color-selector-dropdown-list li` index 1, was `.e2e-color-dropdown li`
+ *      — Protractor `get(1)`), then commit with Enter.
+ *   3. Remove the added tag (`tg-tag .icon-close`, was `.e2e-delete-tag`) to
+ *      leave the list in the original helper's post-condition.
+ *   4. Type "a" one keystroke at a time so the tag autocomplete dropdown fires,
  *      then ArrowDown to highlight the first suggestion and Enter to accept it.
  *
  * The literal tag uses `fill("xxxyy")` (which sets the value and dispatches an
@@ -56,15 +66,65 @@ import type { Page } from "@playwright/test";
  * @param page - The Playwright {@link Page} driving the lightbox.
  */
 export async function fillTags(page: Page): Promise<void> {
-  await page.locator(".e2e-show-tag-input").click();
-  await page.locator(".e2e-open-color-selector").click();
-  await page.locator(".e2e-color-dropdown li").nth(1).click();
+  // Reveal the tag input. The shared `tg-tag-line-common` widget renders the
+  // reveal control as `button.btn-filter > span.add-tag-text` (the legacy
+  // `.e2e-show-tag-input` hook is compiled out of the served dist, exactly like
+  // the card `.e2e-*` hooks in Issue 8); clicking the `.add-tag-text` label
+  // triggers the button's `displayTagInput()`.
+  // Track existing tag chips so the add/remove assertions below are RELATIVE.
+  // `fillTags` is shared by the create-US flow (starts with zero tags) and the
+  // edit-US flow (may start with tags), so hard-coding an absolute chip count
+  // would be wrong; deltas from `initial` are correct in both cases.
+  const chips = page.locator(".tags-container tg-tag");
+  const initial = await chips.count();
 
-  const input = page.locator(".e2e-add-tag-input");
-  await input.fill("xxxyy");
+  await page.locator(".tags-block .add-tag-text").click();
+
+  // The revealed input is `input.tag-input` inside `.add-tag-input`
+  // (was stale `.e2e-add-tag-input`). It stays open across commits, so the same
+  // locator drives both the literal tag and the autocomplete tag below.
+  const input = page.locator(".tags-block .tag-input");
+  await input.waitFor({ state: "visible" });
+  // Use a UNIQUE literal tag name per invocation. Taiga DE-DUPLICATES tags, so a
+  // fixed name ("xxxyy") silently fails to add a new chip whenever the edited
+  // story already carries that exact tag — e.g. a leftover from an earlier run
+  // on the shared, persistent seeded backend — which would make the `initial +
+  // 1` assertion below time out (observed: an edited story already tagged
+  // `xxxyy` stays at its current chip count). A timestamped name is guaranteed
+  // novel, so the add always registers a new chip regardless of the story's
+  // pre-existing tags. (The create-US flow starts with zero tags, so this is
+  // equally correct there.)
+  const literalTag = `xxxyy${Date.now()}`;
+  await input.fill(literalTag);
+
+  // Open the color selector (`.tag-color`, was `.e2e-open-color-selector`),
+  // wait for its dropdown to fully open, then pick the second swatch
+  // (`.color-selector-dropdown-list li`, was `.e2e-color-dropdown li` —
+  // Protractor `get(1)`). COMMIT-RACE GUARD: committing with Enter immediately
+  // after the swatch click races the dropdown's close/color-apply transition
+  // and intermittently fails to register the tag at all (leaving no chip, which
+  // then times out the remove step below). Let that transition settle before
+  // pressing Enter, then WAIT for the committed chip to actually render.
+  await page.locator(".tags-block .tag-color").click();
+  const swatches = page.locator(".tags-block .color-selector-dropdown-list li");
+  await swatches.first().waitFor({ state: "visible" });
+  await swatches.nth(1).click();
+  await page.waitForTimeout(400);
   await input.press("Enter");
+  await expect(chips).toHaveCount(initial + 1);
 
-  await page.locator(".e2e-delete-tag").last().click();
+  // Remove the SPECIFIC chip just added, matched by its unique text — NOT merely
+  // the "last" chip. Tag chips do not always render in insertion order, so a
+  // positional (`.last()`) remove could delete a pre-existing tag and leave the
+  // newly-added one, corrupting the `initial` count assertion. Each `tg-tag`
+  // chip carries the delete control as `tg-svg.icon-close` (was `.e2e-delete-tag`).
+  // Confirm the chip is gone before proceeding so the autocomplete add below
+  // starts from a known state.
+  await page
+    .locator(".tags-container tg-tag", { hasText: literalTag })
+    .locator("tg-svg.icon-close")
+    .click();
+  await expect(chips).toHaveCount(initial);
 
   // Type "a" character-by-character to trigger the autocomplete dropdown,
   // then ArrowDown to highlight the first suggestion and Enter to accept it.

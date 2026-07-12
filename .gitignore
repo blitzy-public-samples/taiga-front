@@ -18,8 +18,35 @@ e2e/reports/
 app/modules/compile-modules/
 yarn.lock
 
-# Keep committed Playwright parity evidence (baseline + react screenshots/videos).
-# These artifacts are the migration deliverable and must NOT be gitignored.
-!e2e-react/
+# ── Playwright parity evidence (AAP §0.6.2) ────────────────────────────────
+# The `e2e-react/artifacts/` tree is written to by Playwright and holds TWO very
+# different kinds of files:
+#   (a) DURABLE, human-reviewed parity evidence — the curated before/after
+#       screenshots and videos that ARE the migration deliverable and MUST be
+#       committed (baseline vs. react), plus each folder's README.md/.gitkeep.
+#   (b) TRANSIENT per-run debris — Playwright's auto per-test screenshots
+#       (`test-finished-*.png`, `test-failed-*.png`), per-test `video.webm`,
+#       failure `trace.zip`, `error-context.md`, the HTML `report/`, and the
+#       runner's `.last-run.json`. Playwright REGENERATES this on every run and
+#       wipes each project's `outputDir` at the start of a run, so committing it
+#       would both add churn and risk stale junk in version control.
+#
+# Issue 10 fix: the previous blanket `!e2e-react/artifacts/**` un-ignored the
+# transient debris too. Instead, IGNORE the whole artifacts tree and RE-INCLUDE
+# ONLY the curated evidence subfolders (`screenshots/`, `videos/`) and the docs.
+# Git cannot re-include a path whose parent directory stays excluded, so every
+# parent directory is re-included before its contents.
+e2e-react/artifacts/**
 !e2e-react/artifacts/
-!e2e-react/artifacts/**
+!e2e-react/artifacts/baseline/
+!e2e-react/artifacts/react/
+!e2e-react/artifacts/**/README.md
+!e2e-react/artifacts/**/.gitkeep
+!e2e-react/artifacts/baseline/screenshots/
+!e2e-react/artifacts/baseline/screenshots/**
+!e2e-react/artifacts/react/screenshots/
+!e2e-react/artifacts/react/screenshots/**
+!e2e-react/artifacts/baseline/videos/
+!e2e-react/artifacts/baseline/videos/**
+!e2e-react/artifacts/react/videos/
+!e2e-react/artifacts/react/videos/**

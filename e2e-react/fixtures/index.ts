@@ -21,7 +21,7 @@
  * `e2e/utils/index.js`.
  *
  * It is a PURE RE-EXPORT barrel — no logic, no declarations, no side effects.
- * It re-exports ONLY the eight locked public names from the five sibling helper
+ * It re-exports ONLY the locked public names from the five sibling helper
  * modules plus the EXTENDED `test`/`expect` from `taiga-fixtures.ts`:
  *
  *   - `test`, `expect`       ← `./taiga-fixtures` (the extended test carrying the
@@ -30,7 +30,10 @@
  *                              than reaching into `@playwright/test` directly)
  *   - `lightbox`             ← `./lightbox`
  *   - `openPopover`          ← `./popover`
- *   - `dragAndDrop`          ← `./dnd`
+ *   - `dragAndDrop`,
+ *     `dragViaEvents`        ← `./dnd` (`dragViaEvents` is the synthetic-event
+ *                              drag used ONLY for the viewport-spanning
+ *                              closed-sprints drags; see its docstring)
  *   - `fillTags`,
  *     `uploadAttachment`     ← `./interactions`
  *   - `runSharedFilters`     ← `./filters`
@@ -45,6 +48,6 @@
 export { test, expect } from "./taiga-fixtures";
 export { lightbox } from "./lightbox";
 export { openPopover } from "./popover";
-export { dragAndDrop } from "./dnd";
+export { dragAndDrop, dragViaEvents } from "./dnd";
 export { fillTags, uploadAttachment } from "./interactions";
 export { runSharedFilters } from "./filters";
