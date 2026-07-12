@@ -7,21 +7,43 @@
  */
 
 /**
- * Component tests for {@link KanbanHeader}.
+ * Jest + @testing-library/react component tests for {@link KanbanHeader}.
  *
- * These tests assert the exact DOM contract reproduced from
- * `app/partials/kanban/kanban.jade` (L20-46) — the `.taskboard-actions` bar —
- * plus the controlled behavior of the filter toggle, the `tg-input-search`
- * search box, and the `tg-board-zoom` zoom radios.
+ * `KanbanHeader` is the React reproduction of the Kanban board
+ * `.taskboard-actions` bar (`app/partials/kanban/kanban.jade` L20-46). Because
+ * the AngularJS -> React migration must be DOM/CSS-identical, these tests assert
+ * the exact element tree, class names, `data-*`/attribute values, and controlled
+ * behavior the legacy template + directives produced:
+ *   - the filter-toggle button (`button.btn-filter.e2e-open-filter`, with its
+ *     `active` state, label swap, and applied-filter badge),
+ *   - the search box (`tg-input-search`), reproducing the `q:'<'` / `change:'&'`
+ *     bindings and the `$onChanges`-style dirty-tracking of
+ *     `input-search.component.coffee`,
+ *   - the zoom control (`tg-board-zoom.board-zoom`), reproducing the four
+ *     `value="0".."3"` radios of `board-zoom.jade`.
+ *
+ * These tests contribute to the >= 70% line-coverage gate for the new React
+ * code and cover every branch of the component.
+ *
+ * Conventions (per the build constraints for this file):
+ *   - Ambient Jest globals (`describe`/`it`/`expect`/`jest`) are used directly
+ *     (provided by @types/jest); they are intentionally NOT imported from the
+ *     Jest globals module.
+ *   - The automatic JSX runtime is used, so there is no `import React`.
+ *   - `@testing-library/jest-dom` matchers (e.g. `toBeInTheDocument`) are
+ *     registered globally by `jest.setup.ts`.
  */
 
-import { describe, expect, it, jest } from "@jest/globals";
-import { fireEvent, render } from "@testing-library/react";
-import { useState } from "react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { KanbanHeader } from "./KanbanHeader";
 import type { KanbanHeaderProps } from "./KanbanHeader";
 
-/** Build a full props object, overriding only what a test cares about. */
+/**
+ * Build a complete, valid {@link KanbanHeaderProps} object, overriding only the
+ * fields a given test cares about. Every callback defaults to a fresh
+ * `jest.fn()` so a test that does not pass its own spy still receives a valid
+ * no-op handler.
+ */
 function makeProps(overrides: Partial<KanbanHeaderProps> = {}): KanbanHeaderProps {
   return {
     openFilter: false,
@@ -45,74 +67,72 @@ describe("KanbanHeader — DOM contract", () => {
     expect(root!.querySelector(".kanban-table-options-end")).not.toBeNull();
   });
 
-  it("renders the filter button with both btn-filter and e2e-open-filter classes", () => {
-    const { container } = render(<KanbanHeader {...makeProps()} />);
+  it("renders the filter button inactive with the 'Filters' label and no badge when closed", () => {
+    const { container } = render(
+      <KanbanHeader {...makeProps({ openFilter: false, selectedFiltersCount: 0 })} />,
+    );
 
     const btn = container.querySelector("button.btn-filter.e2e-open-filter");
     expect(btn).not.toBeNull();
     expect(btn!.getAttribute("type")).toBe("button");
-    // Not active when the filter panel is closed.
+    // Not active while the filter panel is closed.
     expect(btn!.classList.contains("active")).toBe(false);
-  });
+    // The not-open label.
+    expect(btn!.querySelector("span.text")!.textContent).toBe("Filters");
+    // No applied-filters badge when the count is 0.
+    expect(container.querySelector(".selected-filters")).toBeNull();
 
-  it("renders the filter icon as tg-svg > svg.icon-filters", () => {
-    const { container } = render(<KanbanHeader {...makeProps()} />);
-
-    const icon = container.querySelector(
-      ".kanban-table-options-start button .btn-filter, .kanban-table-options-start button",
-    );
-    expect(icon).not.toBeNull();
-    const filterSvg = container.querySelector("button.btn-filter tg-svg svg.icon-filters");
+    // The filter icon renders as a tg-svg wrapper around svg.icon-filters.
+    const filterSvg = container.querySelector(".btn-filter tg-svg svg.icon-filters");
     expect(filterSvg).not.toBeNull();
     expect(filterSvg!.querySelector("use")!.getAttribute("xlink:href")).toBe("#icon-filters");
   });
 
-  it("adds the active class and swaps the label when openFilter is true", () => {
-    const { container } = render(<KanbanHeader {...makeProps({ openFilter: true })} />);
+  it("marks the filter button active, swaps to 'Hide filters', and shows the badge when open", () => {
+    const { container } = render(
+      <KanbanHeader {...makeProps({ openFilter: true, selectedFiltersCount: 3 })} />,
+    );
 
-    const btn = container.querySelector("button.btn-filter")!;
-    expect(btn.classList.contains("active")).toBe(true);
-    expect(btn.querySelector("span.text")!.textContent).toBe("Hide filters");
-  });
-
-  it("shows 'Filters' label when openFilter is false", () => {
-    const { container } = render(<KanbanHeader {...makeProps({ openFilter: false })} />);
-
-    expect(container.querySelector("button.btn-filter span.text")!.textContent).toBe("Filters");
-  });
-
-  it("renders .selected-filters only when selectedFiltersCount > 0", () => {
-    const { container: c0 } = render(<KanbanHeader {...makeProps({ selectedFiltersCount: 0 })} />);
-    expect(c0.querySelector(".selected-filters")).toBeNull();
-
-    const { container: c3 } = render(<KanbanHeader {...makeProps({ selectedFiltersCount: 3 })} />);
-    const badge = c3.querySelector(".selected-filters");
+    const btn = container.querySelector("button.btn-filter.e2e-open-filter");
+    expect(btn).not.toBeNull();
+    // Active while the filter panel is open.
+    expect(btn!.classList.contains("active")).toBe(true);
+    // The open label.
+    expect(btn!.querySelector("span.text")!.textContent).toBe("Hide filters");
+    // The applied-filters badge is present and shows the count.
+    const badge = container.querySelector(".selected-filters");
     expect(badge).not.toBeNull();
     expect(badge!.textContent).toBe("3");
   });
 
   it("sets the button title from the applied-filters count", () => {
     const { container } = render(<KanbanHeader {...makeProps({ selectedFiltersCount: 5 })} />);
+
     expect(container.querySelector("button.btn-filter")!.getAttribute("title")).toBe(
       "5 filters applied",
     );
   });
 
-  it("renders tg-input-search with a type=search input and the search tg-svg icon", () => {
+  it("renders tg-input-search with a search input (value from filterQ) and a search tg-svg icon", () => {
     const { container } = render(<KanbanHeader {...makeProps({ filterQ: "abc" })} />);
 
-    const input = container.querySelector("tg-input-search input[type='search']") as HTMLInputElement;
-    expect(input).not.toBeNull();
-    expect(input.getAttribute("placeholder")).toBe("subject or reference");
+    // `screen` resolves the single search box by its placeholder (locale text).
+    const input = screen.getByPlaceholderText("subject or reference") as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.getAttribute("type")).toBe("search");
+    // The controlled value mirrors the pushed `filterQ`.
     expect(input.value).toBe("abc");
+    // The input must live inside the `tg-input-search` custom element.
+    expect(container.querySelector("tg-input-search input[type='search']")).toBe(input);
 
+    // The search icon renders as a tg-svg wrapper around svg.icon-search.
     const searchSvg = container.querySelector("tg-input-search tg-svg svg.icon-search");
     expect(searchSvg).not.toBeNull();
     expect(searchSvg!.querySelector("use")!.getAttribute("xlink:href")).toBe("#icon-search");
   });
 
   it("renders tg-board-zoom.board-zoom with a title and 4 zoom radios (value 0..3)", () => {
-    const { container } = render(<KanbanHeader {...makeProps({ zoomLevel: 2 })} />);
+    const { container } = render(<KanbanHeader {...makeProps({ zoomLevel: 1 })} />);
 
     const zoom = container.querySelector("tg-board-zoom.board-zoom");
     expect(zoom).not.toBeNull();
@@ -122,19 +142,20 @@ describe("KanbanHeader — DOM contract", () => {
     expect(radios).toHaveLength(4);
 
     radios.forEach((label, index) => {
-      const input = label.querySelector("input[type='radio']") as HTMLInputElement;
+      const input = label.querySelector<HTMLInputElement>("input[type='radio']");
       expect(input).not.toBeNull();
-      expect(input.getAttribute("value")).toBe(String(index));
-      expect(input.getAttribute("name")).toBe("kanban-zoom");
-      // The checked radio reflects zoomLevel (2).
-      expect(input.checked).toBe(index === 2);
-      // Visible target is .checkmark > span.
+      expect(input!.getAttribute("value")).toBe(String(index));
+      expect(input!.getAttribute("name")).toBe("kanban-zoom");
+      // With zoomLevel === 1, only the value="1" radio is checked.
+      expect(input!.checked).toBe(index === 1);
+      // The visible click target is `.checkmark > span`.
       expect(label.querySelector(".checkmark > span")).not.toBeNull();
     });
   });
 
-  it("renders zoom labels from the locale (Compact/Default/Detailed/Expanded)", () => {
+  it("renders the zoom labels from the locale (Compact/Default/Detailed/Expanded)", () => {
     const { container } = render(<KanbanHeader {...makeProps()} />);
+
     const labels = Array.from(
       container.querySelectorAll("tg-board-zoom .zoom-radio .checkmark span"),
     ).map((el) => el.textContent);
@@ -143,60 +164,66 @@ describe("KanbanHeader — DOM contract", () => {
 });
 
 describe("KanbanHeader — interactions", () => {
-  it("calls onToggleFilter when the filter button is clicked", () => {
+  it("calls onToggleFilter once when the filter button is clicked", () => {
     const onToggleFilter = jest.fn();
     const { container } = render(<KanbanHeader {...makeProps({ onToggleFilter })} />);
 
-    fireEvent.click(container.querySelector("button.btn-filter")!);
+    const btn = container.querySelector<HTMLButtonElement>("button.btn-filter.e2e-open-filter");
+    expect(btn).not.toBeNull();
+    fireEvent.click(btn!);
+
     expect(onToggleFilter).toHaveBeenCalledTimes(1);
   });
 
-  it("calls onChangeQ and reflects typed text (dirty) when typing in search", () => {
+  it("calls onChangeQ and reflects the typed text (dirty) when typing in search", () => {
     const onChangeQ = jest.fn();
     const { container } = render(<KanbanHeader {...makeProps({ onChangeQ })} />);
 
-    const input = container.querySelector("tg-input-search input[type='search']") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "story-42" } });
+    const input = container.querySelector<HTMLInputElement>(
+      "tg-input-search input[type='search']",
+    );
+    expect(input).not.toBeNull();
+    fireEvent.change(input!, { target: { value: "story-42" } });
 
     expect(onChangeQ).toHaveBeenCalledWith("story-42");
-    expect(input.value).toBe("story-42");
+    expect(input!.value).toBe("story-42");
   });
 
-  it("calls onSetZoom with the picked index when a zoom radio is selected", () => {
+  it("calls onSetZoom with the picked index when the value=2 zoom radio is selected", () => {
     const onSetZoom = jest.fn();
-    const { container } = render(<KanbanHeader {...makeProps({ zoomLevel: 0, onSetZoom })} />);
+    const { container } = render(<KanbanHeader {...makeProps({ zoomLevel: 1, onSetZoom })} />);
 
-    const radios = container.querySelectorAll("tg-board-zoom input[type='radio']");
-    fireEvent.click(radios[3]);
-    expect(onSetZoom).toHaveBeenCalledWith(3);
+    const radio2 = container.querySelector<HTMLInputElement>(
+      "tg-board-zoom input[type='radio'][value='2']",
+    );
+    expect(radio2).not.toBeNull();
+    fireEvent.click(radio2!);
+
+    expect(onSetZoom).toHaveBeenCalledWith(2);
   });
 
-  it("syncs the input from filterQ while not dirty, then stops syncing once dirty", () => {
-    // A wrapper that lets us push new filterQ values from the parent.
-    function Harness() {
-      const [q, setQ] = useState("initial");
-      return (
-        <div>
-          <button type="button" data-testid="push" onClick={() => setQ("pushed")}>
-            push
-          </button>
-          <KanbanHeader {...makeProps({ filterQ: q })} />
-        </div>
-      );
-    }
+  it("syncs the input from filterQ while not dirty (rerender), then stops once dirty", () => {
+    // A stable props object so only `filterQ` changes across rerenders (the
+    // callback mock identities are preserved).
+    const props = makeProps({ filterQ: "initial" });
+    const { container, rerender } = render(<KanbanHeader {...props} />);
 
-    const { container, getByTestId } = render(<Harness />);
-    const input = container.querySelector("tg-input-search input[type='search']") as HTMLInputElement;
-    expect(input.value).toBe("initial");
+    const input = container.querySelector<HTMLInputElement>(
+      "tg-input-search input[type='search']",
+    );
+    expect(input).not.toBeNull();
+    expect(input!.value).toBe("initial");
 
-    // While not dirty, an external filterQ change propagates into the input.
-    fireEvent.click(getByTestId("push"));
-    expect(input.value).toBe("pushed");
+    // While not dirty, an external `filterQ` change propagates into the input
+    // (mirrors input-search.component.coffee `$onChanges: if changes.q && !dirty`).
+    rerender(<KanbanHeader {...props} filterQ="pushed" />);
+    expect(input!.value).toBe("pushed");
 
-    // After the user types (dirty), external pushes no longer overwrite the input.
-    fireEvent.change(input, { target: { value: "typed" } });
-    expect(input.value).toBe("typed");
-    fireEvent.click(getByTestId("push"));
-    expect(input.value).toBe("typed");
+    // Once the user types, the field is dirty and external pushes no longer
+    // overwrite it.
+    fireEvent.change(input!, { target: { value: "typed" } });
+    expect(input!.value).toBe("typed");
+    rerender(<KanbanHeader {...props} filterQ="ignored" />);
+    expect(input!.value).toBe("typed");
   });
 });

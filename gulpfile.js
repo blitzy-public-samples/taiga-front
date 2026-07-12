@@ -39,6 +39,12 @@ var gulp = require("gulp"),
     classPrefix = require('gulp-class-prefix'),
     coffeelint = require('gulp-coffeelint');
 
+// esbuild (React migration): bundles the app/react/** source tree into
+// dist/<version>/js/react-screens.js via the "react-screens" task defined below.
+// Declared as a standalone require to avoid disturbing the legacy comma-chained
+// var block above (whose intentional semicolons are preserved per the Minimal Change Clause).
+var esbuild = require("esbuild");
+
 var argv = require('minimist')(process.argv.slice(2));
 
 var utils = require("./gulp-utils");
@@ -565,6 +571,25 @@ gulp.task("elements", function() {
         .pipe(gulp.dest(paths.distVersion + "js/"));
 });
 
+// react-screens (React migration): bundle the new React screen source tree
+// (app/react/**) into a single browser IIFE emitted alongside elements.js / app.js /
+// libs.js in dist/<version>/js/ (see AAP section 0.6.1). esbuild ships a portable Go
+// binary compatible with the pinned Node 16.19.1 runtime. The task returns the
+// esbuild.build() Promise so Gulp awaits completion. target/jsx mirror tsconfig.json
+// (target ES2019, jsx "react-jsx" == esbuild "automatic").
+gulp.task("react-screens", function() {
+    return esbuild.build({
+        entryPoints: [paths.app + "react/index.tsx"],
+        bundle: true,
+        format: "iife",
+        platform: "browser",
+        target: "es2019",
+        jsx: "automatic",          // matches tsconfig "jsx": "react-jsx"
+        sourcemap: true,
+        outfile: paths.distVersion + "js/react-screens.js"
+    });
+});
+
 gulp.task("app-watch", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader"));
 
 gulp.task("app-deploy", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader", function() {
@@ -724,6 +749,7 @@ gulp.task("deploy", gulp.series(
         "app-deploy",
         "jslibs-deploy",
         "elements",
+        "react-screens",
         "link-images",
         "compile-themes"
     )
@@ -740,6 +766,7 @@ gulp.task("default", gulp.series(
         "jslibs-watch",
         "jade-deploy",
         "elements",
+        "react-screens",
         "express",
         "watch"
     ))
