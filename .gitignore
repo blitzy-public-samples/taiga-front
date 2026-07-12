@@ -17,3 +17,9 @@ e2e/screenshots/
 e2e/reports/
 app/modules/compile-modules/
 yarn.lock
+
+# Keep committed Playwright parity evidence (baseline + react screenshots/videos).
+# These artifacts are the migration deliverable and must NOT be gitignored.
+!e2e-react/
+!e2e-react/artifacts/
+!e2e-react/artifacts/**
