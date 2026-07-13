@@ -162,13 +162,21 @@ jest.mock("./dnd", () => {
 // Mock `@dnd-kit/core`: `DndContext` becomes a plain div echoing whether it
 // received an `onDragEnd` function + the `autoScroll` flag; the sensor helpers
 // are inert stubs (the real pointer sensor is not needed for a DOM unit test).
+// The most recent props DndContext received are captured on `__dndState` so a
+// spec can assert the EXACT `onDragEnd` handler identity (it must be the fn
+// returned by the mocked `useKanbanDragEnd`, not merely "some function").
 jest.mock("@dnd-kit/core", () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const react = require("react");
+  const dndState: { lastProps: { onDragEnd?: unknown; autoScroll?: unknown } | null } = {
+    lastProps: null,
+  };
   return {
     __esModule: true,
-    DndContext: (props: { onDragEnd?: unknown; autoScroll?: unknown; children?: unknown }) =>
-      react.createElement(
+    __dndState: dndState,
+    DndContext: (props: { onDragEnd?: unknown; autoScroll?: unknown; children?: unknown }) => {
+      dndState.lastProps = { onDragEnd: props.onDragEnd, autoScroll: props.autoScroll };
+      return react.createElement(
         "div",
         {
           "data-testid": "dnd-context",
@@ -176,7 +184,8 @@ jest.mock("@dnd-kit/core", () => {
           "data-autoscroll": String(!!props.autoScroll),
         },
         props.children,
-      ),
+      );
+    },
     PointerSensor: function PointerSensor() {
       /* inert sensor stub */
     },
@@ -523,6 +532,10 @@ describe("KanbanBoard — header row + options ordering", () => {
       expect(h2.tagName).toBe("H2");
       expect(h2).not.toHaveClass("task-column");
     });
+    // The class is the shipped legacy typo with ONE 'm' (`task-colum-name`). The
+    // "correct" two-'m' spelling must NOT appear anywhere in the board DOM, or the
+    // unchanged SCSS + the ported Playwright page objects would fail to select it.
+    expect(container.querySelectorAll(".task-column-name")).toHaveLength(0);
   });
 
   it("adds .vfold to the folded header cell but NOT .task-column", () => {
@@ -553,6 +566,15 @@ describe("KanbanBoard — header row + options ordering", () => {
     // The bulk button's inner svg carries .icon-bulk (openBulkUsLb target).
     expect(optionEls[3].querySelector(".icon-bulk")).toBeInTheDocument();
     expect(container.querySelectorAll(".icon-bulk")).toHaveLength(1);
+    // Icons render through the reproduced `tg-svg` wrapper (matching the legacy
+    // `tgSvg` directive output `<tg-svg><svg class="icon icon-…">`). Assert BOTH
+    // the `tg-svg` wrapper element AND the inner `svg.icon-*` exist on the add and
+    // bulk options, so the unchanged SCSS's `tg-svg` selectors and the e2e
+    // `.icon-*` selectors both resolve against the migrated DOM.
+    expect(optionEls[2].querySelector("tg-svg")).toBeInTheDocument();
+    expect(optionEls[2].querySelector("tg-svg > svg.icon.icon-add")).toBeInTheDocument();
+    expect(optionEls[3].querySelector("tg-svg")).toBeInTheDocument();
+    expect(optionEls[3].querySelector("tg-svg > svg.icon.icon-bulk")).toBeInTheDocument();
   });
 
   it("hides the add + bulk buttons when the add_us permission is absent", () => {
@@ -806,6 +828,15 @@ describe("KanbanBoard — drag-and-drop wiring", () => {
     const dnd = container.querySelector('[data-testid="dnd-context"]');
     expect(dnd).toHaveAttribute("data-has-drag-end", "true");
     expect(dnd).toHaveAttribute("data-autoscroll", "true");
+
+    // The handler passed to DndContext is EXACTLY the fn returned by the mocked
+    // useKanbanDragEnd (the board forwards it verbatim — it does not wrap or
+    // recreate it), so the single-bulk-update-per-drop contract stays in `./dnd`.
+    const returnedHandler = mockedUseKanbanDragEnd.mock.results[0]?.value;
+    const dndMock = jest.requireMock("@dnd-kit/core") as {
+      __dndState: { lastProps: { onDragEnd?: unknown; autoScroll?: unknown } | null };
+    };
+    expect(dndMock.__dndState.lastProps?.onDragEnd).toBe(returnedHandler);
   });
 });
 
