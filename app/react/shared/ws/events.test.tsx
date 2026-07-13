@@ -173,6 +173,15 @@ beforeEach(() => {
   jest.useFakeTimers();
   globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
   setTaigaConfig({ eventsUrl: null });
+  // Finding C4: localStorage is the AUTHORITATIVE credential store consulted
+  // live on every (re)connect. In production the mount snapshot
+  // (`context.token`) is itself read FROM localStorage at mount, so a connected
+  // socket's auth frame carries the stored token. Seed it to mirror the default
+  // context token ("jwt-abc") so the protocol-framing tests represent a real
+  // logged-in session; the "live token auth" describe below clears and drives
+  // the store itself to exercise refresh / logged-out paths.
+  localStorage.clear();
+  localStorage.setItem("token", JSON.stringify("jwt-abc"));
 });
 
 afterEach(() => {
@@ -473,6 +482,25 @@ describe("createEventsClient — close/error handling", () => {
     expect(MockWebSocket.instances.length).toBe(1);
   });
 
+  it("M9: cancels a PENDING reconnect when stop() runs before the back-off fires", () => {
+    jest.spyOn(Math, "random").mockReturnValue(0);
+    const client = connectClient();
+    const socketA = latest();
+
+    // A prior clean close scheduled a reconnect back-off (not yet elapsed).
+    socketA.emit("close");
+    expect(client.isConnected()).toBe(false);
+    expect(MockWebSocket.instances.length).toBe(1);
+
+    // The screen unmounts / route changes / logs out BEFORE the back-off fires.
+    client.stop();
+
+    // Advancing well past the back-off must NOT recreate the socket: an
+    // intentional teardown cancels the pending reconnect (no work after unmount).
+    jest.advanceTimersByTime(RECONNECT_TRY_INTERVAL * 3);
+    expect(MockWebSocket.instances.length).toBe(1);
+  });
+
   it("schedules a reconnect on error while under the connection-error limit", () => {
     jest.spyOn(Math, "random").mockReturnValue(0);
     connectClient();
@@ -639,12 +667,21 @@ describe("createEventsClient — defensive guards", () => {
  * screen is mounted is used on the next reconnect instead of causing silent
  * 401s until the next route change.
  *
- * These tests deliberately drive `localStorage`; because the surrounding
- * suite's protocol tests assert the context-snapshot fallback (`"jwt-abc"`),
- * a describe-scoped `afterEach` clears `localStorage` so no live token leaks
- * across describes regardless of execution order.
+ * These tests deliberately drive `localStorage`. The outer suite seeds a stored
+ * token so its protocol-framing tests represent a logged-in session; this
+ * describe therefore CLEARS `localStorage` in its own `beforeEach` to start from
+ * a known-empty store, drives it explicitly per case, and clears again on
+ * `afterEach` so no live token leaks across describes regardless of order.
+ *
+ * Finding C4 (authoritative logout): when `localStorage` is available but holds
+ * no valid token, the auth frame carries `token: null` — the stale mount
+ * snapshot is NOT resurrected.
  */
-describe("createEventsClient — live token auth (M8)", () => {
+describe("createEventsClient — live token auth (M8 / C4)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   afterEach(() => {
     localStorage.clear();
   });
@@ -663,16 +700,19 @@ describe("createEventsClient — live token auth (M8)", () => {
     });
   });
 
-  it("falls back to the context snapshot token when localStorage has none", () => {
-    // With no stored token, readLiveToken yields the MountContext fallback,
-    // preserving the behaviour the protocol-framing tests rely on.
+  it("C4: sends a null auth token when localStorage has none, NOT the stale context snapshot", () => {
+    // localStorage is available but empty => authoritative logged-out state.
+    // Even though the mount context still carries a snapshot ("jwt-abc"), the
+    // socket must NOT resurrect it; the auth frame carries token: null so the
+    // backend rejects the (logged-out) handshake instead of accepting a
+    // discarded credential.
     expect(localStorage.getItem("token")).toBeNull();
 
-    connectClient();
+    connectClient(); // context.token is still "jwt-abc"
 
     expect(framesOf(latest())[0]).toEqual({
       cmd: "auth",
-      data: { token: "jwt-abc", sessionId: "sess-1" },
+      data: { token: null, sessionId: "sess-1" },
     });
   });
 

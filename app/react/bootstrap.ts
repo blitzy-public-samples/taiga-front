@@ -60,6 +60,7 @@ import { KanbanBoard } from "./kanban/KanbanBoard";
 import { Backlog } from "./backlog/Backlog";
 import type { MountContext } from "./shared/types";
 import { readLiveToken } from "./shared/auth/token";
+import { AUTH_CHANGED_EVENT, AUTH_LOST_EVENT } from "./shared/auth/authEvents";
 
 /**
  * Custom-element tag names. Declared once so the `customElements.get(...)`
@@ -203,6 +204,42 @@ function createReactScreenElement(
             }
         };
 
+        /**
+         * Stable-bound SAME-DOCUMENT auth-changed listener (finding M11). The
+         * browser `storage` event fires only in OTHER tabs, so a token
+         * refresh/login performed inside THIS document (e.g. the `http.ts`
+         * single-flight refresh, finding C3) never reaches {@link onStorage}.
+         * The auth layer dispatches {@link AUTH_CHANGED_EVENT} on `window` for
+         * exactly this case; here we mirror the `onStorage` remount logic so the
+         * fresh credential flows into a new context snapshot and the WebSocket
+         * reconnects/re-authenticates. If the tree was previously torn down by an
+         * auth-loss, a returning valid session re-mounts it.
+         */
+        private readonly onAuthChanged = (): void => {
+            const liveToken = readLiveToken({ token: null });
+            if (this.root === null) {
+                if (liveToken !== null) {
+                    this.mount();
+                }
+                return;
+            }
+            if (liveToken !== this.mountedToken) {
+                this.remount();
+            }
+        };
+
+        /**
+         * Stable-bound SAME-DOCUMENT auth-lost listener (finding M11 / C3). When
+         * the auth layer clears the session (logout / refresh failure) it
+         * dispatches {@link AUTH_LOST_EVENT}; tear the React tree down
+         * immediately so its live subscriptions (WebSocket, in-flight requests)
+         * stop at once, rather than waiting on the redirect navigation the
+         * `http.ts` logout facade also triggers.
+         */
+        private readonly onAuthLost = (): void => {
+            this.unmount();
+        };
+
         /** Create the React root and render the screen with a fresh context. */
         private mount(): void {
             const context = readMountContext(this);
@@ -238,6 +275,10 @@ function createReactScreenElement(
             this.mount();
             if (typeof window !== "undefined") {
                 window.addEventListener("storage", this.onStorage);
+                // Finding M11: also observe SAME-DOCUMENT auth changes (the
+                // `storage` event above only fires cross-tab).
+                window.addEventListener(AUTH_CHANGED_EVENT, this.onAuthChanged);
+                window.addEventListener(AUTH_LOST_EVENT, this.onAuthLost);
             }
         }
 
@@ -248,6 +289,8 @@ function createReactScreenElement(
         disconnectedCallback(): void {
             if (typeof window !== "undefined") {
                 window.removeEventListener("storage", this.onStorage);
+                window.removeEventListener(AUTH_CHANGED_EVENT, this.onAuthChanged);
+                window.removeEventListener(AUTH_LOST_EVENT, this.onAuthLost);
             }
             this.unmount();
         }

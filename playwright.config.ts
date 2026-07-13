@@ -41,12 +41,15 @@
  *   - Browsers are kept minimal (Chromium device profile via `Desktop Chrome`)
  *     per the Minimal Change Clause, but every project pins `channel: "chrome"`
  *     so Playwright launches the TRUSTED pre-installed Google Chrome rather than
- *     downloading/using its bundled browser drivers. Combined with
- *     `playwright_skip_browser_download=1` in `.npmrc`, this is the accepted
- *     mitigation for advisory GHSA-7mvr-c777-76hp (finding M11): the Node
- *     16.19.1 pin (`.nvmrc`) blocks upgrading past the 1.44.x line (1.45 drops
- *     Node 16), so no browser download path is exercised and the parity suite
- *     runs on a trusted browser binary.
+ *     downloading/using its bundled browser drivers. Combined with the
+ *     `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` control enforced in CI
+ *     (`.github/workflows/main.yml` workflow env) and `npm ci --ignore-scripts`
+ *     in the Docker build, this is the accepted mitigation for advisory
+ *     GHSA-7mvr-c777-76hp (findings M13/C1): the Node 16.19.1 pin (`.nvmrc`)
+ *     blocks upgrading past the 1.44.x line (1.45 drops Node 16), so no browser
+ *     download path is exercised and the parity suite runs on a trusted browser
+ *     binary. (The skip control lives in CI rather than a repo-root `.npmrc` to
+ *     keep the frozen operation boundary — see C1.)
  *   - This config is loaded natively by Playwright's own TypeScript loader; no
  *     separate build step is required.
  *
@@ -72,9 +75,19 @@ export default defineConfig({
     video: "on",
     screenshot: "on",
 
-    // Keep a full trace only when a test fails, to aid debugging without bloating
-    // the committed evidence on green runs.
-    trace: "retain-on-failure",
+    // Finding M12 (credential leakage in committed artifacts): tracing is DISABLED.
+    // Every project's `outputDir` below points inside the GIT-TRACKED
+    // `e2e-react/artifacts/**` tree (the before/after evidence is committed on
+    // purpose per AAP §0.6.2). A Playwright trace, however, serializes the full
+    // authenticated session — the JWT bearer + `X-Session-Id` request headers,
+    // response bodies, and `localStorage`/cookies captured after the fixture
+    // logs in (admin/123123). Committing a trace would therefore publish live
+    // credentials into version control. Screenshots + video (above) are the
+    // artifacts the AAP actually requires for parity review and carry no
+    // request headers or storage state, so tracing is turned OFF entirely rather
+    // than `retain-on-failure`. Debugging a failure locally can re-enable it
+    // transiently via `--trace on` on an ad-hoc, NON-committed run.
+    trace: "off",
   },
 
   // Human-readable console output plus a self-contained HTML report written into

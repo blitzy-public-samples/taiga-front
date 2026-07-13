@@ -81,7 +81,6 @@ import type {
     Status,
     Swimlane,
     UserStory,
-    Tag,
     Point,
     Role,
 } from "../../shared/types";
@@ -2043,4 +2042,3 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         submitAssignedUsers,
     };
 }
-

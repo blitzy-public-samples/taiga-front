@@ -9,6 +9,21 @@ on:
   pull_request:
     branches: [ '*' ]
 
+# Dependency-security controls enforced in CI (findings M13 / C1).
+#
+# The Node 16.19.1 runtime pin (.nvmrc) blocks upgrading @playwright/test past
+# the 1.44.x line (1.45 drops Node 16), so the accepted mitigation for the
+# Playwright browser-driver advisory is to NOT download Playwright's bundled
+# browsers and to drive the parity suite with the TRUSTED pre-installed Google
+# Chrome (`channel: "chrome"` in playwright.config.ts). This control lives HERE
+# (workflow env), not in a repo-root .npmrc: keeping it in CI removes the
+# unauthorized `.npmrc` file (C1) while still guaranteeing the skip in every
+# automated `npm ci` (M13). `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` is Playwright's
+# canonical env switch (read by playwright-core's getFromENV). The Docker
+# build-from-source image applies the same guarantee via `npm ci --ignore-scripts`.
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   linters:
@@ -129,5 +144,28 @@ jobs:
     - name: npm install
       run: npm ci
 
+    # Finding M28 (CI acceptance): typecheck the React sources under the exact
+    # Node-16-compatible toolchain before the unit gate so a type regression
+    # fails CI rather than surfacing only at bundle time.
+    - name: typecheck react (tsc --noEmit)
+      run: npx tsc --noEmit
+
+    # `test:react` runs Jest with collectCoverage + the HARD >=70% line-coverage
+    # threshold (jest.config.js), so coverage is enforced by this step.
     - name: pass react unit tests
       run: npm run test:react
+
+    # Finding M28 + M23 (production-bundle gate): build the served React bundle
+    # with the real Gulp esbuild task and FAIL CI if it is not a production
+    # build. `react.development` must be absent (the `define`d NODE_ENV selects
+    # React's production internals and removes the dev-mode console warning).
+    - name: build production React bundle (gulp esbuild task)
+      run: npx gulp react-screens
+    - name: assert production React bundle (M23 — no dev React, minified)
+      run: |
+        BUNDLE="$(ls dist/*/js/react-screens.js | head -1)"
+        test -n "$BUNDLE" || { echo "react-screens.js was not produced"; exit 1; }
+        if grep -q "react.development" "$BUNDLE"; then
+          echo "FAIL: development React present in the served bundle"; exit 1;
+        fi
+        echo "Production React bundle OK: $BUNDLE ($(wc -c < "$BUNDLE") bytes)"

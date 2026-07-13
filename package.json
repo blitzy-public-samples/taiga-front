@@ -26,11 +26,11 @@
   },
   "devDependencies": {
     "@playwright/test": "1.44.1",
-    "@testing-library/jest-dom": "^6.0.0",
-    "@testing-library/react": "^14.0.0",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "14.3.1",
     "@types/jest": "^29.5.14",
-    "@types/react": "^18.2.0",
-    "@types/react-dom": "^18.2.0",
+    "@types/react": "18.2.79",
+    "@types/react-dom": "18.2.25",
     "angular-mocks": "1.5.5",
     "babel-cli": "^6.23.0",
     "babel-polyfill": "^6.7.4",
@@ -106,7 +106,7 @@
     "stylelint-order": "^4.1.0",
     "stylelint-scss": "^3.18.0",
     "through2": "^2.0.1",
-    "ts-jest": "^29.1.0",
+    "ts-jest": "29.1.5",
     "typescript": "5.4.5",
     "uuid": "^3.3.2",
     "vinyl-fs": "^2.1.1"
@@ -153,5 +153,8 @@
     "react-dom": "18.2.0",
     "showdown": "^1.4.3",
     "taiga-html-editor": "https://github.com/taigaio/taiga-html-editor#stable"
+  },
+  "overrides": {
+    "node-releases": "2.0.14"
   }
 }

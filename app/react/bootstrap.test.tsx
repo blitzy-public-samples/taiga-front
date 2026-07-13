@@ -45,6 +45,7 @@ import {
     TgReactKanbanElement,
 } from "./bootstrap";
 import type { MountContext } from "./shared/types";
+import { AUTH_CHANGED_EVENT, AUTH_LOST_EVENT } from "./shared/auth/authEvents";
 
 /* -------------------------------------------------------------------------- */
 /* Mocks                                                                       */
@@ -54,10 +55,13 @@ import type { MountContext } from "./shared/types";
 // forwarded `context.projectSlug` as `data-slug` so a test can assert the bridge
 // payload actually flowed from `readMountContext(host)` into the screen prop.
 jest.mock("./kanban/KanbanBoard", () => ({
-    KanbanBoard: (props: { context: { projectSlug?: string | null } }) => (
+    KanbanBoard: (props: { context: { projectSlug?: string | null; token?: string | null } }) => (
         <div
             data-testid="mock-kanban"
             data-slug={props.context.projectSlug ?? ""}
+            // Echo the forwarded token too so the same-document auth-bridge tests
+            // (finding M11) can prove a remount carried a FRESH context snapshot.
+            data-token={props.context.token ?? ""}
         />
     ),
 }));
@@ -245,6 +249,122 @@ describe("Custom Element lifecycle", () => {
         expect(() =>
             (el as LifecycleElement).disconnectedCallback(),
         ).not.toThrow();
+    });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Same-document auth bridge (finding M11)                                     */
+/* -------------------------------------------------------------------------- */
+
+describe("Custom Element same-document auth bridge (M11)", () => {
+    it("remounts with the FRESH token on a same-document AUTH_CHANGED_EVENT", async () => {
+        localStorage.setItem("token", JSON.stringify("token-old"));
+        const el = document.createElement("tg-react-kanban");
+        act(() => {
+            document.body.appendChild(el);
+        });
+        const mounted = await screen.findByTestId("mock-kanban");
+        expect(mounted).toHaveAttribute("data-token", "token-old");
+
+        // A same-tab refresh (e.g. the http.ts single-flight refresh) writes a
+        // new token then announces it via the same-document event. The browser
+        // `storage` event would NOT fire here (same document), so this bridge is
+        // the only signal — the element must remount with the new credential.
+        act(() => {
+            localStorage.setItem("token", JSON.stringify("token-new"));
+            window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT));
+        });
+
+        await waitFor(() => {
+            expect(screen.getByTestId("mock-kanban")).toHaveAttribute("data-token", "token-new");
+        });
+    });
+
+    it("tears down the React tree on a same-document AUTH_LOST_EVENT", async () => {
+        localStorage.setItem("token", JSON.stringify("token-old"));
+        const el = document.createElement("tg-react-kanban");
+        act(() => {
+            document.body.appendChild(el);
+        });
+        await screen.findByTestId("mock-kanban");
+
+        // A same-tab logout / refresh-failure clears the session and announces
+        // the loss; the tree must unmount at once so its live subscriptions stop.
+        act(() => {
+            localStorage.removeItem("token");
+            window.dispatchEvent(new CustomEvent(AUTH_LOST_EVENT));
+        });
+
+        await waitFor(() => {
+            expect(screen.queryByTestId("mock-kanban")).not.toBeInTheDocument();
+        });
+    });
+
+    it("ignores a spurious AUTH_CHANGED_EVENT when the token is unchanged (no remount)", async () => {
+        localStorage.setItem("token", JSON.stringify("token-same"));
+        const el = document.createElement("tg-react-kanban");
+        act(() => {
+            document.body.appendChild(el);
+        });
+        const first = await screen.findByTestId("mock-kanban");
+
+        act(() => {
+            window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT));
+        });
+
+        // Same token => no teardown/rebuild: the very same DOM node persists.
+        expect(screen.getByTestId("mock-kanban")).toBe(first);
+        expect(first).toHaveAttribute("data-token", "token-same");
+    });
+
+    it("re-mounts a torn-down tree when a valid session returns (auth-lost then auth-changed)", async () => {
+        localStorage.setItem("token", JSON.stringify("token-old"));
+        const el = document.createElement("tg-react-kanban");
+        act(() => {
+            document.body.appendChild(el);
+        });
+        await screen.findByTestId("mock-kanban");
+
+        // Logout tears the tree down...
+        act(() => {
+            localStorage.removeItem("token");
+            window.dispatchEvent(new CustomEvent(AUTH_LOST_EVENT));
+        });
+        await waitFor(() => {
+            expect(screen.queryByTestId("mock-kanban")).not.toBeInTheDocument();
+        });
+
+        // ...and a subsequent same-tab login re-mounts it with the new token.
+        act(() => {
+            localStorage.setItem("token", JSON.stringify("token-relogin"));
+            window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT));
+        });
+        await waitFor(() => {
+            expect(screen.getByTestId("mock-kanban")).toHaveAttribute("data-token", "token-relogin");
+        });
+    });
+
+    it("stops listening for auth events after disconnect", async () => {
+        localStorage.setItem("token", JSON.stringify("token-old"));
+        const el = document.createElement("tg-react-kanban");
+        act(() => {
+            document.body.appendChild(el);
+        });
+        await screen.findByTestId("mock-kanban");
+
+        act(() => {
+            el.remove();
+        });
+        await waitFor(() => {
+            expect(screen.queryByTestId("mock-kanban")).not.toBeInTheDocument();
+        });
+
+        // A late auth event for a disconnected element must not resurrect it.
+        act(() => {
+            localStorage.setItem("token", JSON.stringify("token-new"));
+            window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT));
+        });
+        expect(screen.queryByTestId("mock-kanban")).not.toBeInTheDocument();
     });
 });
 

@@ -603,6 +603,18 @@ gulp.task("elements", function() {
 // note at the esbuild require above. `write` defaults to true, so the IIFE is
 // emitted straight to `outfile`; no server is ever started.
 gulp.task("react-screens", function() {
+    // Finding M23 (build/performance): the served bundle MUST be a PRODUCTION
+    // React build.
+    //  - `define` replaces `process.env.NODE_ENV` with the string "production" at
+    //    bundle time, so esbuild dead-code-eliminates every `if (process.env
+    //    .NODE_ENV !== "production")` guard in react-dom. This selects React's
+    //    production internals (no `react.development.js` payload) and removes the
+    //    "you are using the development build of React" console warning that
+    //    previously fired on every kanban/backlog route.
+    //  - `minify: true` compresses the served JS (the dev bundle was ~1.7 MB).
+    //  - Sourcemap policy: emit an EXTERNAL `.js.map` for debugging but do NOT add
+    //    a `//# sourceMappingURL=` reference into the served bundle, so production
+    //    devtools do not auto-expose original TypeScript sources.
     return esbuild.build({
         entryPoints: [paths.app + "react/index.tsx"],
         bundle: true,
@@ -610,7 +622,9 @@ gulp.task("react-screens", function() {
         platform: "browser",
         target: "es2019",
         jsx: "automatic",          // matches tsconfig "jsx": "react-jsx"
-        sourcemap: true,
+        define: { "process.env.NODE_ENV": "\"production\"" },
+        minify: true,
+        sourcemap: "external",
         outfile: paths.distVersion + "js/react-screens.js"
     });
 });

@@ -205,8 +205,34 @@ export function createEventsClient(context: MountContext): EventsClient {
   let errors = 0;
   let missedHeartbeats = 0;
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  // Pending reconnect back-off handle (finding M9): tracked so an intentional
+  // `stop()` (screen unmount / route change / logout) can CANCEL a reconnect
+  // that a prior `error`/`close` scheduled, preventing a socket from being
+  // recreated after teardown.
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   // Bounded count of malformed inbound frames (finding M9): caps diagnostics.
   let malformedFrameCount = 0;
+
+  /** Cancel any pending reconnect back-off timer (idempotent). */
+  const clearReconnect = (): void => {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  /**
+   * Schedule a single reconnect attempt after the randomized back-off, tracking
+   * the handle so it can be cancelled on teardown (finding M9). Any previously
+   * pending attempt is cleared first so at most one is ever outstanding.
+   */
+  const scheduleReconnect = (): void => {
+    clearReconnect();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      setupConnection();
+    }, randomTryInterval());
+  };
 
   const serialize = (message: OutgoingMessage): string => JSON.stringify(message);
 
@@ -356,7 +382,7 @@ export function createEventsClient(context: MountContext): EventsClient {
     error = true;
     errors += 1;
     if (errors < MAX_CONNECTION_ERRORS) {
-      setTimeout(setupConnection, randomTryInterval());
+      scheduleReconnect();
     }
   };
 
@@ -364,11 +390,15 @@ export function createEventsClient(context: MountContext): EventsClient {
     connected = false;
     stopHeartbeat();
     if (!error) {
-      setTimeout(setupConnection, randomTryInterval());
+      scheduleReconnect();
     }
   };
 
   const stopExistingConnection = (): void => {
+    // Always cancel a pending reconnect back-off first (finding M9): a prior
+    // error/close may have scheduled one even when no socket is currently open,
+    // and an intentional stop must not let it recreate the connection.
+    clearReconnect();
     if (!ws) {
       return;
     }

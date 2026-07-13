@@ -487,4 +487,3 @@ describe("producer purity", () => {
     expect(s.userstories.map((u) => u.id)).toEqual([1, 2, 3]);
   });
 });
-

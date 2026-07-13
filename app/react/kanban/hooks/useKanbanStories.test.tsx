@@ -1102,4 +1102,3 @@ describe("useKanbanStories — request params + real-time + authz parity", () =>
         await waitFor(() => expect(apiClient.getUserStoriesFilters).toHaveBeenCalled());
     });
 });
-

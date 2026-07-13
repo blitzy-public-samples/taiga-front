@@ -13,6 +13,13 @@
  * `%s` placeholders are positional id substitutions (mirrors base/urls.coffee `format`).
  */
 export const URL_TEMPLATES = {
+    // Token refresh endpoint consumed by the single-flight 401 recovery in
+    // `http.ts` (finding C3). This is an EXISTING frozen `/api/v1/` endpoint —
+    // registered verbatim as `"refresh": "/auth/refresh"` in the legacy
+    // `app/coffee/modules/resources.coffee` (L18) and POSTed by the AngularJS
+    // `authHttpIntercept` in `app.coffee`. Reproducing the key is
+    // contract-preserving (C-1) — NOT a new/renamed/versioned endpoint.
+    refresh: "/auth/refresh",
     projects: "/projects",
     userstories: "/userstories",
     "userstories-filters": "/userstories/filters_data",

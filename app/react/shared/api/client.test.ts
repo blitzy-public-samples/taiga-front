@@ -75,6 +75,12 @@ const lastHeaders = (): Record<string, string> => {
 beforeEach(() => {
     fetchMock = setFetch();
     window.localStorage.clear();
+    // Finding C4: localStorage is the AUTHORITATIVE credential store, and in
+    // production the mount snapshot (`baseContext.token`) is read FROM it at
+    // mount time. Seed the store to mirror that snapshot so the bearer contract
+    // is exercised realistically; the two dedicated cases below override this
+    // key to assert the authoritative-logout (absent / garbage) behaviour.
+    window.localStorage.setItem("token", JSON.stringify("jwt-token"));
 });
 
 describe("urls.resolveUrl", () => {
@@ -109,6 +115,9 @@ describe("urls.resolveUrl", () => {
                 "milestones",
                 "move-userstories-to-milestone",
                 "projects",
+                // Frozen `/auth/refresh` endpoint (C3 single-flight token
+                // recovery) — mirrors resources.coffee, contract-preserving.
+                "refresh",
                 "resolver",
                 "swimlanes",
                 "user-storage",

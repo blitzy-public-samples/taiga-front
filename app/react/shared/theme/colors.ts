@@ -78,4 +78,3 @@ export const BURNDOWN_CHART_COLORS = {
     teamIncrement: { line: "rgba(255,160,160,1)", fill: "rgba(255,160,160,0.2)" },
     grid: "#D8DEE9",
 } as const;
-

@@ -851,4 +851,3 @@ export function Card(props: CardProps): JSX.Element {
 }
 
 export default Card;
-
