@@ -50,6 +50,8 @@ export interface UserStory {
     id: number;
     ref?: number;
     subject?: string;
+    /** Long description (edit lightbox); absent on the kanban list projection. */
+    description?: string;
     status: number;
     swimlane: number | null;
     kanban_order?: number;
@@ -60,6 +62,8 @@ export interface UserStory {
     tags?: Tag[];
     attachments?: Attachment[];
     is_blocked?: boolean;
+    /** Block reason (edit lightbox); paired with is_blocked. */
+    blocked_note?: string;
     is_closed?: boolean;
     total_points?: number | null;
     points?: Record<string, number | null>;

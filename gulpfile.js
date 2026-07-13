@@ -43,6 +43,17 @@ var gulp = require("gulp"),
 // dist/<version>/js/react-screens.js via the "react-screens" task defined below.
 // Declared as a standalone require to avoid disturbing the legacy comma-chained
 // var block above (whose intentional semicolons are preserved per the Minimal Change Clause).
+//
+// DEPENDENCY-SECURITY NOTE (finding M11 — esbuild advisory GHSA-67mh-4wv8-2f99):
+// That advisory affects ONLY esbuild's development server (`esbuild.serve()` /
+// the `serve` API), whose permissive default CORS lets any website read the dev
+// server's responses. This build uses esbuild EXCLUSIVELY through the one-shot
+// bundling API (`esbuild.build(...)` in the "react-screens" task) that writes a
+// static file into dist/; it NEVER starts a dev server. `esbuild.serve()` is
+// therefore PROHIBITED in this repository — do not introduce it. Because the
+// Node 16.19.1 pin (.nvmrc) blocks upgrading esbuild off the last Node-16
+// compatible 0.21.x line, prohibiting the vulnerable code path (rather than
+// upgrading) is the accepted mitigation; the served bundle is unaffected.
 var esbuild = require("esbuild");
 
 var argv = require('minimist')(process.argv.slice(2));
@@ -218,6 +229,16 @@ paths.libs.forEach(function(file) {
 });
 
 var isDeploy = argv["_"].indexOf("deploy") !== -1;
+
+// gulp-imagemin bundles the optional native optimizers optipng/gifsicle/mozjpeg,
+// whose binaries are fetched by postinstall scripts that stall on the GitHub CDN in
+// constrained/offline build environments. The Docker build-from-source stage therefore
+// runs `npm ci --ignore-scripts` (the repo's documented install policy) and sets
+// TAIGA_SKIP_IMAGEMIN=1, which bypasses ONLY the image-minification pass: images are
+// still copied to dist verbatim (identical paths/names — DOM/SCSS parity is unaffected),
+// just not byte-optimized. Unset (normal CI with the binaries present) this guard is
+// inert and imagemin runs exactly as before, preserving full production output parity.
+var skipImagemin = !!process.env.TAIGA_SKIP_IMAGEMIN;
 
 gulp.task("clear-sass-cache", function(done) {
     delete cached.caches["sass"];
@@ -577,6 +598,10 @@ gulp.task("elements", function() {
 // binary compatible with the pinned Node 16.19.1 runtime. The task returns the
 // esbuild.build() Promise so Gulp awaits completion. target/jsx mirror tsconfig.json
 // (target ES2019, jsx "react-jsx" == esbuild "automatic").
+//
+// Uses esbuild.build() ONLY (never esbuild.serve()) — see the GHSA-67mh-4wv8-2f99
+// note at the esbuild require above. `write` defaults to true, so the IIFE is
+// emitted straight to `outfile`; no server is ever started.
 gulp.task("react-screens", function() {
     return esbuild.build({
         entryPoints: [paths.app + "react/index.tsx"],
@@ -629,7 +654,7 @@ gulp.task("copy-theme-fonts", function() {
 
 gulp.task("copy-images", function() {
     return gulp.src([paths.app + "/images/**/*", paths.app + '/modules/compile-modules/**/images/*'])
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
+        .pipe(gulpif(isDeploy && !skipImagemin, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"));
 });
 
@@ -640,7 +665,7 @@ gulp.task("copy-emojis", function() {
 
 gulp.task("copy-theme-images", function() {
     return gulp.src(themes.current.path + "/images/**/*")
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
+        .pipe(gulpif(isDeploy && !skipImagemin, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"  + themes.current.name));
 });
 

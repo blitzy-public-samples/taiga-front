@@ -65,14 +65,26 @@
 import type * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 
 import type { MountContext } from "../shared/types";
 import { KanbanHeader } from "./KanbanHeader";
 import { Swimlane } from "./Swimlane";
 import { StatusColumn } from "./StatusColumn";
 import { useKanbanStories } from "./hooks/useKanbanStories";
-import { useKanbanDragEnd } from "./dnd";
+import { KanbanDndProvider } from "./dnd";
+import { adminKanbanPowerUpsUrl } from "../shared/nav/routes";
+// C11/C4 full-filter parity: the Kanban board reuses the SAME screen-agnostic
+// `tg-filter` panel the Backlog screen renders (it consumes the params-based
+// filter VM slice the `useKanbanStories` hook now exposes). It is presentational
+// and imports no Backlog state, so reusing it introduces no cross-screen coupling.
+import { BacklogFilterPanel } from "../backlog/BacklogFilterPanel";
+import {
+  StoryFormLightbox,
+  BulkStoryLightbox,
+  AssignedToLightbox,
+} from "../shared/lightboxes";
+import { storyToFormValues } from "../shared/lightboxes/storyForm";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Custom-element JSX typing. AngularJS custom elements (`tg-*`) that this
@@ -97,41 +109,22 @@ declare global {
 }
 
 /* -------------------------------------------------------------------------- */
-/* i18n labels                                                                 */
+/* i18n                                                                        */
 /* -------------------------------------------------------------------------- */
 /*
- * Reproduced English literals matching the AngularJS `translate` output for the
- * strings this leaf renders. Kept as plain constants (not e2e-critical text;
- * true visual parity is proven by the Playwright evidence).
+ * Finding M7: every visible string the board renders is resolved at RENDER time
+ * through the shared `t()` helper against the bundled `locale-en.json` catalogue
+ * (the same keys the AngularJS `translate` filter used), rather than being
+ * hard-coded here. Resolving inside the component (not at module scope) means a
+ * runtime `setTranslations()` swap done by `bootstrap.ts` is always reflected.
+ * The story lightboxes own their OWN strings (they call `t()` internally), so no
+ * lightbox label constants live here any more. The only exception is the
+ * module-deactivated placeholder: the legacy app gated a deactivated module at
+ * the ROUTE/menu level and never rendered an inline message, so there is no
+ * legacy catalogue key to reproduce — it stays a documented literal.
  */
-/** `mainTitle` section label (`sectionName === 'kanban'`). */
-const SECTION_LABEL = "Kanban";
-/** `KANBAN.TITLE_ACTION_FOLD`. */
-const FOLD_TITLE = "Fold column";
-/** `KANBAN.TITLE_ACTION_UNFOLD`. */
-const UNFOLD_TITLE = "Unfold column";
-/** `KANBAN.TITLE_ACTION_ADD_US`. */
-const ADD_US_TITLE = "Add User Story";
-/** `KANBAN.TITLE_ACTION_ADD_BULK`. */
-const ADD_BULK_TITLE = "Add User Stories in bulk";
-/** `ADMIN.PROJECT_KANBAN_OPTIONS.CREATE_SWIMLANE` (swimlane-add caption). */
-const CREATE_SWIMLANE_LABEL = "Create swimlane";
-/** Shown when the Kanban module is deactivated for the project. */
+/** Placeholder shown when `is_kanban_activated === false` (no legacy key). */
 const MODULE_DISABLED_LABEL = "The Kanban module is not enabled for this project.";
-/** Create/bulk lightbox submit caption (`COMMON.CREATE`). */
-const SUBMIT_LABEL = "Create";
-/** Lightbox close caption (`COMMON.CLOSE` / `LIGHTBOX.CLOSE`). */
-const CLOSE_LABEL = "Close";
-/** Create-US subject field placeholder (`LIGHTBOX.CREATE_EDIT_US.PLACEHOLDER_SUBElement`). */
-const SUBJECT_PLACEHOLDER = "User story subject";
-/** Bulk-US textarea placeholder (`LIGHTBOX.BULK.PLACEHOLDER`). */
-const BULK_PLACEHOLDER = "One user story per line";
-/** Assigned-to lightbox title (`LIGHTBOX.ASSIGNED_TO.TITLE`). */
-const ASSIGN_TITLE = "Assign user story";
-/** Applied/custom filter affordance titles. */
-const REMOVE_FILTER_TITLE = "Remove filter";
-/** Saved custom-filter chip caption (`COMMON.FILTERS.CUSTOM_FILTER`). */
-const SAVED_FILTER_LABEL = "Saved filter";
 
 /* -------------------------------------------------------------------------- */
 /* Module-local helpers                                                        */
@@ -144,6 +137,22 @@ const SAVED_FILTER_LABEL = "Saved filter";
  */
 function cx(...tokens: Array<string | false | null | undefined>): string {
   return tokens.filter((token): token is string => Boolean(token)).join(" ");
+}
+
+/**
+ * Keyboard-activation handler for elements that are semantically buttons but are
+ * rendered as `<a role="button">` (finding M7). Native `<button>`/`<a href>`
+ * elements activate on Enter/Space for free; a role-button anchor does not, so
+ * this maps Enter and Space to the click handler (and calls
+ * `preventDefault` on Space to stop the page from scrolling), giving the
+ * fold/unfold column controls the same keyboard affordance the mouse has. */
+function keyActivate(handler: () => void): (event: React.KeyboardEvent) => void {
+  return (event: React.KeyboardEvent): void => {
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+      event.preventDefault();
+      handler();
+    }
+  };
 }
 
 /**
@@ -199,22 +208,50 @@ export function KanbanBoard(props: { context: MountContext }) {
 
   // --- Board-owned view state -----------------------------------------------
   // The ONLY domain-agnostic UI state the board owns is the filter-panel toggle.
-  // Everything else (zoom, filters, folds, lightboxes) is hook-owned; the board
-  // merely forwards it. `subjectText`/`bulkText` are transient controlled-input
-  // values for the minimal create/bulk lightbox forms (not domain state).
+  // Everything else (zoom, filters, folds, lightboxes, and every create/edit/
+  // bulk/assign form value) is hook- or lightbox-owned; the board merely
+  // forwards it. The story lightboxes are self-contained shared components that
+  // own their own field state and only surface the collected values on submit
+  // (finding C2), so the board holds NO transient input state (finding M2 — no
+  // clear-before-persist).
   const [openFilter, setOpenFilter] = useState<boolean>(false);
-  const [subjectText, setSubjectText] = useState<string>("");
-  const [bulkText, setBulkText] = useState<string>("");
 
   const onToggleFilter = useCallback(() => setOpenFilter((value) => !value), []);
 
   // --- Drag-and-drop ---------------------------------------------------------
-  // PointerSensor with a 5px activation distance (comparable to the legacy
-  // dragula grab threshold); the drag-end handler (from `./dnd`) translates a
-  // `DragEndEvent` into ONE `KanbanDropArgs` and calls `kb.handleDragEnd` exactly
-  // once. `DndContext` renders NO DOM node, so it does not affect the markup.
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
-  const onDragEnd = useKanbanDragEnd(kb);
+  // The board delegates ALL drag mechanics to the single, tested
+  // `KanbanDndProvider` (finding M6): it owns the PointerSensor(5px) +
+  // KeyboardSensor, the built-in autoscroll, the screen-reader announcements,
+  // and the drag-end glue that turns a `DragEndEvent` into ONE `KanbanDropArgs`
+  // dispatched to `kb.handleDragEnd`. There is no hand-wired `DndContext` here
+  // any more, so there is exactly one production drag path.
+  //
+  // `renderCardMirror` supplies the `<DragOverlay>` clone (C3): a `.gu-mirror`
+  // (+ `.multiple-drag-mirror`, matching legacy dragula's `cloned` handler) that
+  // follows the pointer so the drag is visible. It renders NO `tg-card` (kept
+  // out of this file's JSX table) — a `div` mirror carrying the same classes is
+  // enough; the source card is marked `.gu-transit` in place (never translated).
+  const renderCardMirror = useCallback(
+    (activeId: number): React.ReactNode => {
+      const dragged = kb.usMap[activeId];
+      if (dragged === undefined) {
+        return null;
+      }
+      const selectedCount = Object.keys(kb.selectedUss).filter(
+        (id) => kb.selectedUss[Number(id)] === true,
+      ).length;
+      const isMulti = selectedCount > 1 && kb.selectedUss[activeId] === true;
+      return (
+        <div className="gu-mirror multiple-drag-mirror card" data-id={activeId}>
+          <div className="card-inner">
+            <span className="card-title">{dragged.subject ?? `#${activeId}`}</span>
+            {isMulti ? <span className="multiple-drag-count">{selectedCount}</span> : null}
+          </div>
+        </div>
+      );
+    },
+    [kb.usMap, kb.selectedUss],
+  );
 
   // --- `--kanban-width` ResizeObserver (reproduces main.coffee L650-659) ------
   // Keeps the `--kanban-width` CSS variable in sync with the summed column
@@ -259,22 +296,30 @@ export function KanbanBoard(props: { context: MountContext }) {
   const bulkOpen = activeLightboxType === "bulk";
   const assignOpen = activeLightboxType === "assign";
 
-  // --- Lightbox form handlers (minimal, functional) --------------------------
-  const closeLightbox = (): void => {
-    setSubjectText("");
-    setBulkText("");
-    kb.closeLightbox();
-  };
-  const submitCreateUs = (event: React.FormEvent): void => {
-    event.preventDefault();
-    kb.submitNewUs(subjectText);
-    setSubjectText("");
-  };
-  const submitBulkUs = (event: React.FormEvent): void => {
-    event.preventDefault();
-    kb.submitBulkUs(bulkText);
-    setBulkText("");
-  };
+  // --- Lightbox target derivation --------------------------------------------
+  // The shared story lightboxes are self-contained: they own their field state
+  // and surface the collected values to the hook's awaited, guarded submit
+  // methods (`submitNewUs`/`submitEditUs`/`submitBulkUs`/`submitAssignedUsers`),
+  // which keep the lightbox OPEN and preserve the entered values on failure
+  // (finding M2). The board only derives the TARGET of the active lightbox:
+  //   - the status the "+"/bulk affordance was pressed on (create/bulk), and
+  //   - the existing story being edited / re-assigned (edit/assign).
+  const activeUsId = kb.activeLightbox?.usId ?? null;
+  const activeStatusId = kb.activeLightbox?.statusId ?? null;
+  const targetStory = activeUsId !== null ? kb.usMap[activeUsId] : undefined;
+
+  // Create seeds only the target status (+ default swimlane, applied by the
+  // form); edit seeds the full story projection. The value identity feeds the
+  // form body's remount key so switching targets resets the fields.
+  const storyInitialValues =
+    activeLightboxType === "edit" && targetStory !== undefined
+      ? storyToFormValues(targetStory)
+      : { status: activeStatusId ?? undefined };
+
+  // Permission gates (show/hide only — the backend stays the single enforcement
+  // point, constraint C-1): create needs `add_us`, edit/assign need `modify_us`.
+  const canAddUs = project?.my_permissions.includes("add_us") ?? false;
+  const canModifyUs = project?.my_permissions.includes("modify_us") ?? false;
 
   // --- Module-activation guard (mirrors `is_kanban_activated`) ----------------
   // When the module is deactivated we render a minimal placeholder rather than
@@ -295,16 +340,17 @@ export function KanbanBoard(props: { context: MountContext }) {
     <>
       <section className={cx("main", "kanban", hasSwimlanes && "swimlane")}>
         {/* (2) `.kanban-header` — the reproduced `mainTitle` + the actions bar.
-            `mainTitle.jade` is `header > h1[tg-main-title][i18n-section-name]`;
-            reproduced here as `header > h1.main-title` with the project name +
-            section label (the inner `tg-main-title` spans are not e2e-critical —
-            this faithful minimal reproduction is the documented simplification).
+            `mainTitle.jade` is `header > h1[tg-main-title][i18n-section-name]`,
+            and the `tg-main-title` directive template (`common/components/
+            main-title.jade`) renders ONLY `span {{ sectionName | translate }}`.
+            The section name (KANBAN.SECTION_NAME => "Kanban") is therefore the
+            SOLE title text; the project name is NOT part of the heading (it is
+            shown in the AngularJS project menu that the route template keeps).
             `KanbanHeader` renders the `.taskboard-actions` block itself. */}
         <div className="kanban-header">
           <header>
             <h1 className="main-title">
-              {project?.name ?? ""}
-              <span>{SECTION_LABEL}</span>
+              <span>{t("KANBAN.SECTION_NAME")}</span>
             </h1>
           </header>
           <KanbanHeader
@@ -325,60 +371,36 @@ export function KanbanBoard(props: { context: MountContext }) {
         <div className={cx("kanban-manager", !openFilter && "expanded")}>
           {openFilter ? (
             <div className="kanban-filter">
-              {/* Minimal faithful reproduction of the shared `tg-filter` panel
-                  (app/modules/components/filter/** — reproduced, NOT imported):
-                  the applied-filter chips + saved custom-filter chips, wired to
-                  the hook's filter handlers. The e2e opens the panel via
-                  KanbanHeader's `.btn-filter.e2e-open-filter`; deep panel
-                  internals are not asserted. */}
-              <tg-filter>
-                <div className="filters-applied">
-                  {kb.selectedFilters.map((_selectedFilter, index) => (
-                    <button
-                      type="button"
-                      key={index}
-                      className="filter-applied"
-                      title={REMOVE_FILTER_TITLE}
-                      onClick={() => kb.removeFilter(kb.selectedFilters[index])}
-                    >
-                      <Icon name="icon-close" />
-                    </button>
-                  ))}
-                </div>
-                <div className="custom-filters">
-                  {kb.customFilters.map((_customFilter, index) => (
-                    <div key={index} className="custom-filter">
-                      <button
-                        type="button"
-                        className="custom-filter-select"
-                        onClick={() => kb.selectCustomFilter(kb.customFilters[index])}
-                      >
-                        <span className="custom-filter-name">{SAVED_FILTER_LABEL}</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="custom-filter-remove"
-                        title={REMOVE_FILTER_TITLE}
-                        onClick={() => kb.removeCustomFilter(kb.customFilters[index])}
-                      >
-                        <Icon name="icon-trash" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </tg-filter>
+              {/* Full shared `tg-filter` panel (app/modules/components/filter/**
+                  — reproduced by `BacklogFilterPanel`, NOT imported from
+                  AngularJS). It renders the category list, applied-filter chips,
+                  and saved custom-filter rows the shared `runSharedFilters` e2e
+                  fixture drives against BOTH the baseline and react projects. The
+                  Kanban VM feeds the params-based filter slice; `KANBAN_EXCLUDE_FILTERS`
+                  in the hook already omits the `status` category (legacy
+                  `KanbanController.excludeFilters`). */}
+              <BacklogFilterPanel
+                filters={kb.filters}
+                customFilters={kb.customFilters}
+                selectedFilters={kb.selectedFilters}
+                addFilter={kb.addFilter}
+                removeFilter={kb.removeFilter}
+                saveCustomFilter={kb.saveCustomFilter}
+                selectCustomFilter={kb.selectCustomFilter}
+                removeCustomFilter={kb.removeCustomFilter}
+              />
             </div>
           ) : null}
 
           {/* (4) The board — `.kanban-table`. Rendered only once the hook reports
               `initialLoad` AND the project context is resolved (the latter
               narrows `project` to non-null for the child components, which
-              require a non-null `Project`). Wrapped in a `DndContext` (no DOM
-              node emitted). The four legacy board directive tags are emitted as
-              inert, hyphenated attributes for structural parity (no SCSS/e2e
-              dependency). */}
+              require a non-null `Project`). Wrapped in the single tested
+              `KanbanDndProvider` (M6), which emits no DOM node of its own. The
+              four legacy board directive tags are emitted as inert, hyphenated
+              attributes for structural parity (no SCSS/e2e dependency). */}
           {kb.initialLoad && project !== null ? (
-            <DndContext sensors={sensors} onDragEnd={onDragEnd} autoScroll>
+            <KanbanDndProvider context={kb} renderOverlay={renderCardMirror}>
               <div
                 ref={boardRef}
                 className={cx("kanban-table", `zoom-${kb.zoomLevel}`, hasSwimlanes && "kanban-table-swimlane")}
@@ -415,28 +437,19 @@ export function KanbanBoard(props: { context: MountContext }) {
                             <div className="name">{status.name}</div>
                           </div>
                           <div className="options">
-                            <a
-                              className={cx("btn-board", "option", folded && "hidden")}
-                              onClick={() => kb.foldStatus(status)}
-                              title={FOLD_TITLE}
-                              role="button"
-                            >
-                              <Icon name="icon-fold-column" />
-                            </a>
-                            <a
-                              className={cx("btn-board", "option", "hunfold", !folded && "hidden")}
-                              onClick={() => kb.foldStatus(status)}
-                              title={UNFOLD_TITLE}
-                              role="button"
-                            >
-                              <Icon name="icon-unfold-column" />
-                            </a>
+                            {/* Legacy `kanban-table.jade` `.options` order (L30-59):
+                                add-US, bulk, fold, unfold — the add/bulk controls
+                                come FIRST, then the fold/unfold toggles. Preserving
+                                this exact DOM order keeps pixel + selector parity
+                                with the AngularJS board (the E2E helper opens the
+                                new-US lightbox from the column header's FIRST
+                                `.option`). */}
                             {canAdd ? (
                               <button
                                 type="button"
                                 className="btn-board option"
                                 onClick={() => kb.addNewUs("standard", status.id)}
-                                title={ADD_US_TITLE}
+                                title={t("KANBAN.TITLE_ACTION_ADD_US")}
                               >
                                 <Icon name="icon-add" className="add-action" />
                               </button>
@@ -446,11 +459,31 @@ export function KanbanBoard(props: { context: MountContext }) {
                                 type="button"
                                 className="btn-board option"
                                 onClick={() => kb.addNewUs("bulk", status.id)}
-                                title={ADD_BULK_TITLE}
+                                title={t("KANBAN.TITLE_ACTION_ADD_BULK")}
                               >
                                 <Icon name="icon-bulk" className="bulk-action" />
                               </button>
                             ) : null}
+                            <a
+                              className={cx("btn-board", "option", folded && "hidden")}
+                              onClick={() => kb.foldStatus(status)}
+                              onKeyDown={keyActivate(() => kb.foldStatus(status))}
+                              tabIndex={0}
+                              title={t("KANBAN.TITLE_ACTION_FOLD")}
+                              role="button"
+                            >
+                              <Icon name="icon-fold-column" />
+                            </a>
+                            <a
+                              className={cx("btn-board", "option", "hunfold", !folded && "hidden")}
+                              onClick={() => kb.foldStatus(status)}
+                              onKeyDown={keyActivate(() => kb.foldStatus(status))}
+                              tabIndex={0}
+                              title={t("KANBAN.TITLE_ACTION_UNFOLD")}
+                              role="button"
+                            >
+                              <Icon name="icon-unfold-column" />
+                            </a>
                           </div>
                         </h2>
                       );
@@ -544,100 +577,95 @@ export function KanbanBoard(props: { context: MountContext }) {
                 {hasSwimlanes && kb.isAdmin && kb.swimlanesList.length <= 1 ? (
                   <a
                     className="kanban-swimlane-add"
-                    href={`#/project/${project.slug}/admin/project-values/kanban`}
+                    href={adminKanbanPowerUpsUrl(project.slug)}
                   >
                     <Icon name="icon-add" className="add-action" />
-                    <span>{CREATE_SWIMLANE_LABEL}</span>
+                    <span>{t("KANBAN.CREATE_SWIMLANE")}</span>
                   </a>
                 ) : null}
               </div>
-            </DndContext>
+            </KanbanDndProvider>
           ) : (
             <div className="kanban-table-loading" />
           )}
         </div>
       </section>
 
-      {/* (5) The three lightbox hosts — siblings of the `<section>`, always in
-          the DOM (hidden via inline `display` until opened) so the e2e
-          `waitOpen()` (which waits for visibility) resolves after the triggering
-          click. Visibility is driven by the hook-owned active-lightbox state.
-          The marker attributes use the e2e names. */}
-      <div
-        className="lightbox lightbox-generic-form lightbox-create-edit"
-        tg-lb-create-edit-userstory=""
-        style={{ display: createEditOpen ? "flex" : "none" }}
-      >
-        {/* Minimal functional create/edit-US form for e2e host-selector parity:
-            a subject input + submit wired to the hook's create follow-through
-            (`submitNewUs`). Full lightbox fidelity is a shared AngularJS
-            component reproduced minimally here; edit reuses this host for
-            selector parity (the create flow is the e2e-critical path). */}
-        <form className="lightbox-create-edit-userstory-form" onSubmit={submitCreateUs}>
-          <input
-            type="text"
-            name="subject"
-            className="subject"
-            placeholder={SUBJECT_PLACEHOLDER}
-            value={subjectText}
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) => setSubjectText(event.target.value)}
-          />
-          <button type="submit" className="submit-button">
-            {SUBMIT_LABEL}
-          </button>
-          <button type="button" className="close" title={CLOSE_LABEL} onClick={closeLightbox}>
-            <Icon name="icon-close" />
-          </button>
-        </form>
+      {/* (5) Board-level status / error live region (finding M2). A polite
+          `aria-live` region that surfaces the hook's sanitized, user-facing
+          error text for board-level operations (initial load, drag reorder,
+          delete, WIP edit) whenever NO lightbox is open — a failed lightbox
+          submit is reported INSIDE that lightbox (which stays open, preserving
+          the entered values), so this avoids a duplicate message. Always
+          present in the DOM (empty when idle) so assistive tech announces late
+          errors without a node insertion. */}
+      <div className="kanban-board-status" role="status" aria-live="polite">
+        {kb.errorMessage !== null && kb.activeLightbox === null ? (
+          <div className="notification-message-error" data-type="error">
+            {kb.errorMessage}
+          </div>
+        ) : null}
       </div>
 
-      <div
-        className="lightbox lightbox-generic-bulk"
-        tg-lb-create-bulk-userstories=""
-        style={{ display: bulkOpen ? "flex" : "none" }}
-      >
-        {/* Minimal bulk-create form: a textarea (one US per line) + submit wired
-            to the hook's `submitBulkUs`; opened by `addNewUs("bulk", id)`. */}
-        <form className="lightbox-create-bulk-userstories-form" onSubmit={submitBulkUs}>
-          <textarea
-            name="bulk"
-            className="bulk-subjects"
-            placeholder={BULK_PLACEHOLDER}
-            value={bulkText}
-            onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => setBulkText(event.target.value)}
-          />
-          <button type="submit" className="submit-button">
-            {SUBMIT_LABEL}
-          </button>
-          <button type="button" className="close" title={CLOSE_LABEL} onClick={closeLightbox}>
-            <Icon name="icon-close" />
-          </button>
-        </form>
-      </div>
+      {/* (6) Story lightboxes (finding C2). These are the SHARED, self-contained
+          React lightbox components (`app/react/shared/lightboxes/**`) — reused
+          verbatim by the Backlog screen (finding C7). Each is ALWAYS mounted so
+          its host node (carrying the e2e marker attribute + the `.lightbox`
+          class) is present in the DOM even while closed; the `Lightbox` shell
+          they wrap drives visibility SOLELY through the `.lightbox.open` class
+          the preserved `lightbox.scss` reveals (the previous inline-`display`
+          hosts never added `.open`, so the mixin left them `opacity: 0` — the
+          C2 root cause). They own their field state and only surface the
+          collected values to the hook's awaited, guarded submit methods, which
+          keep the lightbox open and preserve values on failure (finding M2). */}
 
-      <div
-        className="lightbox lightbox-assigned-to"
-        tg-lb-assignedto=""
-        style={{ display: assignOpen ? "flex" : "none" }}
-      >
-        {/* Minimal assign-to form: the project member list + a close control;
-            opened by a card's assign affordance -> `changeUsAssignedUsers`.
-            Committing an assignment is a shared AngularJS component not exposed
-            by the hook; this host exists for e2e selector parity. */}
-        <div className="assigned-to">
-          <h2 className="title">{ASSIGN_TITLE}</h2>
-          <ul className="user-list">
-            {(project?.members ?? []).map((member) => (
-              <li key={member.id} className="user-list-single">
-                {member.full_name_display ?? member.full_name ?? member.username ?? ""}
-              </li>
-            ))}
-          </ul>
-          <button type="button" className="close" title={CLOSE_LABEL} onClick={closeLightbox}>
-            <Icon name="icon-close" />
-          </button>
-        </div>
-      </div>
+      {/* (6a) Create / edit user story. One component serves both modes; the
+          inner form remounts (resetting fields from `storyInitialValues`) when
+          the target changes, via the value-derived key inside the component. */}
+      <StoryFormLightbox
+        open={createEditOpen}
+        mode={activeLightboxType === "edit" ? "edit" : "create"}
+        onClose={kb.closeLightbox}
+        onSubmit={activeLightboxType === "edit" ? kb.submitEditUs : kb.submitNewUs}
+        statuses={kb.usStatusList}
+        members={project?.members ?? []}
+        roles={project?.roles ?? []}
+        points={project?.points ?? []}
+        swimlanes={kb.swimlanesList}
+        defaultSwimlaneId={kb.defaultSwimlaneId}
+        isKanban={true}
+        initialValues={storyInitialValues}
+        saving={kb.savingUs}
+        errorMessage={kb.errorMessage}
+        canSubmit={activeLightboxType === "edit" ? canModifyUs : canAddUs}
+      />
+
+      {/* (6b) Bulk create user stories. */}
+      <BulkStoryLightbox
+        open={bulkOpen}
+        onClose={kb.closeLightbox}
+        onSubmit={kb.submitBulkUs}
+        statuses={kb.usStatusList}
+        swimlanes={kb.swimlanesList}
+        defaultSwimlaneId={kb.defaultSwimlaneId}
+        isKanban={true}
+        initialStatusId={activeStatusId}
+        saving={kb.savingUs}
+        errorMessage={kb.errorMessage}
+        canSubmit={canAddUs}
+      />
+
+      {/* (6c) Edit assignment (assigned users / primary assignee). */}
+      <AssignedToLightbox
+        open={assignOpen}
+        onClose={kb.closeLightbox}
+        onSubmit={kb.submitAssignedUsers}
+        members={project?.members ?? []}
+        initialAssignedUsers={targetStory?.assigned_users ?? []}
+        saving={kb.savingUs}
+        errorMessage={kb.errorMessage}
+        canSubmit={canModifyUs}
+      />
     </>
   );
 }

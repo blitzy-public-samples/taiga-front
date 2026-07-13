@@ -7,6 +7,7 @@
  */
 
 import type { MountContext } from "../types";
+import { readLiveToken } from "../auth/token";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -40,25 +41,13 @@ export class ApiError extends Error {
 const MUTATING: ReadonlyArray<HttpMethod> = ["POST", "PUT", "PATCH", "DELETE"];
 
 /**
- * Resolve the bearer token. Prefer `MountContext.token` (already JSON-decoded by
- * the bootstrap layer); otherwise read the AngularJS `$tgStorage` JSON-encoded
- * "token" localStorage value, treating missing/garbage as no token.
+ * Resolve the bearer token LIVE on every request (finding M8). Prefer the
+ * current `$tgStorage` JSON-encoded "token" localStorage value so a JWT refresh
+ * while a screen is mounted is picked up immediately; fall back to the
+ * `MountContext.token` snapshot only when `localStorage` is unavailable
+ * (e.g. unit tests passing a synthetic context). Missing/garbage -> no token.
  */
-const resolveToken = (context: MountContext): string | null => {
-    if (context.token) {
-        return context.token;
-    }
-    try {
-        const raw = typeof localStorage !== "undefined" ? localStorage.getItem("token") : null;
-        if (raw === null) {
-            return null;
-        }
-        const parsed: unknown = JSON.parse(raw);
-        return typeof parsed === "string" ? parsed : null;
-    } catch {
-        return null;
-    }
-};
+const resolveToken = (context: MountContext): string | null => readLiveToken(context);
 
 /** Reuse the existing session id; never mint a new one. */
 const resolveSessionId = (context: MountContext): string | null => {

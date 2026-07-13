@@ -66,6 +66,7 @@ import type { Status, UserStory, Project } from "../shared/types";
 import { Card } from "./Card";
 import type { CardMember } from "./Card";
 import { useColumnDroppable } from "./dnd/useColumnDroppable";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Custom-element JSX typing. `StatusColumn` emits one literal custom-element
@@ -94,11 +95,15 @@ declare global {
  * plain English literals for the POC (true visual parity is proven by the
  * Playwright evidence; the string catalogue is out of scope for this leaf).
  */
-/** `KANBAN.NUMBER_US` — the `.kanban-task-counter` title attribute. */
-const NUMBER_US_LABEL = "user stories";
-/** `KANBAN.ARCHIVED` — shown in the collapsed placeholder for an archived status. */
-const ARCHIVED_LABEL = "Archived";
-/** The WIP-limit marker caption. */
+/**
+ * The WIP-limit marker caption. The legacy board hard-coded a bare
+ * `<span>WIP Limit</span>` in `kanban/main.coffee` (the `tgKanbanWipLimit`
+ * directive template) with NO `translate` call and there is no `KANBAN.WIP_LIMIT`
+ * catalogue key, so this stays a documented literal (faithful to the original).
+ * The other two labels (`KANBAN.NUMBER_US`, `KANBAN.ARCHIVED`) ARE catalogue
+ * keys and are resolved through the shared `t()` helper at render time (review
+ * finding M7: "visible text is hard-coded. Use … the legacy i18n mechanism").
+ */
 const WIP_LIMIT_LABEL = "WIP Limit";
 
 /**
@@ -264,6 +269,22 @@ export function StatusColumn(props: StatusColumnProps): JSX.Element {
   const dataSwimlane =
     swimlaneId === undefined || swimlaneId === null ? undefined : swimlaneId;
 
+  // Render-time i18n labels (the legacy `translate('KANBAN.NUMBER_US')` /
+  // `translate('KANBAN.ARCHIVED')` calls in `kanban-table.jade`).
+  const numberUsLabel = t("KANBAN.NUMBER_US");
+  const archivedLabel = t("KANBAN.ARCHIVED");
+
+  // Unique document id. The legacy `kanban-table.jade` used `id="column-{{s.id}}"`
+  // INSIDE the per-swimlane repeat, so the same id was emitted once per swimlane
+  // (a duplicate-id defect). In swimlane mode we therefore qualify the id with
+  // the swimlane id so every column is a UNIQUE document node (review finding
+  // M7); non-swimlane mode keeps the plain `column-<statusId>` id. Styling and
+  // e2e continue to target `data-status`/`data-swimlane` (never `#column-`), and
+  // the @dnd-kit droppable id already encodes both ids separately, so this is a
+  // pure accessibility/correctness fix with no visual or behavioural change.
+  const columnDomId =
+    dataSwimlane === undefined ? `column-${status.id}` : `column-${dataSwimlane}-${status.id}`;
+
   // Root class list. `task-column` is ADDED beyond the legacy classes: the e2e
   // suite selects columns via `$$('.task-column')` and asserts exactly one
   // `.vfold.task-column` per folded status. The board's header cell
@@ -342,14 +363,14 @@ export function StatusColumn(props: StatusColumnProps): JSX.Element {
   return (
     <div
       ref={setNodeRef}
-      id={`column-${status.id}`}
+      id={columnDomId}
       className={rootClassName}
       data-status={status.id}
       data-swimlane={dataSwimlane}
     >
       {/* Child 1 — WIP counter (rendered when the column is NOT folded). */}
       {!folded ? (
-        <div className="kanban-task-counter" title={NUMBER_US_LABEL}>
+        <div className="kanban-task-counter" title={numberUsLabel}>
           <tg-animated-counter
             data-count={count}
             data-wip={wip ?? undefined}
@@ -387,7 +408,7 @@ export function StatusColumn(props: StatusColumnProps): JSX.Element {
               </div>
             ) : null}
             <div className="text-holder">
-              {isArchived ? <div className="archived">{ARCHIVED_LABEL}</div> : null}
+              {isArchived ? <div className="archived">{archivedLabel}</div> : null}
               <div className="name">{status.name}</div>
             </div>
             <div

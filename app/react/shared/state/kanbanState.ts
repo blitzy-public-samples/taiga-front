@@ -457,6 +457,59 @@ export function move(
 }
 
 /**
+ * Position fields captured for a single story before an optimistic move, used
+ * to reverse that move on API failure. `status`/`swimlane` are present only for
+ * the stories that actually changed column/swimlane (the dragged cards);
+ * displaced cards carry only their prior `order`.
+ */
+export interface StoryPositionDelta {
+    id: number;
+    status?: number;
+    swimlane?: number | null;
+    order: number;
+}
+
+/**
+ * Precise, delta-based rollback for a failed optimistic move (finding M1).
+ *
+ * Rather than restoring a STALE whole-state snapshot — which would clobber any
+ * unrelated change (a WebSocket `replaceModel`/`add`/`remove`, another move)
+ * that landed between the optimistic apply and the API rejection (CWE-362) —
+ * this re-applies ONLY the captured pre-move position fields of the affected
+ * stories onto the CURRENT state. A story that no longer exists (removed via a
+ * real-time event in the meantime) is skipped, and only the `status`/`swimlane`
+ * that a delta explicitly carries are touched, so concurrently-updated fields
+ * (subject, assignee, ...) on those same stories survive. Projections are then
+ * rebuilt exactly as `move` does.
+ */
+export function restoreStories(
+    state: KanbanState,
+    deltas: ReadonlyArray<StoryPositionDelta>,
+): KanbanState {
+    return produce(state, (draft) => {
+        for (const delta of deltas) {
+            const model = draft.userstoriesRaw.find((it) => it.id === delta.id);
+            if (!model) {
+                // Story was removed concurrently (e.g. a `userstories` delete
+                // event); nothing to restore.
+                continue;
+            }
+            if (delta.status !== undefined) {
+                model.status = delta.status;
+            }
+            if (delta.swimlane !== undefined) {
+                model.swimlane = delta.swimlane;
+            }
+            draft.order[delta.id] = delta.order;
+            draft.usMap[delta.id] = model;
+        }
+        // refreshUsMap=false matches `move`; projections are rebuilt from the
+        // restored `order`/`status`/`swimlane`.
+        applyRefresh(draft, false, true);
+    });
+}
+
+/**
  * Move a single story to the very end of a status by assigning order `-1`
  * (legacy `moveToEnd`). Returns the `{ us_id, order }` payload the legacy
  * service returned for the single-story reorder endpoint.

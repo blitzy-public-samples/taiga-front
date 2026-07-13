@@ -6,11 +6,9 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { renderHook } from "@testing-library/react";
-
 import type { DragEndEvent } from "@dnd-kit/core";
 
-import { createKanbanDragEndHandler, useKanbanDragEnd } from "./index";
+import { createKanbanDragEndHandler } from "./index";
 import type { KanbanDragEndContext, KanbanDropArgs } from "./types";
 import type { UserStory } from "../../shared/types";
 
@@ -237,34 +235,6 @@ describe("createKanbanDragEndHandler", () => {
             index: 0,
             previousCard: null,
             nextCard: 4,
-        });
-    });
-});
-
-describe("useKanbanDragEnd", () => {
-    beforeEach(() => {
-        buildBoard();
-    });
-
-    afterEach(() => {
-        document.body.innerHTML = "";
-    });
-
-    it("wires the board's handleDragEnd as the single dispatch target", () => {
-        const handleDragEnd = jest.fn();
-        const kb = makeContext({}, handleDragEnd);
-
-        const { result } = renderHook(() => useKanbanDragEnd(kb));
-        result.current(makeEvent(2, { statusId: 20, swimlaneId: null }, -10));
-
-        expect(handleDragEnd).toHaveBeenCalledTimes(1);
-        expect(handleDragEnd.mock.calls[0][0]).toEqual({
-            usList: [2],
-            statusId: 20,
-            swimlaneId: null,
-            index: 1,
-            previousCard: 4,
-            nextCard: null,
         });
     });
 });

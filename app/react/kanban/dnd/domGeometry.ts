@@ -18,6 +18,22 @@ function cardId(el: Element): number {
 }
 
 /**
+ * Whether a card participates in drag geometry (M6). A card inside a FOLDED
+ * status column is collapsed by the theme (`.vfold tg-card { display: none }`)
+ * yet is still mounted in the DOM (StatusColumn always renders its cards so the
+ * fold e2e checks the class, not card removal). Such hidden cards must NOT
+ * pollute the document-order multi-drag scan or the insertion-index geometry —
+ * they have no visible position to measure or to count against.
+ *
+ * The check is CLASS-BASED (`closest(".vfold")`), not layout-based, so it is
+ * deterministic under jsdom (which performs no layout and reports every rect as
+ * zero) exactly as it is in the browser.
+ */
+function isCardGeometryVisible(el: Element): boolean {
+    return el.closest(".vfold") === null;
+}
+
+/**
  * Locate the droppable column element for a status column / swimlane cell.
  * - swimlane mode (swimlaneId !== null, incl. -1): match BOTH data attributes,
  *   since each swimlane x status cell carries `data-status` AND `data-swimlane`.
@@ -50,7 +66,11 @@ export function readColumnOrderedIds(columnEl: Element): number[] {
  * ordered multi-move set.
  */
 export function readCardIdsInDomOrder(): number[] {
-    const cards = Array.from(document.querySelectorAll("tg-card[data-id]"));
+    // Only VISIBLE cards (M6): cards inside a folded (`.vfold`) column are
+    // collapsed and must not appear in the multi-drag document-order set.
+    const cards = Array.from(document.querySelectorAll("tg-card[data-id]")).filter(
+        isCardGeometryVisible,
+    );
     return cards.map(cardId).filter((id) => !Number.isNaN(id));
 }
 
@@ -90,7 +110,9 @@ export function computeInsertionIndex(columnEl: Element, pointerY: number, moved
     let index = 0;
     for (const card of cards) {
         const id = cardId(card);
-        if (Number.isNaN(id) || movedIds.indexOf(id) !== -1) {
+        // Skip moved cards (legacy `:not(.gu-transit)`) AND cards collapsed by a
+        // folded column (M6): a `display:none` card has no measurable position.
+        if (Number.isNaN(id) || movedIds.indexOf(id) !== -1 || !isCardGeometryVisible(card)) {
             continue;
         }
         if (midpointY(card) < pointerY) {

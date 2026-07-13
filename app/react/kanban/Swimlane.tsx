@@ -85,16 +85,20 @@ import type {
 } from "../shared/types";
 import { StatusColumn } from "./StatusColumn";
 import type { CardMember } from "./Card";
+import { t } from "../shared/i18n/translate";
 
 /*
  * i18n labels. The migration reproduces the AngularJS `translate` output as
  * plain English literals for the POC (true visual parity is proven by the
  * Playwright evidence; the string catalogue is out of scope for this leaf).
  */
-/** `KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP` — the unclassified-swimlane help tooltip. */
-const UNCLASSIFIED_TOOLTIP = "The user stories that are not part of any swimlane are here.";
-/** `ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT` — the default-swimlane star caption. */
-const DEFAULT_LABEL = "Default";
+/*
+ * i18n. Both visible strings are catalogue keys and are resolved through the
+ * shared `t()` helper AT RENDER TIME (the legacy `translate(...)` calls in
+ * `kanban-table.jade`), not ad-hoc English literals (review finding M7: "visible
+ * text is hard-coded. Use … the legacy i18n mechanism"). The keys are resolved
+ * inside the component so a runtime `setTranslations()` override is honoured.
+ */
 
 /**
  * Join truthy class-name tokens into a single `className` string. A tiny local
@@ -241,6 +245,11 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
   // title, the help tooltip, and the higher stacking context (`.unclassified-*`).
   const isUnclassified = swimlane.id === -1;
 
+  // Render-time i18n labels (the legacy `translate('KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP')`
+  // and `translate('ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT')` calls).
+  const unclassifiedTooltip = t("KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP");
+  const defaultLabel = t("ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT");
+
   // The default-swimlane star matches the legacy
   // `ng-if="swimlane.id == project.default_swimlane && project.swimlanes.length > 1"`.
   const showDefaultStar =
@@ -276,13 +285,13 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
         {isUnclassified ? (
           <div className="unclassified-us-info">
             <Icon icon="icon-help-circle" />
-            <div className="tooltip pop-help">{UNCLASSIFIED_TOOLTIP}</div>
+            <div className="tooltip pop-help">{unclassifiedTooltip}</div>
           </div>
         ) : null}
         {showDefaultStar ? (
           <div className="default-swimlane">
             <Icon icon="icon-star" className="default-swimlane-icon" />
-            <span className="default-text">{DEFAULT_LABEL}</span>
+            <span className="default-text">{defaultLabel}</span>
           </div>
         ) : null}
       </button>

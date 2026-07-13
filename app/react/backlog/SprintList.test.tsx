@@ -18,9 +18,13 @@
  * selectors target specific class names / literal `tg-*` attributes, these tests
  * assert on the emitted DOM structure (via `container.querySelector` /
  * `querySelectorAll`), on the `add_milestone` permission gating, on the
- * closed-sprints toggle label, and on the add / toggle / edit callback wiring —
- * NOT on translated copy (the i18n keys are rendered as their resolved English
- * copy by the component).
+ * closed-sprints toggle label, and on the add / toggle / edit callback wiring.
+ * All visible copy is asserted THROUGH the shared `t()` runtime against the SAME
+ * keys the component binds (`BACKLOG.SPRINTS.TITLE`, `.TITLE_ACTION_NEW_SPRINT`,
+ * `.EMPTY`, `.ACTION_SHOW_CLOSED_SPRINTS` / `.ACTION_HIDE_CLOSED_SPRINTS`,
+ * `COMMON.ADD`) — never against a hard-coded literal — so a broken key wiring or
+ * a dropped translation is caught, and a dedicated test proves no raw `KEY.PATH`
+ * token leaks into the DOM.
  *
  * Conventions (match the repo's React test harness — see `Sprint.test.tsx`):
  *   - Test-framework globals are imported explicitly from `@jest/globals`.
@@ -44,6 +48,7 @@ import { DndContext } from "@dnd-kit/core";
 import { SprintList } from "./SprintList";
 import type { SprintListProps } from "./SprintList";
 import type { Milestone, Project } from "../shared/types";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Build a {@link Project} with the given permission set. `archived_code` defaults
@@ -136,14 +141,16 @@ describe("SprintList — header and count", () => {
         const number = header!.querySelector("h1 .number") as HTMLElement | null;
         expect(number).not.toBeNull();
         expect(number!.textContent).toBe("2");
-        expect((header!.querySelector("h1 .title") as HTMLElement).textContent).toBe("SPRINTS");
+        expect((header!.querySelector("h1 .title") as HTMLElement).textContent).toBe(
+            t("BACKLOG.SPRINTS.TITLE"),
+        );
 
         // Add-sprint button carries BOTH btn-link (jade) and add-sprint (SCSS/e2e).
         const add = header!.querySelector("a.add-sprint") as HTMLElement | null;
         expect(add).not.toBeNull();
         expect(add!.classList.contains("btn-link")).toBe(true);
-        expect(add!.getAttribute("title")).toBe("Add a sprint");
-        expect((add!.querySelector("span") as HTMLElement).textContent).toBe("Add");
+        expect(add!.getAttribute("title")).toBe(t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT"));
+        expect((add!.querySelector("span") as HTMLElement).textContent).toBe(t("COMMON.ADD"));
         // Compiled tg-svg sprite: <svg class="icon icon-add"><use xlink:href="#icon-add"/></svg>.
         expect(add!.querySelector("svg.icon.icon-add use")!.getAttribute("xlink:href")).toBe(
             "#icon-add",
@@ -156,7 +163,9 @@ describe("SprintList — header and count", () => {
         // The header add-sprint anchor is not rendered when totalMilestones is 0…
         expect(container.querySelector("header.sprint-header a.add-sprint")).toBeNull();
         // …but the title is always present.
-        expect((container.querySelector("h1 .title") as HTMLElement).textContent).toBe("SPRINTS");
+        expect((container.querySelector("h1 .title") as HTMLElement).textContent).toBe(
+            t("BACKLOG.SPRINTS.TITLE"),
+        );
     });
 
     it("hides the header add-sprint button when the user lacks add_milestone", () => {
@@ -193,17 +202,19 @@ describe("SprintList — empty state", () => {
         expect(empty).not.toBeNull();
 
         const img = empty!.querySelector("img") as HTMLImageElement;
-        expect(img.getAttribute("alt")).toBe("There are no sprints yet");
+        expect(img.getAttribute("alt")).toBe(t("BACKLOG.SPRINTS.EMPTY"));
         expect(img.getAttribute("src")).toBe("/v/images/empty/empty_sprint.png");
         expect((empty!.querySelector("p.title") as HTMLElement).textContent).toBe(
-            "There are no sprints yet",
+            t("BACKLOG.SPRINTS.EMPTY"),
         );
 
         // The empty-state add link (user has add_milestone) carries btn-link + add-sprint.
         const add = empty!.querySelector("a.add-sprint") as HTMLElement | null;
         expect(add).not.toBeNull();
         expect(add!.classList.contains("btn-link")).toBe(true);
-        expect((add!.querySelector("span") as HTMLElement).textContent).toBe(" Add a sprint");
+        expect((add!.querySelector("span") as HTMLElement).textContent).toBe(
+            " " + t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT"),
+        );
     });
 
     it("omits the empty-state add link when the user lacks add_milestone", () => {
@@ -297,7 +308,7 @@ describe("SprintList — closed sprints toggle", () => {
             "#icon-folder",
         );
         expect((toggle!.querySelector(".text") as HTMLElement).textContent).toBe(
-            "Show closed sprints",
+            t("BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS"),
         );
 
         // Closed cards are NOT rendered while hidden.
@@ -316,7 +327,7 @@ describe("SprintList — closed sprints toggle", () => {
 
         expect(
             (container.querySelector("a.filter-closed-sprints .text") as HTMLElement).textContent,
-        ).toBe("Hide closed sprints");
+        ).toBe(t("BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS"));
 
         const closedCards = container.querySelectorAll(".sprint.sprint-closed");
         expect(closedCards).toHaveLength(2);
@@ -355,5 +366,96 @@ describe("SprintList — closed sprints toggle", () => {
         toggle.dispatchEvent(event);
         expect(calls).toBe(1);
         expect(event.defaultPrevented).toBe(true);
+    });
+});
+
+describe("SprintList — i18n resolution (M7)", () => {
+    // Guards finding M7: every visible string must be a RESOLVED translation, not
+    // a hard-coded literal AND not an unresolved `KEY.PATH` token leaking through.
+    it("resolves the header, add-sprint and closed-toggle keys to non-empty copy (never the raw key)", () => {
+        // Header title, add-sprint button + empty-state key + both toggle labels.
+        for (const key of [
+            "BACKLOG.SPRINTS.TITLE",
+            "BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT",
+            "BACKLOG.SPRINTS.EMPTY",
+            "BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS",
+            "BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS",
+            "COMMON.ADD",
+        ]) {
+            const resolved = t(key);
+            expect(resolved.length).toBeGreaterThan(0);
+            // A resolved value must differ from the dotted key path it was looked up by.
+            expect(resolved).not.toBe(key);
+        }
+    });
+
+    it("emits no raw KEY.PATH i18n token anywhere in the rendered sprint list", () => {
+        // Render a fully-populated list so every translated surface is present:
+        // header (count + add button), open cards, the closed toggle (SHOW state)
+        // and, in a second render, the HIDE state + closed cards + empty state.
+        const populated = renderList({
+            openSprints: [makeOpenSprint(1), makeOpenSprint(2)],
+            totalMilestones: 2,
+            closedSprints: [makeClosedSprint(9)],
+            totalClosedMilestones: 1,
+            closedSprintsVisible: true,
+        });
+        const empty = renderList({ totalMilestones: 0 });
+
+        // An unresolved AngularJS/React i18n key would surface as an uppercase,
+        // dot-separated token (e.g. "BACKLOG.SPRINTS.TITLE"). Assert none leak.
+        const RAW_KEY = /\b[A-Z][A-Z0-9_]+(?:\.[A-Z0-9_]+)+\b/;
+        expect(RAW_KEY.test(populated.container.textContent ?? "")).toBe(false);
+        expect(RAW_KEY.test(empty.container.textContent ?? "")).toBe(false);
+
+        // And the concrete resolved copy IS present.
+        expect(populated.container.textContent).toContain(t("BACKLOG.SPRINTS.TITLE"));
+        expect(populated.container.textContent).toContain(
+            t("BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS"),
+        );
+        expect(empty.container.textContent).toContain(t("BACKLOG.SPRINTS.EMPTY"));
+    });
+});
+
+// =============================================================================
+// renderStoryRow forwarding (finding C8)
+//
+// `./Backlog.tsx` threads a `renderStoryRow` render-prop for SORTABLE sprint
+// story rows. It must reach OPEN sprint cards (whose stories become draggable)
+// but NEVER the CLOSED sprint cards (whose stories stay plain / non-draggable,
+// matching the closed-sprint rejection contract).
+// =============================================================================
+describe("SprintList — renderStoryRow forwarding (C8)", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const openStory = { id: 301, ref: 301, subject: "Open story", status: 1 } as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const closedStory = { id: 901, ref: 901, subject: "Closed story", status: 1 } as any;
+
+    it("forwards renderStoryRow to OPEN sprints only, never to CLOSED sprints", () => {
+        const seen: number[] = [];
+        const { container } = renderList({
+            openSprints: [makeOpenSprint(3, { user_stories: [openStory] })],
+            closedSprints: [makeClosedSprint(9, { user_stories: [closedStory] })],
+            totalMilestones: 1,
+            totalClosedMilestones: 1,
+            closedSprintsVisible: true,
+            renderStoryRow: (us) => {
+                seen.push(us.id);
+                return <div key={us.id} data-testid="rr" data-id={String(us.id)} />;
+            },
+        });
+
+        // Only the OPEN sprint's story went through renderStoryRow.
+        expect(seen).toEqual([openStory.id]);
+
+        // The open sprint's story rendered via the custom (sortable) row...
+        const custom = container.querySelectorAll('[data-testid="rr"]');
+        expect(custom.length).toBe(1);
+        expect(custom[0].getAttribute("data-id")).toBe(String(openStory.id));
+
+        // ...while the closed sprint's story rendered via the PLAIN row path.
+        const plainRows = container.querySelectorAll(".milestone-us-item-row");
+        expect(plainRows.length).toBe(1);
+        expect(plainRows[0].getAttribute("data-id")).toBe(String(closedStory.id));
     });
 });

@@ -108,10 +108,17 @@ mainLoad = ->
             .then(() => loadApp(emojisPromise))
 
 loadApp = (emojisPromise) ->
+    # Load-order contract (AAP 0.6.1): elements.js -> react-screens.js -> app.js,
+    # i.e. all BEFORE angular.bootstrap. react-screens.js is the esbuild bundle
+    # whose entry (app/react/index.tsx) imports bootstrap.ts for its side effect,
+    # registering the <tg-react-kanban> / <tg-react-backlog> Custom Elements. They
+    # MUST be defined before AngularJS routes to the kanban/backlog templates that
+    # host those tags, so the browser upgrades them and the React roots mount.
     loadJS("#{window._version}/js/elements.js").then () ->
-        loadJS("#{window._version}/js/app.js").then () ->
-            emojisPromise.then ->
-                angular.bootstrap(document, ['taiga'])
+        loadJS("#{window._version}/js/react-screens.js").then () ->
+            loadJS("#{window._version}/js/app.js").then () ->
+                emojisPromise.then ->
+                    angular.bootstrap(document, ['taiga'])
 
 promise = fetch "conf.json"
 promise

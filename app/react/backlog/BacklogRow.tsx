@@ -1,3 +1,4 @@
+
 /*
  * This source code is licensed under the terms of the
  * GNU Affero General Public License found in the LICENSE file in
@@ -22,17 +23,37 @@
  *
  * The row reproduces every legacy affordance:
  *   - the drag handle (`.draggable-us-row`, `@dnd-kit` activator),
- *   - the multiselect checkbox (`.custom-checkbox > input#us-check-<ref>`),
+ *   - the multiselect checkbox (`.custom-checkbox > input#us-check-<ref>`) with
+ *     shift-range selection (shift+click selects the contiguous range from the
+ *     last-clicked anchor, matching the legacy backlog multiselect),
  *   - the user-story link (`#<ref>` + escaped subject), due-date, tags and
  *     epic pills,
  *   - the inline STATUS editor (`tg-us-status` -> `.us-status` + `.pop-status`
  *     popover), from `app/coffee/modules/common/popovers.coffee` UsStatusDirective,
  *   - the inline POINTS editor (`tg-backlog-us-points` -> `.us-points` +
- *     `.pop-role` popover with the two-step role -> point selection), from the
+ *     `.pop-role` / `.pop-points-open` two-step popover), reproducing the
  *     `UsPointsDirective` / `EstimationProcess` of
  *     `app/coffee/modules/backlog/main.coffee` + `common/estimation.coffee`,
  *   - the row OPTIONS popup (`tg-us-edit-selector` -> `.us-option-popup` with
  *     edit / delete / move-to-top), from `app/partials/backlog/us-edit-popover.jade`.
+ *
+ * Popover behavior (the M4 root-cause fix): all three inline popovers use the
+ * shared {@link usePopover} hook, which enforces a GLOBAL single-active
+ * invariant (opening any popover — in THIS row or any OTHER row — closes the
+ * previously open one), closes on outside pointer-down and on Escape (restoring
+ * focus to the trigger), and moves focus to the first actionable item on open.
+ * This replaces the previous row-local `useState` flags that only guaranteed a
+ * single active popover WITHIN a row and had no dismissal/focus semantics.
+ *
+ * Points display (the second M4 fix): the points value is computed with the
+ * legacy estimation rules ({@link calculateTotalPoints}) so an UNESTIMATED
+ * story (`us.points` empty, or every role's point value null) renders the
+ * literal `"?"` — never `0`. When a header role is selected (the `displayRoleId`
+ * prop broadcast by the `.backlog-table-header` role selector) and the project
+ * has more than one computable role, the value renders in the legacy
+ * `"{point name} / <span>{total}</span>"` split form; otherwise it renders the
+ * bare total. The per-role popover entries render `"{role name} ({points})"`
+ * exactly as `common/estimation/us-points-roles-popover.jade` did.
  *
  * @dnd-kit interop: `./Backlog.tsx` makes each row a sortable item and passes
  * the sortable wiring down via the optional {@link BacklogRowDnd} `dnd` prop.
@@ -50,10 +71,9 @@
  *   - The legacy `ng-bind-html="us.subject | emojify"` becomes a plain, ESCAPED
  *     React text node (no `dangerouslySetInnerHTML`) preserving XSS-safety
  *     (AAP §0.6.4).
- *   - Visible action text uses the English values from
- *     `app/locales/taiga/locale-en.json` ("Status Name", "Edit", "Delete",
- *     "Move to top") so the rendered output matches the AngularJS `translate`
- *     output exactly.
+ *   - Visible action text is resolved at render time through the i18n helper
+ *     `t(...)` against the compiled `app/locales/taiga/locale-en.json` bundle so
+ *     the rendered output matches the AngularJS `translate` output exactly.
  *
  * The literal `ng-repeat="us in userstories"` attribute on the row root is a
  * STATIC string (NOT AngularJS behavior) required by the ported e2e selector
@@ -67,6 +87,16 @@ import type * as React from "react";
 import { useState } from "react";
 import type { CSSProperties } from "react";
 import type { UserStory, Project, Status, Tag } from "../shared/types";
+import { userStoryUrl } from "../shared/nav/routes";
+import { t } from "../shared/i18n/translate";
+import { usePopover } from "../shared/popover/usePopover";
+import {
+  UNESTIMATED,
+  buildPointsById,
+  calculateTotalPoints,
+  computableRoles as computeComputableRoles,
+  roleDisplayPoints,
+} from "../shared/estimation/points";
 
 /**
  * Custom-element JSX typing. The AngularJS `tg-svg` custom element that this
@@ -140,8 +170,8 @@ export interface BacklogRowDnd {
 /**
  * Props contract for {@link BacklogRow}. The component is fully controlled: it
  * owns no cross-row state and mirrors the bindings the legacy directives used.
- * The only internal state is the transient open/closed flags of the three
- * inline popovers (status / points / options).
+ * The only internal state is the transient point-value step of the points
+ * popover; open/closed state is owned by the shared {@link usePopover} hook.
  */
 export interface BacklogRowProps {
   /** The user story rendered by this row. */
@@ -156,13 +186,30 @@ export interface BacklogRowProps {
   selected: boolean;
   /** Adds the `first` class to the options button (legacy `first_us_in_backlog`). */
   isFirstInBacklog?: boolean;
-  /** Toggle the multiselect checkbox for this story. */
-  onToggleSelected: (us: UserStory, checked: boolean) => void;
+  /**
+   * Header-selected role broadcast by the `.backlog-table-header` role selector
+   * (legacy `uspoints:select` / `uspoints:clear-selection`). `null`/`undefined`
+   * means "All points" (show the bare total); a role id switches every row's
+   * points display to the `"{point} / {total}"` split form when the project has
+   * more than one computable role.
+   */
+  displayRoleId?: number | null;
+  /**
+   * When `true` a mutation for this story is in flight; interactive controls are
+   * disabled and popovers cannot be opened (mirrors the legacy `$qqueue` guard
+   * that serialized per-story saves).
+   */
+  saving?: boolean;
+  /**
+   * Toggle the multiselect checkbox for this story. `shiftKey` is forwarded so
+   * `./Backlog.tsx` can implement contiguous range selection from the anchor.
+   */
+  onToggleSelected: (us: UserStory, checked: boolean, shiftKey: boolean) => void;
   /** Change this story's status (single `bulk`/PATCH persisted by the hook). */
   onUpdateStatus: (us: UserStory, statusId: number) => void;
   /** Set the point value for a role on this story (`roleId` null when single role). */
   onUpdatePoints: (us: UserStory, roleId: number | null, pointId: number) => void;
-  /** Open the (AngularJS) edit-story lightbox via the hook's window CustomEvent bridge. */
+  /** Open the shared edit-story lightbox for this story. */
   onEdit: (us: UserStory) => void;
   /** Delete this story. */
   onDelete: (us: UserStory) => void;
@@ -181,6 +228,7 @@ export interface BacklogRowProps {
  */
 export function BacklogRow(props: BacklogRowProps): JSX.Element {
   const { us, project } = props;
+  const saving = props.saving === true;
 
   // --- Permission gating (mirrors `tg-check-permission` / `tg-class-permission`).
   // There is NO parallel authorization: these flags only gate which controls
@@ -197,59 +245,74 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
   // UserStory model; read them defensively without widening the shared type.
   const dueDate = (us as { due_date?: string }).due_date;
   const isNew = (us as { new?: boolean }).new === true;
-  // Only `computable` roles participate in estimation (legacy
-  // `EstimationProcess.calculateRoles` = `_.filter(project.roles, "computable")`).
-  const computableRoles = (project.roles ?? []).filter((role) => role.computable !== false);
 
-  // --- Inline-popover open state. At most ONE popover is open at any time so
-  // the DOM never contains more than a single `.popover.active` element (the
-  // ported Playwright helper asserts `.popover.active` count === 1). ---
-  const [statusOpen, setStatusOpen] = useState<boolean>(false);
-  const [pointsOpen, setPointsOpen] = useState<boolean>(false);
-  const [optionsOpen, setOptionsOpen] = useState<boolean>(false);
+  // --- Estimation projections (legacy `EstimationProcess`). Only `computable`
+  // roles participate; `calculateTotalPoints` yields `"?"` for an unestimated
+  // story so the points value is NEVER a fabricated `0`. ---
+  const computableRoles = computeComputableRoles(project);
+  const pointsById = buildPointsById(project);
+  const totalPoints = calculateTotalPoints(us, pointsById);
+  // When the header broadcasts a specific role AND more than one computable role
+  // exists, the legacy `render()` shows "{that role's point} / {total}".
+  const headerRoleId = props.displayRoleId ?? null;
+  const showRoleSplit = headerRoleId !== null && computableRoles.length > 1;
+  // The points editor is not clickable with no modify permission or no
+  // computable roles (legacy `roles.length == 0 -> addClass("not-clickable")`).
+  const pointsNotClickable = !modifyUs || computableRoles.length === 0;
+
+  // --- Shared inline popovers (status / points / options). The hook enforces a
+  // GLOBAL single-active invariant and provides outside-click / Escape / focus. ---
+  const statusPop = usePopover();
+  const pointsPop = usePopover();
+  const optionsPop = usePopover();
+
   // Which role's point values are being chosen inside the points popover:
-  // `null` shows the role-selection step, a role id shows the point-value step.
-  // Mirrors `UsPointsDirective.selectedRoleId`.
-  const [selectedRoleId, setSelectedRoleId] = useState<number | null>(null);
+  // `null` shows the role-selection step, a role id shows the point-value step
+  // (legacy `UsPointsDirective` `selectedRoleId` / `updatingSelectedRoleId`).
+  const [pointStepRoleId, setPointStepRoleId] = useState<number | null>(null);
 
-  /** Open/close the STATUS popover, closing the others (single-active invariant). */
-  const toggleStatus = (): void => {
-    if (!modifyUs) {
+  /** Toggle the STATUS popover (no-op without modify permission or while saving). */
+  const onStatusTriggerClick = (event: React.MouseEvent): void => {
+    event.preventDefault();
+    if (!modifyUs || saving) {
       return;
     }
-    setPointsOpen(false);
-    setSelectedRoleId(null);
-    setOptionsOpen(false);
-    setStatusOpen((open) => !open);
+    statusPop.toggle();
   };
 
   /**
-   * Open/close the POINTS popover, closing the others. On open, preselect the
-   * single computable role (legacy `roles.length === 1` preselects, jumping
-   * straight to the point-value step); otherwise start at the role step.
+   * Toggle the POINTS popover. On open, seed the point-value step exactly as the
+   * legacy directive did: a single computable role is preselected (jumping
+   * straight to the point step), otherwise a header-selected role is honored,
+   * otherwise the role-selection step is shown first.
    */
-  const togglePoints = (): void => {
-    if (!modifyUs) {
+  const onPointsTriggerClick = (event: React.MouseEvent): void => {
+    event.preventDefault();
+    if (pointsNotClickable || saving) {
       return;
     }
-    setStatusOpen(false);
-    setOptionsOpen(false);
-    if (pointsOpen) {
-      setPointsOpen(false);
-      setSelectedRoleId(null);
+    if (pointsPop.open) {
+      pointsPop.close();
+      setPointStepRoleId(null);
       return;
     }
-    const onlyRole = computableRoles.length === 1 ? computableRoles[0] : undefined;
-    setSelectedRoleId(onlyRole ? onlyRole.id : null);
-    setPointsOpen(true);
+    const seed =
+      computableRoles.length === 1
+        ? computableRoles[0].id
+        : headerRoleId !== null
+        ? headerRoleId
+        : null;
+    setPointStepRoleId(seed);
+    pointsPop.toggle();
   };
 
-  /** Open/close the row OPTIONS popup, closing the others. */
-  const toggleOptions = (): void => {
-    setStatusOpen(false);
-    setPointsOpen(false);
-    setSelectedRoleId(null);
-    setOptionsOpen((open) => !open);
+  /** Toggle the row OPTIONS popup (no-op while saving). */
+  const onOptionsTriggerClick = (event: React.MouseEvent): void => {
+    event.preventDefault();
+    if (saving) {
+      return;
+    }
+    optionsPop.toggle();
   };
 
   // --- Row root modifier classes (legacy `ng-class` + `tg-class-permission`). ---
@@ -281,13 +344,35 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
         ) : null}
         {modifyUs ? (
           <div className="input">
-            <div className="custom-checkbox">
+            <div
+              className="custom-checkbox"
+              onMouseDown={(event) => {
+                // When a prior row is focused, a Shift+click initiates a native
+                // text-selection extension across the intervening rows, and the
+                // browser then swallows the label -> checkbox activation so the
+                // `change` event never fires. Suppressing the default only for
+                // the Shift gesture stops that selection from starting, letting
+                // the subsequent click toggle the checkbox and drive the
+                // contiguous range selection. Non-Shift clicks are untouched, so
+                // ordinary text remains selectable.
+                if (event.shiftKey) {
+                  event.preventDefault();
+                }
+              }}
+            >
               <input
                 type="checkbox"
                 name="filter-mode"
                 id={`us-check-${us.ref}`}
                 checked={props.selected}
-                onChange={(event) => props.onToggleSelected(us, event.target.checked)}
+                disabled={saving}
+                onChange={(event) => {
+                  // The checkbox `change` is fired by the click, so its
+                  // `nativeEvent` carries the `shiftKey` modifier used for
+                  // contiguous range selection.
+                  const native = event.nativeEvent as unknown as { shiftKey?: boolean };
+                  props.onToggleSelected(us, event.target.checked, native.shiftKey === true);
+                }}
               />
               <label htmlFor={`us-check-${us.ref}`} tabIndex={0} />
             </div>
@@ -296,7 +381,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
       </div>
 
       <div className="user-stories user-story-main-data">
-        <a className="user-story-link" href={`#/project/${project.slug}/us/${us.ref}`}>
+        <a className="user-story-link" href={userStoryUrl(project.slug, us.ref ?? "")}>
           <span className="user-story-number" tg-bo-ref="us.ref">{`#${us.ref} `}</span>
           <span className="user-story-name">{us.subject ?? ""}</span>
         </a>
@@ -326,20 +411,28 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
       {/* INLINE STATUS EDITOR (tg-us-status + popover-us-status) */}
       <div className="status">
         <a
-          className={"us-status" + (!modifyUs ? " not-clickable" : "")}
-          href=""
-          title="Status Name"
-          style={{ color: currentStatus?.color }}
-          onClick={(event) => {
-            event.preventDefault();
-            toggleStatus();
+          ref={(el) => {
+            statusPop.triggerRef.current = el;
           }}
+          className={"us-status" + (!modifyUs || saving ? " not-clickable" : "")}
+          href=""
+          title={t("BACKLOG.STATUS_NAME")}
+          aria-haspopup="true"
+          aria-expanded={statusPop.open}
+          aria-disabled={saving ? true : undefined}
+          style={{ color: currentStatus?.color }}
+          onClick={onStatusTriggerClick}
         >
           <span className="us-status-bind">{currentStatus?.name ?? ""}</span>
           {modifyUs ? <Icon name="icon-arrow-down" /> : null}
         </a>
-        {statusOpen ? (
-          <ul className="popover pop-status active">
+        {statusPop.open ? (
+          <ul
+            ref={(el) => {
+              statusPop.contentRef.current = el;
+            }}
+            className="popover pop-status active"
+          >
             {props.statuses.map((status) => (
               <li key={status.id} className="popover-status">
                 <a
@@ -350,7 +443,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
                   onClick={(event) => {
                     event.preventDefault();
                     props.onUpdateStatus(us, status.id);
-                    setStatusOpen(false);
+                    statusPop.close();
                   }}
                 >
                   <span className="item-text">{status.name}</span>
@@ -361,95 +454,138 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
         ) : null}
       </div>
 
-
       {/* INLINE POINTS EDITOR (tg-backlog-us-points -> us-estimation-total + role/points popover) */}
       <div className="points">
         <button
-          type="button"
-          className={"us-points" + (!modifyUs ? " not-clickable" : "")}
-          onClick={(event) => {
-            event.preventDefault();
-            togglePoints();
+          ref={(el) => {
+            pointsPop.triggerRef.current = el;
           }}
+          type="button"
+          className={"us-points" + (pointsNotClickable ? " not-clickable" : "")}
+          disabled={saving}
+          aria-haspopup="true"
+          aria-expanded={pointsPop.open}
+          onClick={onPointsTriggerClick}
         >
-          <span className="points-value">{us.total_points ?? 0}</span>
+          <span className="points-value">
+            {showRoleSplit ? (
+              <>
+                {roleDisplayPoints(us, headerRoleId as number, pointsById)}
+                {" / "}
+                <span>{String(totalPoints)}</span>
+              </>
+            ) : (
+              String(totalPoints)
+            )}
+          </span>
         </button>
-        {pointsOpen ? (
-          <ul className="popover pop-role active">
-            {selectedRoleId == null
-              ? computableRoles.map((role) => (
-                  <li key={role.id}>
-                    <a
-                      className="role"
-                      href=""
-                      title={role.name}
-                      data-role-id={String(role.id)}
-                      onClick={(event) => {
-                        event.preventDefault();
-                        setSelectedRoleId(role.id);
-                      }}
-                    >
-                      <span className="item-text">{role.name ?? ""}</span>
-                    </a>
-                  </li>
-                ))
-              : (project.points ?? []).map((point) => {
-                  // The currently-assigned point for this role is highlighted
-                  // (legacy `us-estimation-points.jade`: the selected point gets
-                  // the `active` class).
-                  const isCurrent = us.points ? us.points[selectedRoleId] === point.id : false;
-                  return (
-                    <li key={point.id}>
-                      <a
-                        className={"point" + (isCurrent ? " active" : "")}
-                        href=""
-                        title={point.name}
-                        data-point-id={String(point.id)}
-                        data-role-id={String(selectedRoleId)}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          props.onUpdatePoints(us, selectedRoleId, point.id);
-                          setPointsOpen(false);
-                          setSelectedRoleId(null);
-                        }}
-                      >
-                        <span className="item-text">{point.name ?? ""}</span>
-                      </a>
-                    </li>
-                  );
-                })}
+        {pointsPop.open && pointStepRoleId === null ? (
+          <ul
+            ref={(el) => {
+              pointsPop.contentRef.current = el;
+            }}
+            className="popover pop-role active"
+          >
+            {computableRoles.map((role) => (
+              <li key={role.id}>
+                <a
+                  className="role"
+                  href=""
+                  title={role.name}
+                  data-role-id={String(role.id)}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    setPointStepRoleId(role.id);
+                  }}
+                >
+                  <span className="item-text">
+                    {(role.name ?? "") + " (" + roleDisplayPoints(us, role.id, pointsById) + ")"}
+                  </span>
+                </a>
+              </li>
+            ))}
           </ul>
         ) : null}
+        {pointsPop.open && pointStepRoleId !== null
+          ? (() => {
+              // The point-value step (`common/estimation/us-estimation-points.jade`).
+              // `horizontal` when any point name is longer than 5 chars; the
+              // currently-assigned point for this role is marked `.active`.
+              const activeRoleId = pointStepRoleId;
+              const allPoints = project.points ?? [];
+              const horizontal = allPoints.some((point) => (point.name ?? "").length > 5);
+              const currentPointId = us.points ? us.points[String(activeRoleId)] : null;
+              return (
+                <ul
+                  ref={(el) => {
+                    pointsPop.contentRef.current = el;
+                  }}
+                  className={"popover pop-points-open active" + (horizontal ? " horizontal" : "")}
+                >
+                  {allPoints.map((point) => {
+                    const isCurrent = currentPointId === point.id;
+                    return (
+                      <li key={point.id}>
+                        <a
+                          className={"point" + (isCurrent ? " active" : "")}
+                          href=""
+                          title={point.name}
+                          data-point-id={String(point.id)}
+                          data-role-id={String(activeRoleId)}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            props.onUpdatePoints(us, activeRoleId, point.id);
+                            pointsPop.close();
+                            setPointStepRoleId(null);
+                          }}
+                        >
+                          <span className="item-text">{point.name ?? ""}</span>
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              );
+            })()
+          : null}
       </div>
 
       {/* ROW OPTIONS POPUP (tg-us-edit-selector + us-edit-popover) — gated on modify_us */}
       {modifyUs ? (
         <div className="us-option">
           <button
+            ref={(el) => {
+              optionsPop.triggerRef.current = el;
+            }}
             type="button"
             className={
               "us-option-popup-button js-popup-button" + (props.isFirstInBacklog ? " first" : "")
             }
-            onClick={(event) => {
-              event.preventDefault();
-              toggleOptions();
-            }}
+            disabled={saving}
+            aria-haspopup="true"
+            aria-expanded={optionsPop.open}
+            onClick={onOptionsTriggerClick}
           >
             <Icon name="icon-more-vertical" />
           </button>
-          {optionsOpen ? (
-            <ul className="popover us-option-popup active">
+          {optionsPop.open ? (
+            <ul
+              ref={(el) => {
+                optionsPop.contentRef.current = el;
+              }}
+              className="popover us-option-popup active"
+            >
               <li>
                 <button
                   type="button"
                   className="e2e-edit edit-story"
                   onClick={() => {
                     props.onEdit(us);
-                    setOptionsOpen(false);
+                    optionsPop.close();
                   }}
                 >
                   <Icon name="icon-edit" />
-                  <span>Edit</span>
+                  <span>{t("COMMON.EDIT")}</span>
                 </button>
               </li>
               {canDelete ? (
@@ -459,11 +595,11 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
                     className="e2e-delete"
                     onClick={() => {
                       props.onDelete(us);
-                      setOptionsOpen(false);
+                      optionsPop.close();
                     }}
                   >
                     <Icon name="icon-trash" />
-                    <span>Delete</span>
+                    <span>{t("COMMON.DELETE")}</span>
                   </button>
                 </li>
               ) : null}
@@ -473,11 +609,11 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
                   className="e2e-edit move-to-top"
                   onClick={() => {
                     props.onMoveToTop(us);
-                    setOptionsOpen(false);
+                    optionsPop.close();
                   }}
                 >
                   <Icon name="icon-move-to-top" />
-                  <span>Move to top</span>
+                  <span>{t("COMMON.MOVE_TO_TOP")}</span>
                 </button>
               </li>
             </ul>
@@ -488,3 +624,5 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
   );
 }
 
+/** Re-exported so consumers can reference the legacy "?" unestimated sentinel. */
+export { UNESTIMATED };

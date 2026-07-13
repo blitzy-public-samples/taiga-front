@@ -75,22 +75,3 @@ export interface ColumnDroppableData {
     statusId: number;
     swimlaneId: number | null;
 }
-
-/**
- * Public API of the `useKanbanSelection` hook — the multi-select state that
- * replaces the legacy `window.dragMultiple` + controller `selectedUss` map.
- *
- * - `selectedIds`: currently-selected ids in insertion (click) order.
- * - `selectedUss`: id -> selected? map mirroring the legacy shape (a de-selected
- *   id may map to `false` rather than being removed).
- * - `isSelected`: true only when the id is currently selected.
- * - `toggleSelected`: ctrl/meta-click toggle of one card into/out of selection.
- * - `clearSelection`: drop all selections (legacy `cleanSelectedUss`).
- */
-export interface KanbanSelectionApi {
-    selectedIds: number[];
-    selectedUss: Record<number, boolean>;
-    isSelected: (usId: number) => boolean;
-    toggleSelected: (usId: number) => void;
-    clearSelection: () => void;
-}

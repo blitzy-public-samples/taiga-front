@@ -16,6 +16,7 @@ export type {
     UnassignedUserStoriesResult,
 } from "./client";
 export { ApiError } from "./http";
+export { sanitizeErrorMessage } from "./errors";
 export type { HttpMethod, HttpResponse, RequestOptions } from "./http";
 export { URL_TEMPLATES, resolveUrl, buildUrl } from "./urls";
 export type { EndpointKey, QueryParams } from "./urls";

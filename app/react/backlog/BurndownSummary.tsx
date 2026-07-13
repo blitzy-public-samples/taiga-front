@@ -20,6 +20,7 @@
  *   - app/partials/backlog/progress-bar.jade               -> the `.summary-progress-bar` inner bars
  *   - app/coffee/modules/backlog/main.coffee (L1345-1385)  -> TgBacklogProgressBarDirective percentage math
  *   - app/coffee/modules/backlog/main.coffee (L1166-1210)  -> tgToggleBurndownVisibility show/hide behavior
+ *   - app/coffee/modules/backlog/main.coffee (L1217-1338)  -> TgBurndownBacklogGraphDirective (Flot chart)
  *   - app/partials/backlog/backlog.jade (L20-30)           -> the `div.backlog-summary` wrapper + burndown container
  *
  * SCSS this DOM is styled by (unchanged; the visual source of truth):
@@ -27,17 +28,40 @@
  *                                              .data .number, .stats, .empty-burndown, .graphics-container)
  *   - app/styles/modules/backlog/burndown.scss  (.burndown { width: 100% })
  *
- * i18n NOTE: there is no React i18n runtime in scope for this POC, so translation
- * KEYS are rendered as literal text (e.g. "BACKLOG.SUMMARY.DEFINED_POINTS") and
- * used verbatim inside `title=` attributes. The e2e / visual-parity checks assert
- * DOM structure and class names, not translated copy, so rendering keys literally
- * is intentional and safe here. User-supplied content is not involved in this
- * component; all displayed strings are either numeric stats or static i18n keys,
- * and everything is rendered via React's default (escaping) text nodes.
+ * i18n: every displayed label is resolved through the React i18n runtime
+ * `t()` (`app/react/shared/i18n/translate.ts`), which compiles in the same
+ * `locale-en.json` message bundle the AngularJS `$translate` used. No raw
+ * `BACKLOG.*` key is ever shown to the user. The few summary labels whose
+ * message contains an inline `<br />` (e.g. `defined<br />points`) are split so
+ * the reproduced `.description` span carries a real `<br>` node, matching the
+ * DOM the legacy `translate` directive produced. All content is either numeric
+ * stats or static translated copy rendered through React's default escaping.
  */
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { t } from "../shared/i18n/translate";
+import { BURNDOWN_CHART_COLORS } from "../shared/theme/colors";
+
+/**
+ * A single burndown milestone data point, mirroring one entry of the frozen
+ * `GET /projects/{id}/stats` `milestones` array (taiga-back
+ * `taiga/projects/services/stats.py` `_get_milestones_stats_for_backlog`):
+ * each entry carries a scalar `optimal`, a scalar (nullable) `evolution`, and
+ * the two increment fields (hyphenated exactly as the backend serializes them).
+ */
+export interface BurndownMilestoneStat {
+    /** Sprint name (or a localized "Future sprint" / "Project End" sentinel). */
+    name?: string;
+    /** Optimal remaining points for this sprint (descending "ideal" line). */
+    optimal?: number | null;
+    /** Real remaining points (the burndown "evolution" line); `null` for future sprints. */
+    evolution?: number | null;
+    /** Cumulative team-increment points (added scope from the team). */
+    "team-increment"?: number | null;
+    /** Cumulative client-increment points (added scope from the client). */
+    "client-increment"?: number | null;
+}
 
 /**
  * Shape of the aggregate backlog statistics consumed by the summary region.
@@ -48,8 +72,9 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
  *
  * Mirrors the `stats` object the AngularJS `BacklogController` exposed
  * (defined_points / closed_points / total_points / speed / completedPercentage /
- * assigned_points / total_milestones). Every member is optional because the
- * resource loader may not have populated the projection yet on first paint.
+ * assigned_points / total_milestones / milestones[]). Every member is optional
+ * because the resource loader may not have populated the projection yet on first
+ * paint.
  */
 export interface BacklogStats {
     total_points?: number;
@@ -59,6 +84,13 @@ export interface BacklogStats {
     speed?: number;
     completedPercentage?: number;
     total_milestones?: number;
+    /**
+     * Per-sprint burndown series from the authoritative `/stats` payload. Drives
+     * the {@link BurndownChart}. Absent/empty until stats resolve (or when the
+     * project has no configured points/sprints, in which case the "customize
+     * graph" placeholder is shown instead).
+     */
+    milestones?: BurndownMilestoneStat[];
 }
 
 /**
@@ -96,6 +128,15 @@ interface ProgressBarPercentages {
  */
 function fmt(n: number | undefined): string {
     return n == null ? "" : String(Math.round(n));
+}
+
+/**
+ * Coerce an unknown stat field to a finite number (0 when absent/NaN), so the
+ * SVG geometry never produces `NaN` path coordinates.
+ */
+function num(v: unknown): number {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
 }
 
 /**
@@ -163,6 +204,251 @@ function GraphIcon(): JSX.Element {
 }
 
 /**
+ * Render a `.summary-stats .description` span for a translation key. Some backlog
+ * summary labels embed an inline `<br />` (`defined<br />points`); the legacy
+ * AngularJS `translate` directive injected that as HTML, so we split on `<br />`
+ * and interleave real `<br>` nodes to reproduce the identical DOM. The message
+ * bundle is a trusted, compiled-in asset (never user content).
+ */
+function TranslatedDescription({ translationKey }: { translationKey: string }): JSX.Element {
+    const parts = t(translationKey).split(/<br\s*\/?>/i);
+    return (
+        <span className="description">
+            {parts.map((part, index) => (
+                <Fragment key={index}>
+                    {index > 0 ? <br /> : null}
+                    {part}
+                </Fragment>
+            ))}
+        </span>
+    );
+}
+
+/* ---------------------------------------------------------------------------
+ * Burndown chart geometry.
+ *
+ * The legacy chart was jQuery-Flot (`element.plot(data, options)`), which is not
+ * part of the React stack. We reproduce it as a dependency-free inline SVG line
+ * chart driven by the SAME authoritative `stats.milestones[]` series the Flot
+ * directive consumed (main.coffee L1240-1256). The viewBox keeps the legacy 6:1
+ * aspect ratio (`element.height(element.width() / 6)`); the SVG scales to the
+ * `.burndown { width: 100% }` container. Colours come from the documented
+ * `BURNDOWN_CHART_COLORS` token block (mirrors the Flot `colors`/`fillColor`).
+ * ------------------------------------------------------------------------- */
+const CHART_VIEW_W = 660;
+const CHART_VIEW_H = 110;
+const CHART_PAD_L = 30;
+const CHART_PAD_R = 20;
+const CHART_PAD_T = 8;
+const CHART_PAD_B = 22;
+
+interface ChartPoint {
+    x: number;
+    y: number;
+    /** Localized tooltip text (already resolved through `t()`). */
+    tooltip: string;
+}
+
+interface ChartSeries {
+    /** Stable class suffix for the series (`optimal` / `evolution` / ...). */
+    key: string;
+    line: string;
+    fill: string;
+    points: ChartPoint[];
+}
+
+/**
+ * Real burndown graph: an inline SVG reproducing the legacy Flot series
+ * (optimal, evolution/real, client-increment, team-increment) from the
+ * authoritative `/stats` `milestones` array. Returns `null` when there is no
+ * milestone data to plot (the container stays empty, exactly as Flot would draw
+ * nothing).
+ */
+function BurndownChart({ milestones }: { milestones: BurndownMilestoneStat[] }): JSX.Element | null {
+    if (!milestones || milestones.length === 0) {
+        return null;
+    }
+
+    const count = milestones.length;
+    const xAt = (index: number): number =>
+        count <= 1
+            ? CHART_PAD_L
+            : CHART_PAD_L + (index * (CHART_VIEW_W - CHART_PAD_L - CHART_PAD_R)) / (count - 1);
+
+    // Build the four visible legacy series (the invisible zero baseline is not
+    // rendered). `evolution` skips null entries (future sprints) but keeps each
+    // remaining point at its true milestone x-index.
+    const rawSeries: Array<{ key: string; line: string; fill: string; tooltipKey: string; value: (m: BurndownMilestoneStat) => number | null }> = [
+        {
+            key: "optimal",
+            line: BURNDOWN_CHART_COLORS.optimal.line,
+            fill: BURNDOWN_CHART_COLORS.optimal.fill,
+            tooltipKey: "BACKLOG.CHART.OPTIMAL",
+            value: (m) => num(m.optimal),
+        },
+        {
+            key: "evolution",
+            line: BURNDOWN_CHART_COLORS.evolution.line,
+            fill: BURNDOWN_CHART_COLORS.evolution.fill,
+            tooltipKey: "BACKLOG.CHART.REAL",
+            value: (m) => (m.evolution == null ? null : num(m.evolution)),
+        },
+        {
+            key: "client-increment",
+            line: BURNDOWN_CHART_COLORS.clientIncrement.line,
+            fill: BURNDOWN_CHART_COLORS.clientIncrement.fill,
+            tooltipKey: "BACKLOG.CHART.INCREMENT_CLIENT",
+            value: (m) => -(num(m["team-increment"]) + num(m["client-increment"])),
+        },
+        {
+            key: "team-increment",
+            line: BURNDOWN_CHART_COLORS.teamIncrement.line,
+            fill: BURNDOWN_CHART_COLORS.teamIncrement.fill,
+            tooltipKey: "BACKLOG.CHART.INCREMENT_TEAM",
+            value: (m) => -num(m["team-increment"]),
+        },
+    ];
+
+    // Collect every plotted magnitude (plus the zero baseline) to size the y-axis.
+    const allValues: number[] = [0];
+    const seriesValues = rawSeries.map((s) =>
+        milestones.map((m) => {
+            const v = s.value(m);
+            if (v != null) {
+                allValues.push(v);
+            }
+            return v;
+        }),
+    );
+    const yMax = Math.max(...allValues);
+    const yMin = Math.min(...allValues);
+    const ySpan = yMax - yMin || 1;
+    const yAt = (value: number): number =>
+        CHART_PAD_T + ((yMax - value) * (CHART_VIEW_H - CHART_PAD_T - CHART_PAD_B)) / ySpan;
+    const baselineY = yAt(0);
+
+    const series: ChartSeries[] = rawSeries.map((s, si) => {
+        const points: ChartPoint[] = [];
+        seriesValues[si].forEach((value, index) => {
+            if (value == null) {
+                return;
+            }
+            // Tooltip value mirrors the legacy `Math.abs(datapoint[1] * 10) / 10`.
+            const displayValue = Math.abs(Math.round(value * 10) / 10);
+            points.push({
+                x: xAt(index),
+                y: yAt(value),
+                tooltip: t(s.tooltipKey, {
+                    sprintName: milestones[index]?.name ?? "",
+                    value: displayValue,
+                }),
+            });
+        });
+        return { key: s.key, line: s.line, fill: s.fill, points };
+    });
+
+    const centerX = (CHART_VIEW_W - CHART_PAD_L - CHART_PAD_R) / 2 + CHART_PAD_L;
+    const centerY = (CHART_VIEW_H - CHART_PAD_T - CHART_PAD_B) / 2 + CHART_PAD_T;
+    const xAxisLabel = t("BACKLOG.CHART.XAXIS_LABEL");
+    const yAxisLabel = t("BACKLOG.CHART.YAXIS_LABEL");
+
+    return (
+        <svg
+            className="burndown-graph"
+            viewBox={`0 0 ${CHART_VIEW_W} ${CHART_VIEW_H}`}
+            preserveAspectRatio="none"
+            // The theme's global `svg{width:1rem;height:1rem}` rule (specificity
+            // 0,0,1) would otherwise collapse this inline chart to a 16x16 icon:
+            // the legacy burndown was a Flot <canvas>, so the theme has no
+            // `svg.burndown-graph` sizing rule. An INLINE style beats that bare
+            // `svg` rule and reproduces the legacy `element.height(width/6)`
+            // sizing — `width:100%` fills the `.burndown` container and the
+            // 660/110 (6:1) aspect-ratio drives `height = width/6`, staying well
+            // under the `.graphics-container.open` 300px max-height cap.
+            style={{ width: "100%", height: "auto", aspectRatio: `${CHART_VIEW_W} / ${CHART_VIEW_H}` }}
+            role="img"
+            aria-label={`${yAxisLabel} / ${xAxisLabel}`}
+        >
+            {/* axes (grid border colour reused from the legacy Flot grid) */}
+            <line
+                className="burndown-axis burndown-axis-x"
+                x1={CHART_PAD_L}
+                y1={CHART_VIEW_H - CHART_PAD_B}
+                x2={CHART_VIEW_W - CHART_PAD_R}
+                y2={CHART_VIEW_H - CHART_PAD_B}
+                stroke={BURNDOWN_CHART_COLORS.grid}
+            />
+            <line
+                className="burndown-axis burndown-axis-y"
+                x1={CHART_PAD_L}
+                y1={CHART_PAD_T}
+                x2={CHART_PAD_L}
+                y2={CHART_VIEW_H - CHART_PAD_B}
+                stroke={BURNDOWN_CHART_COLORS.grid}
+            />
+
+            {series.map((s) => {
+                if (s.points.length === 0) {
+                    return null;
+                }
+                const linePoints = s.points.map((p) => `${p.x},${p.y}`).join(" ");
+                const first = s.points[0];
+                const last = s.points[s.points.length - 1];
+                const areaPoints = `${first.x},${baselineY} ${linePoints} ${last.x},${baselineY}`;
+                return (
+                    <g className={`burndown-series burndown-series-${s.key}`} key={s.key}>
+                        <polygon
+                            className={`burndown-area burndown-area-${s.key}`}
+                            points={areaPoints}
+                            fill={s.fill}
+                            stroke="none"
+                        />
+                        <polyline
+                            className={`burndown-line burndown-line-${s.key}`}
+                            points={linePoints}
+                            fill="none"
+                            stroke={s.line}
+                            strokeWidth={2}
+                        />
+                        {s.points.map((p, pi) => (
+                            <circle
+                                className={`burndown-point burndown-point-${s.key}`}
+                                key={pi}
+                                cx={p.x}
+                                cy={p.y}
+                                r={3}
+                                fill={s.line}
+                            >
+                                <title>{p.tooltip}</title>
+                            </circle>
+                        ))}
+                    </g>
+                );
+            })}
+
+            {/* axis labels (resolved translations, matching the Flot axisLabel) */}
+            <text
+                className="burndown-axis-label burndown-xaxis-label"
+                x={centerX}
+                y={CHART_VIEW_H - 4}
+                textAnchor="middle"
+            >
+                {xAxisLabel}
+            </text>
+            <text
+                className="burndown-axis-label burndown-yaxis-label"
+                x={10}
+                y={centerY}
+                textAnchor="middle"
+                transform={`rotate(-90 10 ${centerY})`}
+            >
+                {yAxisLabel}
+            </text>
+        </svg>
+    );
+}
+
+/**
  * Renders the backlog summary panel, the points progress bar, the optional
  * "customize graph" empty state, and the (collapsible) burndown graph container.
  *
@@ -198,6 +484,7 @@ export function BurndownSummary(props: BurndownSummaryProps): JSX.Element {
     const safeStats: BacklogStats = stats ?? {};
     const { projectPointsPercentage, closedPointsPercentage } =
         computeProgressBarPercentages(safeStats);
+    const milestones = safeStats.milestones ?? [];
 
     // `shown` + `open` both resolve to max-height:300px in the SCSS slide mixin
     // (visible); their absence collapses the container to max-height:0 (hidden).
@@ -214,15 +501,15 @@ export function BurndownSummary(props: BurndownSummaryProps): JSX.Element {
             <div className="summary">
                 {/* ---- div.summary-progress-bar (progress-bar.jade + TgBacklogProgressBarDirective) ---- */}
                 <div className="summary-progress-bar">
-                    <div className="defined-points" title="BACKLOG.EXCESS_OF_POINTS" />
+                    <div className="defined-points" title={t("BACKLOG.EXCESS_OF_POINTS")} />
                     <div
                         className="project-points-progress"
-                        title="BACKLOG.PENDING_POINTS"
+                        title={t("BACKLOG.PENDING_POINTS")}
                         style={{ width: `${projectPointsPercentage}%` }}
                     />
                     <div
                         className="closed-points-progress"
-                        title="BACKLOG.CLOSED_POINTS"
+                        title={t("BACKLOG.CLOSED_POINTS")}
                         style={{ width: `${closedPointsPercentage}%` }}
                     />
                 </div>
@@ -236,33 +523,33 @@ export function BurndownSummary(props: BurndownSummaryProps): JSX.Element {
                 {safeStats.total_points ? (
                     <div className="summary-stats">
                         <span className="number">{fmt(safeStats.total_points)}</span>
-                        <span className="description">BACKLOG.SUMMARY.PROJECT_POINTS</span>
+                        <TranslatedDescription translationKey="BACKLOG.SUMMARY.PROJECT_POINTS" />
                     </div>
                 ) : null}
 
                 {/* ---- summary-stats: DEFINED_POINTS ---- */}
                 <div className="summary-stats">
                     <span className="number">{fmt(safeStats.defined_points)}</span>
-                    <span className="description">BACKLOG.SUMMARY.DEFINED_POINTS</span>
+                    <TranslatedDescription translationKey="BACKLOG.SUMMARY.DEFINED_POINTS" />
                 </div>
 
                 {/* ---- summary-stats: CLOSED_POINTS ---- */}
                 <div className="summary-stats">
                     <span className="number">{fmt(safeStats.closed_points)}</span>
-                    <span className="description">BACKLOG.SUMMARY.CLOSED_POINTS</span>
+                    <TranslatedDescription translationKey="BACKLOG.SUMMARY.CLOSED_POINTS" />
                 </div>
 
                 {/* ---- summary-stats: POINTS_PER_SPRINT (speed, 0 decimals) ---- */}
                 <div className="summary-stats">
                     <span className="number">{fmt(safeStats.speed)}</span>
-                    <span className="description">BACKLOG.SUMMARY.POINTS_PER_SPRINT</span>
+                    <TranslatedDescription translationKey="BACKLOG.SUMMARY.POINTS_PER_SPRINT" />
                 </div>
 
                 {/* ---- toggle button (hidden when a graph placeholder is shown) ---- */}
                 {!showGraphPlaceholder ? (
                     <div
                         className={toggleButtonClassName}
-                        title="BACKLOG.SPRINT_SUMMARY.TOGGLE_BAKLOG_GRAPH"
+                        title={t("BACKLOG.SPRINT_SUMMARY.TOGGLE_BAKLOG_GRAPH")}
                         role="button"
                         tabIndex={0}
                         aria-pressed={burndownVisible}
@@ -279,11 +566,11 @@ export function BurndownSummary(props: BurndownSummaryProps): JSX.Element {
                 <div className="empty-burndown">
                     <GraphIcon />
                     <div className="empty-text">
-                        <p className="title">BACKLOG.CUSTOMIZE_GRAPH</p>
+                        <p className="title">{t("BACKLOG.CUSTOMIZE_GRAPH")}</p>
                         <p>
-                            BACKLOG.CUSTOMIZE_GRAPH_TEXT{" "}
-                            <a href={adminModulesUrl ?? ""} title="BACKLOG.CUSTOMIZE_GRAPH_TITLE">
-                                BACKLOG.CUSTOMIZE_GRAPH_ADMIN
+                            {t("BACKLOG.CUSTOMIZE_GRAPH_TEXT")}{" "}
+                            <a href={adminModulesUrl ?? ""} title={t("BACKLOG.CUSTOMIZE_GRAPH_TITLE")}>
+                                {t("BACKLOG.CUSTOMIZE_GRAPH_ADMIN")}
                             </a>
                         </p>
                     </div>
@@ -291,12 +578,15 @@ export function BurndownSummary(props: BurndownSummaryProps): JSX.Element {
             ) : null}
 
             {/* ---- burndown graph container ----
-                DOM placeholder reproducing `div.burndown(tg-burndown-backlog-graph)`.
-                A live chart is intentionally NOT rendered for this POC (no e2e asserts
-                chart internals); the empty `.burndown` container is styled by the SCSS
-                (`.burndown { width: 100% }`). Visibility is driven by `burndownVisible`. */}
+                Reproduces `div.graphics-container.js-burndown-graph > div.burndown`
+                (backlog.jade L29-30). The real chart is rendered by {@link BurndownChart}
+                from the authoritative `stats.milestones[]` series; the `.burndown`
+                element is styled by the unchanged SCSS (`.burndown { width: 100% }`)
+                and visibility is driven by `burndownVisible`. */}
             <div className={graphicsContainerClassName}>
-                <div className="burndown" />
+                <div className="burndown">
+                    <BurndownChart milestones={milestones} />
+                </div>
             </div>
         </div>
     );

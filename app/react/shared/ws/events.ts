@@ -33,6 +33,21 @@
  * `backlog/hooks/useBacklogStories.ts` conform to.
  */
 import type { MountContext } from "../types";
+import { readLiveToken } from "../auth/token";
+
+/**
+ * Upper bound (bytes/UTF-16 code units) on an inbound WS frame we will attempt
+ * to `JSON.parse` (finding M9). The frozen event payloads are small; a frame
+ * larger than this is treated as malformed and ignored rather than risking a
+ * large allocation/parse from a corrupt or hostile socket.
+ */
+export const MAX_INBOUND_FRAME_LENGTH = 1_000_000;
+
+/**
+ * Maximum number of malformed-frame diagnostics emitted per client (bounded
+ * diagnostics, finding M9): a broken/hostile socket cannot flood the console.
+ */
+export const MAX_MALFORMED_FRAME_LOGS = 5;
 
 /**
  * Interval, in milliseconds, between outgoing heartbeat `ping` frames.
@@ -190,6 +205,8 @@ export function createEventsClient(context: MountContext): EventsClient {
   let errors = 0;
   let missedHeartbeats = 0;
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  // Bounded count of malformed inbound frames (finding M9): caps diagnostics.
+  let malformedFrameCount = 0;
 
   const serialize = (message: OutgoingMessage): string => JSON.stringify(message);
 
@@ -259,7 +276,9 @@ export function createEventsClient(context: MountContext): EventsClient {
   const handleOpen = (): void => {
     connected = true;
     pendingMessages = [];
-    sendMessage({ cmd: "auth", data: { token: context.token, sessionId: context.sessionId } });
+    // Re-authenticate with the LIVE token on every (re)connect (finding M8), so a
+    // JWT refreshed while the screen is mounted is honoured after any reconnect.
+    sendMessage({ cmd: "auth", data: { token: readLiveToken(context), sessionId: context.sessionId } });
     startHeartbeat();
     for (const routingKey of Object.keys(subscriptions)) {
       const subscription = subscriptions[routingKey];
@@ -271,12 +290,65 @@ export function createEventsClient(context: MountContext): EventsClient {
     }
   };
 
+  /**
+   * Emit a bounded malformed-frame diagnostic (finding M9). Only the first
+   * {@link MAX_MALFORMED_FRAME_LOGS} are logged so a broken/hostile socket
+   * cannot flood the console; the counter keeps growing for observability but
+   * without further output.
+   */
+  const noteMalformedFrame = (reason: string): void => {
+    malformedFrameCount += 1;
+    if (malformedFrameCount <= MAX_MALFORMED_FRAME_LOGS && typeof console !== "undefined") {
+      // eslint-disable-next-line no-console
+      console.warn(`[events] ignoring malformed WS frame (${reason})`);
+    }
+  };
+
   const handleMessage = (event: MessageEvent): void => {
-    const message = JSON.parse(event.data as string) as IncomingMessage;
+    // (M9) Validate the frame defensively before trusting it: bound the size,
+    // parse safely, require a plain object with a string `cmd`, and require a
+    // string `routing_key` when present. A malformed frame is ignored (never
+    // throws out of the listener) so one bad frame cannot break the socket.
+    const raw = event.data;
+    if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_INBOUND_FRAME_LENGTH) {
+      noteMalformedFrame("non-string or out-of-bounds frame");
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      noteMalformedFrame("JSON parse error");
+      return;
+    }
+
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      noteMalformedFrame("frame is not a JSON object");
+      return;
+    }
+
+    const message = parsed as IncomingMessage;
+    // A `cmd`, when present, must be a string; a `routing_key`, when present,
+    // must be a string. The server sends data frames as `{ routing_key, data }`
+    // (NO cmd) and control frames as `{ cmd: "pong" }` (legacy events.coffee),
+    // so NEITHER field is mandatory — only well-typed when present.
+    if (message.cmd !== undefined && typeof message.cmd !== "string") {
+      noteMalformedFrame("non-string cmd");
+      return;
+    }
+    if (message.routing_key !== undefined && typeof message.routing_key !== "string") {
+      noteMalformedFrame("non-string routing_key");
+      return;
+    }
+
     if (message.cmd === "pong") {
       missedHeartbeats = 0;
       return;
     }
+    // `dispatchMessage` further restricts delivery to routing keys we actually
+    // subscribed to (frozen `changes.project.{id}.{...}` keys), so an unknown
+    // key is silently and safely ignored.
     dispatchMessage(message);
   };
 

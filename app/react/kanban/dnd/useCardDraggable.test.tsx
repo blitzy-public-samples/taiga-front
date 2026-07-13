@@ -59,20 +59,41 @@ describe("useCardDraggable", () => {
         expect(mockUseDraggable.mock.calls[0][0].disabled).toBe(false);
     });
 
-    it("returns only setNodeRef, attributes, listeners and isDragging (no transform)", () => {
+    it("surfaces setNodeRef, attributes, listeners, isDragging AND the dnd-kit transform (C3)", () => {
         const { result } = renderHook(() => useCardDraggable(1));
 
+        // C3: the hook is a FAITHFUL wrapper over useDraggable — it no longer
+        // strips `transform`. (The source card still does not translate itself;
+        // the DragOverlay mirror provides the visible motion — that is asserted
+        // in KanbanDndProvider.test.tsx, not here.)
         expect(Object.keys(result.current).sort()).toEqual([
             "attributes",
             "isDragging",
             "listeners",
             "setNodeRef",
+            "transform",
         ]);
         expect(typeof result.current.setNodeRef).toBe("function");
         expect(result.current.attributes).toEqual({ role: "button", tabIndex: 0 });
         expect(result.current.listeners).toEqual({ onPointerDown: expect.any(Function) });
         expect(result.current.isDragging).toBe(false);
-        expect("transform" in result.current).toBe(false);
+        expect("transform" in result.current).toBe(true);
+        expect(result.current.transform).toBeNull();
+    });
+
+    it("surfaces a non-null transform when dnd-kit reports one (C3)", () => {
+        mockUseDraggable.mockReturnValue({
+            setNodeRef: () => undefined,
+            attributes: {},
+            listeners: {},
+            isDragging: true,
+            transform: { x: 12, y: -8, scaleX: 1, scaleY: 1 },
+            node: { current: null },
+        });
+
+        const { result } = renderHook(() => useCardDraggable(1));
+
+        expect(result.current.transform).toEqual({ x: 12, y: -8, scaleX: 1, scaleY: 1 });
     });
 
     it("reflects the dragging state reported by dnd-kit", () => {

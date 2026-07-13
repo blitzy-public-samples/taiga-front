@@ -17,6 +17,7 @@ import type {
 } from "../types";
 import { resolveUrl, buildUrl, type EndpointKey, type QueryParams } from "./urls";
 import { httpGet, httpPost, httpPatch, request, parseHeaderInt } from "./http";
+import { generateHash } from "../storage/legacyStorage";
 
 /** A single {us_id, order} pair used by the milestone/move bulk payloads. */
 export interface BulkStoryOrder {
@@ -359,6 +360,64 @@ export const createApiClient = (context: MountContext) => {
             );
 
             return { ...entity, ...response.data } as T;
+        },
+
+        /**
+         * Read a per-user custom-filter map from `user-storage` (faithful
+         * reproduction of `tgFilterRemoteStorageService.getFilters`,
+         * filter-remote.service.coffee). The storage entry key is
+         * `generateHash([projectId, "<projectId>:<suffix>"])`; the stored blob is
+         * `{ key, value }` and the filter map lives under `value`. A missing entry
+         * (404) resolves to `{}` — exactly the legacy `deferred.resolve({})` on the
+         * error path — so callers never see a rejection for "no filters saved yet".
+         */
+        getUserFilters: async (
+            projectId: number,
+            suffix: string,
+        ): Promise<Record<string, unknown>> => {
+            const hash = generateHash([projectId, `${projectId}:${suffix}`]);
+            const url = `${resolve("user-storage")}/${encodeURIComponent(hash)}`;
+            try {
+                const response = await httpGet<{ value?: unknown }>(context, url);
+                const value = response.data?.value;
+                return value && typeof value === "object"
+                    ? (value as Record<string, unknown>)
+                    : {};
+            } catch {
+                return {};
+            }
+        },
+
+        /**
+         * Persist a per-user custom-filter map to `user-storage` (faithful
+         * reproduction of `tgFilterRemoteStorageService.storeFilters`). An empty
+         * map DELETEs the entry; otherwise it PUTs `{ key, value }` to the keyed
+         * URL, and — when the entry does not exist yet (the PUT 404s) — falls back
+         * to POSTing to the collection, mirroring the legacy inner-promise retry.
+         */
+        storeUserFilters: async (
+            projectId: number,
+            filters: Record<string, unknown>,
+            suffix: string,
+        ): Promise<void> => {
+            const hash = generateHash([projectId, `${projectId}:${suffix}`]);
+            const base = resolve("user-storage");
+            const keyedUrl = `${base}/${encodeURIComponent(hash)}`;
+            const payload = { key: hash, value: filters };
+            if (!filters || Object.keys(filters).length === 0) {
+                try {
+                    await request<null>(context, "DELETE", keyedUrl, { body: payload });
+                } catch {
+                    /* already absent — treat as success (legacy resolve()) */
+                }
+                return;
+            }
+            try {
+                await request<unknown>(context, "PUT", keyedUrl, { body: payload });
+            } catch {
+                // Entry does not exist yet -> create it on the collection endpoint.
+                await httpPost<unknown>(context, base, payload);
+            }
         },
 
         /** DELETE a resource (mirrors base/repository.coffee `remove`). */

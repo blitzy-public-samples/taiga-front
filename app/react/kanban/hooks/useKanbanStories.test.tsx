@@ -28,11 +28,20 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 
 import { useKanbanStories } from "./useKanbanStories";
-import { createApiClient } from "../../shared/api";
+import { createApiClient, ApiError } from "../../shared/api";
+import { generateHash } from "../../shared/storage/legacyStorage";
 import { createEventsClient, subscribeToProject } from "../../shared/ws/events";
+import { createEmptyStoryValues } from "../../shared/lightboxes";
 import type { MountContext, Status, UserStory } from "../../shared/types";
 
-jest.mock("../../shared/api");
+jest.mock("../../shared/api", () => {
+    // Preserve the REAL barrel (real ApiError, real sanitizeErrorMessage,
+    // real url helpers) and replace ONLY the network factory. Auto-mocking
+    // the whole module would stub sanitizeErrorMessage to return undefined,
+    // which would mask the M2 sanitized-error contract under test.
+    const actual = jest.requireActual("../../shared/api");
+    return { __esModule: true, ...actual, createApiClient: jest.fn() };
+});
 jest.mock("../../shared/ws/events");
 
 /* -------------------------------------------------------------------------- */
@@ -98,40 +107,44 @@ function filtersPayload(): unknown {
     };
 }
 
-/** Install a runtime project on `window` (the cross-framework bridge). */
-function setRuntimeProject(overrides: Record<string, unknown> = {}): void {
-    (window as unknown as { taigaConfig?: unknown }).taigaConfig = {
-        project: {
-            id: PROJECT_ID,
-            slug: "proj",
-            name: "Proj",
-            my_permissions: ["modify_us", "add_us"],
-            is_kanban_activated: true,
-            is_backlog_activated: false,
-            i_am_admin: true,
-            default_swimlane: null,
-            us_statuses: STATUSES,
-            swimlanes: [],
-            members: [{ id: 7, full_name_display: "Alice" }],
-            ...overrides,
-        },
+/**
+ * The AUTHORITATIVE project-detail payload the hook now loads via
+ * `getProjectBySlug` (finding C1). It carries the real `my_permissions`,
+ * activation flags, statuses, members, and admin flag — there is no `window`
+ * bridge and no fabricated fallback.
+ */
+function projectPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        id: PROJECT_ID,
+        slug: "proj",
+        name: "Proj",
+        my_permissions: ["modify_us", "add_us"],
+        is_kanban_activated: true,
+        is_backlog_activated: false,
+        i_am_admin: true,
+        default_swimlane: null,
+        us_statuses: STATUSES,
+        members: [{ id: 7, full_name_display: "Alice" }],
+        ...overrides,
     };
 }
 
-function clearRuntimeProject(): void {
-    const w = window as unknown as {
-        taigaConfig?: unknown;
-        _project?: unknown;
-        taigaCurrentProject?: unknown;
-    };
-    delete w.taigaConfig;
-    delete w._project;
-    delete w.taigaCurrentProject;
-}
+/** Authoritative swimlanes payload (empty => non-swimlane board). */
+const SWIMLANES: unknown[] = [];
+
+/** Legacy-hash localStorage keys (finding M5) — mirror `shared/storage/legacyStorage`. */
+const foldsKey = (pid: number): string =>
+    generateHash([pid, `${pid}:kanban-statuscolumnmodels`]);
+const swimlaneFoldsKey = (pid: number): string =>
+    generateHash([pid, `${pid}:kanban-swimlanesmodels`]);
 
 interface MockApiClient {
     resolveProject: jest.Mock;
+    getProjectBySlug: jest.Mock;
+    listSwimlanes: jest.Mock;
     getUserStoriesFilters: jest.Mock;
+    getUserFilters: jest.Mock;
+    storeUserFilters: jest.Mock;
     listUserStories: jest.Mock;
     bulkUpdateKanbanOrder: jest.Mock;
     editStatus: jest.Mock;
@@ -155,12 +168,14 @@ let wsCleanup: jest.Mock;
 beforeEach(() => {
     jest.clearAllMocks();
     window.localStorage.clear();
-    clearRuntimeProject();
-    setRuntimeProject();
 
     apiClient = {
         resolveProject: jest.fn().mockResolvedValue(PROJECT_ID),
+        getProjectBySlug: jest.fn().mockImplementation(() => Promise.resolve(projectPayload())),
+        listSwimlanes: jest.fn().mockImplementation(() => Promise.resolve([...SWIMLANES])),
         getUserStoriesFilters: jest.fn().mockImplementation(() => Promise.resolve(filtersPayload())),
+        getUserFilters: jest.fn().mockResolvedValue({}),
+        storeUserFilters: jest.fn().mockResolvedValue(undefined),
         listUserStories: jest.fn().mockImplementation(() => Promise.resolve(fresh())),
         bulkUpdateKanbanOrder: jest.fn().mockResolvedValue([]),
         editStatus: jest.fn().mockImplementation(() => Promise.resolve({ ...STATUSES[0] })),
@@ -204,7 +219,7 @@ describe("useKanbanStories — initial load", () => {
     test("resolves project, loads statuses, swimlanes, stories and members", async () => {
         const { result } = await renderLoaded();
 
-        expect(apiClient.resolveProject).toHaveBeenCalledWith("proj");
+        expect(apiClient.getProjectBySlug).toHaveBeenCalledWith("proj");
         expect(result.current.projectId).toBe(PROJECT_ID);
         expect(result.current.isAdmin).toBe(true);
 
@@ -240,18 +255,28 @@ describe("useKanbanStories — initial load", () => {
         expect(result.current.folds[3]).toBe(true);
     });
 
-    test("graceful degradation when no runtime project on window", async () => {
-        clearRuntimeProject();
+    test("fails closed when the authoritative project cannot be loaded", async () => {
+        // C1: a rejected getProjectBySlug (403/404/network) must NOT fabricate a
+        // permissive read-only project from window globals. The board fails CLOSED:
+        // project stays null, a sanitized message is surfaced, no stories load, and
+        // initialLoad still completes so a real error state can render.
+        apiClient.getProjectBySlug.mockRejectedValue(
+            new ApiError(403, { _error_message: "nope" }),
+        );
         const { result } = await renderLoaded();
 
-        expect(result.current.project).not.toBeNull();
-        expect(result.current.project?.my_permissions).toEqual([]);
-        expect(result.current.project?.is_kanban_activated).toBe(true);
+        expect(result.current.project).toBeNull();
+        expect(result.current.projectId).toBeNull();
         expect(result.current.isAdmin).toBe(false);
+        expect(result.current.error).toBeInstanceOf(ApiError);
+        expect(result.current.errorMessage).toBe("nope");
+        expect(apiClient.listUserStories).not.toHaveBeenCalled();
     });
 
     test("module-disabled project still completes initialLoad", async () => {
-        setRuntimeProject({ is_kanban_activated: false });
+        apiClient.getProjectBySlug.mockResolvedValue(
+            projectPayload({ is_kanban_activated: false }),
+        );
         const { result } = await renderLoaded();
 
         expect(result.current.initialLoad).toBe(true);
@@ -260,14 +285,8 @@ describe("useKanbanStories — initial load", () => {
     });
 
     test("hydrates folds/swimlane folds from localStorage on init", async () => {
-        window.localStorage.setItem(
-            `taiga.react.kanban.folds.${PROJECT_ID}`,
-            JSON.stringify({ 2: true }),
-        );
-        window.localStorage.setItem(
-            `taiga.react.kanban.swimlanes.${PROJECT_ID}`,
-            JSON.stringify({ 9: true }),
-        );
+        window.localStorage.setItem(foldsKey(PROJECT_ID), JSON.stringify({ 2: true }));
+        window.localStorage.setItem(swimlaneFoldsKey(PROJECT_ID), JSON.stringify({ 9: true }));
         const { result } = await renderLoaded();
 
         expect(result.current.folds[2]).toBe(true);
@@ -484,7 +503,7 @@ describe("useKanbanStories — folds and localStorage", () => {
         });
         expect(result.current.folds[1]).toBe(true);
         expect(
-            JSON.parse(window.localStorage.getItem(`taiga.react.kanban.folds.${PROJECT_ID}`) ?? "{}"),
+            JSON.parse(window.localStorage.getItem(foldsKey(PROJECT_ID)) ?? "{}"),
         ).toMatchObject({ 1: true });
 
         act(() => {
@@ -502,7 +521,7 @@ describe("useKanbanStories — folds and localStorage", () => {
         expect(result.current.foldedSwimlane[5]).toBe(true);
         expect(
             JSON.parse(
-                window.localStorage.getItem(`taiga.react.kanban.swimlanes.${PROJECT_ID}`) ?? "{}",
+                window.localStorage.getItem(swimlaneFoldsKey(PROJECT_ID)) ?? "{}",
             ),
         ).toMatchObject({ 5: true });
     });
@@ -546,7 +565,9 @@ describe("useKanbanStories — userstory CRUD + lightbox", () => {
         expect(result.current.activeLightbox).toEqual({ type: "create", statusId: 1 });
 
         await act(async () => {
-            await result.current.submitNewUs("brand new");
+            await result.current.submitNewUs(
+                createEmptyStoryValues({ subject: "brand new", status: 1 }),
+            );
         });
 
         expect(apiClient.create).toHaveBeenCalledWith(
@@ -565,7 +586,12 @@ describe("useKanbanStories — userstory CRUD + lightbox", () => {
         expect(result.current.activeLightbox).toEqual({ type: "bulk", statusId: 1 });
 
         await act(async () => {
-            await result.current.submitBulkUs("line a\nline b");
+            await result.current.submitBulkUs({
+                bulk: "line a\nline b",
+                status: 1,
+                swimlane: null,
+                us_position: "bottom",
+            });
         });
         expect(apiClient.bulkCreateUserStories).toHaveBeenCalledWith(PROJECT_ID, 1, "line a\nline b", null);
         expect(result.current.usMap[201]).toBeDefined();
@@ -656,25 +682,91 @@ describe("useKanbanStories — selection, wip, filters, selectors", () => {
         expect(result.current.showPlaceHolder(999)).toBe(true);
     });
 
-    test("custom filters operate on local state and never throw", async () => {
+    test("custom filters PERSIST through the user-storage endpoint (M5) — save, apply, remove round-trip", async () => {
+        // A faithful in-memory model of the frozen `user-storage` endpoint: a
+        // saved filter must survive a reload, so it is written remotely (NOT kept
+        // only in component state) under the `kanban-custom-filters` suffix.
+        let store: Record<string, unknown> = {};
+        apiClient.getUserFilters.mockImplementation(async () => ({ ...store }));
+        apiClient.storeUserFilters.mockImplementation(
+            async (_pid: number, filters: Record<string, unknown>) => {
+                store = { ...filters };
+            },
+        );
+
         const { result } = await renderLoaded();
+        // Mount read the persisted custom filters (none yet) from the endpoint.
+        expect(apiClient.getUserFilters).toHaveBeenCalledWith(PROJECT_ID, "kanban-custom-filters");
+        expect(result.current.customFilters.length).toBe(0);
+
+        // Apply an ad-hoc filter, then save it under a name.
         act(() => {
-            result.current.addFilter({ category: "tags", id: "urgent" });
+            result.current.addFilter({
+                category: { dataType: "tags" },
+                filter: { id: "urgent" },
+                mode: "include",
+            });
         });
-        act(() => {
+        await act(async () => {
             result.current.saveCustomFilter("my filter");
         });
-        expect(result.current.customFilters.length).toBe(1);
+
+        // Persisted remotely with the applied-params snapshot (category->ids map).
+        await waitFor(() =>
+            expect(apiClient.storeUserFilters).toHaveBeenCalledWith(
+                PROJECT_ID,
+                expect.objectContaining({
+                    "my filter": { tags: "urgent" },
+                }),
+                "kanban-custom-filters",
+            ),
+        );
+        // Reloaded from the endpoint -> present in the VM.
+        await waitFor(() => expect(result.current.customFilters.length).toBe(1));
+        expect(store).toHaveProperty("my filter");
+
+        // Applying the saved filter restores its chips.
         act(() => {
             result.current.selectCustomFilter(result.current.customFilters[0]);
         });
-        act(() => {
-            result.current.removeFilter({ category: "tags", id: "urgent" });
-        });
-        act(() => {
+        expect(result.current.selectedFilters).toEqual([
+            expect.objectContaining({ dataType: "tags", id: "urgent" }),
+        ]);
+
+        // Removing it deletes the remote entry and refreshes the list.
+        await act(async () => {
             result.current.removeCustomFilter(result.current.customFilters[0]);
         });
-        expect(result.current.customFilters.length).toBe(0);
+        await waitFor(() => expect(result.current.customFilters.length).toBe(0));
+        expect(store).not.toHaveProperty("my filter");
+    });
+
+    test("saveCustomFilter ignores a blank name (no remote write)", async () => {
+        const { result } = await renderLoaded();
+        apiClient.storeUserFilters.mockClear();
+        await act(async () => {
+            result.current.saveCustomFilter("   ");
+        });
+        expect(apiClient.storeUserFilters).not.toHaveBeenCalled();
+    });
+
+    test("a persisted custom filter loaded on mount is exposed in the VM (survives reload)", async () => {
+        apiClient.getUserFilters.mockResolvedValue({
+            Saved: { tags: "urgent" },
+        });
+        const { result } = await renderLoaded();
+        expect(apiClient.getUserFilters).toHaveBeenCalledWith(PROJECT_ID, "kanban-custom-filters");
+        expect(result.current.customFilters).toEqual([
+            { id: "Saved", name: "Saved", filter: { tags: "urgent" } },
+        ]);
+    });
+
+    test("a failed custom-filter load on mount is non-fatal (board still initialises)", async () => {
+        apiClient.getUserFilters.mockRejectedValue(new Error("user-storage down"));
+        const { result } = await renderLoaded();
+        // Board reached initialLoad despite the custom-filter fetch rejecting.
+        expect(result.current.initialLoad).toBe(true);
+        expect(result.current.customFilters).toEqual([]);
     });
 
     test("showArchivedStatus reveals a hidden archived column and fetches its stories", async () => {
@@ -776,15 +868,39 @@ describe("useKanbanStories — return surface completeness", () => {
 /* blocks a move on missing permissions).                                       */
 /* -------------------------------------------------------------------------- */
 describe("useKanbanStories — request params + real-time + authz parity", () => {
-    test("initial listUserStories uses base params (archived excluded, empty q, no attachments at zoom 1)", async () => {
+    test("initial listUserStories is project-scoped and uses base params (archived excluded, empty q, no attachments at zoom 1)", async () => {
         await renderLoaded();
 
         // The very first list load is the mount effect's userstory fetch.
         const firstArg = apiClient.listUserStories.mock.calls[0][0];
-        expect(firstArg).toMatchObject({ status__is_archived: false, q: "" });
+        // C11: the list request MUST carry `project` (mirror legacy
+        // `listAll(projectId, params)` — resources/userstories.coffee L58);
+        // without it `/userstories` returns stories across EVERY project and the
+        // board renders foreign content.
+        expect(firstArg).toMatchObject({ project: PROJECT_ID, status__is_archived: false, q: "" });
         // At the default zoom level (1) the attachment/task includes are absent.
         expect(firstArg).not.toHaveProperty("include_attachments");
         expect(firstArg).not.toHaveProperty("include_tasks");
+    });
+
+    test("filters_data is project-scoped and OMITS the list-only params (C11)", async () => {
+        // The `/userstories/filters_data` endpoint REQUIRES `project` (HTTP 404
+        // without it) and REJECTS `status__is_archived` (HTTP 500); it also does
+        // not accept `q` or the `include_*` flags. `loadFiltersParams()` mirrors
+        // the legacy `UsFiltersMixin.generateFilters` `loadFilters` and therefore
+        // carries ONLY the project id plus recognised URL filter categories —
+        // DISTINCT from the list request's params. Reusing the list params here
+        // was the C11 mount defect (empty board + "requested item could not be
+        // found").
+        await renderLoaded();
+
+        expect(apiClient.getUserStoriesFilters).toHaveBeenCalled();
+        const filtersArg = apiClient.getUserStoriesFilters.mock.calls[0][0];
+        expect(filtersArg).toMatchObject({ project: PROJECT_ID });
+        expect(filtersArg).not.toHaveProperty("status__is_archived");
+        expect(filtersArg).not.toHaveProperty("q");
+        expect(filtersArg).not.toHaveProperty("include_attachments");
+        expect(filtersArg).not.toHaveProperty("include_tasks");
     });
 
     test("handleDragEnd forwards the exact (project, status, swimlane, after, before, bulk) tuple", async () => {
@@ -835,8 +951,9 @@ describe("useKanbanStories — request params + real-time + authz parity", () =>
     });
 
     test("handleDragEnd still calls the API when permissions are empty (no client-side authz)", async () => {
-        // No runtime project -> read-only fallback with my_permissions: [].
-        clearRuntimeProject();
+        // The backend is the single enforcement point: even when the AUTHORITATIVE
+        // project grants no permissions, the hook never blocks the request.
+        apiClient.getProjectBySlug.mockResolvedValue(projectPayload({ my_permissions: [] }));
         const { result } = await renderLoaded();
         expect(result.current.project?.my_permissions).toEqual([]);
 

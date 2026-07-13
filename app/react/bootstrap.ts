@@ -59,6 +59,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { KanbanBoard } from "./kanban/KanbanBoard";
 import { Backlog } from "./backlog/Backlog";
 import type { MountContext } from "./shared/types";
+import { readLiveToken } from "./shared/auth/token";
 
 /**
  * Custom-element tag names. Declared once so the `customElements.get(...)`
@@ -176,20 +177,68 @@ function createReactScreenElement(
         /** The React root owning this element's subtree, or `null` when unmounted. */
         private root: Root | null = null;
 
+        /** The bearer token captured at the last mount (for auth-change detection). */
+        private mountedToken: string | null = null;
+
+        /**
+         * Stable-bound `storage` listener so it can be added on connect and
+         * removed on disconnect. Kept as a field (not re-created) so
+         * add/removeEventListener reference the SAME function.
+         */
+        private readonly onStorage = (event: StorageEvent): void => {
+            // Only react to changes of the `$tgStorage` "token" key (or a full
+            // clear, where `event.key === null`). Finding M8: on a real auth
+            // change (refresh / re-login / cross-tab logout) remount so the
+            // fresh token flows into a new context snapshot AND the WebSocket
+            // reconnects/re-authenticates with the new credential.
+            if (event.key !== null && event.key !== "token") {
+                return;
+            }
+            if (this.root === null) {
+                return;
+            }
+            const liveToken = readLiveToken({ token: null });
+            if (liveToken !== this.mountedToken) {
+                this.remount();
+            }
+        };
+
+        /** Create the React root and render the screen with a fresh context. */
+        private mount(): void {
+            const context = readMountContext(this);
+            this.mountedToken = context.token;
+            this.root = createRoot(this);
+            this.root.render(createElement(Component, { context }));
+        }
+
+        /** Tear down the React root (idempotent). */
+        private unmount(): void {
+            if (this.root !== null) {
+                this.root.unmount();
+                this.root = null;
+            }
+        }
+
+        /** Unmount then re-mount with a freshly-read context (auth-change path). */
+        private remount(): void {
+            this.unmount();
+            this.mount();
+        }
+
         /**
          * Mount the React tree into the element itself. Guarded so a spurious
          * re-connect (or a connect fired while already mounted) does not create a
-         * second root over the same container.
+         * second root over the same container. Also subscribes to `storage` so a
+         * token refresh/expiry while connected is propagated (finding M8).
          */
         connectedCallback(): void {
             if (this.root !== null) {
                 return;
             }
-
-            this.root = createRoot(this);
-            this.root.render(
-                createElement(Component, { context: readMountContext(this) }),
-            );
+            this.mount();
+            if (typeof window !== "undefined") {
+                window.addEventListener("storage", this.onStorage);
+            }
         }
 
         /**
@@ -197,10 +246,10 @@ function createReactScreenElement(
          * cleanly and releases its listeners / WebSocket subscriptions.
          */
         disconnectedCallback(): void {
-            if (this.root !== null) {
-                this.root.unmount();
-                this.root = null;
+            if (typeof window !== "undefined") {
+                window.removeEventListener("storage", this.onStorage);
             }
+            this.unmount();
         }
     };
 }

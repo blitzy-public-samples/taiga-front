@@ -228,12 +228,35 @@ beforeEach(() => {
 
 describe("StatusColumn — root element", () => {
   it("renders div.kanban-uses-box.taskboard-column.task-column#column-<id> with data-status", () => {
+    // Non-swimlane mode: the document id is the plain `column-<statusId>`.
     const { container } = renderColumn({ status: makeStatus({ id: 5 }) });
     const root = container.querySelector("#column-5") as HTMLElement;
     expect(root).toBeInTheDocument();
     expect(root.tagName.toLowerCase()).toBe("div");
     expect(root).toHaveClass("kanban-uses-box", "taskboard-column", "task-column");
     expect(root).toHaveAttribute("data-status", "5");
+  });
+
+  it("qualifies the document id with the swimlane id in swimlane mode (M7 unique ids)", () => {
+    // The legacy `kanban-table.jade` emitted `id="column-{{s.id}}"` INSIDE the
+    // per-swimlane repeat, so the same id repeated across swimlanes (a duplicate-
+    // id defect). In swimlane mode the React column qualifies the id with the
+    // swimlane id so every column is a UNIQUE document node, while `data-status`
+    // (styling/e2e authority) stays the bare status id.
+    const colA = renderColumn({ status: makeStatus({ id: 5 }), swimlaneId: 3 });
+    expect(colA.container.querySelector("#column-3-5")).toBeInTheDocument();
+    expect(colA.root).toHaveAttribute("data-status", "5");
+    expect(colA.root).toHaveAttribute("data-swimlane", "3");
+    // The same status in a DIFFERENT swimlane yields a DIFFERENT document id, so
+    // the two columns never collide.
+    const colB = renderColumn({ status: makeStatus({ id: 5 }), swimlaneId: 7 });
+    expect(colB.container.querySelector("#column-7-5")).toBeInTheDocument();
+    expect(colA.root.id).not.toBe(colB.root.id);
+  });
+
+  it("qualifies the id for the unclassified swimlane (-1) too", () => {
+    const { container } = renderColumn({ status: makeStatus({ id: 5 }), swimlaneId: -1 });
+    expect(container.querySelector("#column--1-5")).toBeInTheDocument();
   });
 
   it("omits data-swimlane in non-swimlane mode (swimlaneId undefined)", () => {

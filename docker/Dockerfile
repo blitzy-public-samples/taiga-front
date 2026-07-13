@@ -26,8 +26,21 @@ WORKDIR /app
 # Install dependencies first so this layer is cached across source-only changes.
 # `npm ci` is strict: package-lock.json must be in sync with package.json (the
 # lock is regenerated when the React / esbuild / TypeScript deps are added).
+#
+# `--ignore-scripts` is REQUIRED in this environment: the gulp-imagemin binary
+# downloaders (gifsicle / mozjpeg / optipng, each a `node lib/install.js`) stall
+# indefinitely on the GitHub CDN and would hang the build. They drive an OPTIONAL
+# image-BYTE-minification pass only; skipping their lifecycle scripts leaves the
+# optimizer binaries absent, so the `npx gulp deploy` step below sets
+# TAIGA_SKIP_IMAGEMIN=1 to bypass that pass (images are still copied to dist verbatim
+# at identical paths — DOM/SCSS parity is unaffected). esbuild is UNAFFECTED because its Linux binary ships via
+# the `@esbuild/linux-x64` OPTIONAL DEPENDENCY (an npm package, not a postinstall
+# download), so the React `react-screens` bundle still builds. node-sass DOES need
+# its native binding compiled, so it is built explicitly afterward (this mirrors the
+# documented environment setup recipe).
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+    && (cd node_modules/node-sass && node scripts/build.js --force)
 
 # Copy the rest of the submodule source (node_modules/, dist/, tmp/, .git are
 # excluded by .dockerignore).
@@ -36,6 +49,10 @@ COPY . .
 # Compile CoffeeScript/Jade/SCSS AND run the new `react-screens` esbuild task,
 # emitting the versioned dist/ (dist/index.html + dist/v-<ts>/js/{elements.js,
 # react-screens.js, app.js, libs.js, templates.js} + themes/svg/fonts/images).
+# TAIGA_SKIP_IMAGEMIN=1 bypasses the optional image-byte-minification pass whose
+# native optimizers were not downloaded above (guarded in gulpfile.js); all other
+# deploy optimizations (JS/CSS uglify/minify, template cache) run unchanged.
+ENV TAIGA_SKIP_IMAGEMIN=1
 RUN npx gulp deploy
 
 # ---------------------------------------------------------------------------

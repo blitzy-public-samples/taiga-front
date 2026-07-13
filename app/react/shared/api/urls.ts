@@ -29,6 +29,12 @@ export const URL_TEMPLATES = {
     milestones: "/milestones",
     "move-userstories-to-milestone": "/milestones/%s/move_userstories_to_sprint",
     resolver: "/resolver",
+    // Per-user key/value storage (`GET/POST/PUT/DELETE /api/v1/user-storage[/<key>]`).
+    // The legacy `tgFilterRemoteStorageService` (filter-remote.service.coffee)
+    // persists custom filters here under a `generateHash([projectId, ...])` key.
+    // This is an EXISTING frozen endpoint (present in the `/api/v1/` root), so
+    // reproducing it is contract-preserving (C-1) — NOT a new/renamed key.
+    "user-storage": "/user-storage",
 } as const;
 
 export type EndpointKey = keyof typeof URL_TEMPLATES;

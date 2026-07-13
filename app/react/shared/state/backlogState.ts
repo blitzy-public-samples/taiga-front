@@ -218,6 +218,17 @@ export function shiftDrag(state: BacklogState): BacklogState {
     });
 }
 
+/**
+ * Producer: clear the ENTIRE coalesced drag queue. Used by the per-operation
+ * rollback path (M1) after `restoreBacklogStories` has repositioned the moved
+ * stories, so no stale queued move is drained against the rolled-back state.
+ */
+export function clearDragQueue(state: BacklogState): BacklogState {
+    return produce(state, (draft: Draft<BacklogState>) => {
+        draft.pendingDrag = [];
+    });
+}
+
 /** True when at least one drag move is queued. */
 export function hasPendingDrag(state: BacklogState): boolean {
     return state.pendingDrag.length > 0;
@@ -388,10 +399,238 @@ export function reconcileMovedStory(
 }
 
 /* ------------------------------------------------------------------------- *
+ * Per-operation rollback (delta restore) — the M1 (CWE-362) fix
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The pre-move position of a single story, captured BEFORE an optimistic drag so
+ * a failed persist can be undone WITHOUT clobbering unrelated concurrent changes
+ * (review finding M1). `milestone === null` means the story belonged to the
+ * backlog list; otherwise it belonged to that sprint. The order fields carry the
+ * story's original `backlog_order` / `sprint_order` so the container can be
+ * re-sorted to its exact prior arrangement.
+ */
+export interface BacklogPositionDelta {
+    /** User-story id. */
+    id: number;
+    /** Original container: `null` => backlog list; otherwise the sprint id. */
+    milestone: number | null;
+    /** Original `backlog_order` (when the story lived in the backlog). */
+    backlog_order?: number;
+    /** Original `sprint_order` (when the story lived in a sprint). */
+    sprint_order?: number;
+}
+
+/**
+ * Capture the current position of each story in `usList` as a
+ * {@link BacklogPositionDelta}, reading the SAME model instance the state holds
+ * (so the captured order fields reflect the authoritative pre-move values).
+ * Stories not present in `usList` are ignored; a story whose model lacks order
+ * fields simply omits them (the restore then re-inserts by container membership
+ * and a stable sort leaves it where the surviving order values place it).
+ */
+export function captureBacklogPositions(
+    usList: ReadonlyArray<UserStory>,
+): BacklogPositionDelta[] {
+    return usList.map((us) => {
+        const delta: BacklogPositionDelta = { id: us.id, milestone: us.milestone ?? null };
+        if (us.backlog_order !== undefined) {
+            delta.backlog_order = us.backlog_order;
+        }
+        if (us.sprint_order !== undefined) {
+            delta.sprint_order = us.sprint_order;
+        }
+        return delta;
+    });
+}
+
+/**
+ * PER-OPERATION rollback. Restores ONLY the stories named in `deltas` to their
+ * captured pre-move positions, applied to the CURRENT `state` (never a stale
+ * whole-state snapshot) — the M1 fix that prevents a failed drag from erasing
+ * newer changes to OTHER stories (a WebSocket reload, a concurrent inline edit,
+ * etc.). A story that was concurrently removed (e.g. a `userstories` delete
+ * event) is skipped rather than resurrected. Each restored story is detached
+ * from wherever it currently sits and re-inserted into its ORIGINAL container,
+ * then every touched container is re-sorted by its order field so the pre-move
+ * arrangement is reproduced exactly.
+ */
+export function restoreBacklogStories(
+    state: BacklogState,
+    deltas: ReadonlyArray<BacklogPositionDelta>,
+): BacklogState {
+    if (deltas.length === 0) {
+        return state;
+    }
+    return produce(state, (draft: Draft<BacklogState>) => {
+        const touchedSprintIds = new Set<number>();
+        let touchedBacklog = false;
+
+        for (const delta of deltas) {
+            // Locate the live model wherever it currently lives.
+            let model: Draft<UserStory> | undefined = draft.userstories.find(
+                (it) => it.id === delta.id,
+            );
+            if (!model) {
+                for (const sp of draft.sprints) {
+                    const f = sp.user_stories?.find((it) => it.id === delta.id);
+                    if (f) {
+                        model = f;
+                        break;
+                    }
+                }
+            }
+            if (!model) {
+                for (const sp of draft.closedSprints) {
+                    const f = sp.user_stories?.find((it) => it.id === delta.id);
+                    if (f) {
+                        model = f;
+                        break;
+                    }
+                }
+            }
+            // Concurrently deleted -> nothing to restore.
+            if (!model) {
+                continue;
+            }
+
+            // Snapshot the restored model with its original milestone/order.
+            const restored: UserStory = { ...model, milestone: delta.milestone };
+            if (delta.backlog_order !== undefined) {
+                restored.backlog_order = delta.backlog_order;
+            }
+            if (delta.sprint_order !== undefined) {
+                restored.sprint_order = delta.sprint_order;
+            }
+
+            // Detach from every container it might currently occupy.
+            draft.userstories = draft.userstories.filter((it) => it.id !== delta.id);
+            for (const sp of draft.sprints) {
+                if (sp.user_stories) {
+                    sp.user_stories = sp.user_stories.filter((it) => it.id !== delta.id);
+                }
+            }
+            for (const sp of draft.closedSprints) {
+                if (sp.user_stories) {
+                    sp.user_stories = sp.user_stories.filter((it) => it.id !== delta.id);
+                }
+            }
+
+            // Re-insert into the ORIGINAL container.
+            if (delta.milestone == null) {
+                draft.userstories.push(restored);
+                touchedBacklog = true;
+                if (delta.backlog_order !== undefined) {
+                    draft.backlogOrder[delta.id] = delta.backlog_order;
+                }
+            } else {
+                const sp =
+                    draft.sprints.find((s) => s.id === delta.milestone) ??
+                    draft.closedSprints.find((s) => s.id === delta.milestone);
+                if (sp) {
+                    if (!sp.user_stories) {
+                        sp.user_stories = [];
+                    }
+                    sp.user_stories.push(restored);
+                    touchedSprintIds.add(delta.milestone);
+                    if (delta.sprint_order !== undefined) {
+                        if (!draft.milestonesOrder[delta.milestone]) {
+                            draft.milestonesOrder[delta.milestone] = {};
+                        }
+                        draft.milestonesOrder[delta.milestone][delta.id] = delta.sprint_order;
+                    }
+                } else {
+                    // The original sprint is no longer loaded; keep the story rather
+                    // than dropping it (degrade to the backlog list).
+                    draft.userstories.push(restored);
+                    touchedBacklog = true;
+                }
+            }
+        }
+
+        // Re-sort only the containers we touched, by their order fields, so the
+        // pre-move arrangement is reproduced (stable relative to survivors).
+        if (touchedBacklog) {
+            draft.userstories.sort(
+                (a, b) => (a.backlog_order ?? 0) - (b.backlog_order ?? 0),
+            );
+        }
+        for (const sp of draft.sprints) {
+            if (sp.user_stories && touchedSprintIds.has(sp.id)) {
+                sp.user_stories.sort(
+                    (a, b) => (a.sprint_order ?? 0) - (b.sprint_order ?? 0),
+                );
+            }
+        }
+    });
+}
+
+/* ------------------------------------------------------------------------- *
  * State builders / setters
  * ------------------------------------------------------------------------- */
 
 /** Empty initial state (mirrors the `BacklogController` constructor init). */
+/**
+ * Producer: re-insert a FULL user story into the container named by its own
+ * `milestone` (backlog list when null, else the matching sprint), degrading to
+ * the backlog list when that sprint is not loaded. Used by the delete-rollback
+ * path (M1): unlike {@link restoreBacklogStories} — which SKIPS a story that is
+ * absent from the current state (correct for a move whose story was concurrently
+ * deleted) — this deliberately re-adds a story that the optimistic delete
+ * removed, restoring it onto the CURRENT state without a stale whole-state
+ * snapshot. Idempotent: an already-present story is first detached so it is
+ * never duplicated. The touched container is re-sorted by its order field.
+ */
+export function reinsertBacklogStory(state: BacklogState, story: UserStory): BacklogState {
+    return produce(state, (draft: Draft<BacklogState>) => {
+        const id = story.id;
+        // Detach any existing copy so re-insert is idempotent.
+        draft.userstories = draft.userstories.filter((it) => it.id !== id);
+        for (const sp of draft.sprints) {
+            if (sp.user_stories) {
+                sp.user_stories = sp.user_stories.filter((it) => it.id !== id);
+            }
+        }
+        for (const sp of draft.closedSprints) {
+            if (sp.user_stories) {
+                sp.user_stories = sp.user_stories.filter((it) => it.id !== id);
+            }
+        }
+        const restored = { ...story } as Draft<UserStory>;
+        const milestone = story.milestone ?? null;
+        if (milestone == null) {
+            draft.userstories.push(restored);
+            if (story.backlog_order !== undefined) {
+                draft.backlogOrder[id] = story.backlog_order;
+            }
+            draft.userstories.sort((a, b) => (a.backlog_order ?? 0) - (b.backlog_order ?? 0));
+        } else {
+            const sp =
+                draft.sprints.find((x) => x.id === milestone) ??
+                draft.closedSprints.find((x) => x.id === milestone);
+            if (sp) {
+                if (!sp.user_stories) {
+                    sp.user_stories = [];
+                }
+                sp.user_stories.push(restored);
+                if (story.sprint_order !== undefined) {
+                    if (!draft.milestonesOrder[milestone]) {
+                        draft.milestonesOrder[milestone] = {};
+                    }
+                    draft.milestonesOrder[milestone][id] = story.sprint_order;
+                }
+                sp.user_stories.sort((a, b) => (a.sprint_order ?? 0) - (b.sprint_order ?? 0));
+            } else {
+                // Original sprint no longer loaded -> degrade to the backlog list.
+                draft.userstories.push(restored);
+                draft.userstories.sort(
+                    (a, b) => (a.backlog_order ?? 0) - (b.backlog_order ?? 0),
+                );
+            }
+        }
+    });
+}
+
 export function createInitialBacklogState(): BacklogState {
     return {
         userstories: [],

@@ -39,6 +39,7 @@ export {
   replace,
   move,
   moveToEnd,
+  restoreStories,
   toggleFold,
   resetFolds,
   addArchivedStatus,
@@ -52,7 +53,7 @@ export {
 } from "./kanbanState";
 
 // Type-only exports (erased at compile time; must use `export type`).
-export type { KanbanState, KanbanMoveResult } from "./kanbanState";
+export type { KanbanState, KanbanMoveResult, StoryPositionDelta } from "./kanbanState";
 
 /* -------------------------------------------------------------------------- */
 /* Backlog / Sprint-Planning state (mirrors backlog/main.coffee via           */
@@ -71,11 +72,15 @@ export {
   buildMilestonePayload,
   enqueueDrag,
   shiftDrag,
+    clearDragQueue,
   hasPendingDrag,
   shouldCoalesceDrag,
   peekDrag,
   applyOptimisticMove,
   reconcileMovedStory,
+  captureBacklogPositions,
+  restoreBacklogStories,
+    reinsertBacklogStory,
   setUserstories,
   setSprints,
   setClosedSprints,
@@ -89,4 +94,5 @@ export type {
   BacklogOrderPayload,
   MilestonePayload,
   BulkOrderEntry,
+  BacklogPositionDelta,
 } from "./backlogState";

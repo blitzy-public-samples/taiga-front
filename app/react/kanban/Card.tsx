@@ -42,15 +42,14 @@
  *     `.icon-*` SCSS selector resolving against the global sprite in `index.jade`.
  *
  * Selection ownership: multi-select state (the legacy `window.dragMultiple`
- * set + `KanbanController.selectedUss`) is BOARD-level state owned by
- * `useKanbanSelection` in `KanbanBoard`/`useKanbanStories`, NOT by this leaf.
- * `Card` therefore consumes the resolved `selected` flag and the
- * `onToggleSelect` handler via props (the concrete contract in this file's
- * brief), exactly as `kanban-table.jade` bound
+ * set + `KanbanController.selectedUss`) is the SINGLE board-level selection
+ * owned by `useKanbanStories`, NOT by this leaf. `Card` therefore consumes the
+ * resolved `selected` flag and the `onToggleSelect` handler via props (the
+ * concrete contract in this file's brief), exactly as `kanban-table.jade` bound
  * `ng-class="{'kanban-task-selected': ctrl.selectedUss[usId]}"` +
  * `ng-click="($event.ctrlKey || $event.metaKey) && ctrl.toggleSelectedUs(usId)"`.
- * Instantiating `useKanbanSelection()` here would create isolated per-card state
- * (a defect) whose return would be dead code, so it is intentionally not called.
+ * Owning selection here would create isolated per-card state (a defect) whose
+ * return would be dead code, so it is intentionally not done.
  *
  * Drag-and-drop: a single card is wired as a `@dnd-kit/core` draggable through
  * {@link useCardDraggable}; the board decides drag eligibility and this
@@ -63,7 +62,7 @@
 // augmentation below and in the props typings; it is erased at emit
 // (isolatedModules-safe) and does not conflict with the automatic JSX runtime.
 import type * as React from "react";
-import { useMemo, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 
 import type {
   UserStory,
@@ -72,6 +71,9 @@ import type {
   UserStoryEpic,
 } from "../shared/types";
 import { useCardDraggable } from "./dnd/useCardDraggable";
+import { userStoryUrl, epicUrl, taskUrl } from "../shared/nav/routes";
+import { t } from "../shared/i18n/translate";
+import { DEFAULT_TAG_COLOR, IOCAINE_COLOR } from "../shared/theme/colors";
 
 /**
  * Custom-element JSX typing. `Card` emits one literal custom-element tag,
@@ -95,39 +97,22 @@ declare global {
 }
 
 /*
- * i18n labels. The migration reproduces the AngularJS `translate` output as
- * plain English literals for the POC (true visual parity is proven by the
- * Playwright evidence; the string catalogue is out of scope for this leaf).
+ * i18n. Visible/`title` strings are resolved AT RENDER TIME through the shared
+ * `t()` helper (`shared/i18n/translate`), which bundles the same
+ * `locale-en.json` catalogue the AngularJS `translate` filter used and honours a
+ * runtime `setTranslations()` override — i.e. the LEGACY i18n mechanism, not
+ * ad-hoc English literals (review finding M7: "visible text is hard-coded. Use
+ * … the legacy i18n mechanism"). The keys mirror the exact `translate(...)`
+ * calls in the legacy `card-templates/*.jade`; the two INTERPOLATED strings
+ * (`COMMON.CARD.PTS`, `COMMON.CARD.EXTRA_ASSIGNED_USERS`, `COMMON.CARD.TASKS`)
+ * are resolved inline with their `{{ token }}` params at their call sites.
+ *
+ * The one exception is the actions-popup trigger label: the legacy
+ * `card-actions.jade` button carried NO `title`/`aria-label` and there is no
+ * `COMMON.CARD.ACTIONS` catalogue key, so this remains a documented literal (it
+ * is an accessibility-only addition — the trigger is otherwise icon-only).
  */
-/** `COMMON.ASSIGNED_TO.NOT_ASSIGNED`. */
-const NOT_ASSIGNED = "Not assigned";
-/** `COMMON.CARD.EXTRA_ASSIGNED_USERS`. */
-const EXTRA_ASSIGNED_USERS = "More assigned users";
-/** `COMMON.CARD.ESTIMATION`. */
-const ESTIMATION = "Estimation";
-/** `COMMON.CARD.PTS` unit suffix. */
-const PTS = "pts";
-/** `COMMON.CARD.NO_PTS`. */
-const NO_PTS = "--";
-/** `TASK.FIELDS.IS_IOCAINE`. */
-const IS_IOCAINE = "Iocaine";
-/** `COMMON.CARD.TASKS`. */
-const TASKS = "Tasks";
-/** `ATTACHMENT.SECTION_NAME`. */
-const ATTACHMENTS = "Attachments";
-/** `COMMON.WATCHERS.WATCHERS`. */
-const WATCHERS = "Watchers";
-/** `COMMENTS.TITLE`. */
-const COMMENTS = "Comments";
-/** Accessible label for the assign-to affordance. */
-const ASSIGN_LABEL = "Assigned to";
-/** Accessible label for the edit affordance. */
-const EDIT_LABEL = "Edit";
-/** Accessible label for the delete affordance. */
-const DELETE_LABEL = "Delete";
-/** Accessible label for the move-to-top affordance. */
-const MOVE_TO_TOP_LABEL = "Move to top";
-/** Accessible label for the card actions popup trigger. */
+/** Accessible label for the card actions popup trigger (no legacy catalogue key). */
 const ACTIONS_LABEL = "Actions";
 
 /**
@@ -230,7 +215,7 @@ function cx(...tokens: Array<string | false | null | undefined>): string {
  * explicit colour.
  */
 function getTagColor(color: string | null): string {
-  return color || "#A9AABC";
+  return color || DEFAULT_TAG_COLOR;
 }
 
 /**
@@ -294,15 +279,73 @@ export function Card(props: CardProps): JSX.Element {
   // Drag eligibility reproduces the sortable.coffee init guards: draggable only
   // with modify_us, on a non-archived project, and not a per-card archived story.
   const canDrag = canModify && !project.archived_code && !archived;
-  const { setNodeRef, attributes, listeners } = useCardDraggable(story.id, {
+  const { setNodeRef, attributes, listeners, isDragging } = useCardDraggable(story.id, {
     disabled: !canDrag,
   });
 
-  // Local popup-menu state for the `.card-actions .js-popup-button`. This is a
-  // simplified in-place reproduction of the legacy shared popover: the menu is
-  // hidden by default (so it never interferes with e2e selectors) and wires the
-  // edit / delete / move-to-top actions the legacy popover exposed.
+  // Local popup-menu state for the `.card-actions .js-popup-button`. This is an
+  // in-place reproduction of the LEGACY SHARED POPOVER the `js-popup-button`
+  // opened (`card-actions.jade` only rendered the trigger; the edit/delete/
+  // move-to-top items came from the shared popover directive). The menu is
+  // hidden by default (so it never interferes with e2e selectors) and — per
+  // review finding M4 — now reproduces the shared popover LIFECYCLE, not just
+  // its markup: it closes on an outside click and on Escape, focuses its first
+  // item when opened, and returns focus to the trigger when dismissed.
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
+  const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  // Shared-popover lifecycle. Mounts document-level listeners only while the
+  // menu is open (mirroring the legacy popover service, which bound
+  // `body.on("click", …)` on open and unbound it on close), so a closed card
+  // adds no global listeners.
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+    const onDocPointerDown = (event: Event): void => {
+      const target = event.target as Node | null;
+      // A click inside the menu or on its trigger keeps the popover open; any
+      // other click (elsewhere on the board / document) dismisses it.
+      if (menuRef.current?.contains(target) || menuTriggerRef.current?.contains(target)) {
+        return;
+      }
+      setMenuOpen(false);
+    };
+    const onDocKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setMenuOpen(false);
+        // Return focus to the trigger so keyboard users are not stranded.
+        menuTriggerRef.current?.focus();
+      }
+    };
+    document.addEventListener("mousedown", onDocPointerDown, true);
+    document.addEventListener("keydown", onDocKeyDown, true);
+    // Move focus to the first menu item when the popover opens (the shared
+    // popover focused its first actionable control).
+    const firstItem = menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]');
+    firstItem?.focus();
+    return () => {
+      document.removeEventListener("mousedown", onDocPointerDown, true);
+      document.removeEventListener("keydown", onDocKeyDown, true);
+    };
+  }, [menuOpen]);
+
+  // Static (non-interpolated) i18n labels, resolved through the shared `t()`
+  // helper at render time (the legacy `translate(...)` calls in
+  // `card-templates/*.jade`). Interpolated strings are resolved inline below.
+  const NOT_ASSIGNED = t("COMMON.ASSIGNED_TO.NOT_ASSIGNED");
+  const ESTIMATION = t("COMMON.CARD.ESTIMATION");
+  const NO_PTS = t("COMMON.CARD.NO_PTS");
+  const IS_IOCAINE = t("TASK.FIELDS.IS_IOCAINE");
+  const ATTACHMENTS = t("ATTACHMENT.SECTION_NAME");
+  const WATCHERS = t("COMMON.WATCHERS.WATCHERS");
+  const COMMENTS = t("COMMENTS.TITLE");
+  const ASSIGN_LABEL = t("COMMON.FIELDS.ASSIGNED_TO");
+  const EDIT_LABEL = t("COMMON.EDIT");
+  const DELETE_LABEL = t("COMMON.DELETE");
+  const MOVE_TO_TOP_LABEL = t("COMMON.CARD.MOVE_TO_TOP");
 
   // Cumulative zoom feature gate. `props.zoom` is built by the board (the
   // board-zoom directive map); the card only consumes it — never recomputes it.
@@ -362,10 +405,10 @@ export function Card(props: CardProps): JSX.Element {
   const watchersCount = item.total_watchers ?? item.watchers?.length ?? 0;
   const commentsCount = item.total_comments ?? 0;
 
-  // Navigation hashbang URLs (mirror the legacy tg-nav keys). Cross-framework
-  // links use `window.location` hashbang URLs so React<->AngularJS navigation
-  // behaves identically.
-  const usNavHref = `#/project/${project.slug}/us/${story.ref ?? ""}`;
+  // Navigation URLs (mirror the legacy tg-nav keys). The surviving app runs in
+  // HTML5 push-state mode, so these are PLAIN pathnames (`/project/...`), not
+  // hashbangs — a `#/project/...` href would be a no-op fragment (finding C9).
+  const usNavHref = userStoryUrl(project.slug, story.ref ?? "");
   const titleAttr =
     zoomLevel === 0 ? `#${story.ref ?? ""} ${story.subject ?? ""}` : undefined;
   const cardInnerTitle =
@@ -398,7 +441,7 @@ export function Card(props: CardProps): JSX.Element {
     list.map((epic, index) => (
       <a
         className="card-epic"
-        href={`#/project/${project.slug}/epic/${epic.ref ?? ""}`}
+        href={epicUrl(project.slug, epic.ref ?? "")}
         key={epic.id}
       >
         <span
@@ -422,6 +465,11 @@ export function Card(props: CardProps): JSX.Element {
     selected && "kanban-task-selected",
     selected && "ui-multisortable-multiple",
     moved && "kanban-moved",
+    // C3: while this card is the drag source, mark it `.gu-transit` — the exact
+    // dragula class for the dimmed placeholder left in place. The visible motion
+    // is the `.gu-mirror` DragOverlay clone (KanbanDndProvider); the source is
+    // never CSS-translated (that would break domGeometry's drop-position math).
+    isDragging && "gu-transit",
     !canModify && "readonly",
   );
 
@@ -479,6 +527,7 @@ export function Card(props: CardProps): JSX.Element {
           {zoomLevel > 0 && (canModify || canDelete) ? (
             <div className="card-actions">
               <button
+                ref={menuTriggerRef}
                 className="js-popup-button"
                 type="button"
                 title={ACTIONS_LABEL}
@@ -489,7 +538,7 @@ export function Card(props: CardProps): JSX.Element {
                 <Icon icon="icon-more-vertical" />
               </button>
               {menuOpen ? (
-                <div className="card-actions-menu" role="menu">
+                <div ref={menuRef} className="card-actions-menu" role="menu">
                   {canModify ? (
                     <button
                       className="card-action-edit"
@@ -580,7 +629,12 @@ export function Card(props: CardProps): JSX.Element {
                           />
                         ) : null}
                         {index === 2 && assignedUsersCount > 3 ? (
-                          <span className="extra-assigned" title={EXTRA_ASSIGNED_USERS}>
+                          <span
+                            className="extra-assigned"
+                            title={t("COMMON.CARD.EXTRA_ASSIGNED_USERS", {
+                              total: assignedUsersCount - 2,
+                            })}
+                          >
                             {`${assignedUsersCount - 2}+`}
                           </span>
                         ) : null}
@@ -599,7 +653,7 @@ export function Card(props: CardProps): JSX.Element {
                       <div className="card-iocaine-user-bg">
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 28 17">
                           <path
-                            fill="#B400D1"
+                            fill={IOCAINE_COLOR}
                             fillOpacity=".5"
                             d="M27.409 3c0 7.732-6.136 14-13.705 14C6.136 17 0 10.732 0 3s.703 3.5 8.272 3.5S27.409-4.732 27.409 3z"
                           />
@@ -617,11 +671,24 @@ export function Card(props: CardProps): JSX.Element {
                 {visible("extra_info") ? (
                   <>
                     <div className="card-statistics-init">
-                      <span className="card-estimation" title={ESTIMATION} data-id={story.id}>
-                        {story.total_points != null
-                          ? `${story.total_points} ${PTS}`
-                          : NO_PTS}
-                      </span>
+                      {/*
+                        * Estimation. Legacy `card-data.jade`: WITH points ->
+                        * `span.card-estimation(title, data-id)` whose text is the
+                        * interpolated `COMMON.CARD.PTS` ("{{pts}} pts"); WITHOUT
+                        * points -> a bare `span.card-estimation` showing
+                        * `COMMON.CARD.NO_PTS` ("N/E") with no title/data-id.
+                        */}
+                      {story.total_points != null ? (
+                        <span
+                          className="card-estimation"
+                          title={ESTIMATION}
+                          data-id={story.id}
+                        >
+                          {t("COMMON.CARD.PTS", { pts: story.total_points })}
+                        </span>
+                      ) : (
+                        <span className="card-estimation">{NO_PTS}</span>
+                      )}
                       {item.due_date ? (
                         <span className="card-due-date" title={item.due_date}>
                           <Icon icon="icon-clock" />
@@ -660,8 +727,12 @@ export function Card(props: CardProps): JSX.Element {
                       {totalTasks > 0 ? (
                         <div
                           className={cx("statistic", "card-completed-tasks", allTasksClosed && "completed")}
+                          title={t("COMMON.CARD.TASKS", {
+                            completed: closedTasks,
+                            total: totalTasks,
+                          })}
                         >
-                          <span title={TASKS}>{`${closedTasks} / ${totalTasks}`}</span>
+                          {`${closedTasks} / ${totalTasks}`}
                         </div>
                       ) : null}
                     </div>
@@ -689,7 +760,7 @@ export function Card(props: CardProps): JSX.Element {
                 {(item.tasks ?? []).map((task) => (
                   <li className="card-task" key={task.id}>
                     <a
-                      href={`#/project/${project.slug}/task/${task.ref ?? ""}`}
+                      href={taskUrl(project.slug, task.ref ?? "")}
                       className={cx(task.is_closed && "closed-task", task.is_blocked && "blocked-task")}
                     >
                       <span className="card-task-ref">{`#${task.ref ?? ""}`}</span>
@@ -712,7 +783,18 @@ export function Card(props: CardProps): JSX.Element {
                 onClickAssignedTo(story.id);
               }}
             >
-              <span className="card-owner-name">{assigneeDisplayName}</span>
+              {/*
+                Owner-name label doubles as the assign affordance target. When the
+                story is unassigned `assigneeDisplayName` is empty, which would
+                collapse the `.e2e-assign` anchor to a zero-size (unclickable)
+                box — leaving no way to assign an unassigned card (a real
+                behavioural-parity gap, since the legacy screens allowed
+                assigning from an unassigned card). Fall back to the localized
+                "Not assigned" label so the anchor always has a clickable area.
+              */}
+              <span className="card-owner-name">
+                {assigneeDisplayName || NOT_ASSIGNED}
+              </span>
             </a>
             {canModify ? (
               <a

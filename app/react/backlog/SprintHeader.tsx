@@ -37,17 +37,19 @@
  *   icon-<name>">` wrapping `<use xlink:href="#icon-<name>">`, exactly matching
  *   the compiled sprite output of the legacy `tg-svg` directive.
  *
- * i18n NOTE: there is no React i18n runtime in scope for this POC, so the legacy
- * translation KEYS are rendered as their resolved English copy — the point labels
- * "closed" (`BACKLOG.CLOSED_POINTS`) and "total" (`BACKLOG.TOTAL_POINTS`) and the
- * static `title=` strings ("Compact Sprint", "Edit Sprint", "Go to the taskboard
- * of <name>"). The e2e / visual-parity checks assert DOM structure and class
- * names, so this is intentional and safe. The only user-supplied value rendered
- * is `sprint.name`, which goes through React's default (escaping) text node to
- * preserve XSS-safety.
+ * i18n: every visible string is resolved at render time through the shared
+ * `t(...)` helper against the compiled `app/locales/taiga/locale-en.json`
+ * bundle, reproducing the AngularJS `translate` output exactly — the fold /
+ * edit / taskboard `title=` strings (`BACKLOG.COMPACT_SPRINT`,
+ * `BACKLOG.EDIT_SPRINT`, `BACKLOG.GO_TO_TASKBOARD`) and the point labels
+ * (`BACKLOG.CLOSED_POINTS`, `BACKLOG.TOTAL_POINTS`). The only user-supplied
+ * value rendered is `sprint.name`, which goes through React's default
+ * (escaping) text node to preserve XSS-safety.
  */
 
 import type { Milestone, Project } from "../shared/types";
+import { taskboardUrl as buildTaskboardUrl } from "../shared/nav/routes";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Abbreviated English month names, indexed 0..11 to line up with the numeric
@@ -168,8 +170,16 @@ export function SprintHeader(props: SprintHeaderProps): JSX.Element {
     // The taskboard link is only shown to users who can view milestones.
     const isVisible = project.my_permissions.indexOf("view_milestones") !== -1;
 
-    // resolve("project-taskboard", {project: slug, sprint: sprint.slug}) -> hashbang.
-    const taskboardUrl = `#/project/${project.slug}/taskboard/${sprint.slug ?? ""}`;
+    // resolve("project-taskboard", {project: slug, sprint: sprint.slug}) — HTML5 plain path.
+    const taskboardUrl = buildTaskboardUrl(project.slug, sprint.slug);
+
+    // The taskboard tooltip carries the sprint name. The locale value uses the
+    // legacy AngularJS one-time token `{{::name}}`, which the shared `t()` does
+    // not interpolate, so the name is substituted here after resolution.
+    const goToTaskboardTitle = t("BACKLOG.GO_TO_TASKBOARD").replace(
+        "{{::name}}",
+        sprint.name ?? "",
+    );
 
     // `sprint.closed_points or 0` / `sprint.total_points or 0` from the directive.
     const closedPoints = sprint.closed_points ?? 0;
@@ -190,7 +200,7 @@ export function SprintHeader(props: SprintHeaderProps): JSX.Element {
                     <button
                         type="button"
                         className={compactSprintClassName}
-                        title="Compact Sprint"
+                        title={t("BACKLOG.COMPACT_SPRINT")}
                         onClick={(event) => {
                             event.preventDefault();
                             onToggleCompact();
@@ -201,10 +211,7 @@ export function SprintHeader(props: SprintHeaderProps): JSX.Element {
                         </svg>
                     </button>
                     {isVisible ? (
-                        <a
-                            href={taskboardUrl}
-                            title={`Go to the taskboard of ${sprint.name}`}
-                        >
+                        <a href={taskboardUrl} title={goToTaskboardTitle}>
                             <span>{sprint.name}</span>
                         </a>
                     ) : null}
@@ -216,7 +223,7 @@ export function SprintHeader(props: SprintHeaderProps): JSX.Element {
                     <a
                         className="edit-sprint"
                         href=""
-                        title="Edit Sprint"
+                        title={t("BACKLOG.EDIT_SPRINT")}
                         onClick={(event) => {
                             event.preventDefault();
                             onEdit();
@@ -231,11 +238,11 @@ export function SprintHeader(props: SprintHeaderProps): JSX.Element {
                     <ul>
                         <li>
                             <span className="number">{closedPoints}</span>
-                            <span className="description">closed</span>
+                            <span className="description">{t("BACKLOG.CLOSED_POINTS")}</span>
                         </li>
                         <li>
                             <span className="number">{totalPoints}</span>
-                            <span className="description">total</span>
+                            <span className="description">{t("BACKLOG.TOTAL_POINTS")}</span>
                         </li>
                     </ul>
                 </div>

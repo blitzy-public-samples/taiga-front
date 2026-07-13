@@ -15,7 +15,7 @@
  * dragend handler in `app/coffee/modules/kanban/sortable.coffee` plus the
  * `window.dragMultiple` multi-select set from `app/js/dragula-drag-multiple.js`.
  * They are intentionally PURE (no DOM, no React render, no `@dnd-kit` runtime):
- * the caller (`useKanbanDragEnd`) pre-computes every primitive from board state
+ * the caller (`createKanbanDragEndHandler`) pre-computes every primitive from board state
  * and DOM geometry, so the whole drop semantics can be locked with plain value
  * assertions. That keeps these tests fast and lets them contribute real covered
  * lines toward the repo-wide >= 70% Jest line-coverage gate.

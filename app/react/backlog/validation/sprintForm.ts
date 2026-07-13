@@ -16,7 +16,14 @@
  *   - estimated_start  -> data-required="true"
  *   - estimated_finish -> data-required="true"
  *
- * plus a defensive cross-field rule (finish must not precede start).
+ * These are the ONLY rules the legacy form enforced. In particular there is NO
+ * cross-field `finish >= start` rule: the recovered legacy template
+ * (`lightbox-sprint-add-edit.jade`) declares only `data-required` on both date
+ * inputs, and `lightboxes.coffee` runs `form.checksley().validate()` with no
+ * custom comparator. An earlier React version added a `finish >= start` check
+ * that the legacy checksley does not prove; per finding M3 (and the Minimal
+ * Change Clause) it has been REMOVED so validation matches the authoritative
+ * contract exactly.
  *
  * NO React, NO AngularJS, NO DOM, NO date library. Pure & deterministic
  * (never reads `Date.now()`): every result depends solely on the inputs.
@@ -67,13 +74,10 @@ export function validateSprintForm(values: SprintFormValues): SprintFormErrors {
     errors.estimated_start = "Estimated start is required";
   }
 
-  // estimated_finish: required, and (when both present) >= estimated_start.
-  // "YYYY-MM-DD" is zero-padded, so a lexicographic compare equals a
-  // chronological compare -- no date library required.
+  // estimated_finish: required. (No cross-field finish>=start rule — the legacy
+  // checksley only declared `data-required`; see the module note above, M3.)
   if (finishTrimmed.length === 0) {
     errors.estimated_finish = "Estimated finish is required";
-  } else if (startTrimmed.length > 0 && finishTrimmed < startTrimmed) {
-    errors.estimated_finish = "Estimated finish must be after estimated start";
   }
 
   return errors;

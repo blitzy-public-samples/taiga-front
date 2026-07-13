@@ -64,11 +64,12 @@
  *     (`tg-belong-to-epics`, `tg-due-date`) are reproduced as their rendered DOM
  *     (`.us-epic-container` / `.belong-to-epic-pill`, `.due-date`) rather than
  *     imported from `app/modules/components/**` (AAP §0.6.5 — no ngUpgrade bridge).
- *   - Visible copy uses the resolved English values from
- *     `app/locales/taiga/locale-en.json` ("This sprint has no user stories",
- *     "Drop here Stories from your backlog to start a new sprint",
- *     "Sprint Taskboard") so the rendered output matches the AngularJS `translate`
- *     output exactly (there is no React i18n runtime in scope for this POC).
+ *   - Visible copy is resolved at render time through the shared `t(...)` helper
+ *     against `app/locales/taiga/locale-en.json` — the two empty-sprint warnings
+ *     (`BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS` /
+ *     `BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT`) and the taskboard link
+ *     (`BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD` / `BACKLOG.SPRINTS.LINK_TASKBOARD`)
+ *     — so the rendered output matches the AngularJS `translate` output exactly.
  *
  * @dnd-kit interop: `./Backlog.tsx` owns the `DndContext`. It may make each sprint
  * a droppable (a US dropped onto the `.sprint-table` is moved into the sprint) and
@@ -78,9 +79,19 @@
  */
 
 import { useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import type { Milestone, Project, UserStory } from "../shared/types";
 import { SprintHeader } from "./SprintHeader";
+import { taskboardUrl as buildTaskboardUrl, userStoryUrl } from "../shared/nav/routes";
+import { t } from "../shared/i18n/translate";
+
+/**
+ * Pointer travel (px) above which a story-link `click` is treated as the tail of
+ * a whole-row drag and its navigation is suppressed. Kept just below the
+ * @dnd-kit `PointerSensor` activation distance (8px) used by the Backlog
+ * `DndContext`, so any movement that could start a drag also blocks the link.
+ */
 
 /**
  * `@dnd-kit` sortable wiring for a single story row, supplied per-story by the
@@ -109,6 +120,107 @@ export interface StoryRowDndProps {
 }
 
 /**
+ * Props for {@link SprintStoryRow}.
+ */
+export interface SprintStoryRowProps {
+    /** The user story this row renders. */
+    us: UserStory;
+    /** Project context — supplies the slug for the story URL. */
+    project: Project;
+    /** Optional `@dnd-kit` sortable wiring (see {@link StoryRowDndProps}). */
+    dnd?: StoryRowDndProps;
+}
+
+/**
+ * ONE sprint story row (`.row.milestone-us-item-row`), extracted so that BOTH the
+ * plain (`getStoryRowProps`) path and the sortable (`renderStoryRow`) path emit
+ * byte-identical DOM. Reproduces the row markup of the legacy `sprint.jade` story
+ * loop; `dnd` (when supplied) applies the sortable ref/style/attributes/listeners
+ * to the row root exactly as documented on {@link StoryRowDndProps}.
+ *
+ * @param props - See {@link SprintStoryRowProps}.
+ * @returns The story row element, DOM/class-identical to the AngularJS original.
+ */
+export function SprintStoryRow({ us, project, dnd }: SprintStoryRowProps): JSX.Element {
+    // `due_date` is a legacy view field not present on the strict UserStory model;
+    // read it defensively without widening the type.
+    const dueDate = (us as { due_date?: string | null }).due_date;
+    const epics = us.epics ?? [];
+
+    const rowClassName =
+        "row milestone-us-item-row" +
+        (us.is_closed ? " closedRow" : "") +
+        (us.is_blocked ? " blockedRow" : "") +
+        (dnd?.isDragging ? " dragging" : "");
+
+    const usNameClassName =
+        "us-name clickable" +
+        (us.is_closed ? " closed" : "") +
+        (us.is_blocked ? " blocked" : "");
+
+    const usHref = userStoryUrl(
+        project.slug,
+        us.ref ?? "",
+        us.milestone != null ? { milestone: us.milestone } : undefined,
+    );
+
+    return (
+        <div
+            ref={dnd?.setNodeRef}
+            style={dnd?.style}
+            data-id={String(us.id)}
+            className={rowClassName}
+            {...(dnd?.attributes ?? {})}
+            {...(dnd?.listeners ?? {})}
+        >
+            <div className="column-us">
+                <a
+                    className={usNameClassName}
+                    href={usHref}
+                    title={`#${us.ref} ${us.subject ?? ""}`}
+                    // Anchors are natively draggable; letting the browser start
+                    // its own link drag interferes with the @dnd-kit pointer
+                    // drag. Disable it so the whole-row sortable drag is clean.
+                    // (The post-drag phantom-click navigation is suppressed at the
+                    // Backlog `DndContext` level; see `onDragEnd` there.)
+                    draggable={false}
+                    onDragStart={(event) => event.preventDefault()}
+                >
+                    <span className="us-ref-text" tg-bo-ref="us.ref">{`#${us.ref} `}</span>
+                    <span className="us-name-text">{us.subject ?? ""}</span>
+                    {epics.length > 0 ? (
+                        <span className="us-epic-container">
+                            {epics.map((epic) => (
+                                <span
+                                    key={epic.id}
+                                    className="belong-to-epic-pill"
+                                    style={{ background: epic.color ?? undefined }}
+                                    title={`#${epic.ref} ${epic.subject ?? ""}`}
+                                />
+                            ))}
+                        </span>
+                    ) : null}
+                    {dueDate ? (
+                        <div className="due-date">{String(dueDate)}</div>
+                    ) : null}
+                </a>
+            </div>
+            {us.total_points ? (
+                <div
+                    className={
+                        "column-points width-1" +
+                        (us.is_closed ? " closed" : "") +
+                        (us.is_blocked ? " blocked" : "")
+                    }
+                >
+                    <span className="points-container">{us.total_points}</span>
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+/**
  * Props contract for {@link Sprint}. The component is fully controlled apart from
  * the local `expanded` (fold) state; it owns no story/sprint data and mirrors the
  * bindings the legacy `tg-sprint` directive read off its scope.
@@ -129,6 +241,28 @@ export interface SprintProps {
     isOver?: boolean;
     /** Optional per-row sortable wiring (see {@link StoryRowDndProps}). */
     getStoryRowProps?: (us: UserStory) => StoryRowDndProps | undefined;
+    /**
+     * Optional render-prop for a SORTABLE story row. When supplied (by
+     * `./Backlog.tsx` inside its `DndContext`), the story list is wrapped in a
+     * `@dnd-kit` `SortableContext` and each row is rendered via this callback
+     * (which returns a sortable `SprintStoryRow`), enabling within/between-sprint
+     * reorder and sprint->backlog drags (C8). When absent, rows render via the
+     * plain `getStoryRowProps` path, preserving standalone / unit-test use.
+     */
+    renderStoryRow?: (us: UserStory) => ReactNode;
+    /**
+     * Optional CONTROLLED fold state. When supplied (by `./SprintList.tsx`,
+     * which lifts the fold state so the sprint's `useDroppable` can be gated on
+     * it — a sprint accepts drops only while its `.sprint-table` is EXPANDED,
+     * matching the legacy `tgBacklogSprint` directive where the collapsed table
+     * was not a dragula container), the card renders folded/unfolded per this
+     * value and delegates toggling to {@link SprintProps.onToggleExpanded}. When
+     * ABSENT (standalone / unit-test use), the card owns the fold state locally,
+     * defaulting to expanded for OPEN sprints and collapsed for CLOSED ones.
+     */
+    expanded?: boolean;
+    /** Toggle the CONTROLLED fold state (paired with {@link SprintProps.expanded}). */
+    onToggleExpanded?: () => void;
 }
 
 /**
@@ -146,6 +280,8 @@ export function Sprint(props: SprintProps): JSX.Element {
 
     // `sprint.user_stories` is optional on the model; treat a missing list as empty.
     const stories: UserStory[] = sprint.user_stories ?? [];
+    // Stable id list for the sortable context (renderStoryRow path).
+    const storyIds = stories.map((us) => us.id);
 
     // Permission gating (mirrors `tg-class-permission` / `tg-check-permission`).
     // NO parallel authorization: these flags only gate which controls render;
@@ -153,8 +289,8 @@ export function Sprint(props: SprintProps): JSX.Element {
     const modifyUs = project.my_permissions.indexOf("modify_us") !== -1;
     const viewMilestones = project.my_permissions.indexOf("view_milestones") !== -1;
 
-    // resolve("project-taskboard", {project: slug, sprint: sprint.slug}) -> hashbang.
-    const taskboardUrl = `#/project/${project.slug}/taskboard/${sprint.slug ?? ""}`;
+    // resolve("project-taskboard", {project: slug, sprint: sprint.slug}) — HTML5 plain path.
+    const taskboardUrl = buildTaskboardUrl(project.slug, sprint.slug);
 
     // Progress bar: `tg-progress-bar="100 * sprint.closed_points / sprint.total_points"`
     // clamped to [0, 100] by TgProgressBarDirective, with a guard so a zero total
@@ -165,11 +301,17 @@ export function Sprint(props: SprintProps): JSX.Element {
 
     // Fold state: OPEN sprints are expanded by default, CLOSED sprints collapsed
     // (BacklogSprintDirective: open -> `toggleSprint` opens; closed -> stays shut).
-    const [expanded, setExpanded] = useState<boolean>(!sprint.closed);
+    // When the parent supplies a CONTROLLED `expanded` (SprintList lifts it so the
+    // droppable can be gated on the fold state), use it; otherwise own it locally
+    // so standalone / unit-test renders keep working unchanged.
+    const [internalExpanded, setInternalExpanded] = useState<boolean>(!sprint.closed);
+    const expanded = props.expanded ?? internalExpanded;
+    const toggleExpanded =
+        props.onToggleExpanded ?? ((): void => setInternalExpanded((value) => !value));
 
     // `.sprint-table` class list: the `sprint-empty-wrapper` modifier when there
-    // are no stories, the `open` modifier while expanded (kept for DOM parity even
-    // though the fold itself is driven by the inline `display` below, mirroring the
+    // are no stories, the `open` modifier while expanded (kept for DOM parity; the
+    // fold VISIBILITY itself is driven by the inline `display` below, mirroring the
     // legacy jQuery `slideToggle`), and `drag-over` while a draggable hovers.
     const sprintTableClassName =
         "sprint-table" +
@@ -184,7 +326,7 @@ export function Sprint(props: SprintProps): JSX.Element {
                     sprint={sprint}
                     project={project}
                     expanded={expanded}
-                    onToggleCompact={() => setExpanded((value) => !value)}
+                    onToggleCompact={toggleExpanded}
                     onEdit={() => props.onEditSprint(sprint)}
                 />
             </header>
@@ -198,7 +340,13 @@ export function Sprint(props: SprintProps): JSX.Element {
             <div
                 ref={props.dropRef}
                 className={sprintTableClassName}
-                style={expanded ? undefined : { display: "none" }}
+                // Inline `display` is set for BOTH fold states (mirroring the legacy
+                // jQuery `slideToggle`): an inline style beats the class-level CSS,
+                // so an UNFOLDED CLOSED sprint reveals its table even though
+                // `.sprint-closed .sprint-table{display:none}` (specificity 0,2,0)
+                // would otherwise keep it hidden. `block` matches the effective
+                // display of an expanded OPEN sprint's table.
+                style={{ display: expanded ? "block" : "none" }}
             >
                 {stories.length === 0 ? (
                     <div className="sprint-empty">
@@ -206,96 +354,38 @@ export function Sprint(props: SprintProps): JSX.Element {
                             modify_us (the legacy `tg-class-permission` added `hidden`
                             when the user HAD modify_us). */}
                         <span className={modifyUs ? "hidden" : ""}>
-                            This sprint has no user stories
+                            {t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS")}
                         </span>
                         {/* WARNING_EMPTY_SPRINT — shown to users WITH modify_us. */}
                         <span className={!modifyUs ? "hidden" : ""}>
-                            Drop here Stories from your backlog to start a new sprint
+                            {t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT")}
                         </span>
                     </div>
                 ) : null}
 
-                {stories.map((us) => {
-                    // Optional per-row sortable wiring (undefined outside a DndContext).
-                    const dnd = props.getStoryRowProps ? props.getStoryRowProps(us) : undefined;
-                    // `due_date` is a legacy view field not present on the strict
-                    // UserStory model; read it defensively without widening the type.
-                    const dueDate = (us as { due_date?: string | null }).due_date;
-                    const epics = us.epics ?? [];
-
-                    const rowClassName =
-                        "row milestone-us-item-row" +
-                        (us.is_closed ? " closedRow" : "") +
-                        (us.is_blocked ? " blockedRow" : "") +
-                        (dnd?.isDragging ? " dragging" : "");
-
-                    const usNameClassName =
-                        "us-name clickable" +
-                        (us.is_closed ? " closed" : "") +
-                        (us.is_blocked ? " blocked" : "");
-
-                    const usHref =
-                        `#/project/${project.slug}/us/${us.ref}` +
-                        (us.milestone != null ? `?milestone=${us.milestone}` : "");
-
-                    return (
-                        <div
+                {props.renderStoryRow
+                    ? (
+                        <SortableContext items={storyIds} strategy={verticalListSortingStrategy}>
+                            {stories.map((us) => props.renderStoryRow!(us))}
+                        </SortableContext>
+                    )
+                    : stories.map((us) => (
+                        <SprintStoryRow
                             key={us.id}
-                            ref={dnd?.setNodeRef}
-                            style={dnd?.style}
-                            data-id={String(us.id)}
-                            className={rowClassName}
-                            {...(dnd?.attributes ?? {})}
-                            {...(dnd?.listeners ?? {})}
-                        >
-                            <div className="column-us">
-                                <a
-                                    className={usNameClassName}
-                                    href={usHref}
-                                    title={`#${us.ref} ${us.subject ?? ""}`}
-                                >
-                                    <span className="us-ref-text">{`#${us.ref} `}</span>
-                                    <span className="us-name-text">{us.subject ?? ""}</span>
-                                    {epics.length > 0 ? (
-                                        <span className="us-epic-container">
-                                            {epics.map((epic) => (
-                                                <span
-                                                    key={epic.id}
-                                                    className="belong-to-epic-pill"
-                                                    style={{ background: epic.color ?? undefined }}
-                                                    title={`#${epic.ref} ${epic.subject ?? ""}`}
-                                                />
-                                            ))}
-                                        </span>
-                                    ) : null}
-                                    {dueDate ? (
-                                        <div className="due-date">{String(dueDate)}</div>
-                                    ) : null}
-                                </a>
-                            </div>
-                            {us.total_points ? (
-                                <div
-                                    className={
-                                        "column-points width-1" +
-                                        (us.is_closed ? " closed" : "") +
-                                        (us.is_blocked ? " blocked" : "")
-                                    }
-                                >
-                                    <span className="points-container">{us.total_points}</span>
-                                </div>
-                            ) : null}
-                        </div>
-                    );
-                })}
+                            us={us}
+                            project={project}
+                            dnd={props.getStoryRowProps ? props.getStoryRowProps(us) : undefined}
+                        />
+                    ))}
             </div>
 
             {viewMilestones ? (
                 <a
                     className="btn-small"
                     href={taskboardUrl}
-                    title={`Go to Taskboard of "${sprint.name}"`}
+                    title={t("BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD", { name: sprint.name ?? "" })}
                 >
-                    <span>Sprint Taskboard</span>
+                    <span>{t("BACKLOG.SPRINTS.LINK_TASKBOARD")}</span>
                 </a>
             ) : null}
         </>

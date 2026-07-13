@@ -17,9 +17,9 @@
  * exact class names and element hierarchy), these tests assert on the emitted
  * DOM structure (class names, `title` attributes, the taskboard `href`, the
  * inline `svg.icon-*` sprite markup, the `DD MMM YYYY` date range, and the
- * closed/total points projection) rather than on translated copy — the i18n
- * KEYS are rendered as their resolved English copy by the component for this
- * POC.
+ * closed/total points projection). Visible copy is asserted through the shared
+ * `t(...)` helper so the expectations track the locale bundle (the source of
+ * truth) rather than hard-coded English, proving the i18n keys resolve.
  *
  * These tests exercise every branch of the component (the `isVisible` /
  * `isEditable` permission gates, the archived-project guard, the `expanded`
@@ -40,14 +40,15 @@
  *     matcher extension).
  *
  * jsdom note: the taskboard `href` is asserted via `getAttribute("href")` (the
- * literal `#/...` attribute value) rather than the `.href` IDL property, which
- * jsdom would resolve to an absolute `http://localhost/#/...` URL and cause a
- * false negative. The same applies to the `title` attributes.
+ * literal plain `/project/...` attribute value) rather than the `.href` IDL
+ * property, which jsdom would resolve to an absolute `http://localhost/...` URL
+ * and cause a false negative. The same applies to the `title` attributes.
  */
 
 import { render, fireEvent } from "@testing-library/react";
 import { SprintHeader } from "./SprintHeader";
 import type { Milestone, Project } from "../shared/types";
+import { t } from "../shared/i18n/translate";
 
 // --- Fixtures -------------------------------------------------------------
 
@@ -151,10 +152,10 @@ describe("SprintHeader — DOM contract", () => {
     expect(items).toHaveLength(2);
 
     expect(items[0].querySelector(".number")!.textContent).toBe("5");
-    expect(items[0].querySelector(".description")!.textContent).toBe("closed");
+    expect(items[0].querySelector(".description")!.textContent).toBe(t("BACKLOG.CLOSED_POINTS"));
 
     expect(items[1].querySelector(".number")!.textContent).toBe("20");
-    expect(items[1].querySelector(".description")!.textContent).toBe("total");
+    expect(items[1].querySelector(".description")!.textContent).toBe(t("BACKLOG.TOTAL_POINTS"));
   });
 
   it("marks the compact toggle active only when expanded, with icon + title", () => {
@@ -173,7 +174,7 @@ describe("SprintHeader — DOM contract", () => {
     const toggle = container.querySelector(".compact-sprint");
     expect(toggle).not.toBeNull();
     expect(toggle!.classList.contains("active")).toBe(true);
-    expect(toggle!.getAttribute("title")).toBe("Compact Sprint");
+    expect(toggle!.getAttribute("title")).toBe(t("BACKLOG.COMPACT_SPRINT"));
     expect(toggle!.querySelector("svg.icon-arrow-right")).not.toBeNull();
 
     // With `expanded={false}` the `active` class must be absent (SCSS uses it to
@@ -210,9 +211,11 @@ describe("SprintHeader — DOM contract", () => {
     const link = container.querySelector(".sprint-name a");
     expect(link).not.toBeNull();
     expect(link!.getAttribute("href")).toBe(
-      "#/project/proj/taskboard/sprint-1",
+      "/project/proj/taskboard/sprint-1",
     );
-    expect(link!.getAttribute("title")).toBe("Go to the taskboard of Sprint 1");
+    expect(link!.getAttribute("title")).toBe(
+      t("BACKLOG.GO_TO_TASKBOARD").replace("{{::name}}", "Sprint 1"),
+    );
   });
 });
 
@@ -235,6 +238,7 @@ describe("SprintHeader — permission gating", () => {
     const editControl = editable.querySelector(".edit-sprint");
     expect(editControl).not.toBeNull();
     expect(editControl!.querySelector("svg.icon-edit")).not.toBeNull();
+    expect(editControl!.getAttribute("title")).toBe(t("BACKLOG.EDIT_SPRINT"));
 
     // Without `modify_milestone`, the control must not be rendered.
     const { container: notEditable } = render(

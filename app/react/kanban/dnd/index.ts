@@ -14,11 +14,8 @@ export type { CardDraggableResult, UseCardDraggableOptions } from "./useCardDrag
 export { useColumnDroppable } from "./useColumnDroppable";
 export type { ColumnDroppableResult, UseColumnDroppableArgs } from "./useColumnDroppable";
 
-// Multi-select state hook (replaces window.dragMultiple)
-export { useKanbanSelection } from "./useKanbanSelection";
-
-// Drag-end orchestration (the glue)
-export { createKanbanDragEndHandler, useKanbanDragEnd } from "./useKanbanDragEnd";
+// Drag-end orchestration (the pure glue used by KanbanDndProvider)
+export { createKanbanDragEndHandler } from "./useKanbanDragEnd";
 
 // Encapsulated DndContext provider (AAP-mandated)
 export { KanbanDndProvider } from "./KanbanDndProvider";
@@ -44,5 +41,4 @@ export type {
     ColumnDroppableData,
     KanbanDragEndContext,
     KanbanDropArgs,
-    KanbanSelectionApi,
 } from "./types";

@@ -6,8 +6,6 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { useMemo } from "react";
-
 import type { DragEndEvent } from "@dnd-kit/core";
 
 import {
@@ -126,15 +124,4 @@ export function createKanbanDragEndHandler(
             onDrop(result);
         }
     };
-}
-
-/**
- * React hook wrapping `createKanbanDragEndHandler`, bound to the board context's
- * `handleDragEnd`. KanbanBoard passes the result straight to
- * `<DndContext onDragEnd={...}>`.
- */
-export function useKanbanDragEnd(
-    kb: KanbanDragEndContext,
-): (event: DragEndEvent) => void {
-    return useMemo(() => createKanbanDragEndHandler(kb, kb.handleDragEnd), [kb]);
 }

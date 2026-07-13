@@ -17,8 +17,9 @@
  * SCSS (`app/styles/modules/backlog/sprints.scss`) targets specific class names
  * and element hierarchy, these tests assert on the emitted DOM structure (via
  * `container.querySelector` / `querySelectorAll`), on the permission gating, on
- * the fold behavior, and on the progress-bar width math — NOT on translated copy
- * (the i18n keys are rendered as their resolved English copy by the component).
+ * the fold behavior, and on the progress-bar width math. Visible copy is
+ * asserted through the shared `t(...)` helper so the expectations track the
+ * locale bundle (the source of truth), proving the i18n keys resolve.
  *
  * Test harness conventions (see `jest.config.js` / `tsconfig.json`):
  *   - AMBIENT Jest globals — `describe` / `it` / `expect` / `jest` are provided
@@ -37,8 +38,9 @@
  */
 
 import { render, fireEvent } from "@testing-library/react";
-import { Sprint } from "./Sprint";
+import { Sprint, SprintStoryRow } from "./Sprint";
 import type { Milestone, Project, UserStory } from "../shared/types";
+import { t } from "../shared/i18n/translate";
 
 // --- Fixtures (partial objects cast with `as`, per the model contracts). ------
 
@@ -174,7 +176,7 @@ describe("Sprint", () => {
         );
 
         const link = container.querySelector(".us-name") as HTMLAnchorElement;
-        expect(link.getAttribute("href")).toBe("#/project/proj/us/101?milestone=3");
+        expect(link.getAttribute("href")).toBe("/project/proj/us/101?milestone=3");
         expect(link.getAttribute("title")).toBe("#101 Story A");
     });
 
@@ -195,6 +197,11 @@ describe("Sprint", () => {
         // warning is shown.
         expect((spans[0] as HTMLElement).classList.contains("hidden")).toBe(true);
         expect((spans[1] as HTMLElement).classList.contains("hidden")).toBe(false);
+        // Both warnings render their resolved translations (M7).
+        expect(spans[0].textContent).toBe(
+            t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS"),
+        );
+        expect(spans[1].textContent).toBe(t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT"));
     });
 
     // 5 -----------------------------------------------------------------------
@@ -205,8 +212,13 @@ describe("Sprint", () => {
 
         const taskboard = container.querySelector(".btn-small") as HTMLAnchorElement;
         expect(taskboard).not.toBeNull();
-        expect(taskboard.getAttribute("href")).toBe("#/project/proj/taskboard/sprint-1");
-        expect(taskboard.querySelector("span")!.textContent).toBe("Sprint Taskboard");
+        expect(taskboard.getAttribute("href")).toBe("/project/proj/taskboard/sprint-1");
+        expect(taskboard.querySelector("span")!.textContent).toBe(
+            t("BACKLOG.SPRINTS.LINK_TASKBOARD"),
+        );
+        expect(taskboard.getAttribute("title")).toBe(
+            t("BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD", { name: "Sprint 1" }),
+        );
 
         // A project without view_milestones hides the taskboard link entirely.
         const noViewProject = {
@@ -384,7 +396,7 @@ describe("Sprint — additional branch coverage", () => {
         // No milestone -> href without the `?milestone=` query.
         const noMilestoneRow = container.querySelector('[data-id="16"]') as HTMLElement;
         expect((noMilestoneRow.querySelector(".us-name") as HTMLElement).getAttribute("href")).toBe(
-            "#/project/proj/us/107",
+            "/project/proj/us/107",
         );
     });
 
@@ -398,6 +410,10 @@ describe("Sprint — additional branch coverage", () => {
         // Without modify_us: the anonymous warning is shown, the drop warning hidden.
         expect((spans[0] as HTMLElement).classList.contains("hidden")).toBe(false);
         expect((spans[1] as HTMLElement).classList.contains("hidden")).toBe(true);
+        expect(spans[0].textContent).toBe(
+            t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS"),
+        );
+        expect(spans[1].textContent).toBe(t("BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT"));
     });
 });
 
@@ -464,5 +480,117 @@ describe("Sprint — @dnd-kit wiring", () => {
         expect(table.classList.contains("drag-over")).toBe(false);
         const row = container.querySelector(".milestone-us-item-row") as HTMLElement;
         expect(row.classList.contains("dragging")).toBe(false);
+    });
+});
+
+// =============================================================================
+// renderStoryRow path + exported SprintStoryRow (finding C8)
+//
+// When `./Backlog.tsx` owns the DndContext it threads a `renderStoryRow` render-
+// prop through `SprintList -> Sprint`, so each sprint story becomes a SORTABLE
+// row (enabling within/between-sprint reorder and sprint->backlog drags). When
+// `renderStoryRow` is present the default rows are replaced by its output inside
+// a `SortableContext`; when absent, the plain `getStoryRowProps` path is used.
+// =============================================================================
+
+describe("Sprint — renderStoryRow (sortable) path", () => {
+    it("delegates every story to renderStoryRow and renders its output", () => {
+        const seen: number[] = [];
+        const { container } = render(
+            <Sprint
+                sprint={openSprint}
+                project={project}
+                onEditSprint={noop}
+                renderStoryRow={(us) => {
+                    seen.push(us.id);
+                    return <div key={us.id} data-testid="custom-row" data-id={String(us.id)} />;
+                }}
+            />,
+        );
+
+        // Called once per story, and its custom output is what renders.
+        expect(seen).toEqual([story.id]);
+        const custom = container.querySelectorAll('[data-testid="custom-row"]');
+        expect(custom.length).toBe(1);
+        expect(custom[0].getAttribute("data-id")).toBe(String(story.id));
+        // The default (getStoryRowProps) row is NOT auto-rendered on this path.
+        expect(container.querySelector(".milestone-us-item-row")).toBeNull();
+    });
+
+    it("still renders the empty-drop placeholder (renderStoryRow only affects rows)", () => {
+        const { container } = render(
+            <Sprint
+                sprint={emptySprint}
+                project={project}
+                onEditSprint={noop}
+                renderStoryRow={() => <div />}
+            />,
+        );
+        expect(container.querySelector(".sprint-empty")).not.toBeNull();
+    });
+});
+
+describe("SprintStoryRow (exported leaf)", () => {
+    it("renders the milestone row DOM with ref, subject and points", () => {
+        const { container } = render(<SprintStoryRow us={story} project={project} />);
+        const row = container.querySelector(".milestone-us-item-row") as HTMLElement;
+        expect(row).not.toBeNull();
+        expect(row.getAttribute("data-id")).toBe(String(story.id));
+        expect(container.querySelector(".us-ref-text")!.textContent).toBe(`#${story.ref} `);
+        expect(container.querySelector(".us-name-text")!.textContent).toBe(story.subject);
+        expect(container.querySelector(".points-container")!.textContent).toBe(
+            String(story.total_points),
+        );
+    });
+
+    it("applies the @dnd-kit sortable wiring to the row root", () => {
+        let rowEl: HTMLElement | null = null;
+        const { container } = render(
+            <SprintStoryRow
+                us={story}
+                project={project}
+                dnd={{
+                    setNodeRef: (el) => {
+                        rowEl = el;
+                    },
+                    style: { transform: "translateY(6px)" },
+                    isDragging: true,
+                    attributes: { "data-dnd-attr": "yes" },
+                    listeners: { "data-dnd-listener": "yes" },
+                }}
+            />,
+        );
+        const row = container.querySelector(".milestone-us-item-row") as HTMLElement;
+        expect(rowEl).toBe(row);
+        expect(row.classList.contains("dragging")).toBe(true);
+        expect(row.getAttribute("data-dnd-attr")).toBe("yes");
+        expect(row.getAttribute("data-dnd-listener")).toBe("yes");
+        expect(row.style.transform).toBe("translateY(6px)");
+    });
+
+    it("disables native drag on the story link so the whole-row sortable drag stays clean", () => {
+        const { container } = render(<SprintStoryRow us={story} project={project} />);
+        const link = container.querySelector(".us-name") as HTMLAnchorElement;
+        // `draggable={false}` renders the attribute as the string "false".
+        expect(link.getAttribute("draggable")).toBe("false");
+        // A native dragstart on the link is prevented (would otherwise hijack the
+        // @dnd-kit pointer drag).
+        const dragStarted = fireEvent.dragStart(link);
+        expect(dragStarted).toBe(false);
+    });
+
+
+    it("marks closed/blocked stories with the row + link + points modifiers", () => {
+        const { container: closed } = render(
+            <SprintStoryRow us={closedStory} project={project} />,
+        );
+        expect(closed.querySelector(".milestone-us-item-row")!.classList.contains("closedRow")).toBe(true);
+        expect(closed.querySelector(".us-name")!.classList.contains("closed")).toBe(true);
+
+        const { container: blocked } = render(
+            <SprintStoryRow us={blockedStory} project={project} />,
+        );
+        expect(blocked.querySelector(".milestone-us-item-row")!.classList.contains("blockedRow")).toBe(true);
+        expect(blocked.querySelector(".us-name")!.classList.contains("blocked")).toBe(true);
     });
 });

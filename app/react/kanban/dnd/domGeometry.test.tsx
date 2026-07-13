@@ -270,4 +270,51 @@ describe("domGeometry", () => {
             expect(computeInsertionIndex(flatColumn(), Number.POSITIVE_INFINITY, [])).toBe(3);
         });
     });
+
+    describe("folded-column visibility (M6)", () => {
+        /**
+         * Rebuild the fixture with the flat status-10 column marked `.vfold`
+         * (folded). StatusColumn keeps rendering the collapsed cards, so they
+         * remain in the DOM but must be excluded from every geometry scan.
+         */
+        const buildFoldedBoard = (): void => {
+            document.body.innerHTML = `
+                <section class="kanban">
+                    <div class="kanban-uses-box taskboard-column vfold" data-status="10">
+                        <tg-card data-id="1"></tg-card>
+                        <tg-card data-id="2"></tg-card>
+                        <tg-card data-id="3"></tg-card>
+                    </div>
+                    <div class="kanban-uses-box taskboard-column" data-status="20">
+                        <tg-card data-id="4"></tg-card>
+                        <tg-card data-id="5"></tg-card>
+                    </div>
+                </section>
+            `;
+        };
+
+        it("readCardIdsInDomOrder excludes cards inside a folded (.vfold) column", () => {
+            buildFoldedBoard();
+
+            // Cards 1/2/3 are collapsed under `.vfold`; only the visible 4/5 remain.
+            expect(readCardIdsInDomOrder()).toEqual([4, 5]);
+        });
+
+        it("computeInsertionIndex ignores collapsed cards in a folded column", () => {
+            buildFoldedBoard();
+
+            // Stub rects for the folded column's cards well ABOVE the pointer. If
+            // the fold filter were absent they would each add to the index; with
+            // it they are skipped entirely, so the index stays 0.
+            const foldedColumn = findColumnElement(10, null);
+            if (foldedColumn === null) {
+                throw new Error("folded flat column not found");
+            }
+            stubRect(cardEl(1), { top: 0, height: 10 });
+            stubRect(cardEl(2), { top: 20, height: 10 });
+            stubRect(cardEl(3), { top: 40, height: 10 });
+
+            expect(computeInsertionIndex(foldedColumn, 1000, [])).toBe(0);
+        });
+    });
 });

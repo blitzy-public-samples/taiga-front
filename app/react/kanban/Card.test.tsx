@@ -367,7 +367,13 @@ describe("Card — card-data statistics (zoom 2 => extra_info)", () => {
 
   it("shows the no-points placeholder when total_points is null", () => {
     const { container } = renderCard({ zoomLevel: 2, zoom: ZOOM2 });
-    expect(container.querySelector(".card-estimation")).toHaveTextContent("--");
+    // COMMON.CARD.NO_PTS resolves to "N/E" in the bundled catalogue (the legacy
+    // `card-data.jade` no-points branch), NOT an ad-hoc "--" literal (M7).
+    const est = container.querySelector(".card-estimation") as HTMLElement;
+    expect(est).toHaveTextContent("N/E");
+    // The no-points branch is a bare span (no title / data-id), per the legacy DOM.
+    expect(est).not.toHaveAttribute("title");
+    expect(est).not.toHaveAttribute("data-id");
   });
 
   it("renders due-date, iocaine and lock indicators when present", () => {
@@ -567,9 +573,19 @@ describe("Card — behaviour", () => {
     expect(container.querySelector(".card-owner-name")).toHaveTextContent("Ada Lovelace");
   });
 
-  it("renders an empty .card-owner-name when unassigned", () => {
+  it("falls back to the 'Not assigned' label in .card-owner-name when unassigned, keeping the .e2e-assign affordance clickable", () => {
+    // An unassigned story used to leave `.card-owner-name` empty, which
+    // collapsed the wrapping `.e2e-assign` anchor to a zero-size (unclickable)
+    // box — leaving no way to assign an unassigned card. The label now falls
+    // back to the localized "Not assigned" string so the assign affordance
+    // always has a clickable area.
     const { container } = renderCard();
-    expect(container.querySelector(".card-owner-name")).toHaveTextContent("");
+    const ownerName = container.querySelector(".card-owner-name");
+    expect(ownerName).toHaveTextContent("Not assigned");
+    // The assign anchor wraps the (now non-empty) label, so it is present and sized.
+    const assign = container.querySelector(".e2e-assign");
+    expect(assign).toBeInTheDocument();
+    expect(assign).toContainElement(ownerName as HTMLElement);
   });
 
   it("opens the actions menu and wires edit / delete / move-to-top", () => {
@@ -672,7 +688,7 @@ describe("Card — defensive value states and partial-permission menu", () => {
 
     // The nav href tolerates the missing ref (…/us/ with the empty fallback).
     const link = container.querySelector(".card-title a") as HTMLAnchorElement;
-    expect(link.getAttribute("href")).toBe("#/project/proj/us/");
+    expect(link.getAttribute("href")).toBe("/project/proj/us/");
   });
 
   it("renders an epic with a null color and missing ref without breaking the DOM", () => {
@@ -687,7 +703,7 @@ describe("Card — defensive value states and partial-permission menu", () => {
     const epic = container.querySelector(".card-epics .card-epic") as HTMLAnchorElement;
     expect(epic).toBeInTheDocument();
     // ref fallback -> …/epic/ ; a null color yields no inline background-color.
-    expect(epic.getAttribute("href")).toBe("#/project/proj/epic/");
+    expect(epic.getAttribute("href")).toBe("/project/proj/epic/");
     const color = epic.querySelector(".epic-color") as HTMLElement;
     expect(color.style.backgroundColor).toBe("");
     // At zoom > 0 the first epic also shows its name.
@@ -769,7 +785,9 @@ describe("Card — assigned-to preview counter (size-2 rule)", () => {
     const extra = container.querySelector(".extra-assigned");
     expect(extra).toBeInTheDocument();
     expect(extra).toHaveTextContent("2+");
-    expect(extra).toHaveAttribute("title", "More assigned users");
+    // COMMON.CARD.EXTRA_ASSIGNED_USERS = "{{total}} more assigned users"; for four
+    // assignees the overflow total is 4 - 2 = 2 => "2 more assigned users" (M7).
+    expect(extra).toHaveAttribute("title", "2 more assigned users");
   });
 });
 
@@ -895,8 +913,130 @@ describe("Card — defensive nullish guards for missing optional collections", (
     // The .card-inner must NOT gain the assigned-user modifier for an empty set.
     expect(container.querySelector(".card-inner")).not.toHaveClass("with-assigned-user");
 
-    // Estimation falls back to the no-points placeholder.
-    expect(container.querySelector(".card-estimation")).toHaveTextContent("--");
+    // Estimation falls back to the no-points placeholder (COMMON.CARD.NO_PTS = "N/E").
+    expect(container.querySelector(".card-estimation")).toHaveTextContent("N/E");
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// M4 — shared-popover LIFECYCLE for the `.card-actions` menu. The legacy
+// `js-popup-button` opened a SHARED popover that dismissed on an outside click
+// and on Escape and managed focus; the React reproduction must do the same
+// (not merely toggle markup). These assert that behaviour explicitly.
+// ---------------------------------------------------------------------------
+describe("Card — actions popover lifecycle (M4)", () => {
+  function openMenu() {
+    const utils = renderCard({ zoomLevel: 1, zoom: ZOOM1 });
+    fireEvent.click(utils.container.querySelector(".js-popup-button") as HTMLElement);
+    expect(utils.container.querySelector(".card-actions-menu")).toBeInTheDocument();
+    return utils;
+  }
+
+  it("focuses the first menu item when the popover opens", () => {
+    const { container } = openMenu();
+    const firstItem = container.querySelector('[role="menuitem"]') as HTMLElement;
+    expect(document.activeElement).toBe(firstItem);
+  });
+
+  it("closes the popover on an outside pointer-down", () => {
+    const { container } = openMenu();
+    fireEvent.mouseDown(document.body);
+    expect(container.querySelector(".card-actions-menu")).toBeNull();
+  });
+
+  it("keeps the popover open on a pointer-down inside the menu", () => {
+    const { container } = openMenu();
+    fireEvent.mouseDown(container.querySelector(".card-actions-menu") as HTMLElement);
+    expect(container.querySelector(".card-actions-menu")).toBeInTheDocument();
+  });
+
+  it("closes the popover on Escape and returns focus to the trigger", () => {
+    const { container } = openMenu();
+    const trigger = container.querySelector(".js-popup-button") as HTMLElement;
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(container.querySelector(".card-actions-menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("removes its document listeners when the menu closes (no residual outside-click handler)", () => {
+    const { container } = openMenu();
+    // Close via the edit item; the document-level listeners must be torn down so
+    // a later outside pointer-down does not throw / re-close a non-existent menu.
+    fireEvent.click(container.querySelector(".card-action-edit") as HTMLElement);
+    expect(container.querySelector(".card-actions-menu")).toBeNull();
+    // A subsequent outside click is a no-op (listeners removed on close).
+    fireEvent.mouseDown(document.body);
+    expect(container.querySelector(".card-actions-menu")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M7 — visible/`title` text resolved through the legacy i18n catalogue (not
+// ad-hoc literals). These assert the INTERPOLATED `title` strings the legacy
+// `card-data.jade` produced via `translate(key, params)`.
+// ---------------------------------------------------------------------------
+describe("Card — legacy i18n titles (M7)", () => {
+  it("resolves the iocaine indicator title to TASK.FIELDS.IS_IOCAINE ('Is iocaine')", () => {
+    const { container } = renderCard({
+      zoomLevel: 2,
+      zoom: ZOOM2,
+      story: makeStory({ is_iocaine: true }),
+    });
+    expect(container.querySelector(".card-iocaine")).toHaveAttribute("title", "Is iocaine");
+  });
+
+  it("resolves the completed-tasks title to the interpolated COMMON.CARD.TASKS", () => {
+    const { container } = renderCard({
+      zoomLevel: 2,
+      zoom: ZOOM2,
+      story: makeStory({ tasks: [{ id: 1, is_closed: true }, { id: 2, is_closed: false }] }),
+    });
+    const stat = container.querySelector(".card-completed-tasks") as HTMLElement;
+    // COMMON.CARD.TASKS = "{{completed}} tasks of {{total}} completed".
+    expect(stat).toHaveAttribute("title", "1 tasks of 2 completed");
+    // The visible text remains the compact "closed / total" count.
+    expect(stat).toHaveTextContent("1 / 2");
+  });
+
+  it("resolves the estimation-with-points text to the interpolated COMMON.CARD.PTS", () => {
+    const { container } = renderCard({
+      zoomLevel: 2,
+      zoom: ZOOM2,
+      story: makeStory({ total_points: 8 }),
+    });
+    const est = container.querySelector(".card-estimation") as HTMLElement;
+    // COMMON.CARD.PTS = "{{pts}} pts" => "8 pts"; the has-points branch keeps
+    // the title (COMMON.CARD.ESTIMATION = "Estimation") and the data-id.
+    expect(est).toHaveTextContent("8 pts");
+    expect(est).toHaveAttribute("title", "Estimation");
+    expect(est).toHaveAttribute("data-id", "42");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4 — the two inline colour literals are sourced from the documented theme
+// tokens (shared/theme/colors). The rendered values are byte-identical to the
+// legacy `$default-tags` / `$iocaine` variables (jsdom normalises hex -> rgb).
+// ---------------------------------------------------------------------------
+describe("Card — theme-token colours (M4)", () => {
+  it("applies the DEFAULT_TAG_COLOR (#A9AABC == rgb(169,170,188)) fallback for a colourless tag", () => {
+    const { container } = renderCard({
+      zoomLevel: 3,
+      zoom: ZOOM3,
+      story: makeStory({ tags: [["needs-review", null]] }),
+    });
+    const tag = container.querySelector(".card-tag") as HTMLElement;
+    expect(tag).toHaveStyle({ backgroundColor: "#A9AABC" });
+  });
+
+  it("uses the IOCAINE_COLOR (#B400D1) fill for the decorative iocaine avatar backdrop", () => {
+    const { container } = renderCard({
+      story: makeStory({ assigned_to: 1, is_iocaine: true }),
+      usersById: { 1: makeMember({ id: 1 }) },
+    });
+    const path = container.querySelector(".card-iocaine-user-bg svg path") as SVGPathElement;
+    expect(path).toHaveAttribute("fill", "#B400D1");
+    expect(path).toHaveAttribute("fill-opacity", ".5");
+  });
+});

@@ -32,7 +32,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { produce } from "immer";
-import { createApiClient } from "../../shared/api";
+import { createApiClient, sanitizeErrorMessage } from "../../shared/api";
 import type { QueryParams } from "../../shared/api";
 import { createEventsClient, subscribeToProject } from "../../shared/ws/events";
 import {
@@ -43,6 +43,7 @@ import {
     remove,
     replaceModel,
     move,
+    restoreStories,
     toggleFold as toggleCardFold, // shared/state CARD-fold producer (renamed to avoid clashing with this hook's COLUMN foldStatus).
     resetFolds,
     addArchivedStatus,
@@ -51,13 +52,36 @@ import {
     isUsInArchivedHiddenStatus as isUsInArchivedHiddenStatusShared,
     UNCLASSIFIED_SWIMLANE_ID,
 } from "../../shared/state";
-import type { KanbanState } from "../../shared/state";
+import type { KanbanState, StoryPositionDelta } from "../../shared/state";
+import { generateHash } from "../../shared/storage/legacyStorage";
+import {
+    buildDataCollection,
+    buildFilterPanels,
+    computeSelectedFilters,
+    collectCustomFilterParams,
+    addParamValue,
+    removeParamValue,
+    paramNameFor,
+} from "../../shared/filters/panels";
+import type {
+    FilterPanel,
+    FilterChip,
+    CustomFilter,
+    DataCollection,
+} from "../../shared/filters/panels";
+import type { StoryFormValues, BulkStoryValues } from "../../shared/lightboxes/storyForm";
+import {
+    Savable,
+    buildCreateStoryPayload as buildCreatePayload,
+    diffStoryValues,
+} from "../../shared/lightboxes/storyPayload";
 import type {
     MountContext,
     Project,
     Status,
     Swimlane,
     UserStory,
+    Tag,
     Point,
     Role,
 } from "../../shared/types";
@@ -138,6 +162,10 @@ export interface UseKanbanStoriesResult {
     renderInProgress: boolean;
     notFoundUserstories: boolean;
     error: unknown;
+    /** Sanitized, user-facing error text (finding M2); null when no error. */
+    errorMessage: string | null;
+    /** True while a create/bulk-create save is in flight (finding M2). */
+    savingUs: boolean;
 
     /* Board data */
     usStatusList: Status[];
@@ -164,9 +192,9 @@ export interface UseKanbanStoriesResult {
     setZoom: (index: number) => void;
 
     /* Filters */
-    filters: unknown;
-    customFilters: unknown[];
-    selectedFilters: unknown[];
+    filters: FilterPanel[];
+    customFilters: CustomFilter[];
+    selectedFilters: FilterChip[];
     filterQ: string;
     changeQ: (q: string) => void;
     addFilter: (f: unknown) => void;
@@ -199,8 +227,14 @@ export interface UseKanbanStoriesResult {
     /* Lightbox wiring */
     activeLightbox: KanbanLightboxState | null;
     closeLightbox: () => void;
-    submitNewUs: (subject: string) => void;
-    submitBulkUs: (bulkText: string) => void;
+    /** Persist a new story from the create lightbox (finding C2 rich form). */
+    submitNewUs: (values: StoryFormValues) => void;
+    /** Persist edits from the edit lightbox (dirty-PATCH; finding C2). */
+    submitEditUs: (values: StoryFormValues) => void;
+    /** Bulk-create stories from the bulk lightbox (finding C2). */
+    submitBulkUs: (values: BulkStoryValues) => void;
+    /** Commit an assignment change from the assign lightbox (finding C2). */
+    submitAssignedUsers: (assignedUsers: number[], assignedTo: number | null) => void;
 }
 
 /**
@@ -256,10 +290,39 @@ const VALID_QUERY_PARAMS: string[] = [
     "owner",
 ];
 
-/** React-namespaced localStorage keys — the AngularJS kanban is removed and React owns persistence. */
-const foldsKey = (projectId: number): string => `taiga.react.kanban.folds.${projectId}`;
-const swimlaneFoldsKey = (projectId: number): string => `taiga.react.kanban.swimlanes.${projectId}`;
-const columnModesKey = (projectId: number): string => `taiga.react.kanban.columnModes.${projectId}`;
+/**
+ * Categories the Kanban filter panel omits (legacy `KanbanController.excludeFilters`).
+ * A status-column board is already grouped by status, so the `status` category is
+ * not offered as a filter (matches `validQueryParams`, which likewise omits it).
+ */
+const KANBAN_EXCLUDE_FILTERS: readonly string[] = ["status"];
+
+/**
+ * Legacy-compatible localStorage keys (finding M5). The AngularJS kanban stored
+ * these three per-project preferences through `$tgKanbanResourcesProvider`,
+ * keying each with `taiga.generateHash([projectId, "<projectId>:<suffix>"])`.
+ * Reproducing the exact hash (see `shared/storage/legacyStorage.ts`) makes React
+ * read/write the SAME entries a user already saved from the stock screen, rather
+ * than stranding them behind fresh `taiga.react.*` keys.
+ *   - column folds  -> `kanban-statuscolumnmodels` (legacy `getStatusColumnModes`)
+ *   - swimlane folds -> `kanban-swimlanesmodels`    (legacy `getSwimlanesModes`)
+ *   - column view    -> `kanban-statusviewmodels`   (legacy reserved suffix)
+ */
+const foldsKey = (projectId: number): string =>
+    generateHash([projectId, `${projectId}:kanban-statuscolumnmodels`]);
+const swimlaneFoldsKey = (projectId: number): string =>
+    generateHash([projectId, `${projectId}:kanban-swimlanesmodels`]);
+const columnModesKey = (projectId: number): string =>
+    generateHash([projectId, `${projectId}:kanban-statusviewmodels`]);
+
+/**
+ * The suffix for the persisted named custom filters (finding M5, part 2). Like
+ * the backlog screen, kanban custom filters are stored through the frozen
+ * `user-storage` endpoint (the AngularJS `FilterRemoteStorageService` store),
+ * keyed by `taiga.generateHash([projectId, "<projectId>:kanban-custom-filters"])`,
+ * so a saved filter survives a full page reload instead of living only in memory.
+ */
+const KANBAN_CUSTOM_FILTERS_SUFFIX = "kanban-custom-filters";
 
 /* -------------------------------------------------------------------------- */
 /* Module-scope helpers                                                        */
@@ -383,50 +446,6 @@ function debounceLeading<A extends unknown[]>(wait: number, fn: (...args: A) => 
     return debounced;
 }
 
-/**
- * THE single intentional cross-framework bridge in the migration: read the
- * runtime project metadata the surviving AngularJS shell exposes on `window`
- * (the frozen REST surface has no project-by-slug endpoint that returns this
- * metadata). Defensive: returns the first candidate that is an object, else null.
- *
- * `context` is accepted for a future slug/id match refinement; it is reserved.
- */
-function readRuntimeProject(context: MountContext): ProjectRuntime | null {
-    void context; // reserved for slug/id disambiguation; the shell exposes the active project.
-    if (typeof window === "undefined") {
-        return null;
-    }
-    const w = window as unknown as {
-        taigaConfig?: { project?: unknown };
-        _project?: unknown;
-        taigaCurrentProject?: unknown;
-    };
-    const candidates = [w.taigaConfig?.project, w._project, w.taigaCurrentProject];
-    for (const c of candidates) {
-        if (c && typeof c === "object") {
-            return c as ProjectRuntime;
-        }
-    }
-    return null;
-}
-
-/**
- * MANDATORY graceful-degradation fallback when no runtime project is found: the
- * board renders READ-ONLY (`my_permissions: []`) but is NOT blanked
- * (`is_kanban_activated: true`).
- */
-function buildFallbackProject(projectId: number, context: MountContext): ProjectRuntime {
-    return {
-        id: projectId,
-        slug: context.projectSlug ?? "",
-        name: "",
-        my_permissions: [],
-        is_kanban_activated: true,
-        is_backlog_activated: false,
-        archived_code: null,
-    };
-}
-
 /** The URL query string, from `window.location.search` or the hashbang query. */
 function getUrlSearchString(): string {
     if (typeof window === "undefined") {
@@ -504,18 +523,15 @@ function parseStatuses(filtersData: unknown, runtime: ProjectRuntime | null): St
     return [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
-/** Normalise the filter categories from the `getUserStoriesFilters` response. */
-function buildFilters(filtersData: unknown): unknown {
-    const fd = (filtersData ?? {}) as Record<string, unknown>;
-    return {
-        statuses: fd.statuses ?? [],
-        tags: fd.tags ?? [],
-        assigned_to: fd.assigned_to ?? [],
-        owner: fd.owners ?? fd.owner ?? [],
-        epic: fd.epics ?? fd.epic ?? [],
-        role: fd.roles ?? fd.role ?? [],
-    };
-}
+/* -------------------------------------------------------------------------- */
+/* Story-lightbox payload helpers (finding C2, C7)                             */
+/* -------------------------------------------------------------------------- */
+/*
+ * `buildCreatePayload` (create body) and `diffStoryValues` (dirty edit diff)
+ * plus the `Savable<T>` bridge now live in the SHARED module
+ * `shared/lightboxes/storyPayload.ts` and are imported above, so the Backlog
+ * screen reuses the identical request-shaping (finding C7).
+ */
 
 /* -------------------------------------------------------------------------- */
 /* The hook                                                                    */
@@ -548,15 +564,22 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
     const [columnModes, setColumnModes] = useState<Record<number, "max" | "min" | undefined>>({});
     const [zoomLevel, setZoomLevel] = useState<number>(() => readZoom());
     const [zoom, setZoomState] = useState<string[]>(() => getZoomView(readZoom()));
-    const [filters, setFilters] = useState<unknown>(null);
-    const [customFilters, setCustomFilters] = useState<unknown[]>([]);
-    const [selectedFilters, setSelectedFilters] = useState<unknown[]>([]);
+    const [filters, setFilters] = useState<FilterPanel[]>([]);
+    const [customFilters, setCustomFilters] = useState<CustomFilter[]>([]);
+    const [selectedFilters, setSelectedFilters] = useState<FilterChip[]>([]);
+    // C11/C4: the applied-filter params (URL-style category -> comma-joined ids),
+    // the single source of truth shared with the Backlog screen's filter model.
+    const [appliedParams, setAppliedParams] = useState<Record<string, string>>({});
     const [filterQ, setFilterQ] = useState<string>("");
     const [activeLightbox, setActiveLightbox] = useState<KanbanLightboxState | null>(null);
     const [initialLoad, setInitialLoad] = useState<boolean>(false);
     const [renderInProgress, setRenderInProgress] = useState<boolean>(false);
     const [notFoundUserstories, setNotFoundUserstories] = useState<boolean>(false);
     const [error, setError] = useState<unknown>(null);
+    // M2: a sanitized, user-facing message derived from `error` (never the
+    // raw thrown value); and a lightbox save-in-flight guard.
+    const [errorMessage, setErrorMessage] = useState<string | null>(null);
+    const [savingUs, setSavingUs] = useState<boolean>(false);
 
     /* ---------------------------------------------------------------------- */
     /* Refs — the "latest value" pattern for async callbacks (no re-render).   */
@@ -574,13 +597,18 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
     const projectIdRef = useRef<number | null>(projectId);
     const projectRef = useRef<ProjectRuntime | null>(project);
     const usStatusListRef = useRef<Status[]>(usStatusList);
-    const selectedFiltersRef = useRef<unknown[]>(selectedFilters);
+    const selectedFiltersRef = useRef<FilterChip[]>(selectedFilters);
+    const appliedParamsRef = useRef<Record<string, string>>({});
+    const dataCollectionRef = useRef<DataCollection>({});
     const activeLightboxRef = useRef<KanbanLightboxState | null>(activeLightbox);
     const foldsRef = useRef<Record<number, boolean>>(folds);
     const foldedSwimlaneRef = useRef<Record<number, boolean>>(foldedSwimlane);
     const columnModesRef = useRef<Record<number, "max" | "min" | undefined>>(columnModes);
     const isFirstLoadRef = useRef<boolean>(true);
     const pendingProjectRefreshRef = useRef<boolean>(false);
+    // M2 pending guards: a create/bulk save in flight, and per-status WIP saves.
+    const savingUsRef = useRef<boolean>(false);
+    const wipPendingRef = useRef<Record<number, boolean>>({});
 
     // Keep the refs in sync with committed state (backstop; some handlers also
     // update the relevant ref synchronously before an immediate async read).
@@ -606,6 +634,9 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         selectedFiltersRef.current = selectedFilters;
     }, [selectedFilters]);
     useEffect(() => {
+        appliedParamsRef.current = appliedParams;
+    }, [appliedParams]);
+    useEffect(() => {
         activeLightboxRef.current = activeLightbox;
     }, [activeLightbox]);
     useEffect(() => {
@@ -618,6 +649,16 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         columnModesRef.current = columnModes;
     }, [columnModes]);
 
+    /**
+     * Record a failure (finding M2): keep the raw value in `error` for
+     * diagnostics AND expose a sanitized, user-facing `errorMessage` that never
+     * leaks internal detail (status body, tokens, stack).
+     */
+    const reportError = useCallback((e: unknown): void => {
+        setError(e);
+        setErrorMessage(sanitizeErrorMessage(e));
+    }, []);
+
     /* ---------------------------------------------------------------------- */
     /* Data loading                                                            */
     /* ---------------------------------------------------------------------- */
@@ -629,30 +670,49 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
      */
     const loadUserstoriesParams = useCallback((): QueryParams => {
         const params: QueryParams = { status__is_archived: false };
+        // Project scope (mirror legacy `listAll(projectId, params)` which merges
+        // `{project: projectId}` — resources/userstories.coffee L58). Without it
+        // `/userstories` returns stories across ALL projects rather than this board.
+        const listPid = projectRef.current?.id;
+        if (listPid != null) {
+            params.project = listPid;
+        }
         if (zoomLevelRef.current >= 2) {
             params.include_attachments = 1;
             params.include_tasks = 1;
         }
         // URL filter params (validQueryParams).
         Object.assign(params, parseUrlQueryParams());
-        // Selected filter chips -> grouped query params (category -> comma-joined ids).
-        const grouped: Record<string, Array<string | number>> = {};
-        for (const f of selectedFiltersRef.current) {
-            const ff = f as { category?: unknown; id?: unknown };
-            if (
-                typeof ff.category === "string" &&
-                (typeof ff.id === "string" || typeof ff.id === "number")
-            ) {
-                if (!grouped[ff.category]) {
-                    grouped[ff.category] = [];
-                }
-                grouped[ff.category].push(ff.id);
-            }
-        }
-        for (const key of Object.keys(grouped)) {
-            params[key] = grouped[key].join(",");
-        }
+        // Applied filter params (category / exclude_category -> comma-joined ids),
+        // the params-based model shared with the Backlog screen (C11/C4 full-filter
+        // parity). `appliedParams` is the single source of truth for panel-applied
+        // filters and wins on key collisions with the URL params.
+        Object.assign(params, appliedParamsRef.current);
         params.q = filterQRef.current;
+        return params;
+    }, []);
+
+    /**
+     * Build the filters_data request params (mirror UsFiltersMixin.generateFilters
+     * `loadFilters` — controllerMixins.coffee L229-246). This is DELIBERATELY
+     * DISTINCT from loadUserstoriesParams: the `/userstories/filters_data`
+     * endpoint REQUIRES `project` (HTTP 404 without it) and REJECTS
+     * `status__is_archived` (HTTP 500); it also does not take `q` or the
+     * `include_*` flags. It therefore carries ONLY the project id plus the
+     * recognised URL filter category params (each category key and its
+     * `exclude_` variant, via parseUrlQueryParams()).
+     */
+    const loadFiltersParams = useCallback((): QueryParams => {
+        const params: QueryParams = {};
+        const pid = projectRef.current?.id;
+        if (pid != null) {
+            params.project = pid;
+        }
+        Object.assign(params, parseUrlQueryParams());
+        // Reflect the panel-applied filters in the filters_data request too, so the
+        // returned category counts are scoped to the current filter set (legacy
+        // `generateFilters` loadFilters). `appliedParams` wins on key collisions.
+        Object.assign(params, appliedParamsRef.current);
         return params;
     }, []);
 
@@ -727,11 +787,28 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
     const refreshStatusesAndSwimlanes = useCallback(async (): Promise<void> => {
         try {
             const rt = projectRef.current;
-            const filtersData = await apiRef.current.getUserStoriesFilters(loadUserstoriesParams());
+            const filtersData = await apiRef.current.getUserStoriesFilters(loadFiltersParams());
             const statuses = parseStatuses(filtersData, rt);
             usStatusListRef.current = statuses;
             setUsStatusList(statuses);
-            setFilters(buildFilters(filtersData));
+            const filterDc = buildDataCollection(filtersData);
+            dataCollectionRef.current = filterDc;
+            setFilters(buildFilterPanels(filterDc, KANBAN_EXCLUDE_FILTERS));
+            setSelectedFilters(
+                computeSelectedFilters(filterDc, appliedParamsRef.current),
+            );
+            // Re-fetch swimlanes authoritatively (they may have changed with the
+            // project). Failure degrades to the previously-known swimlanes.
+            const pid = projectIdRef.current;
+            if (rt && pid != null) {
+                try {
+                    const swimlanes = await apiRef.current.listSwimlanes(pid);
+                    rt.swimlanes = swimlanes as Array<Swimlane & { statuses?: Status[] }>;
+                    projectRef.current = rt;
+                } catch {
+                    /* keep prior swimlanes */
+                }
+            }
             applyLoadSwimlanes(rt, statuses);
             const archived = statuses.filter((s) => s.is_archived === true);
             if (archived.length) {
@@ -749,7 +826,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                 });
             }
         } catch (e) {
-            setError(e);
+            reportError(e);
         }
     }, [loadUserstoriesParams, applyLoadSwimlanes]);
 
@@ -762,17 +839,23 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
 
         const firstLoad = async (): Promise<void> => {
             try {
-                // 1. Resolve the numeric project id from the slug.
-                const pid = await apiRef.current.resolveProject(context.projectSlug ?? "");
+                // 1-2. loadProject (C1): load the AUTHORITATIVE project detail by
+                //    slug from the frozen REST surface (GET /projects/by_slug).
+                //    Real `my_permissions`, activation flags, statuses, members and
+                //    the default swimlane come from the backend — never `window`
+                //    globals, never a fabricated read-only fallback. A rejected
+                //    request (404/403/network) is caught below and fails CLOSED:
+                //    `project` stays null so the board renders an error state
+                //    instead of a permissive stub.
+                const rt = (await apiRef.current.getProjectBySlug(
+                    context.projectSlug ?? "",
+                )) as ProjectRuntime;
                 if (cancelled) {
                     return;
                 }
+                const pid = rt.id;
                 projectIdRef.current = pid;
                 setProjectId(pid);
-
-                // 2. loadProject — read the runtime project from the shell bridge,
-                //    with mandatory graceful degradation to a safe read-only default.
-                const rt = readRuntimeProject(context) ?? buildFallbackProject(pid, context);
                 projectRef.current = rt;
                 setProject(rt);
                 setIsAdmin(Boolean(rt.i_am_admin));
@@ -817,7 +900,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
 
                 // 3. Statuses + filter categories (from getUserStoriesFilters).
                 const filtersData = await apiRef.current.getUserStoriesFilters(
-                    loadUserstoriesParams(),
+                    loadFiltersParams(),
                 );
                 if (cancelled) {
                     return;
@@ -825,13 +908,39 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                 const statuses = parseStatuses(filtersData, rt);
                 usStatusListRef.current = statuses;
                 setUsStatusList(statuses);
-                setFilters(buildFilters(filtersData));
+                const filterDc = buildDataCollection(filtersData);
+                dataCollectionRef.current = filterDc;
+                setFilters(buildFilterPanels(filterDc, KANBAN_EXCLUDE_FILTERS));
+                setSelectedFilters(
+                    computeSelectedFilters(filterDc, appliedParamsRef.current),
+                );
 
-                // 4. Swimlanes (from the runtime project).
+                // 4. Swimlanes (authoritative: GET /swimlanes?project=<id>). The
+                //    by_slug payload does not embed swimlanes, so fetch them and
+                //    merge onto the project runtime. A rejection degrades to the
+                //    non-swimlane board (empty list) rather than blanking.
+                try {
+                    const swimlanes = await apiRef.current.listSwimlanes(pid);
+                    if (!cancelled) {
+                        rt.swimlanes = swimlanes as Array<Swimlane & { statuses?: Status[] }>;
+                        projectRef.current = rt;
+                        setProject(rt);
+                    }
+                } catch {
+                    /* no swimlanes endpoint data -> non-swimlane board (graceful) */
+                }
                 applyLoadSwimlanes(rt, statuses);
 
                 // 5. Userstories.
                 await loadUserstories();
+                if (cancelled) {
+                    return;
+                }
+
+                // 5b. Persisted named custom filters (M5, part 2) from the frozen
+                //     `user-storage` endpoint. Non-fatal: a failure surfaces a
+                //     sanitized message but never blocks the board render.
+                await loadCustomFilters(pid);
                 if (cancelled) {
                     return;
                 }
@@ -873,7 +982,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             } catch (e) {
                 // Never leave the board perpetually blank on a rejected promise.
                 if (!cancelled) {
-                    setError(e);
+                    reportError(e);
                     setInitialLoad(true);
                     isFirstLoadRef.current = false;
                 }
@@ -921,7 +1030,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                 });
             });
         } catch (e) {
-            setError(e);
+            reportError(e);
         }
     }, [loadUserstoriesParams]);
 
@@ -1020,6 +1129,28 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                 previousCard,
                 nextCard,
             );
+            // M1: capture the pre-move positions of every AFFECTED story (dragged
+            // cards carry status+swimlane+order; displaced cards carry only order)
+            // so a failure can be reversed precisely against the CURRENT state,
+            // never a stale whole-state snapshot (CWE-362).
+            const movedSet = new Set(usList);
+            const rollbackDeltas: StoryPositionDelta[] = [];
+            for (const idStr of Object.keys(snapshot.usMap)) {
+                const id = Number(idStr);
+                const before = snapshot.order[id];
+                const after = next.order[id];
+                if (movedSet.has(id)) {
+                    const m = snapshot.usMap[id];
+                    rollbackDeltas.push({
+                        id,
+                        status: m.status,
+                        swimlane: m.swimlane ?? null,
+                        order: before ?? 0,
+                    });
+                } else if (before !== after) {
+                    rollbackDeltas.push({ id, order: before ?? 0 });
+                }
+            }
             // Optimistic apply.
             stateRef.current = next;
             setState(next);
@@ -1038,11 +1169,14 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                 // updated). Clear the moved highlight (parity with redraw:wip).
                 window.setTimeout(() => setMovedUs([]), 300);
             } catch (e) {
-                // ROLLBACK (mandated by AAP §0.6.3 — legacy had none).
-                stateRef.current = snapshot;
-                setState(snapshot);
+                // M1 ROLLBACK: reverse ONLY this move's position changes against
+                // the CURRENT state, preserving any real-time updates that landed
+                // meanwhile (AAP §0.6.3 mandates rollback; legacy had none).
+                const rolledBack = restoreStories(stateRef.current, rollbackDeltas);
+                stateRef.current = rolledBack;
+                setState(rolledBack);
                 setMovedUs([]);
-                setError(e);
+                reportError(e);
             }
         },
         [],
@@ -1138,7 +1272,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                         await loadUserstories();
                         setState((p) => resetFolds(p));
                     } catch (e) {
-                        setError(e);
+                        reportError(e);
                     } finally {
                         setRenderInProgress(false);
                     }
@@ -1219,7 +1353,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                     return next;
                 });
             } catch (e) {
-                setError(e);
+                reportError(e);
             }
         },
         [],
@@ -1231,21 +1365,35 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
      */
     const editWipLimit = useCallback(
         async (statusId: number, wipLimit: number | null): Promise<void> => {
+            // M2 pending guard: ignore a second edit to the same column while its
+            // save is still in flight.
+            if (wipPendingRef.current[statusId]) {
+                return;
+            }
             const snapshot = usStatusListRef.current;
+            const priorWip = snapshot.find((s) => s.id === statusId)?.wip_limit ?? null;
             const optimistic = snapshot.map((s) =>
                 s.id === statusId ? { ...s, wip_limit: wipLimit } : s,
             );
             usStatusListRef.current = optimistic;
             setUsStatusList(optimistic);
+            wipPendingRef.current[statusId] = true;
             try {
                 await apiRef.current.editStatus(statusId, wipLimit);
             } catch (e) {
-                usStatusListRef.current = snapshot;
-                setUsStatusList(snapshot);
-                setError(e);
+                // M1: revert ONLY this status against the CURRENT list, so a
+                // concurrent WIP change to another column is not clobbered.
+                const reverted = usStatusListRef.current.map((s) =>
+                    s.id === statusId ? { ...s, wip_limit: priorWip } : s,
+                );
+                usStatusListRef.current = reverted;
+                setUsStatusList(reverted);
+                reportError(e);
+            } finally {
+                delete wipPendingRef.current[statusId];
             }
         },
-        [],
+        [reportError],
     );
 
     /** Persist and set a column display mode (squish/maximize parity). */
@@ -1298,49 +1446,221 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         }
     }, [refreshStatusesAndSwimlanes]);
 
-    /** Create a single userstory in the lightbox's target status. */
+    /**
+     * Create a single userstory from the create lightbox (finding C2). Sends the
+     * full editable attribute set the shared `StoryFormLightbox` collects. The
+     * `us_position` field is a CLIENT-SIDE ordering hint that the legacy form
+     * DELETES before POSTing (`common/lightboxes.coffee` L785) and applies AFTER
+     * success (`kanban/main.coffee` `usform:new:success` -> `moveUsToTop`); this
+     * reproduces that exactly: it is never sent to the backend, and a `"top"`
+     * choice reuses the tested `moveToTopDropdown` primitive (one optimistic
+     * `bulk-update-us-kanban-order` with rollback). M2: awaited, double-submit
+     * guarded, and the lightbox stays OPEN on failure so the typed values survive.
+     */
     const submitNewUs = useCallback(
-        async (subject: string): Promise<void> => {
+        async (values: StoryFormValues): Promise<void> => {
             const lb = activeLightboxRef.current;
             if (!lb || lb.type !== "create" || lb.statusId == null) {
                 return;
             }
+            if (savingUsRef.current) {
+                return;
+            }
+            savingUsRef.current = true;
+            setSavingUs(true);
+            setErrorMessage(null);
             try {
-                const created = await apiRef.current.create<UserStory>("userstories", {
-                    project: projectIdRef.current,
-                    status: lb.statusId,
-                    subject,
-                });
-                setState((prev) => add(prev, created));
+                const payload = buildCreatePayload(projectIdRef.current, lb.statusId, values);
+                const created = await apiRef.current.create<UserStory>("userstories", payload);
+                const next = add(stateRef.current, created);
+                stateRef.current = next;
+                setState(next);
                 closeLightbox();
+                if (values.us_position === "top") {
+                    moveToTopDropdown(created.id);
+                }
             } catch (e) {
-                setError(e);
+                // Keep the lightbox OPEN so the typed values are preserved; surface
+                // the sanitized message instead of clearing the form (finding M2).
+                reportError(e);
+            } finally {
+                savingUsRef.current = false;
+                setSavingUs(false);
             }
         },
-        [closeLightbox],
+        [closeLightbox, reportError, moveToTopDropdown],
     );
 
-    /** Bulk-create userstories (one per line) in the lightbox's target status. */
+    /**
+     * Persist edits from the edit lightbox (finding C2). Builds a DIRTY diff of
+     * the changed attributes only (mirroring `base/repository.save` +
+     * `model.getAttrs`), PATCHes with the optimistic-concurrency `version`, and
+     * on success updates the local model. When the STATUS changed it re-buckets
+     * the story to the END of the new status column and persists that order in a
+     * single optimistic call, reproducing legacy `usform:edit:success`. M2:
+     * awaited, double-submit guarded, lightbox stays OPEN on failure.
+     */
+    const submitEditUs = useCallback(
+        async (values: StoryFormValues): Promise<void> => {
+            const lb = activeLightboxRef.current;
+            if (!lb || lb.type !== "edit" || lb.usId == null) {
+                return;
+            }
+            if (savingUsRef.current) {
+                return;
+            }
+            const story = stateRef.current.usMap[lb.usId];
+            if (!story) {
+                return;
+            }
+            const modified = diffStoryValues(story, values);
+            if (Object.keys(modified).length === 0) {
+                // Nothing changed — close without a needless request (save() would
+                // short-circuit anyway, but this also skips the spinner).
+                closeLightbox();
+                return;
+            }
+            const statusChanged = Object.prototype.hasOwnProperty.call(modified, "status");
+            savingUsRef.current = true;
+            setSavingUs(true);
+            setErrorMessage(null);
+            try {
+                const updated = await apiRef.current.save<Savable<UserStory>>(
+                    "userstories",
+                    story as Savable<UserStory>,
+                    modified,
+                );
+                const next = replaceModel(stateRef.current, updated);
+                stateRef.current = next;
+                setState(next);
+                closeLightbox();
+                if (statusChanged) {
+                    const swimlaneId = updated.swimlane ?? null;
+                    const colList =
+                        swimlaneId != null
+                            ? stateRef.current.usByStatusSwimlanes[String(swimlaneId)]?.[
+                                  String(updated.status)
+                              ] ?? []
+                            : stateRef.current.usByStatus[String(updated.status)] ?? [];
+                    const lastCard = colList.length > 0 ? colList[colList.length - 1] : null;
+                    applyMoveAndPersist(
+                        [updated.id],
+                        updated.status,
+                        swimlaneId,
+                        colList.length,
+                        lastCard,
+                        null,
+                    );
+                }
+            } catch (e) {
+                reportError(e);
+            } finally {
+                savingUsRef.current = false;
+                setSavingUs(false);
+            }
+        },
+        [closeLightbox, reportError, applyMoveAndPersist],
+    );
+
+    /**
+     * Bulk-create userstories (one per line) from the bulk lightbox (finding C2).
+     * Uses the status/swimlane the shared `BulkStoryLightbox` collected (falling
+     * back to the trigger column). `us_position === "top"` moves the whole batch
+     * to the head of the column in a single optimistic order call (legacy
+     * `usform:bulk:success` -> `moveUsToTop(uss)`). M2 semantics as above.
+     */
     const submitBulkUs = useCallback(
-        async (bulkText: string): Promise<void> => {
+        async (values: BulkStoryValues): Promise<void> => {
             const lb = activeLightboxRef.current;
             if (!lb || lb.type !== "bulk" || lb.statusId == null) {
                 return;
             }
+            if (savingUsRef.current) {
+                return;
+            }
+            const statusId = values.status ?? lb.statusId;
+            const swimlaneId = values.swimlane;
+            savingUsRef.current = true;
+            setSavingUs(true);
+            setErrorMessage(null);
             try {
                 const created = await apiRef.current.bulkCreateUserStories(
                     projectIdRef.current as number,
-                    lb.statusId,
-                    bulkText,
-                    null,
+                    statusId,
+                    values.bulk,
+                    swimlaneId,
                 );
-                setState((prev) => add(prev, created));
+                const next = add(stateRef.current, created);
+                stateRef.current = next;
+                setState(next);
                 closeLightbox();
+                if (values.us_position === "top" && created.length > 0) {
+                    const batchIds = created.map((us) => us.id);
+                    const batchSet = new Set(batchIds);
+                    const colList =
+                        swimlaneId != null
+                            ? stateRef.current.usByStatusSwimlanes[String(swimlaneId)]?.[
+                                  String(statusId)
+                              ] ?? []
+                            : stateRef.current.usByStatus[String(statusId)] ?? [];
+                    const firstExisting = colList.find((id) => !batchSet.has(id)) ?? null;
+                    if (firstExisting !== null) {
+                        applyMoveAndPersist(batchIds, statusId, swimlaneId, 0, null, firstExisting);
+                    }
+                }
             } catch (e) {
-                setError(e);
+                // Keep the lightbox OPEN so the typed lines are preserved.
+                reportError(e);
+            } finally {
+                savingUsRef.current = false;
+                setSavingUs(false);
             }
         },
-        [closeLightbox],
+        [closeLightbox, reportError, applyMoveAndPersist],
+    );
+
+    /**
+     * Commit an assignment change from the assign lightbox (finding C2). PATCHes
+     * `assigned_users`/`assigned_to` (dirty + version) and updates the local
+     * model. M2: awaited, double-submit guarded, lightbox stays OPEN on failure.
+     */
+    const submitAssignedUsers = useCallback(
+        async (assignedUsers: number[], assignedTo: number | null): Promise<void> => {
+            const lb = activeLightboxRef.current;
+            if (!lb || lb.type !== "assign" || lb.usId == null) {
+                return;
+            }
+            if (savingUsRef.current) {
+                return;
+            }
+            const story = stateRef.current.usMap[lb.usId];
+            if (!story) {
+                return;
+            }
+            savingUsRef.current = true;
+            setSavingUs(true);
+            setErrorMessage(null);
+            try {
+                const updated = await apiRef.current.save<Savable<UserStory>>(
+                    "userstories",
+                    story as Savable<UserStory>,
+                    {
+                        assigned_users: assignedUsers,
+                        assigned_to: assignedTo,
+                    },
+                );
+                const next = replaceModel(stateRef.current, updated);
+                stateRef.current = next;
+                setState(next);
+                closeLightbox();
+            } catch (e) {
+                reportError(e);
+            } finally {
+                savingUsRef.current = false;
+                setSavingUs(false);
+            }
+        },
+        [closeLightbox, reportError],
     );
 
     /** Delete a userstory optimistically, rolling back the state on failure. */
@@ -1350,17 +1670,25 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         if (!us) {
             return;
         }
+        const priorOrder = snapshot.order[usId] ?? 0;
         const nextState = remove(snapshot, { id: usId, status: us.status });
         stateRef.current = nextState;
         setState(nextState);
         try {
             await apiRef.current.remove("userstories", usId);
         } catch (e) {
-            stateRef.current = snapshot;
-            setState(snapshot);
-            setError(e);
+            // M1: re-insert ONLY the deleted story into the CURRENT state (never a
+            // stale whole-state snapshot), then restore its prior column position,
+            // so concurrent real-time changes to other stories are preserved.
+            let restored = add(stateRef.current, us);
+            restored = restoreStories(restored, [
+                { id: usId, status: us.status, swimlane: us.swimlane ?? null, order: priorOrder },
+            ]);
+            stateRef.current = restored;
+            setState(restored);
+            reportError(e);
         }
-    }, []);
+    }, [reportError]);
 
     /**
      * Toggle a story's multi-select membership. The board gates on ctrl/meta;
@@ -1418,58 +1746,175 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         [filtersReloadContent],
     );
 
-    /** Append a selected filter chip, then reload. */
+    /* ---------------------------------------------------------------------- */
+    /* Filter engine (params-based, shared with the Backlog screen — C11/C4)   */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * Commit a new applied-params set: sync state + ref, recompute the applied
+     * chips from the cached data collection (optimistic, like the legacy
+     * `generateFilters` in-memory `selectedFilters` rebuild), then trigger the
+     * debounced userstory reload. The category panels do not change on apply
+     * (same options), only which options are shown-as-applied, so we recompute
+     * chips from the cached data collection rather than re-fetching filters_data.
+     */
+    const applyParams = useCallback(
+        (next: Record<string, string>): void => {
+            setAppliedParams(next);
+            appliedParamsRef.current = next;
+            setSelectedFilters(
+                computeSelectedFilters(dataCollectionRef.current, next),
+            );
+            filtersReloadContent();
+        },
+        [filtersReloadContent],
+    );
+
+    /**
+     * Apply a filter option (legacy `selectFilter`). Receives the panel's
+     * `{ category: { dataType }, filter: { id }, mode }` shape and merges the id
+     * into the matching `appliedParams` category (or its `exclude_` variant).
+     */
     const addFilter = useCallback(
-        (f: unknown): void => {
-            setSelectedFilters((prev) => {
-                const next = [...prev, f];
-                selectedFiltersRef.current = next;
-                return next;
-            });
-            filtersReloadContent();
+        (newFilter: unknown): void => {
+            const nf = newFilter as {
+                category?: { dataType?: string };
+                filter?: { id?: string | number };
+                mode?: string;
+            };
+            const category = nf.category?.dataType;
+            const id = nf.filter?.id;
+            if (!category || id === undefined || id === null) {
+                return;
+            }
+            const mode: "include" | "exclude" =
+                nf.mode === "exclude" ? "exclude" : "include";
+            const next = addParamValue(
+                appliedParamsRef.current,
+                paramNameFor(category, mode),
+                String(id),
+            );
+            applyParams(next);
         },
-        [filtersReloadContent],
+        [applyParams],
     );
 
-    /** Remove a selected filter chip, then reload. */
+    /** Remove an applied filter chip (legacy `unselectFilter`). */
     const removeFilter = useCallback(
-        (f: unknown): void => {
-            setSelectedFilters((prev) => {
-                const next = prev.filter((x) => x !== f);
-                selectedFiltersRef.current = next;
-                return next;
-            });
-            filtersReloadContent();
+        (filter: unknown): void => {
+            const chip = filter as FilterChip;
+            if (!chip || !chip.dataType || chip.id === undefined) {
+                return;
+            }
+            const mode: "include" | "exclude" =
+                chip.mode === "exclude" ? "exclude" : "include";
+            const next = removeParamValue(
+                appliedParamsRef.current,
+                paramNameFor(chip.dataType, mode),
+                String(chip.id),
+            );
+            applyParams(next);
         },
-        [filtersReloadContent],
+        [applyParams],
     );
 
-    // Custom filters: the frozen API surface exposes NO custom-filter endpoint,
-    // so these operate purely on local state for this POC (documented deviation).
-    // They MUST exist (KanbanBoard destructures them) and must never throw.
+    // Custom filters (M5, part 2): persisted through the frozen `user-storage`
+    // endpoint (the same remote store the AngularJS `FilterRemoteStorageService`
+    // used), keyed by `generateHash([pid, "<pid>:kanban-custom-filters"])`. Each
+    // saved entry's value is the applied-params snapshot (a category->ids map),
+    // matching the Backlog custom-filter format, so a saved filter survives a
+    // full reload rather than living only in memory. They MUST exist (KanbanBoard
+    // destructures them) and must never throw.
 
-    /** Persist the current selected filters under a name (local-only). */
-    const saveCustomFilter = useCallback((name: string): void => {
-        const snapshot = selectedFiltersRef.current;
-        setCustomFilters((prev) => [...prev, { name, filters: snapshot }]);
-    }, []);
+    /** Load the persisted named custom filters from `user-storage`. */
+    const loadCustomFilters = useCallback(
+        async (pid: number): Promise<void> => {
+            try {
+                const raw = await apiRef.current.getUserFilters(
+                    pid,
+                    KANBAN_CUSTOM_FILTERS_SUFFIX,
+                );
+                const list: CustomFilter[] = Object.keys(raw).map((name) => ({
+                    id: name,
+                    name,
+                    filter: (raw[name] ?? {}) as Record<string, string>,
+                }));
+                setCustomFilters(list);
+            } catch (e) {
+                reportError(e);
+            }
+        },
+        [reportError],
+    );
 
-    /** Apply a previously-saved custom filter, then reload. */
+    /** Persist the current applied filters under a name (user-storage). */
+    const saveCustomFilter = useCallback(
+        (name: string): void => {
+            const pid = projectIdRef.current;
+            const trimmed = (name ?? "").trim();
+            if (!pid || !trimmed) {
+                return;
+            }
+            const snapshot = collectCustomFilterParams(appliedParamsRef.current);
+            void (async (): Promise<void> => {
+                try {
+                    const raw = await apiRef.current.getUserFilters(
+                        pid,
+                        KANBAN_CUSTOM_FILTERS_SUFFIX,
+                    );
+                    raw[trimmed] = snapshot;
+                    await apiRef.current.storeUserFilters(
+                        pid,
+                        raw,
+                        KANBAN_CUSTOM_FILTERS_SUFFIX,
+                    );
+                    await loadCustomFilters(pid);
+                } catch (e) {
+                    reportError(e);
+                }
+            })();
+        },
+        [loadCustomFilters, reportError],
+    );
+
+    /** Apply a previously-saved custom filter (legacy `replaceAllFilters`). */
     const selectCustomFilter = useCallback(
         (f: unknown): void => {
-            const cf = f as { filters?: unknown[] };
-            const next = Array.isArray(cf.filters) ? [...cf.filters] : [];
-            selectedFiltersRef.current = next;
-            setSelectedFilters(next);
-            filtersReloadContent();
+            const cf = f as CustomFilter;
+            const next = cf && cf.filter ? { ...cf.filter } : {};
+            applyParams(next);
         },
-        [filtersReloadContent],
+        [applyParams],
     );
 
-    /** Remove a saved custom filter (local-only). */
-    const removeCustomFilter = useCallback((f: unknown): void => {
-        setCustomFilters((prev) => prev.filter((x) => x !== f));
-    }, []);
+    /** Remove a saved custom filter from `user-storage`, by id. */
+    const removeCustomFilter = useCallback(
+        (f: unknown): void => {
+            const pid = projectIdRef.current;
+            const cf = f as CustomFilter;
+            if (!pid || !cf || cf.id === undefined) {
+                return;
+            }
+            void (async (): Promise<void> => {
+                try {
+                    const raw = await apiRef.current.getUserFilters(
+                        pid,
+                        KANBAN_CUSTOM_FILTERS_SUFFIX,
+                    );
+                    delete raw[cf.id];
+                    await apiRef.current.storeUserFilters(
+                        pid,
+                        raw,
+                        KANBAN_CUSTOM_FILTERS_SUFFIX,
+                    );
+                    await loadCustomFilters(pid);
+                } catch (e) {
+                    reportError(e);
+                }
+            })();
+        },
+        [loadCustomFilters, reportError],
+    );
 
     /* ---------------------------------------------------------------------- */
     /* Selectors                                                               */
@@ -1529,6 +1974,8 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         renderInProgress,
         notFoundUserstories,
         error,
+        errorMessage,
+        savingUs,
 
         /* Board data */
         usStatusList,
@@ -1591,7 +2038,9 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         activeLightbox,
         closeLightbox,
         submitNewUs,
+        submitEditUs,
         submitBulkUs,
+        submitAssignedUsers,
     };
 }
 

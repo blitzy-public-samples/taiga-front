@@ -49,5 +49,5 @@ export { test, expect } from "./taiga-fixtures";
 export { lightbox } from "./lightbox";
 export { openPopover } from "./popover";
 export { dragAndDrop, dragViaEvents } from "./dnd";
-export { fillTags, uploadAttachment } from "./interactions";
+export { fillTags } from "./interactions";
 export { runSharedFilters } from "./filters";

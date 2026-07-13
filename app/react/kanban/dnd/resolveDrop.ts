@@ -30,7 +30,7 @@ export interface DropOrigin {
 }
 
 /** All primitives `resolveKanbanDrop` needs. Everything is pre-computed by the
- * caller (`useKanbanDragEnd`) from board state + DOM geometry, keeping this
+ * caller (`createKanbanDragEndHandler`) from board state + DOM geometry, keeping this
  * function pure and fully unit-testable. */
 export interface ResolveKanbanDropInput {
     /** id of the card actually dragged (dnd-kit `active.id`). */

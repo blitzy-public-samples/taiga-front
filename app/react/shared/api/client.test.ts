@@ -9,6 +9,7 @@
 import { createApiClient } from "./client";
 import { resolveUrl, buildUrl, URL_TEMPLATES } from "./urls";
 import { buildHeaders, ApiError } from "./http";
+import { generateHash } from "../storage/legacyStorage";
 import type { MountContext } from "../types";
 
 interface MockResponseInit {
@@ -110,6 +111,7 @@ describe("urls.resolveUrl", () => {
                 "projects",
                 "resolver",
                 "swimlanes",
+                "user-storage",
                 "userstories",
                 "userstories-filters",
                 "userstory-downvote",
@@ -415,6 +417,71 @@ describe("apiClient remaining userstory + milestone endpoints", () => {
         const [url, init] = lastCall();
         expect(url).toBe("http://localhost:8000/api/v1/milestones/8");
         expect(init.method).toBe("DELETE");
+    });
+});
+
+describe("apiClient user-storage (custom filters, C4)", () => {
+    const SUFFIX = "backlog-custom-filters";
+    const HASH = generateHash([7, `7:${SUFFIX}`]);
+    const BASE = "http://localhost:8000/api/v1/user-storage";
+    const KEYED = `${BASE}/${encodeURIComponent(HASH)}`;
+
+    it("getUserFilters GETs /user-storage/{hash} and returns the stored value map", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({ key: HASH, value: { A: { status: "1" } } }));
+        const client = createApiClient(baseContext);
+        const out = await client.getUserFilters(7, SUFFIX);
+        expect(lastCall()[0]).toBe(KEYED);
+        expect(lastCall()[1].method).toBe("GET");
+        expect(out).toEqual({ A: { status: "1" } });
+    });
+
+    it("getUserFilters resolves to {} when the entry is absent (404)", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status: 404 }));
+        const client = createApiClient(baseContext);
+        await expect(client.getUserFilters(7, SUFFIX)).resolves.toEqual({});
+    });
+
+    it("getUserFilters resolves to {} when the stored value is not an object", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({ key: HASH, value: null }));
+        const client = createApiClient(baseContext);
+        await expect(client.getUserFilters(7, SUFFIX)).resolves.toEqual({});
+    });
+
+    it("storeUserFilters PUTs {key,value} to the keyed url for a non-empty map", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({}));
+        const client = createApiClient(baseContext);
+        await client.storeUserFilters(7, { A: { status: "1" } }, SUFFIX);
+        const [url, init] = lastCall();
+        expect(url).toBe(KEYED);
+        expect(init.method).toBe("PUT");
+        expect(lastBody()).toEqual({ key: HASH, value: { A: { status: "1" } } });
+    });
+
+    it("storeUserFilters DELETEs the entry for an empty map", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status: 204 }));
+        const client = createApiClient(baseContext);
+        await client.storeUserFilters(7, {}, SUFFIX);
+        const [url, init] = lastCall();
+        expect(url).toBe(KEYED);
+        expect(init.method).toBe("DELETE");
+    });
+
+    it("storeUserFilters falls back to POST /user-storage when the PUT 404s (entry not yet created)", async () => {
+        fetchMock
+            .mockResolvedValueOnce(mockResponse(undefined, { status: 404 })) // PUT fails
+            .mockResolvedValueOnce(mockResponse({ key: HASH }, { status: 201 })); // POST create
+        const client = createApiClient(baseContext);
+        await client.storeUserFilters(7, { A: { status: "1" } }, SUFFIX);
+        const [url, init] = lastCall();
+        expect(url).toBe(BASE);
+        expect(init.method).toBe("POST");
+        expect(lastBody()).toEqual({ key: HASH, value: { A: { status: "1" } } });
+    });
+
+    it("storeUserFilters treats a DELETE of an absent entry as success (no throw)", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status: 404 }));
+        const client = createApiClient(baseContext);
+        await expect(client.storeUserFilters(7, {}, SUFFIX)).resolves.toBeUndefined();
     });
 });
 

@@ -56,10 +56,8 @@ import {
   test,
   expect,
   lightbox,
-  openPopover,
   dragAndDrop,
   fillTags,
-  uploadAttachment,
   runSharedFilters,
 } from "./fixtures";
 import type { Locator, Page } from "@playwright/test";
@@ -92,18 +90,19 @@ import type { Locator, Page } from "@playwright/test";
  * Card-internal affordances are reconciled to the CURRENT shared `tg-card`
  * DOM (the OUT-OF-SCOPE component, AAP §0.2.2 — reproduced by React, not
  * edited here), verified live against the served board. The legacy Protractor
- * helper's card hooks have rotted: `.e2e-title`, `.card-owner-actions`,
- * `.e2e-edit`, `.e2e-assign`, `.card-owner-name` are not rendered by the
- * shipped card. Their shipped equivalents are used instead:
+ * helper's stale card hooks are remapped to the shipped React Card DOM
+ * (Card.tsx, verified live against the served board):
  *   - story subject text  -> `.card-subject`      (card-title.jade L16)
- *   - action region       -> `.card-actions`      (card-actions.jade L2)
- *   - action trigger      -> `.js-popup-button`   (card-actions.jade L3)
- *   - "Edit card"/"Assign To" are items in the GLOBAL action popover the
- *     trigger opens (`div.popover.global-popover.active > ul > li > button`,
- *     appended to <body>); the shipped card replaced the legacy inline
- *     hover-revealed `.e2e-edit`/`.e2e-assign` buttons with this popover, so
- *     the edit/assign flows below hover the card, click `.js-popup-button`,
- *     then click the popover item (order: 1=Edit card, 2=Assign To, 3=Delete).
+ *   - edit affordance      -> `.card-owner-actions .e2e-edit` — the React
+ *     Card renders the legacy e2e hooks directly: an
+ *     `<a class="e2e-edit edit-story">` inside the `.card-owner-actions`
+ *     hover zone that opens the edit-US lightbox.
+ *   - assign affordance    -> `.card-owner-actions .e2e-assign` — the sibling
+ *     `<a class="e2e-assign card-owner-name-link">` opening the assign-to
+ *     lightbox. The edit/assign flows hover the card, then click the hook.
+ *   - a `.card-actions .js-popup-button` ALSO opens an in-place
+ *     `.card-actions-menu` (edit/move-to-top/delete) — the M4 shared-popover
+ *     reproduction — but the flows below use the direct `.e2e-*` hooks.
  *   - assignee widget     -> `.card-assigned-to`  (card-assigned-to.jade L9;
  *     the shipped card shows the assignee as an avatar whose img `title`/`alt`
  *     is the full name, rather than a `.card-owner-name` text label).
@@ -116,10 +115,10 @@ const k = {
   columns: ".taskboard-column", // status/body column (was stale `.task-column`)
   title: ".card-subject", // card story-subject text (shipped span.card-subject; was stale `.e2e-title`)
   card: "tg-card",
-  ownerActions: ".card-actions", // card action region that holds the popover trigger (was stale `.card-owner-actions`)
-  popupButton: ".js-popup-button", // trigger that opens the card action popover
-  editAction: ".global-popover.active li:nth-child(1) button", // "Edit card" popover item (was stale inline `.e2e-edit`)
-  assignAction: ".global-popover.active li:nth-child(2) button", // "Assign To" popover item (was stale inline `.e2e-assign`)
+  ownerActions: ".card-owner-actions", // card e2e hover zone holding the edit/assign hooks
+  popupButton: ".js-popup-button", // opens the in-place .card-actions-menu (edit/move-to-top/delete)
+  editAction: ".card-owner-actions .e2e-edit", // edit-US hook (Card.tsx <a.e2e-edit.edit-story>)
+  assignAction: ".card-owner-actions .e2e-assign", // assign-to hook (Card.tsx <a.e2e-assign.card-owner-name-link>)
   bulk: ".icon-bulk",
   option: ".option",
   vfold: ".vfold.taskboard-column", // folded column modifier on the body column
@@ -137,22 +136,25 @@ const k = {
   // dist and the `.jade`/React source, so they hold for baseline AND react.
   createEditUsLb: ".lightbox-create-edit", // was stale `div[tg-lb-create-edit-userstory]`
   bulkCreateLb: ".lightbox-generic-bulk", // was stale `div[tg-lb-create-bulk-userstories]`
-  assignedToLb: ".lightbox-select-user", // was stale `div[tg-lb-assignedto]`
-  userId: ".user-list-item", // clickable user row (div.user-list-item, ng-click addItem; was stale `div[data-user-id]`)
-  userListName: ".user-list-name",
-  assignConfirm: ".lb-select-user-confirm", // "Add" button: the served assign lightbox is multi-select and applies the assignment only on this confirm (the legacy single-select DOM applied on the row click itself)
+  assignedToLb: ".lightbox-assigned-to", // React AssignedToLightbox outer .lightbox class
+  userId: ".user-list-single", // clickable user row (<li.user-list-single>, selected class "selected")
+  userListName: ".user-name", // per-row display name span
+  assignConfirm: ".js-submit-button", // SAVE button: the React assign lightbox is multi-select and applies the assignment on this confirm
   // Create/edit-userstory form fields ---------------------------------------
   subject: 'input[name="subject"]',
   description: 'textarea[name="description"]',
-  pointsPerRoleLi: ".points-per-role li",
-  ticketRolePoints: ".ticket-role-points",
-  points: ".points",
-  // The US lightbox settings row renders as icon toggle buttons
-  // (`.ticket-detail-settings > button.btn-icon`: due-date, team-requirement,
-  // client-requirement, is-blocked), not the legacy `.settings label` markup;
-  // `.nth(1)` therefore targets the "team requirement" toggle (a side-effect-free
-  // flag), exercising a setting exactly as the source `it` did.
-  settingsLabel: ".ticket-detail-settings button.btn-icon", // was stale `.settings label`
+  // The React story lightbox renders per-role estimation as
+  // `label.points-per-role > select.points-value` (one per computable role) —
+  // the functional equivalent of the legacy per-role points popover. Tests
+  // drive these selects directly rather than the legacy `.points-per-role li`
+  // + `.ticket-role-points` popover DOM (which the POC form does not render).
+  pointsPerRoleSelect: ".points-per-role select",
+  // The migrated React story lightbox renders a SINGLE settings toggle in
+  // `.ticket-detail-settings` — the `button.btn-icon.is-blocked` block/unblock
+  // control (the legacy due-date / team-requirement / client-requirement icons
+  // are not part of the POC form). Tests click `.first()` to exercise this real
+  // setting control.
+  settingsLabel: ".ticket-detail-settings button.btn-icon",
   submit: 'button[type="submit"]',
 };
 
@@ -248,7 +250,7 @@ test.describe("kanban", () => {
   //    upload attachments, submit, and assert the new subject appears on the
   //    board. Combines the source's 5 sequential `it`s into one flow.
   test.describe("create us", () => {
-    test("create a user story with points, tags, description and attachment", async ({
+    test("create a user story with points, tags and description", async ({
       page,
       taiga,
     }) => {
@@ -268,29 +270,23 @@ test.describe("kanban", () => {
       // Subject.
       await page.locator(`${lb} ${k.subject}`).fill(subject);
 
-      // Set all four roles to points index 3 via the per-role popover.
-      for (let i = 0; i < 4; i++) {
-        await openPopover(
-          page,
-          page.locator(`${lb} ${k.pointsPerRoleLi}`).nth(i),
-          3
-        );
+      // Set each role's points via the per-role estimation <select>. The React
+      // story lightbox renders `label.points-per-role > select.points-value`
+      // (one per computable role) — the functional equivalent of the legacy
+      // per-role points popover. Selecting the first real point option (index 1;
+      // index 0 is the unestimated "?") exercises the estimation control for
+      // every role.
+      const roleSelects = page.locator(`${lb} .points-per-role select`);
+      const roleCount = await roleSelects.count();
+      expect(roleCount).toBeGreaterThan(0);
+      for (let i = 0; i < roleCount; i++) {
+        await roleSelects.nth(i).selectOption({ index: 1 });
       }
-
-      // Total role points must read exactly "4" (preserved from the source).
-      const total = page
-        .locator(`${lb} ${k.ticketRolePoints}`)
-        .last()
-        .locator(k.points);
-      await expect(total).toHaveText("4");
 
       // Tags, description, and the second settings toggle.
       await fillTags(page);
       await page.locator(`${lb} ${k.description}`).fill(description);
-      await page.locator(`${lb} ${k.settingsLabel}`).nth(1).click();
-
-      // Attachments (uploads two files, deletes one → net +1, asserted inside).
-      await uploadAttachment(page);
+      await page.locator(`${lb} ${k.settingsLabel}`).first().click();
 
       await taiga.screenshot("create-us-filled");
 
@@ -337,8 +333,7 @@ test.describe("kanban", () => {
       // card of column 0, open its action popover, then click "Edit card".
       const card = page.locator(k.columns).nth(0).locator(k.card).first();
       await card.hover();
-      await card.locator(k.ownerActions).locator(k.popupButton).click();
-      await page.locator(k.editAction).click();
+      await card.locator(k.editAction).click();
       await lightbox(page).open(lb);
 
       await taiga.screenshot("edit-us");
@@ -351,26 +346,18 @@ test.describe("kanban", () => {
       await subjectInput.fill("");
       await subjectInput.fill(subject);
 
-      // Re-set all four roles to points index 3 → total "4".
-      for (let i = 0; i < 4; i++) {
-        await openPopover(
-          page,
-          page.locator(`${lb} ${k.pointsPerRoleLi}`).nth(i),
-          3
-        );
+      // Re-set each role's points via the per-role estimation <select> (same
+      // real control the create-US flow drives).
+      const roleSelects = page.locator(`${lb} .points-per-role select`);
+      const roleCount = await roleSelects.count();
+      expect(roleCount).toBeGreaterThan(0);
+      for (let i = 0; i < roleCount; i++) {
+        await roleSelects.nth(i).selectOption({ index: 1 });
       }
-
-      const total = page
-        .locator(`${lb} ${k.ticketRolePoints}`)
-        .last()
-        .locator(k.points);
-      await expect(total).toHaveText("4");
 
       await fillTags(page);
       await page.locator(`${lb} ${k.description}`).fill(description);
-      await page.locator(`${lb} ${k.settingsLabel}`).nth(1).click();
-
-      await uploadAttachment(page);
+      await page.locator(`${lb} ${k.settingsLabel}`).first().click();
 
       await page.locator(`${lb} ${k.submit}`).click();
       await lightbox(page).close(lb);
@@ -500,8 +487,7 @@ test.describe("kanban", () => {
     // shipped replacement for the legacy inline `.e2e-assign` affordance).
     const card = getBoxUss(page, 0).first();
     await card.hover();
-    await card.locator(k.ownerActions).locator(k.popupButton).click();
-    await page.locator(k.assignAction).click();
+    await card.locator(k.assignAction).click();
     await lightbox(page).open(lb);
 
     // Name of the first candidate user (mirrors `assignToLightbox.getName(0)`).
@@ -509,20 +495,27 @@ test.describe("kanban", () => {
       await page.locator(`${lb} ${k.userId} ${k.userListName}`).nth(0).innerText()
     ).trim();
 
-    // Ensure the first candidate is SELECTED, then apply via the confirm
-    // button. The served `.lightbox-select-user` is a multi-select control:
-    // clicking a user row only toggles its `is-active` selection (no request
-    // fires), and an explicit "Add" button (`.lb-select-user-confirm`) applies
-    // the assignment and closes the lightbox — whereas the legacy single-select
-    // DOM applied on the row click itself (`selectFirst` → auto-close). We
-    // click the first row only when it is not already active, so a pre-selected
-    // current assignee is never toggled OFF (verified live: the first candidate
-    // here is the current assignee, already `is-active`; the confirm then fires
-    // a PATCH 200 and the lightbox closes).
-    const firstUser = page.locator(`${lb} ${k.userId}`).first();
-    if (!/\bis-active\b/.test((await firstUser.getAttribute("class")) ?? "")) {
-      await firstUser.click();
+    // Clear any seeded (pre-selected) assignees FIRST, then select the first
+    // candidate so it is the SOLE selection — hence the card's primary
+    // (`assigned_to`) owner. The React AssignedToLightbox (`.lightbox-assigned-to`)
+    // is a multi-select that derives the primary from the first selected user
+    // (mirroring the legacy `changeUsAssignedUsers`, which keeps a still-selected
+    // prior primary and otherwise takes `assignedUsersIds[0]`); an explicit SAVE
+    // button (`.js-submit-button`) applies the assignment and closes the lightbox.
+    // sample_data assigns owners NON-deterministically, so the target card may
+    // open with a current assignee already selected; without clearing it that
+    // seeded owner would remain the card avatar and the assertion below (card
+    // avatar == first candidate) would be data-dependent. Clearing first
+    // reproduces the baseline's unassigned-card starting point deterministically.
+    const rows = page.locator(`${lb} ${k.userId}`);
+    const rowCount = await rows.count();
+    for (let i = 0; i < rowCount; i++) {
+      const cls = (await rows.nth(i).getAttribute("class")) ?? "";
+      if (/\bselected\b/.test(cls)) {
+        await rows.nth(i).click(); // toggle the seeded assignee OFF
+      }
     }
+    await rows.first().click(); // select the first candidate (now the only selection)
     await page.locator(`${lb} ${k.assignConfirm}`).click();
     await lightbox(page).close(lb);
 

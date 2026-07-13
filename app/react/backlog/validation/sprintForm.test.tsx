@@ -61,12 +61,23 @@ describe("validateSprintForm", () => {
     expect(errors.estimated_finish).toBe("Estimated finish is required");
   });
 
-  it("flags estimated_finish earlier than estimated_start", () => {
+  // M3: the legacy checksley form declared ONLY `data-required` on the two date
+  // inputs (see `lightbox-sprint-add-edit.jade`) and ran no custom comparator, so
+  // a finish date earlier than the start date is VALID as far as this form is
+  // concerned (the backend remains free to reject it). An earlier React version
+  // added an unproven `finish >= start` rule; it has been removed, so a
+  // finish-before-start pair must now produce NO client-side error.
+  it("accepts estimated_finish earlier than estimated_start (no unproven cross-field rule)", () => {
     const errors = validateSprintForm(
       makeValues({ estimated_start: "2020-01-24", estimated_finish: "2020-01-10" }),
     );
-    expect(errors.estimated_finish).toBe("Estimated finish must be after estimated start");
+    expect(errors.estimated_finish).toBeUndefined();
     expect(errors.estimated_start).toBeUndefined();
+    expect(
+      isSprintFormValid(
+        makeValues({ estimated_start: "2020-01-24", estimated_finish: "2020-01-10" }),
+      ),
+    ).toBe(true);
   });
 
   it("accepts estimated_finish equal to estimated_start", () => {

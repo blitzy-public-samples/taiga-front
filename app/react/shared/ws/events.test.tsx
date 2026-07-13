@@ -43,6 +43,8 @@ import {
   HEARTBEAT_INTERVAL_TIME,
   MAX_MISSED_HEARTBEATS,
   RECONNECT_TRY_INTERVAL,
+  MAX_INBOUND_FRAME_LENGTH,
+  MAX_MALFORMED_FRAME_LOGS,
 } from "./events";
 import type { MountContext } from "../types";
 
@@ -626,3 +628,233 @@ describe("createEventsClient — defensive guards", () => {
   });
 });
 
+
+
+/**
+ * M8 (auth lifecycle): the WebSocket auth handshake must carry the CURRENT
+ * bearer token, read live from `localStorage` on every (re)connect, rather
+ * than the one-time `MountContext.token` snapshot captured at mount. This
+ * mirrors the legacy `$tgStorage.get("token")` that the AngularJS auth layer
+ * consulted afresh on each connection, so a token refreshed while a React
+ * screen is mounted is used on the next reconnect instead of causing silent
+ * 401s until the next route change.
+ *
+ * These tests deliberately drive `localStorage`; because the surrounding
+ * suite's protocol tests assert the context-snapshot fallback (`"jwt-abc"`),
+ * a describe-scoped `afterEach` clears `localStorage` so no live token leaks
+ * across describes regardless of execution order.
+ */
+describe("createEventsClient — live token auth (M8)", () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("authenticates with the LIVE localStorage token, not the context snapshot", () => {
+    // The mount snapshot is the stale "jwt-abc"; the live store holds the
+    // refreshed credential that the auth layer wrote after a token refresh.
+    localStorage.setItem("token", JSON.stringify("live-token-xyz"));
+
+    connectClient(); // context.token is still "jwt-abc"
+
+    const auth = framesOf(latest())[0];
+    expect(auth).toEqual({
+      cmd: "auth",
+      data: { token: "live-token-xyz", sessionId: "sess-1" },
+    });
+  });
+
+  it("falls back to the context snapshot token when localStorage has none", () => {
+    // With no stored token, readLiveToken yields the MountContext fallback,
+    // preserving the behaviour the protocol-framing tests rely on.
+    expect(localStorage.getItem("token")).toBeNull();
+
+    connectClient();
+
+    expect(framesOf(latest())[0]).toEqual({
+      cmd: "auth",
+      data: { token: "jwt-abc", sessionId: "sess-1" },
+    });
+  });
+
+  it("re-authenticates on reconnect with a token refreshed mid-mount", () => {
+    // Connect with the original live token, then simulate an auth refresh
+    // (a new JWT written to localStorage) before the socket drops. The
+    // reconnect handshake must carry the NEW token, not the original.
+    localStorage.setItem("token", JSON.stringify("token-v1"));
+    jest.spyOn(Math, "random").mockReturnValue(0);
+
+    const client = createEventsClient(makeContext());
+    client.setupConnection();
+    latest().emit("open");
+    expect(framesOf(latest())[0]).toEqual({
+      cmd: "auth",
+      data: { token: "token-v1", sessionId: "sess-1" },
+    });
+
+    // Token is refreshed by the surviving AngularJS auth layer mid-mount.
+    localStorage.setItem("token", JSON.stringify("token-v2"));
+
+    // A clean close schedules the deterministic reconnect.
+    latest().emit("close");
+    jest.advanceTimersByTime(RECONNECT_TRY_INTERVAL);
+    expect(MockWebSocket.instances.length).toBe(2);
+
+    const socketB = latest();
+    socketB.emit("open");
+    expect(framesOf(socketB)[0]).toEqual({
+      cmd: "auth",
+      data: { token: "token-v2", sessionId: "sess-1" },
+    });
+  });
+
+  it("sends a null token in the auth frame when neither store nor context has one", () => {
+    // A logged-out / token-less mount must still handshake deterministically
+    // (token: null) rather than throw; the backend rejects it, matching the
+    // legacy behaviour of authenticating with whatever storage returned.
+    connectClient({ token: undefined as unknown as string });
+
+    expect(framesOf(latest())[0]).toEqual({
+      cmd: "auth",
+      data: { token: null, sessionId: "sess-1" },
+    });
+  });
+});
+
+/**
+ * M9 (inbound-frame validation): a hostile or buggy socket must never be able
+ * to break the client. `handleMessage` bounds the frame size, parses JSON
+ * safely, requires a plain object, and requires `cmd`/`routing_key` (when
+ * present) to be strings; any violation is ignored (never thrown out of the
+ * listener) and logged at most `MAX_MALFORMED_FRAME_LOGS` times so a flood of
+ * bad frames cannot swamp the console. A single bad frame must not stop a
+ * later, well-formed frame from being dispatched.
+ */
+describe("createEventsClient — malformed frame validation (M9)", () => {
+  const KEY = "changes.project.7.userstories";
+
+  /**
+   * Connect a client subscribed to {@link KEY}, spy on `console.warn`, and
+   * return both so a test can assert the callback was never invoked and the
+   * bounded diagnostic fired. `console.warn` is restored by the global
+   * `afterEach` (`jest.restoreAllMocks()`).
+   */
+  function connectSubscribed(): {
+    cb: jest.Mock;
+    warn: jest.SpyInstance;
+    socket: MockWebSocket;
+  } {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const client = createEventsClient(makeContext());
+    client.setupConnection();
+    const cb = jest.fn();
+    client.subscribe(KEY, cb);
+    latest().emit("open");
+    latest().sent = []; // discard the auth+subscribe frames; focus on inbound
+    return { cb, warn, socket: latest() };
+  }
+
+  it("ignores a non-string frame payload without throwing or dispatching", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    expect(() =>
+      socket.emit("message", { data: 123 as unknown as string }),
+    ).not.toThrow();
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an empty-string frame", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    socket.emit("message", { data: "" });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an over-length frame beyond MAX_INBOUND_FRAME_LENGTH", () => {
+    const { cb, warn, socket } = connectSubscribed();
+    const huge = "x".repeat(MAX_INBOUND_FRAME_LENGTH + 1);
+
+    socket.emit("message", { data: huge });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a frame that is not valid JSON without throwing", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    expect(() =>
+      socket.emit("message", { data: "{ not valid json" }),
+    ).not.toThrow();
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a JSON array frame (not a plain object)", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    socket.emit("message", { data: JSON.stringify([1, 2, 3]) });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a JSON null frame (not a plain object)", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    socket.emit("message", { data: JSON.stringify(null) });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a frame whose cmd is not a string", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    socket.emit("message", {
+      data: JSON.stringify({ cmd: 5, routing_key: KEY, data: { id: 1 } }),
+    });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a frame whose routing_key is not a string", () => {
+    const { cb, warn, socket } = connectSubscribed();
+
+    socket.emit("message", {
+      data: JSON.stringify({ routing_key: 5, data: { id: 1 } }),
+    });
+
+    expect(cb).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("still dispatches a well-formed frame that arrives after a malformed one", () => {
+    const { cb, socket } = connectSubscribed();
+
+    socket.emit("message", { data: "{ broken" }); // malformed: ignored
+    socket.emit("message", {
+      data: JSON.stringify({ routing_key: KEY, data: { id: 99 } }),
+    }); // well-formed: must dispatch
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ id: 99 });
+  });
+
+  it("bounds malformed-frame logging to MAX_MALFORMED_FRAME_LOGS", () => {
+    const { warn, socket } = connectSubscribed();
+
+    // Emit strictly more than the cap; only the first MAX are logged, but
+    // every one is still safely ignored (no throw).
+    for (let i = 0; i < MAX_MALFORMED_FRAME_LOGS + 3; i += 1) {
+      socket.emit("message", { data: "{ broken" });
+    }
+
+    expect(warn).toHaveBeenCalledTimes(MAX_MALFORMED_FRAME_LOGS);
+  });
+});

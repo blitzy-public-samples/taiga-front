@@ -41,7 +41,6 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { KanbanBoard } from "./KanbanBoard";
 import { useKanbanStories } from "./hooks/useKanbanStories";
-import { useKanbanDragEnd } from "./dnd";
 
 /* -------------------------------------------------------------------------- */
 /* Mocks                                                                       */
@@ -149,54 +148,55 @@ jest.mock("./hooks/useKanbanStories", () => ({
   useKanbanStories: jest.fn(),
 }));
 
-// Mock the `./dnd` drag-end glue: `useKanbanDragEnd` returns a stable handler so
-// the board's DndContext wiring can be asserted (handler passed + called with kb).
+// Mock the single `./dnd` provider (M6): `KanbanDndProvider` becomes a plain
+// passthrough that records the props the board hands it (the drag `context`, the
+// `renderOverlay` mirror renderer, the `enabled` flag) on `__providerState` and
+// renders its children. The real drop-forwarding + overlay behaviour is proven
+// in `dnd/KanbanDndProvider.test.tsx`; here we assert only the board's WIRING —
+// that it forwards the exact hook return as the context and supplies a mirror
+// renderer, with no hand-rolled DndContext.
 jest.mock("./dnd", () => {
-  const handler = jest.fn();
-  return {
-    __esModule: true,
-    useKanbanDragEnd: jest.fn(() => handler),
-  };
-});
-
-// Mock `@dnd-kit/core`: `DndContext` becomes a plain div echoing whether it
-// received an `onDragEnd` function + the `autoScroll` flag; the sensor helpers
-// are inert stubs (the real pointer sensor is not needed for a DOM unit test).
-// The most recent props DndContext received are captured on `__dndState` so a
-// spec can assert the EXACT `onDragEnd` handler identity (it must be the fn
-// returned by the mocked `useKanbanDragEnd`, not merely "some function").
-jest.mock("@dnd-kit/core", () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const react = require("react");
-  const dndState: { lastProps: { onDragEnd?: unknown; autoScroll?: unknown } | null } = {
-    lastProps: null,
-  };
+  const providerState: {
+    lastProps: {
+      context?: unknown;
+      onDrop?: unknown;
+      renderOverlay?: unknown;
+      enabled?: unknown;
+    } | null;
+  } = { lastProps: null };
   return {
     __esModule: true,
-    __dndState: dndState,
-    DndContext: (props: { onDragEnd?: unknown; autoScroll?: unknown; children?: unknown }) => {
-      dndState.lastProps = { onDragEnd: props.onDragEnd, autoScroll: props.autoScroll };
+    __providerState: providerState,
+    KanbanDndProvider: (props: {
+      context?: unknown;
+      onDrop?: unknown;
+      renderOverlay?: unknown;
+      enabled?: unknown;
+      children?: unknown;
+    }) => {
+      providerState.lastProps = {
+        context: props.context,
+        onDrop: props.onDrop,
+        renderOverlay: props.renderOverlay,
+        enabled: props.enabled,
+      };
       return react.createElement(
         "div",
         {
-          "data-testid": "dnd-context",
-          "data-has-drag-end": String(typeof props.onDragEnd === "function"),
-          "data-autoscroll": String(!!props.autoScroll),
+          "data-testid": "dnd-provider",
+          "data-has-context": String(props.context != null),
+          "data-has-render-overlay": String(typeof props.renderOverlay === "function"),
         },
         props.children,
       );
     },
-    PointerSensor: function PointerSensor() {
-      /* inert sensor stub */
-    },
-    useSensor: (sensor: unknown, options: unknown) => ({ sensor, options }),
-    useSensors: (...descriptors: unknown[]) => descriptors,
   };
 });
 
 // The mocked hook — cast to a Jest mock so we can drive its return value per test.
 const mockedUseKanbanStories = useKanbanStories as unknown as jest.Mock;
-const mockedUseKanbanDragEnd = useKanbanDragEnd as unknown as jest.Mock;
 
 /* -------------------------------------------------------------------------- */
 /* Fixtures                                                                    */
@@ -224,6 +224,8 @@ function makeProject(overrides: ProjectOverrides = {}) {
     is_kanban_activated: true,
     is_backlog_activated: true,
     members: [],
+    roles: [],
+    points: [],
     ...overrides,
   };
 }
@@ -272,7 +274,7 @@ function makeKb(overrides: ProjectOverrides = {}) {
     zoom: [],
     zoomLevel: 1,
     setZoom: jest.fn(),
-    filters: null,
+    filters: [],
     customFilters: [],
     selectedFilters: [],
     filterQ: "",
@@ -300,9 +302,13 @@ function makeKb(overrides: ProjectOverrides = {}) {
     isUsInArchivedHiddenStatus: jest.fn(() => false),
     showPlaceHolder: jest.fn(() => false),
     activeLightbox: null,
+    savingUs: false,
+    errorMessage: null,
     closeLightbox: jest.fn(),
     submitNewUs: jest.fn(),
+    submitEditUs: jest.fn(),
     submitBulkUs: jest.fn(),
+    submitAssignedUsers: jest.fn(),
     ...overrides,
   };
 }
@@ -406,7 +412,7 @@ describe("KanbanBoard — section + header", () => {
     expect(container.querySelector("section.main.kanban")).toHaveClass("swimlane");
   });
 
-  it("reproduces the mainTitle header (header > h1.main-title) with the project name + section label", () => {
+  it("reproduces the mainTitle header (header > h1.main-title) with ONLY the section label - main-title.jade renders `span {{ sectionName | translate }}`, never the project name", () => {
     mockedUseKanbanStories.mockReturnValue(
       makeKb({ project: makeProject({ name: "Acme Board" }) }),
     );
@@ -414,8 +420,12 @@ describe("KanbanBoard — section + header", () => {
 
     const heading = container.querySelector(".kanban-header header h1.main-title");
     expect(heading).toBeInTheDocument();
-    expect(heading).toHaveTextContent("Acme Board");
+    // The section label (KANBAN.SECTION_NAME => "Kanban") is the SOLE title text.
     expect(heading?.querySelector("span")).toHaveTextContent("Kanban");
+    // Legacy parity: the project NAME must NOT leak into the heading (it lives in
+    // the AngularJS project menu, never in the reproduced mainTitle h1).
+    expect(heading).not.toHaveTextContent("Acme Board");
+    expect(heading?.textContent).toBe("Kanban");
   });
 
   it("renders KanbanHeader inside .kanban-header and forwards the controlled props", () => {
@@ -462,22 +472,38 @@ describe("KanbanBoard — manager + filter panel", () => {
     expect(container.querySelector(".kanban-manager")).toHaveClass("expanded");
   });
 
-  it("wires the filter panel chips to the hook filter handlers", () => {
-    const selected = [{ id: "s1" }];
-    const custom = [{ id: "c1" }];
+  it("wires the shared filter panel (BacklogFilterPanel) to the hook handlers", () => {
+    // The board now renders the FULL shared `tg-filter` panel (C11/C4), so the
+    // params-based FilterChip / CustomFilter shapes drive its DOM: an applied
+    // chip in `.filters-applied` and a saved row in `.custom-filter-list`.
+    const selected = [
+      { id: "s1", key: "tags:s1", dataType: "tags", name: "S1", mode: "include" },
+    ];
+    const custom = [{ id: "c1", name: "C1", filter: { tags: "s1" } }];
     const kb = makeKb({ selectedFilters: selected, customFilters: custom });
     mockedUseKanbanStories.mockReturnValue(kb);
     const { container } = renderBoard();
 
     fireEvent.click(container.querySelector(".mock-toggle-filter") as Element);
 
-    fireEvent.click(container.querySelector(".filters-applied .filter-applied") as Element);
+    // Remove an applied chip (the ✕ inside `.filters-applied`).
+    fireEvent.click(
+      container.querySelector(".filters-applied .remove-filter") as Element,
+    );
     expect(kb.removeFilter).toHaveBeenCalledWith(selected[0]);
 
-    fireEvent.click(container.querySelector(".custom-filter .custom-filter-select") as Element);
+    // Apply a saved custom filter (its name button in the custom-filter list).
+    fireEvent.click(
+      container.querySelector(
+        ".custom-filter-list .single-filter-type-custom .name",
+      ) as Element,
+    );
     expect(kb.selectCustomFilter).toHaveBeenCalledWith(custom[0]);
 
-    fireEvent.click(container.querySelector(".custom-filter .custom-filter-remove") as Element);
+    // Remove a saved custom filter (its trash button).
+    fireEvent.click(
+      container.querySelector(".custom-filter-list .remove-filter") as Element,
+    );
     expect(kb.removeCustomFilter).toHaveBeenCalledWith(custom[0]);
   });
 });
@@ -551,7 +577,7 @@ describe("KanbanBoard — header row + options ordering", () => {
     expect(header?.querySelector(".deco-square")).toHaveClass("hidden");
   });
 
-  it("orders .options as [fold a, unfold a, add button, bulk button] when add_us is granted", () => {
+  it("orders .options as [add button, bulk button, fold a, unfold a] matching kanban-table.jade", () => {
     mockedUseKanbanStories.mockReturnValue(makeKb({ usStatusList: [makeStatus(10)] }));
     const { container } = renderBoard();
 
@@ -560,21 +586,26 @@ describe("KanbanBoard — header row + options ordering", () => {
     const anchors = options.querySelectorAll("a");
 
     expect(anchors).toHaveLength(2); // fold + unfold are the only <a> elements
-    expect(optionEls).toHaveLength(4); // fold, unfold, add, bulk
-    expect(optionEls[2].tagName).toBe("BUTTON"); // .option index 2 == the add button
-    expect(optionEls[3].tagName).toBe("BUTTON"); // .option index 3 == the bulk button
+    expect(optionEls).toHaveLength(4); // add, bulk, fold, unfold
+    // Legacy `kanban-table.jade` (L30-59) renders add + bulk FIRST, then the
+    // fold/unfold toggles. The E2E helper opens the new-US lightbox from the
+    // column header's FIRST `.option`, so the add button MUST be index 0.
+    expect(optionEls[0].tagName).toBe("BUTTON"); // .option index 0 == the add button
+    expect(optionEls[1].tagName).toBe("BUTTON"); // .option index 1 == the bulk button
+    expect(optionEls[2].tagName).toBe("A"); // .option index 2 == the fold control
+    expect(optionEls[3].tagName).toBe("A"); // .option index 3 == the unfold control
     // The bulk button's inner svg carries .icon-bulk (openBulkUsLb target).
-    expect(optionEls[3].querySelector(".icon-bulk")).toBeInTheDocument();
+    expect(optionEls[1].querySelector(".icon-bulk")).toBeInTheDocument();
     expect(container.querySelectorAll(".icon-bulk")).toHaveLength(1);
     // Icons render through the reproduced `tg-svg` wrapper (matching the legacy
     // `tgSvg` directive output `<tg-svg><svg class="icon icon-…">`). Assert BOTH
     // the `tg-svg` wrapper element AND the inner `svg.icon-*` exist on the add and
     // bulk options, so the unchanged SCSS's `tg-svg` selectors and the e2e
     // `.icon-*` selectors both resolve against the migrated DOM.
-    expect(optionEls[2].querySelector("tg-svg")).toBeInTheDocument();
-    expect(optionEls[2].querySelector("tg-svg > svg.icon.icon-add")).toBeInTheDocument();
-    expect(optionEls[3].querySelector("tg-svg")).toBeInTheDocument();
-    expect(optionEls[3].querySelector("tg-svg > svg.icon.icon-bulk")).toBeInTheDocument();
+    expect(optionEls[0].querySelector("tg-svg")).toBeInTheDocument();
+    expect(optionEls[0].querySelector("tg-svg > svg.icon.icon-add")).toBeInTheDocument();
+    expect(optionEls[1].querySelector("tg-svg")).toBeInTheDocument();
+    expect(optionEls[1].querySelector("tg-svg > svg.icon.icon-bulk")).toBeInTheDocument();
   });
 
   it("hides the add + bulk buttons when the add_us permission is absent", () => {
@@ -694,7 +725,7 @@ describe("KanbanBoard — swimlane-add link gate", () => {
 
     const links = container.querySelectorAll("a.kanban-swimlane-add");
     expect(links).toHaveLength(1);
-    expect(links[0]).toHaveAttribute("href", "#/project/acme/admin/project-values/kanban");
+    expect(links[0]).toHaveAttribute("href", "/project/acme/admin/project-values/kanban-power-ups");
   });
 
   it("does not render the swimlane-add link when the user is not an admin", () => {
@@ -726,68 +757,81 @@ describe("KanbanBoard — swimlane-add link gate", () => {
 /* Phase B/C — Lightbox hosts                                                  */
 /* -------------------------------------------------------------------------- */
 
-describe("KanbanBoard — lightbox hosts", () => {
-  it("renders all three hosts (hidden) by default with the e2e marker attributes", () => {
+describe("KanbanBoard — story lightboxes (C2 real integration)", () => {
+  it("always mounts all three lightbox hosts (marker attrs) and keeps them closed by default", () => {
     const { container } = renderBoard();
 
     const createEdit = container.querySelector("[tg-lb-create-edit-userstory]") as HTMLElement;
     const bulk = container.querySelector("[tg-lb-create-bulk-userstories]") as HTMLElement;
     const assign = container.querySelector("[tg-lb-assignedto]") as HTMLElement;
 
+    // Hosts are always present (so the e2e host selectors resolve before the
+    // opening click) even though the content mounts only while open.
     expect(createEdit).toBeInTheDocument();
     expect(bulk).toBeInTheDocument();
     expect(assign).toBeInTheDocument();
-    expect(createEdit).toHaveStyle({ display: "none" });
-    expect(bulk).toHaveStyle({ display: "none" });
-    expect(assign).toHaveStyle({ display: "none" });
-    expect(createEdit).toHaveClass("lightbox", "lightbox-create-edit");
+
+    // Closed = NO `.open` class (the ONLY thing the preserved lightbox.scss
+    // reveals) + aria-hidden; the previous inline `display` hack is gone (C2).
+    for (const host of [createEdit, bulk, assign]) {
+      expect(host).toHaveClass("lightbox");
+      expect(host).not.toHaveClass("open");
+      expect(host).toHaveAttribute("aria-hidden", "true");
+      expect(host).toHaveAttribute("role", "dialog");
+    }
+    // Closed content is not mounted (mirrors legacy `form(ng-if=lightboxOpen)`).
+    expect(createEdit.querySelector("form")).toBeNull();
   });
 
-  it("shows the create/edit host for the create AND edit lightbox states", () => {
-    mockedUseKanbanStories.mockReturnValue(
-      makeKb({ activeLightbox: { type: "create", statusId: 10 } }),
-    );
-    const { container, rerender } = renderBoard();
-    expect(container.querySelector("[tg-lb-create-edit-userstory]")).toHaveStyle({ display: "flex" });
-
-    mockedUseKanbanStories.mockReturnValue(makeKb({ activeLightbox: { type: "edit", usId: 5 } }));
-    rerender(<KanbanBoard context={CONTEXT} />);
-    expect(container.querySelector("[tg-lb-create-edit-userstory]")).toHaveStyle({ display: "flex" });
-  });
-
-  it("shows the bulk host for the bulk lightbox state", () => {
-    mockedUseKanbanStories.mockReturnValue(
-      makeKb({ activeLightbox: { type: "bulk", statusId: 10 } }),
-    );
-    const { container } = renderBoard();
-    expect(container.querySelector("[tg-lb-create-bulk-userstories]")).toHaveStyle({ display: "flex" });
-    expect(container.querySelector("[tg-lb-create-edit-userstory]")).toHaveStyle({ display: "none" });
-  });
-
-  it("shows the assign host + member list for the assign lightbox state", () => {
+  it("adds `.open` (never inline display) to the create host and mounts the rich form", () => {
     mockedUseKanbanStories.mockReturnValue(
       makeKb({
-        activeLightbox: { type: "assign", usId: 5 },
-        project: makeProject({
-          members: [
-            { id: 1, full_name_display: "Ada Lovelace" },
-            { id: 2, username: "grace" },
-          ],
-        }),
+        activeLightbox: { type: "create", statusId: 10 },
+        usStatusList: [makeStatus(10), makeStatus(11)],
       }),
     );
     const { container } = renderBoard();
 
-    const assign = container.querySelector("[tg-lb-assignedto]") as HTMLElement;
-    expect(assign).toHaveStyle({ display: "flex" });
-    const items = assign.querySelectorAll(".user-list-single");
-    expect(items).toHaveLength(2);
-    expect(items[0]).toHaveTextContent("Ada Lovelace");
-    expect(items[1]).toHaveTextContent("grace");
+    const host = container.querySelector("[tg-lb-create-edit-userstory]") as HTMLElement;
+    expect(host).toHaveClass("open");
+    expect(host).not.toHaveAttribute("aria-hidden");
+    // Rich form DOM (not the old subject-only stub): subject + description +
+    // status dropdown + creation-position radios.
+    expect(host.querySelector('input[name="subject"]')).toBeInTheDocument();
+    expect(host.querySelector("textarea.description")).toBeInTheDocument();
+    expect(host.querySelector("fieldset.status-button .status-dropdown")).toBeInTheDocument();
+    expect(host.querySelector("fieldset.creation-position")).toBeInTheDocument();
+    // Create caption.
+    expect(host.querySelector("#submitButton")).toHaveTextContent("Create");
   });
 
-  it("submits the create form to submitNewUs and closes via closeLightbox", () => {
-    const kb = makeKb({ activeLightbox: { type: "create", statusId: 10 } });
+  it("shows the create host for BOTH create and edit states, with the edit caption on edit", () => {
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({ activeLightbox: { type: "create", statusId: 10 }, usStatusList: [makeStatus(10)] }),
+    );
+    const { container, rerender } = renderBoard();
+    expect(container.querySelector("[tg-lb-create-edit-userstory]")).toHaveClass("open");
+
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({
+        activeLightbox: { type: "edit", usId: 5 },
+        usStatusList: [makeStatus(10)],
+        usMap: { 5: { id: 5, subject: "Existing story", status: 10, version: 3 } },
+      }),
+    );
+    rerender(<KanbanBoard context={CONTEXT} />);
+    const host = container.querySelector("[tg-lb-create-edit-userstory]") as HTMLElement;
+    expect(host).toHaveClass("open");
+    // Seeded from the target story + edit caption.
+    expect(host.querySelector('input[name="subject"]')).toHaveValue("Existing story");
+    expect(host.querySelector("#submitButton")).toHaveTextContent("Save");
+  });
+
+  it("submits the create form to submitNewUs with a value object and cancels via closeLightbox", () => {
+    const kb = makeKb({
+      activeLightbox: { type: "create", statusId: 10 },
+      usStatusList: [makeStatus(10)],
+    });
     mockedUseKanbanStories.mockReturnValue(kb);
     const { container } = renderBoard();
 
@@ -795,48 +839,228 @@ describe("KanbanBoard — lightbox hosts", () => {
     const input = host.querySelector('input[name="subject"]') as HTMLInputElement;
     fireEvent.change(input, { target: { value: "A brand new story" } });
     fireEvent.submit(host.querySelector("form") as HTMLFormElement);
-    expect(kb.submitNewUs).toHaveBeenCalledWith("A brand new story");
 
-    fireEvent.click(host.querySelector("button.close") as Element);
+    // M2: the collected VALUE OBJECT is handed to the hook (not a bare string),
+    // and the board never clears the field before persistence — the form owns it.
+    expect(kb.submitNewUs).toHaveBeenCalledTimes(1);
+    expect(kb.submitNewUs).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "A brand new story", status: 10, us_position: "bottom" }),
+    );
+    expect(kb.submitEditUs).not.toHaveBeenCalled();
+
+    fireEvent.click(host.querySelector("button.cancel") as Element);
     expect(kb.closeLightbox).toHaveBeenCalledTimes(1);
   });
 
-  it("submits the bulk form to submitBulkUs", () => {
-    const kb = makeKb({ activeLightbox: { type: "bulk", statusId: 10 } });
+  it("routes the edit-form submit to submitEditUs (not submitNewUs)", () => {
+    const kb = makeKb({
+      activeLightbox: { type: "edit", usId: 5 },
+      usStatusList: [makeStatus(10)],
+      usMap: { 5: { id: 5, subject: "Existing story", status: 10, version: 3 } },
+    });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    const { container } = renderBoard();
+
+    const host = container.querySelector("[tg-lb-create-edit-userstory]") as HTMLElement;
+    fireEvent.submit(host.querySelector("form") as HTMLFormElement);
+    expect(kb.submitEditUs).toHaveBeenCalledTimes(1);
+    expect(kb.submitEditUs).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "Existing story" }),
+    );
+    expect(kb.submitNewUs).not.toHaveBeenCalled();
+  });
+
+  it("adds `.open` to the bulk host and submits a value object to submitBulkUs", () => {
+    const kb = makeKb({
+      activeLightbox: { type: "bulk", statusId: 10 },
+      usStatusList: [makeStatus(10)],
+    });
     mockedUseKanbanStories.mockReturnValue(kb);
     const { container } = renderBoard();
 
     const host = container.querySelector("[tg-lb-create-bulk-userstories]") as HTMLElement;
+    expect(host).toHaveClass("open");
+    expect(container.querySelector("[tg-lb-create-edit-userstory]")).not.toHaveClass("open");
+
     const textarea = host.querySelector('textarea[name="bulk"]') as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "US 1\nUS 2" } });
     fireEvent.submit(host.querySelector("form") as HTMLFormElement);
-    expect(kb.submitBulkUs).toHaveBeenCalledWith("US 1\nUS 2");
+    expect(kb.submitBulkUs).toHaveBeenCalledTimes(1);
+    expect(kb.submitBulkUs).toHaveBeenCalledWith(
+      expect.objectContaining({ bulk: "US 1\nUS 2", status: 10 }),
+    );
+  });
+
+  it("opens the assign host with a selectable member list and submits to submitAssignedUsers", () => {
+    const kb = makeKb({
+      activeLightbox: { type: "assign", usId: 5 },
+      usMap: { 5: { id: 5, subject: "S", status: 10, assigned_users: [2] } },
+      project: makeProject({
+        members: [
+          { id: 1, full_name_display: "Ada Lovelace" },
+          { id: 2, username: "grace" },
+        ],
+      }),
+    });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    const { container } = renderBoard();
+
+    const assign = container.querySelector("[tg-lb-assignedto]") as HTMLElement;
+    expect(assign).toHaveClass("open");
+    const items = assign.querySelectorAll(".user-list-single");
+    expect(items).toHaveLength(2);
+    expect(items[0]).toHaveTextContent("Ada Lovelace");
+    expect(items[1]).toHaveTextContent("grace");
+    // Seeded from the story's current collaborators.
+    expect(items[1]).toHaveClass("selected");
+
+    fireEvent.submit(assign.querySelector("form") as HTMLFormElement);
+    expect(kb.submitAssignedUsers).toHaveBeenCalledTimes(1);
+    // Current collaborators preserved (grace = id 2).
+    expect(kb.submitAssignedUsers).toHaveBeenCalledWith([2], 2);
   });
 });
 
-/* -------------------------------------------------------------------------- */
-/* Phase C — Drag-and-drop wiring                                              */
-/* -------------------------------------------------------------------------- */
+describe("KanbanBoard — M2 board error region + M7 a11y", () => {
+  it("renders the sanitized hook error in the board status live region when no lightbox is open", () => {
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({ errorMessage: "Could not reorder the story. Please retry.", activeLightbox: null }),
+    );
+    const { container } = renderBoard();
 
-describe("KanbanBoard — drag-and-drop wiring", () => {
-  it("builds the drag-end handler from the hook and passes it (with autoScroll) to DndContext", () => {
+    const region = container.querySelector(".kanban-board-status") as HTMLElement;
+    expect(region).toBeInTheDocument();
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveAttribute("aria-live", "polite");
+    expect(region.querySelector(".notification-message-error")).toHaveTextContent(
+      "Could not reorder the story. Please retry.",
+    );
+  });
+
+  it("does NOT duplicate the error in the board region while a lightbox is open (shown in-lightbox)", () => {
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({
+        errorMessage: "Server said no.",
+        activeLightbox: { type: "create", statusId: 10 },
+        usStatusList: [makeStatus(10)],
+      }),
+    );
+    const { container } = renderBoard();
+
+    // Board-level region is empty (no duplicate)...
+    expect(container.querySelector(".kanban-board-status .notification-message-error")).toBeNull();
+    // ...and the error is surfaced INSIDE the open lightbox instead.
+    const host = container.querySelector("[tg-lb-create-edit-userstory]") as HTMLElement;
+    expect(host.querySelector(".lightbox-error")).toHaveTextContent("Server said no.");
+  });
+
+  it("resolves the section label through t() (M7 i18n, not a hard-coded literal)", () => {
+    const { container } = renderBoard();
+    // KANBAN.SECTION_NAME => "Kanban" in the bundled catalogue.
+    expect(container.querySelector("h1.main-title span")).toHaveTextContent("Kanban");
+  });
+
+  it("resolves the fold/unfold column titles through t() (M7)", () => {
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({ usStatusList: [makeStatus(10)], project: makeProject({ my_permissions: [] }) }),
+    );
+    const { container } = renderBoard();
+    const options = container.querySelector(".task-colum-name .options") as HTMLElement;
+    const anchors = options.querySelectorAll("a[role='button']");
+    expect(anchors[0]).toHaveAttribute("title", "Fold column");
+    expect(anchors[1]).toHaveAttribute("title", "Unfold column");
+  });
+
+  it("makes the fold/unfold role-button anchors keyboard-operable (tabIndex + Enter/Space) — M7", () => {
     const kb = makeKb({ usStatusList: [makeStatus(10)] });
     mockedUseKanbanStories.mockReturnValue(kb);
     const { container } = renderBoard();
 
-    expect(mockedUseKanbanDragEnd).toHaveBeenCalledWith(kb);
-    const dnd = container.querySelector('[data-testid="dnd-context"]');
-    expect(dnd).toHaveAttribute("data-has-drag-end", "true");
-    expect(dnd).toHaveAttribute("data-autoscroll", "true");
+    const options = container.querySelector(".task-colum-name .options") as HTMLElement;
+    const fold = options.querySelectorAll("a[role='button']")[0] as HTMLElement;
+    expect(fold).toHaveAttribute("tabindex", "0");
 
-    // The handler passed to DndContext is EXACTLY the fn returned by the mocked
-    // useKanbanDragEnd (the board forwards it verbatim — it does not wrap or
-    // recreate it), so the single-bulk-update-per-drop contract stays in `./dnd`.
-    const returnedHandler = mockedUseKanbanDragEnd.mock.results[0]?.value;
-    const dndMock = jest.requireMock("@dnd-kit/core") as {
-      __dndState: { lastProps: { onDragEnd?: unknown; autoScroll?: unknown } | null };
+    fireEvent.keyDown(fold, { key: "Enter" });
+    fireEvent.keyDown(fold, { key: " " });
+    // Enter + Space both activate (parity with the mouse click handler).
+    expect(kb.foldStatus).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("KanbanBoard — drag-and-drop wiring (single KanbanDndProvider, M6)", () => {
+  const providerMock = () =>
+    jest.requireMock("./dnd") as {
+      __providerState: {
+        lastProps: {
+          context?: unknown;
+          renderOverlay?: (id: number) => unknown;
+        } | null;
+      };
     };
-    expect(dndMock.__dndState.lastProps?.onDragEnd).toBe(returnedHandler);
+
+  it("wraps the board in the single tested KanbanDndProvider with the hook as the drag context", () => {
+    const kb = makeKb({ usStatusList: [makeStatus(10)] });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    const { container } = renderBoard();
+
+    // The board no longer hand-wires a DndContext; it renders the one tested
+    // provider (M6) and forwards the EXACT hook return as the drag context.
+    const provider = container.querySelector('[data-testid="dnd-provider"]');
+    expect(provider).not.toBeNull();
+    expect(provider).toHaveAttribute("data-has-context", "true");
+    expect(provider).toHaveAttribute("data-has-render-overlay", "true");
+
+    expect(providerMock().__providerState.lastProps?.context).toBe(kb);
+    expect(typeof providerMock().__providerState.lastProps?.renderOverlay).toBe("function");
+  });
+
+  it("supplies a .gu-mirror DragOverlay clone (with the story subject) via renderOverlay (C3)", () => {
+    const kb = makeKb({
+      usStatusList: [makeStatus(10)],
+      usMap: { 7: { id: 7, status: 10, swimlane: null, subject: "Fix login" } },
+      selectedUss: {},
+    });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    renderBoard();
+
+    const renderOverlay = providerMock().__providerState.lastProps
+      ?.renderOverlay as (id: number) => React.ReactElement | null;
+    const { container } = render(renderOverlay(7) as React.ReactElement);
+
+    const mirror = container.querySelector(".gu-mirror");
+    expect(mirror).not.toBeNull();
+    expect(mirror).toHaveClass("multiple-drag-mirror");
+    expect(mirror?.textContent).toContain("Fix login");
+    // A single drag shows no multi-count badge.
+    expect(container.querySelector(".multiple-drag-count")).toBeNull();
+  });
+
+  it("shows the multi-drag count in the overlay when several cards are selected (C3)", () => {
+    const kb = makeKb({
+      usMap: {
+        7: { id: 7, status: 10, swimlane: null, subject: "A" },
+        8: { id: 8, status: 10, swimlane: null, subject: "B" },
+      },
+      selectedUss: { 7: true, 8: true },
+    });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    renderBoard();
+
+    const renderOverlay = providerMock().__providerState.lastProps
+      ?.renderOverlay as (id: number) => React.ReactElement | null;
+    const { container } = render(renderOverlay(7) as React.ReactElement);
+
+    expect(container.querySelector(".multiple-drag-count")?.textContent).toBe("2");
+  });
+
+  it("renders no mirror for an unknown active id", () => {
+    const kb = makeKb({ usMap: {} });
+    mockedUseKanbanStories.mockReturnValue(kb);
+    renderBoard();
+
+    const renderOverlay = providerMock().__providerState.lastProps
+      ?.renderOverlay as (id: number) => React.ReactElement | null;
+    expect(renderOverlay(999)).toBeNull();
   });
 });
 

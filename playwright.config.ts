@@ -38,8 +38,15 @@
  *   - Per-project `outputDir` routes Playwright's auto-captured videos, traces, and
  *     failure screenshots into the two git-tracked artifact folders. The spec files
  *     additionally save explicit, named screenshots into these same directories.
- *   - Browsers are kept minimal (Chromium via `Desktop Chrome`) per the Minimal
- *     Change Clause.
+ *   - Browsers are kept minimal (Chromium device profile via `Desktop Chrome`)
+ *     per the Minimal Change Clause, but every project pins `channel: "chrome"`
+ *     so Playwright launches the TRUSTED pre-installed Google Chrome rather than
+ *     downloading/using its bundled browser drivers. Combined with
+ *     `playwright_skip_browser_download=1` in `.npmrc`, this is the accepted
+ *     mitigation for advisory GHSA-7mvr-c777-76hp (finding M11): the Node
+ *     16.19.1 pin (`.nvmrc`) blocks upgrading past the 1.44.x line (1.45 drops
+ *     Node 16), so no browser download path is exercised and the parity suite
+ *     runs on a trusted browser binary.
  *   - This config is loaded natively by Playwright's own TypeScript loader; no
  *     separate build step is required.
  *
@@ -83,14 +90,14 @@ export default defineConfig({
       name: "baseline",
       testMatch: /.*\.spec\.ts/,
       outputDir: "e2e-react/artifacts/baseline",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], channel: "chrome" },
     },
     {
       // Migrated React capture — run after the migration on the same origin.
       name: "react",
       testMatch: /.*\.spec\.ts/,
       outputDir: "e2e-react/artifacts/react",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], channel: "chrome" },
     },
   ],
 });

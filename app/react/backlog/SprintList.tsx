@@ -57,12 +57,16 @@
  *     gate computed from `project.my_permissions`. There is NO parallel
  *     authorization: this flag only decides whether the add-sprint control
  *     renders; the backend remains the single enforcement point (AAP §0.6.4).
- *   - The AngularJS `translate` keys are rendered as their resolved English copy
- *     from `app/locales/taiga/locale-en.json` ("SPRINTS",
- *     "There are no sprints yet", "Show closed sprints" / "Hide closed sprints")
- *     because there is no React i18n runtime in scope for this POC. The only
- *     user-supplied values rendered (sprint names, refs, etc.) flow through the
- *     child `./Sprint.tsx` via React's default (escaping) text nodes.
+ *   - The AngularJS `translate` filter/directive is reproduced by the shared
+ *     `t()` runtime (`app/react/shared/i18n/translate.ts`), which resolves the
+ *     SAME keys from `app/locales/taiga/locale-en.json` that the legacy
+ *     `sprints.jade` bound (`BACKLOG.SPRINTS.TITLE`,
+ *     `BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT`, `BACKLOG.SPRINTS.EMPTY`,
+ *     `BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS` /
+ *     `BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS`, `COMMON.ADD`). No string is
+ *     hard-coded. The only user-supplied values rendered (sprint names, refs,
+ *     etc.) flow through the child `./Sprint.tsx` via React's default (escaping)
+ *     text nodes.
  *   - `tg-backlog-sprint="sprint"` and `tg-sprint-sortable` were AngularJS
  *     directive hooks; they are reproduced here as LITERAL, inert attribute
  *     strings (NOT AngularJS behavior) purely so the existing e2e selector
@@ -77,9 +81,12 @@
  * still renders correctly outside a `DndContext` (e.g. in isolated unit tests).
  */
 
+import type { ReactNode } from "react";
+import { useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 
-import type { Milestone, Project } from "../shared/types";
+import type { Milestone, Project, UserStory } from "../shared/types";
+import { t } from "../shared/i18n/translate";
 import { Sprint } from "./Sprint";
 
 /**
@@ -101,6 +108,13 @@ interface DroppableSprintProps {
     isClosed: boolean;
     /** Open the create/edit-sprint lightbox for this sprint (legacy `sprintform:edit`). */
     onEditSprint: (sprint: Milestone) => void;
+    /**
+     * Optional SORTABLE row render-prop, forwarded to {@link Sprint}. Supplied by
+     * {@link SprintList} for OPEN sprints (enabling within/between-sprint reorder
+     * and sprint->backlog drags, C8); omitted for CLOSED sprints so their rows
+     * render as plain, non-draggable rows.
+     */
+    renderStoryRow?: (us: UserStory) => ReactNode;
 }
 
 /**
@@ -122,9 +136,23 @@ interface DroppableSprintProps {
  * @returns The sprint-card wrapper element, DOM/class-identical to the legacy repeat.
  */
 function DroppableSprint(props: DroppableSprintProps): JSX.Element {
+    // Fold state is owned HERE (lifted from `Sprint`) so the droppable can be
+    // gated on it. A sprint accepts drops only while its `.sprint-table` is
+    // EXPANDED — the faithful form of C8 "closed rejection": a CLOSED sprint
+    // renders folded by default (so it is not a drop target in normal use), and
+    // a FOLDED open sprint is likewise not a target, exactly as the legacy
+    // `tgBacklogSprint` directive left a collapsed `.sprint-table` out of
+    // dragula's `isContainer`. When the user UNFOLDS a closed sprint and drops a
+    // story into it, the drop is accepted and the backend reopens the sprint
+    // (legacy `open sprint by drag open US to closed sprint`).
+    const [expanded, setExpanded] = useState<boolean>(!props.sprint.closed);
+
     const { setNodeRef, isOver } = useDroppable({
         id: `sprint-${props.sprint.id}`,
         data: { type: "sprint", sprintId: props.sprint.id },
+        // Only EXPANDED sprints are live drop targets (see the block comment
+        // above); a folded/hidden closed sprint therefore rejects drops.
+        disabled: !expanded,
     });
 
     return (
@@ -139,6 +167,9 @@ function DroppableSprint(props: DroppableSprintProps): JSX.Element {
                 onEditSprint={props.onEditSprint}
                 dropRef={setNodeRef}
                 isOver={isOver}
+                expanded={expanded}
+                onToggleExpanded={() => setExpanded((value) => !value)}
+                renderStoryRow={props.renderStoryRow}
             />
         </div>
     );
@@ -179,6 +210,13 @@ export interface SprintListProps {
     onToggleClosedSprints: () => void;
     /** Open the create/edit-sprint lightbox for a given sprint (legacy `sprintform:edit`). */
     onEditSprint: (sprint: Milestone) => void;
+    /**
+     * Optional SORTABLE row render-prop from `./Backlog.tsx` (inside its
+     * `DndContext`). Forwarded to OPEN sprint cards only so their stories become
+     * sortable/draggable (C8); CLOSED sprint cards never receive it and render
+     * plain rows.
+     */
+    renderStoryRow?: (us: UserStory) => ReactNode;
 }
 
 /**
@@ -204,19 +242,19 @@ export function SprintList(props: SprintListProps): JSX.Element {
                     {props.totalMilestones ? (
                         <span className="number">{props.totalMilestones}</span>
                     ) : null}
-                    <span className="title">SPRINTS</span>
+                    <span className="title">{t("BACKLOG.SPRINTS.TITLE")}</span>
                 </h1>
                 {props.totalMilestones && canAddMilestone ? (
                     <a
                         className="btn-link add-sprint"
                         href=""
-                        title="Add a sprint"
+                        title={t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT")}
                         onClick={(event) => {
                             event.preventDefault();
                             props.onAddSprint();
                         }}
                     >
-                        <span>Add</span>
+                        <span>{t("COMMON.ADD")}</span>
                         <svg className="icon icon-add">
                             <use xlinkHref="#icon-add" />
                         </svg>
@@ -226,8 +264,8 @@ export function SprintList(props: SprintListProps): JSX.Element {
 
             {props.totalMilestones === 0 ? (
                 <div className="empty-small">
-                    <img src="/v/images/empty/empty_sprint.png" alt="There are no sprints yet" />
-                    <p className="title">There are no sprints yet</p>
+                    <img src="/v/images/empty/empty_sprint.png" alt={t("BACKLOG.SPRINTS.EMPTY")} />
+                    <p className="title">{t("BACKLOG.SPRINTS.EMPTY")}</p>
                     {canAddMilestone ? (
                         <a
                             className="btn-link add-sprint"
@@ -238,7 +276,7 @@ export function SprintList(props: SprintListProps): JSX.Element {
                                 props.onAddSprint();
                             }}
                         >
-                            <span> Add a sprint</span>
+                            <span> {t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT")}</span>
                             <svg className="icon icon-add">
                                 <use xlinkHref="#icon-add" />
                             </svg>
@@ -254,6 +292,7 @@ export function SprintList(props: SprintListProps): JSX.Element {
                     project={props.project}
                     isClosed={false}
                     onEditSprint={props.onEditSprint}
+                    renderStoryRow={props.renderStoryRow}
                 />
             ))}
 
@@ -270,7 +309,9 @@ export function SprintList(props: SprintListProps): JSX.Element {
                         <use xlinkHref="#icon-folder" />
                     </svg>
                     <span className="text">
-                        {props.closedSprintsVisible ? "Hide closed sprints" : "Show closed sprints"}
+                        {props.closedSprintsVisible
+                            ? t("BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS")
+                            : t("BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS")}
                     </span>
                 </a>
             ) : null}
