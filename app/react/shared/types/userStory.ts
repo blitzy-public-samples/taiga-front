@@ -61,6 +61,12 @@ export interface UserStory {
     assigned_users?: number[];
     tags?: Tag[];
     attachments?: Attachment[];
+    /** Due date as the backend serialises it (`YYYY-MM-DD`) or null (finding M1). */
+    due_date?: string | null;
+    /** "Team requirement" flag toggled in the create/edit form (finding M1). */
+    team_requirement?: boolean;
+    /** "Client requirement" flag toggled in the create/edit form (finding M1). */
+    client_requirement?: boolean;
     is_blocked?: boolean;
     /** Block reason (edit lightbox); paired with is_blocked. */
     blocked_note?: string;

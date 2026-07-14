@@ -472,3 +472,73 @@ describe("BurndownSummary — interactions", () => {
     expect(graphics.classList.contains("open")).toBe(false);
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// M16 — burndown rendering fidelity (documented SVG-vs-Flot parity deviation).
+//
+// The chart is an isolated SVG reproduction of the legacy jQuery-Flot canvas
+// (vendoring jQuery+Flot into the React bundle is forbidden by AAP §0.7.2 /
+// §0.5.1 / §0.2.1 — see the `BurndownChart` doc comment). These tests lock the
+// fidelity that IS reproduced exactly: the legacy point radius, all four series'
+// area+line+point DOM, and the identical absolute-value tooltip formula. The
+// residual canvas/anti-aliasing/tooltip-popup gap is gated by M27 (Phase 7).
+// ---------------------------------------------------------------------------
+describe("BurndownSummary — burndown rendering fidelity (M16)", () => {
+  // Stats with NON-ZERO team/client increments so the increment series carry
+  // real (negative) magnitudes and therefore render points + a meaningful
+  // tooltip. team-increment series value = -team; client-increment = -(team+client).
+  const INCREMENT_STATS = {
+    total_points: 100,
+    defined_points: 80,
+    closed_points: 20,
+    milestones: [
+      { name: "Sprint A", optimal: 100, evolution: 100, "team-increment": 5, "client-increment": 3 },
+      { name: "Sprint B", optimal: 50, evolution: 60, "team-increment": 2, "client-increment": 1 },
+    ],
+  } as BacklogStats;
+
+  it("draws every data point at the legacy Flot radius (r=4)", () => {
+    const { container } = render(
+      <BurndownSummary stats={INCREMENT_STATS} showGraphPlaceholder={false} />,
+    );
+    const points = Array.from(container.querySelectorAll("circle.burndown-point"));
+    expect(points.length).toBeGreaterThan(0);
+    // Flot `points.radius: 4` (main.coffee L1301) — every point must match.
+    points.forEach((c) => expect(c.getAttribute("r")).toBe("4"));
+  });
+
+  it("renders all FOUR legacy series, each with an area polygon + a line", () => {
+    const { container } = render(
+      <BurndownSummary stats={INCREMENT_STATS} showGraphPlaceholder={false} />,
+    );
+    for (const key of ["optimal", "evolution", "client-increment", "team-increment"]) {
+      expect(container.querySelector(`polygon.burndown-area-${key}`)).not.toBeNull();
+      expect(container.querySelector(`polyline.burndown-line-${key}`)).not.toBeNull();
+      expect(
+        container.querySelectorAll(`circle.burndown-point-${key}`).length,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("shows the ABSOLUTE increment magnitude in the tooltip (negative series)", () => {
+    const { container } = render(
+      <BurndownSummary stats={INCREMENT_STATS} showGraphPlaceholder={false} />,
+    );
+    // team-increment for "Sprint A" = -5 -> tooltip value = |−5×10|/10 = 5.
+    const teamTitles = Array.from(
+      container.querySelectorAll("circle.burndown-point-team-increment title"),
+    ).map((el) => el.textContent);
+    expect(teamTitles).toContain(
+      t("BACKLOG.CHART.INCREMENT_TEAM", { sprintName: "Sprint A", value: 5 }),
+    );
+    // client-increment for "Sprint A" = -(5+3) = -8 -> tooltip value = 8.
+    const clientTitles = Array.from(
+      container.querySelectorAll("circle.burndown-point-client-increment title"),
+    ).map((el) => el.textContent);
+    expect(clientTitles).toContain(
+      t("BACKLOG.CHART.INCREMENT_CLIENT", { sprintName: "Sprint A", value: 8 }),
+    );
+    expect(container.innerHTML).not.toContain("BACKLOG.CHART.");
+  });
+});

@@ -52,6 +52,40 @@ let table: TranslationTable = localeEn as unknown as TranslationTable;
  */
 let flat: Record<string, string> = {};
 
+/**
+ * Monotonic version of the active translation table. Bumped every time
+ * {@link setTranslations} swaps the table. React components subscribe to this
+ * (via `useTranslations()` -> `useSyncExternalStore`) so that the runtime locale
+ * bridge (`localeBridge.ts`), which loads the active-language bundle
+ * ASYNCHRONOUSLY after mount, re-renders the tree with the resolved strings.
+ * Without this, a non-English deployment would render the compiled English
+ * fallback and never update once the real bundle arrives.
+ */
+let version = 0;
+
+/** Subscribers notified whenever the active table changes (React re-render). */
+const listeners = new Set<() => void>();
+
+/**
+ * Subscribe to translation-table changes. Returns an unsubscribe function.
+ * Consumed by the React `useTranslations()` hook; framework-agnostic itself.
+ */
+export function subscribeToTranslations(listener: () => void): () => void {
+    listeners.add(listener);
+    return () => {
+        listeners.delete(listener);
+    };
+}
+
+/**
+ * Current translation-table version — the `getSnapshot` for
+ * `useSyncExternalStore`. A change in the returned value signals React to
+ * re-render the subscribing component.
+ */
+export function getTranslationsVersion(): number {
+    return version;
+}
+
 /** Recursively flatten a nested translation table into dotted keys. */
 function flatten(node: TranslationTable, prefix: string, out: Record<string, string>): void {
     for (const key of Object.keys(node)) {
@@ -82,6 +116,12 @@ rebuild();
 export function setTranslations(next: TranslationTable): void {
     table = next ?? {};
     rebuild();
+    // Signal every subscriber (React components via `useTranslations()`) that the
+    // resolved strings changed, so the tree re-renders with the new language.
+    version += 1;
+    for (const listener of listeners) {
+        listener();
+    }
 }
 
 /**

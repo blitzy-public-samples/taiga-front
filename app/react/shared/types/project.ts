@@ -59,6 +59,14 @@ export interface Project {
     id: number;
     slug: string;
     name?: string;
+    /**
+     * Project description (`GET /projects/by_slug` payload). Consumed by the
+     * localized page-metadata effect (M22) to reproduce the legacy
+     * `KANBAN.PAGE_DESCRIPTION` / `BACKLOG.PAGE_DESCRIPTION` interpolation
+     * (`appMetaService.setAll` in the controllers' `firstLoad`). Optional so the
+     * lighter routing/gating projections stay assignable to `Project`.
+     */
+    description?: string;
     my_permissions: string[];
     is_kanban_activated: boolean;
     is_backlog_activated: boolean;
@@ -70,4 +78,11 @@ export interface Project {
     total_milestones?: number | null;
     total_story_points?: number | null;
     default_swimlane?: number | null;
+    /**
+     * Project tag palette (`project.tags_colors`) as a `name -> color` map,
+     * consumed by the shared story form's tag autocomplete + colour assignment
+     * (finding M1, mirroring `TagLineCommonController` reading
+     * `project.tags_colors`). Optional so lighter projections stay assignable.
+     */
+    tags_colors?: Record<string, string | null>;
 }

@@ -82,9 +82,12 @@ import {
   StoryFormLightbox,
   BulkStoryLightbox,
   AssignedToLightbox,
+  ConfirmDeleteLightbox,
 } from "../shared/lightboxes";
 import { storyToFormValues } from "../shared/lightboxes/storyForm";
 import { t } from "../shared/i18n/translate";
+import { useTranslations } from "../shared/i18n/useTranslations";
+import { canEditStory } from "../shared/permissions";
 
 /**
  * Custom-element JSX typing. AngularJS custom elements (`tg-*`) that this
@@ -120,11 +123,15 @@ declare global {
  * The story lightboxes own their OWN strings (they call `t()` internally), so no
  * lightbox label constants live here any more. The only exception is the
  * module-deactivated placeholder: the legacy app gated a deactivated module at
- * the ROUTE/menu level and never rendered an inline message, so there is no
- * legacy catalogue key to reproduce — it stays a documented literal.
+ * the ROUTE/menu level: `KanbanController.loadProject` calls
+ * `errorHandlingService.permissionDenied()` when `is_kanban_activated` is false
+ * (legacy `kanban/main.coffee` L567), which renders the GLOBAL permission-denied
+ * page (`app/partials/error/permission-denied.jade`). The React fail-closed
+ * branch reproduces that page's authoritative DOM (`.error-main` /
+ * `.error-container`, a real class in `app/styles/layout/not-found.scss`) and its
+ * exact i18n keys via `t(...)` (M5), instead of an invented `.module-disabled`
+ * element carrying a made-up English literal.
  */
-/** Placeholder shown when `is_kanban_activated === false` (no legacy key). */
-const MODULE_DISABLED_LABEL = "The Kanban module is not enabled for this project.";
 
 /* -------------------------------------------------------------------------- */
 /* Module-local helpers                                                        */
@@ -177,8 +184,13 @@ function isSwimlaneFolded(foldedSwimlane: Record<number, boolean>, swimlaneId: n
  */
 function Icon(props: { name: string; className?: string; fill?: string; title?: string }) {
   const { name, className, fill, title } = props;
+  // `class` (not `className`) is intentional: React 18 renders `className`
+  // on a hyphenated custom element (`tg-svg`) as the literal `classname`
+  // attribute, which would break the unchanged SCSS that styles the wrapper
+  // (e.g. `.add-action`, `.fold-action`, `.default-swimlane-icon`). The
+  // literal `class` prop is passed through verbatim as the real attribute.
   return (
-    <tg-svg className={className}>
+    <tg-svg class={className}>
       <svg className={`icon ${name}`} style={fill ? { fill } : undefined}>
         <use xlinkHref={`#${name}`}>{title ? <title>{title}</title> : null}</use>
       </svg>
@@ -202,6 +214,12 @@ function Icon(props: { name: string; className?: string; fill?: string; title?: 
  *   three lightbox host `div`s.
  */
 export function KanbanBoard(props: { context: MountContext }) {
+  // M5: subscribe to i18n table changes so the whole board subtree re-renders
+  // when `localeBridge.ts` loads the active-language bundle (async) or the user
+  // switches language live. There is no `React.memo` in this tree, so a re-render
+  // here propagates to every descendant that calls `t(...)`.
+  useTranslations();
+
   // Single hook call — owns ALL data/state/WS/localStorage/zoom. The board is a
   // pure consumer of its exposed API.
   const kb = useKanbanStories(props.context);
@@ -319,7 +337,12 @@ export function KanbanBoard(props: { context: MountContext }) {
   // Permission gates (show/hide only — the backend stays the single enforcement
   // point, constraint C-1): create needs `add_us`, edit/assign need `modify_us`.
   const canAddUs = project?.my_permissions.includes("add_us") ?? false;
-  const canModifyUs = project?.my_permissions.includes("modify_us") ?? false;
+  // M4: `canModifyUs` is the AUTHORITATIVE edit gate (`canEditStory` combines
+  // `modify_us` with a writable / non-archived project). It gates the story-form
+  // SUBMIT in edit mode; the card edit/assign controls that OPEN the lightbox are
+  // already `canEdit`-gated, so this keeps the submit consistent on a read-only
+  // project. `canAddUs` stays a raw `add_us` check (a distinct permission).
+  const canModifyUs = project ? canEditStory(project) : false;
 
   // --- Module-activation guard (mirrors `is_kanban_activated`) ----------------
   // When the module is deactivated we render a minimal placeholder rather than
@@ -327,12 +350,24 @@ export function KanbanBoard(props: { context: MountContext }) {
   // may be null during the initial load; in that case we fall through and let
   // the `initialLoad` gate below render the loading placeholder.
   if (project !== null && !project.is_kanban_activated) {
+    // Reproduce the legacy global permission-denied page (permission-denied.jade)
+    // that `errorHandlingService.permissionDenied()` triggers when the module is
+    // deactivated. `.error-main` is a full-screen fixed overlay (not-found.scss),
+    // so it correctly covers the content region. Text uses the EXACT legacy keys
+    // (M5) so non-English deployments match AngularJS.
+    const version =
+      (window as unknown as { _version?: string })._version ?? "";
     return (
-      <section className="main kanban">
-        <div className="kanban-manager expanded">
-          <div className="module-disabled">{MODULE_DISABLED_LABEL}</div>
+      <div className="error-main">
+        <div className="error-container">
+          <img className="logo-svg" src={`${version}/svg/logo.svg`} alt="TAIGA" />
+          <h1 className="logo">{t("ERROR.PERMISSION_DENIED")}</h1>
+          <p>{t("ERROR.PERMISSION_DENIED_TEXT")}</p>
+          <a href="/" title="">
+            {t("COMMON.GO_HOME")}
+          </a>
         </div>
-      </section>
+      </div>
     );
   }
 
@@ -530,7 +565,6 @@ export function KanbanBoard(props: { context: MountContext }) {
                         onClickAssignedTo={kb.changeUsAssignedUsers}
                         onClickMoveToTop={kb.moveToTopDropdown}
                         onToggleSelect={kb.toggleSelectedUs}
-                        onEditWipLimit={kb.editWipLimit}
                       />
                     ))
                   : (
@@ -563,7 +597,6 @@ export function KanbanBoard(props: { context: MountContext }) {
                               onClickAssignedTo={kb.changeUsAssignedUsers}
                               onClickMoveToTop={kb.moveToTopDropdown}
                               onToggleSelect={kb.toggleSelectedUs}
-                              onEditWipLimit={kb.editWipLimit}
                             />
                           ))}
                         </div>
@@ -586,7 +619,14 @@ export function KanbanBoard(props: { context: MountContext }) {
               </div>
             </KanbanDndProvider>
           ) : (
-            <div className="kanban-table-loading" />
+            /* Loading placeholder (finding M20). The legacy board relied on the
+               global `tgLoader` overlay; the empty `.kanban-table-loading` div
+               conveyed nothing to assistive tech. Give it a localized,
+               screen-reader-announced status so a cold load is readable rather
+               than a silent empty shell. */
+            <div className="kanban-table-loading" role="status" aria-live="polite">
+              {t("COMMON.LOADING")}
+            </div>
           )}
         </div>
       </section>
@@ -600,7 +640,14 @@ export function KanbanBoard(props: { context: MountContext }) {
           present in the DOM (empty when idle) so assistive tech announces late
           errors without a node insertion. */}
       <div className="kanban-board-status" role="status" aria-live="polite">
-        {kb.errorMessage !== null && kb.activeLightbox === null ? (
+        {kb.editLoading ? (
+          /* C6: the edit flow is fetching the authoritative story detail +
+             attachments before opening the lightbox. Announce a localized
+             loading status (the legacy board spun `tgLoading` on the trigger). */
+          <div className="loading-spinner" data-type="loading">
+            {t("COMMON.LOADING")}
+          </div>
+        ) : kb.errorMessage !== null && kb.activeLightbox === null ? (
           <div className="notification-message-error" data-type="error">
             {kb.errorMessage}
           </div>
@@ -635,6 +682,7 @@ export function KanbanBoard(props: { context: MountContext }) {
         defaultSwimlaneId={kb.defaultSwimlaneId}
         isKanban={true}
         initialValues={storyInitialValues}
+        projectTagsColors={project?.tags_colors}
         saving={kb.savingUs}
         errorMessage={kb.errorMessage}
         canSubmit={activeLightboxType === "edit" ? canModifyUs : canAddUs}
@@ -665,6 +713,17 @@ export function KanbanBoard(props: { context: MountContext }) {
         saving={kb.savingUs}
         errorMessage={kb.errorMessage}
         canSubmit={canModifyUs}
+      />
+
+      {/* (6d) C7: localized delete confirmation. The card delete control opens
+          this modal (via `kb.deleteUs`); the story is removed only after the
+          user confirms, reproducing the legacy `$confirm.askOnDelete` flow. */}
+      <ConfirmDeleteLightbox
+        open={kb.pendingDelete !== null}
+        subject={kb.pendingDelete?.subject ?? ""}
+        busy={kb.deleteBusy}
+        onConfirm={kb.confirmDelete}
+        onCancel={kb.cancelDelete}
       />
     </>
   );

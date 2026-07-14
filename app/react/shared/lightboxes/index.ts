@@ -14,6 +14,12 @@ export { BulkStoryLightbox } from "./BulkStoryLightbox";
 export type { BulkStoryLightboxProps } from "./BulkStoryLightbox";
 export { AssignedToLightbox } from "./AssignedToLightbox";
 export type { AssignedToLightboxProps } from "./AssignedToLightbox";
+export { ConfirmDeleteLightbox } from "./ConfirmDeleteLightbox";
+export type { ConfirmDeleteLightboxProps } from "./ConfirmDeleteLightbox";
+export { ConfirmAskLightbox } from "./ConfirmAskLightbox";
+export type { ConfirmAskLightboxProps } from "./ConfirmAskLightbox";
+export { usePendingDelete } from "./usePendingDelete";
+export type { PendingDelete, PendingDeleteController } from "./usePendingDelete";
 export {
     createEmptyStoryValues,
     validateStoryForm,

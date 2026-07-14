@@ -146,6 +146,8 @@ interface MockApiClient {
     getUserFilters: jest.Mock;
     storeUserFilters: jest.Mock;
     listUserStories: jest.Mock;
+    getUserStory: jest.Mock;
+    listUserStoryAttachments: jest.Mock;
     bulkUpdateKanbanOrder: jest.Mock;
     editStatus: jest.Mock;
     bulkCreateUserStories: jest.Mock;
@@ -177,6 +179,16 @@ beforeEach(() => {
         getUserFilters: jest.fn().mockResolvedValue({}),
         storeUserFilters: jest.fn().mockResolvedValue(undefined),
         listUserStories: jest.fn().mockImplementation(() => Promise.resolve(fresh())),
+        // C6: authoritative detail carries the `description` the list projection
+        // omits; the edit flow fetches it (+ attachments) before opening.
+        getUserStory: jest.fn().mockImplementation((_pid: number, usId: number) =>
+            Promise.resolve({
+                ...makeStory(usId, usId === 103 ? 2 : 1, 1),
+                description: `detail for ${usId}`,
+                version: 1,
+            }),
+        ),
+        listUserStoryAttachments: jest.fn().mockResolvedValue([]),
         bulkUpdateKanbanOrder: jest.fn().mockResolvedValue([]),
         editStatus: jest.fn().mockImplementation(() => Promise.resolve({ ...STATUSES[0] })),
         bulkCreateUserStories: jest.fn().mockImplementation(() => Promise.resolve([makeStory(201, 1, 3)])),
@@ -382,6 +394,34 @@ describe("useKanbanStories — drag move + persist + rollback", () => {
             result.current.moveToTopDropdown(firstId);
         });
 
+        expect(apiClient.bulkUpdateKanbanOrder).not.toHaveBeenCalled();
+    });
+
+    test("M4: a read-only (archived_code) project no-ops every reorder (defense-in-depth hook guard)", async () => {
+        // The card drag sensors and the move-to-top menu item are already gated
+        // on `canEdit`; this pins the hook-level guard that also refuses to
+        // persist a reorder if a read-only project's action is somehow invoked
+        // programmatically. Mirrors the legacy `sortable.coffee` init guard.
+        apiClient.getProjectBySlug.mockResolvedValue(
+            projectPayload({ archived_code: "ARCH" }),
+        );
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            result.current.handleDragEnd({
+                usList: [101],
+                statusId: 2,
+                swimlaneId: -1,
+                index: 0,
+                previousCard: null,
+                nextCard: 103,
+            });
+        });
+        await act(async () => {
+            result.current.moveToTopDropdown(102);
+        });
+
+        // Neither entry point may reach the frozen bulk-order endpoint.
         expect(apiClient.bulkUpdateKanbanOrder).not.toHaveBeenCalled();
     });
 });
@@ -598,12 +638,26 @@ describe("useKanbanStories — userstory CRUD + lightbox", () => {
         expect(result.current.activeLightbox).toBeNull();
     });
 
-    test("editUs and changeUsAssignedUsers open the right lightbox", async () => {
+    test("editUs fetches authoritative detail + attachments, reconciles, then opens (C6)", async () => {
         const { result } = await renderLoaded();
-        act(() => {
+        // The list projection for 103 omits the description.
+        expect(result.current.usMap[103].description).toBeUndefined();
+
+        await act(async () => {
             result.current.editUs(103);
         });
-        expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 103 });
+
+        // Detail + attachments were fetched BEFORE the lightbox opened.
+        expect(apiClient.getUserStory).toHaveBeenCalledWith(PROJECT_ID, 103);
+        expect(apiClient.listUserStoryAttachments).toHaveBeenCalledWith(PROJECT_ID, 103);
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 103 }),
+        );
+        // The authoritative detail was reconciled into the projection (so the
+        // form seeds the REAL description, not a blank that could overwrite it).
+        expect(result.current.usMap[103].description).toBe("detail for 103");
+        expect(result.current.editLoading).toBe(false);
+
         act(() => {
             result.current.changeUsAssignedUsers(103);
         });
@@ -614,26 +668,102 @@ describe("useKanbanStories — userstory CRUD + lightbox", () => {
         expect(result.current.activeLightbox).toBeNull();
     });
 
-    test("deleteUs removes optimistically and rolls back on failure", async () => {
-        apiClient.remove.mockRejectedValue(new Error("nope"));
+    test("editUs does NOT open a blank form when the detail fetch fails (C6 error path)", async () => {
+        const { result } = await renderLoaded();
+        apiClient.getUserStory.mockRejectedValueOnce(new ApiError(500, { _error_message: "boom" }));
+
+        await act(async () => {
+            result.current.editUs(103);
+        });
+
+        // No lightbox opened; a sanitized error surfaced; loading released.
+        expect(result.current.activeLightbox).toBeNull();
+        expect(result.current.errorMessage).not.toBeNull();
+        expect(result.current.editLoading).toBe(false);
+    });
+
+    test("editUs opens even when the attachments fetch fails (C6 non-fatal attachments)", async () => {
+        const { result } = await renderLoaded();
+        apiClient.listUserStoryAttachments.mockRejectedValueOnce(
+            new ApiError(500, { _error_message: "no attachments" }),
+        );
+
+        await act(async () => {
+            result.current.editUs(103);
+        });
+
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 103 }),
+        );
+        // Detail still reconciled; attachments degraded to an empty list.
+        expect(result.current.usMap[103].description).toBe("detail for 103");
+        expect(result.current.usMap[103].attachments).toEqual([]);
+    });
+
+    // C7: delete is now confirm-gated. `deleteUs` only OPENS the localized
+    // confirmation modal; nothing is mutated until `confirmDelete` runs, and
+    // `cancelDelete` is a pure no-op. These four tests cover the request,
+    // cancel, confirm(success), and confirm(error/rollback) paths.
+    test("deleteUs opens the confirmation modal (labelled with the subject) and does NOT delete yet (C7 request path)", async () => {
         const { result } = await renderLoaded();
         expect(result.current.usMap[101]).toBeDefined();
 
-        await act(async () => {
-            await result.current.deleteUs(101);
+        act(() => {
+            result.current.deleteUs(101);
         });
 
-        await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
-        // Rolled back -> the story is present again.
+        expect(result.current.pendingDelete).not.toBeNull();
+        expect(result.current.pendingDelete?.subject).toBe("US 101");
+        // No optimistic removal and NO network call until the user confirms.
+        expect(apiClient.remove).not.toHaveBeenCalled();
         expect(result.current.usMap[101]).toBeDefined();
     });
 
-    test("deleteUs removes on success", async () => {
+    test("cancelDelete closes the modal without deleting (C7 cancel path)", async () => {
         const { result } = await renderLoaded();
-        await act(async () => {
-            await result.current.deleteUs(101);
+        act(() => {
+            result.current.deleteUs(101);
         });
-        expect(result.current.usMap[101]).toBeUndefined();
+        expect(result.current.pendingDelete).not.toBeNull();
+
+        act(() => {
+            result.current.cancelDelete();
+        });
+
+        expect(result.current.pendingDelete).toBeNull();
+        expect(apiClient.remove).not.toHaveBeenCalled();
+        expect(result.current.usMap[101]).toBeDefined();
+    });
+
+    test("confirmDelete removes on success and closes the modal (C7 confirm path)", async () => {
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.deleteUs(101);
+        });
+        await act(async () => {
+            result.current.confirmDelete();
+        });
+
+        await waitFor(() => expect(result.current.usMap[101]).toBeUndefined());
+        expect(apiClient.remove).toHaveBeenCalledWith("userstories", 101);
+        // The modal closes once the delete settles (legacy askResponse.finish()).
+        expect(result.current.pendingDelete).toBeNull();
+    });
+
+    test("confirmDelete rolls back + surfaces the error on failure, then closes (C7 error/rollback path)", async () => {
+        apiClient.remove.mockRejectedValue(new Error("nope"));
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.deleteUs(101);
+        });
+        await act(async () => {
+            result.current.confirmDelete();
+        });
+
+        await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
+        // Rolled back -> the story is present again; the modal is closed.
+        expect(result.current.usMap[101]).toBeDefined();
+        expect(result.current.pendingDelete).toBeNull();
     });
 });
 
@@ -648,30 +778,6 @@ describe("useKanbanStories — selection, wip, filters, selectors", () => {
             result.current.toggleSelectedUs(101);
         });
         expect(result.current.selectedUss[101]).toBeUndefined();
-    });
-
-    test("editWipLimit updates optimistically and rolls back on failure", async () => {
-        apiClient.editStatus.mockRejectedValue(new Error("wip fail"));
-        const { result } = await renderLoaded();
-
-        await act(async () => {
-            await result.current.editWipLimit(1, 5);
-        });
-
-        await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
-        // Rolled back to the original (null) wip limit.
-        const s1 = result.current.usStatusList.find((s) => s.id === 1);
-        expect(s1?.wip_limit ?? null).toBeNull();
-    });
-
-    test("editWipLimit persists on success", async () => {
-        const { result } = await renderLoaded();
-        await act(async () => {
-            await result.current.editWipLimit(1, 7);
-        });
-        const s1 = result.current.usStatusList.find((s) => s.id === 1);
-        expect(s1?.wip_limit).toBe(7);
-        expect(apiClient.editStatus).toHaveBeenCalledWith(1, 7);
     });
 
     test("showPlaceHolder reflects emptiness of a column", async () => {
@@ -838,7 +944,6 @@ describe("useKanbanStories — return surface completeness", () => {
             "changeUsAssignedUsers",
             "moveToTopDropdown",
             "toggleSelectedUs",
-            "editWipLimit",
             "showArchivedStatus",
             "setColumnMode",
             "isMaximized",
@@ -1100,5 +1205,163 @@ describe("useKanbanStories — request params + real-time + authz parity", () =>
             result.current.closeLightbox();
         });
         await waitFor(() => expect(apiClient.getUserStoriesFilters).toHaveBeenCalled());
+    });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* M22 — localized page <title>/<meta description> on load + unmount cleanup   */
+/* -------------------------------------------------------------------------- */
+describe("useKanbanStories — page metadata (M22)", () => {
+    let headHtml: string;
+
+    beforeEach(() => {
+        // Preserve and seed the <head> the way index.jade ships it (a <title>).
+        headHtml = document.head.innerHTML;
+        document.head.innerHTML = "<title>Taiga</title>";
+    });
+
+    afterEach(() => {
+        document.head.innerHTML = headHtml;
+    });
+
+    test("sets the localized Kanban title + description once the project loads", async () => {
+        apiClient.getProjectBySlug.mockResolvedValue(
+            projectPayload({ name: "Alpha", description: "the alpha board" }),
+        );
+
+        const { result } = renderHook(() => useKanbanStories(CONTEXT));
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+
+        // KANBAN.PAGE_TITLE = "Kanban - {{projectName}}".
+        expect(document.head.querySelector("title")?.textContent).toBe("Kanban - Alpha");
+        // KANBAN.PAGE_DESCRIPTION interpolates name + description.
+        const desc = document.head
+            .querySelector("meta[name='description']")
+            ?.getAttribute("content");
+        expect(desc).toBe(
+            "The kanban panel, with user stories of the project Alpha: the alpha board",
+        );
+        // The open-graph block is written too (full setAll parity).
+        expect(
+            document.head.querySelector("meta[property='og:title']")?.getAttribute("content"),
+        ).toBe("Kanban - Alpha");
+    });
+
+    test("restores the prior <head> tags on unmount (no stale title leak)", async () => {
+        apiClient.getProjectBySlug.mockResolvedValue(
+            projectPayload({ name: "Alpha", description: "the alpha board" }),
+        );
+
+        const { result, unmount } = renderHook(() => useKanbanStories(CONTEXT));
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+        expect(document.head.querySelector("title")?.textContent).toBe("Kanban - Alpha");
+        expect(document.head.querySelector("meta[property='og:title']")).not.toBeNull();
+
+        act(() => {
+            unmount();
+        });
+
+        // Title restored; the screen-created og/twitter tags removed.
+        expect(document.head.querySelector("title")?.textContent).toBe("Taiga");
+        expect(document.head.querySelector("meta[property='og:title']")).toBeNull();
+        expect(document.head.querySelector("meta[name='twitter:card']")).toBeNull();
+    });
+
+    test("does not set a Kanban title when the initial project load fails", async () => {
+        apiClient.getProjectBySlug.mockRejectedValue(new ApiError(500, { _error_message: "boom" }));
+
+        const { result } = renderHook(() => useKanbanStories(CONTEXT));
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+
+        // project stayed null -> no metadata written (parity with onInitialDataError).
+        expect(document.head.querySelector("title")?.textContent).toBe("Taiga");
+        expect(document.head.querySelector("meta[property='og:title']")).toBeNull();
+    });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* M9 — operation-generation guard (ignore superseded completions/rollbacks)   */
+/* -------------------------------------------------------------------------- */
+describe("useKanbanStories — operation generation (M9, CWE-362)", () => {
+    test("a delete rollback that settles AFTER a slug-change reload is ignored", async () => {
+        // Deferred remove so we can settle it only after the board reloads.
+        let rejectRemove!: (e: unknown) => void;
+        apiClient.remove.mockImplementationOnce(
+            () =>
+                new Promise<void>((_resolve, reject) => {
+                    rejectRemove = reject;
+                }),
+        );
+
+        const { result, rerender } = renderHook((ctx: typeof CONTEXT) => useKanbanStories(ctx), {
+            initialProps: CONTEXT,
+        });
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+        expect(result.current.usMap[101]).toBeDefined();
+
+        // Confirm-delete 101 -> optimistic removal + a pending remove() request.
+        act(() => {
+            result.current.deleteUs(101);
+        });
+        await act(async () => {
+            result.current.confirmDelete();
+        });
+        expect(result.current.usMap[101]).toBeUndefined();
+
+        // Slug change -> firstLoad cleanup bumps the generation and reloads.
+        const CONTEXT2 = { ...CONTEXT, projectSlug: "proj2" };
+        await act(async () => {
+            rerender(CONTEXT2);
+        });
+        await waitFor(() => expect(result.current.usMap[101]).toBeDefined());
+
+        // The stale delete now FAILS: its rollback + error MUST be ignored so the
+        // reloaded board is not corrupted and no stale error surfaces.
+        await act(async () => {
+            rejectRemove(new ApiError(500, { _error_message: "stale delete failed" }));
+            await Promise.resolve();
+        });
+        expect(result.current.errorMessage).toBeNull();
+        expect(result.current.usMap[101]).toBeDefined();
+    });
+
+    test("a create that resolves AFTER a slug-change reload does not write onto the new board", async () => {
+        let resolveCreate!: (us: unknown) => void;
+        apiClient.create.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    resolveCreate = resolve;
+                }),
+        );
+
+        const { result, rerender } = renderHook((ctx: typeof CONTEXT) => useKanbanStories(ctx), {
+            initialProps: CONTEXT,
+        });
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+
+        // Open create lightbox + submit -> pending create().
+        act(() => {
+            result.current.addNewUs("standard", 1);
+        });
+        await act(async () => {
+            result.current.submitNewUs(
+                createEmptyStoryValues({ subject: "late story", status: 1 }),
+            );
+        });
+
+        // Reload before the create resolves.
+        await act(async () => {
+            rerender({ ...CONTEXT, projectSlug: "proj2" });
+        });
+        await waitFor(() => expect(result.current.initialLoad).toBe(true));
+
+        // Resolve the stale create -> its `add()` MUST be ignored.
+        await act(async () => {
+            resolveCreate({ id: 999, ref: 999, subject: "late story", status: 1, swimlane: null });
+            await Promise.resolve();
+        });
+        expect(result.current.usMap[999]).toBeUndefined();
     });
 });

@@ -36,7 +36,7 @@ import type { BacklogVM } from "./useBacklogStories";
 import type { Milestone, MountContext, Project, UserStory } from "../../shared/types";
 import type { ApiClient, ProjectStats } from "../../shared/api";
 import type { EventsClient, ProjectEventHandlers } from "../../shared/ws/events";
-import { createApiClient } from "../../shared/api";
+import { createApiClient, ApiError } from "../../shared/api";
 import { createEventsClient, subscribeToProject } from "../../shared/ws/events";
 import { generateHash } from "../../shared/storage/legacyStorage";
 import { createEmptyStoryValues, storyToFormValues } from "../../shared/lightboxes";
@@ -167,6 +167,24 @@ interface Deferred<T> {
     reject: (reason: unknown) => void;
 }
 
+/**
+ * Build an `UnassignedUserStoriesResult` (the M2 paginated shape) from a plain
+ * story array. `backlogTotal` defaults to the array length; `hasNext` to false.
+ */
+function page(
+    list: UserStory[],
+    over: Partial<{ hasNext: boolean; backlogTotal: number | null; count: number; current: number; paginatedBy: number }> = {},
+): { userStories: UserStory[]; count: number; current: number; paginatedBy: number; hasNext: boolean; backlogTotal: number | null } {
+    return {
+        userStories: list,
+        count: over.count ?? list.length,
+        current: over.current ?? 1,
+        paginatedBy: over.paginatedBy ?? 30,
+        hasNext: over.hasNext ?? false,
+        backlogTotal: over.backlogTotal ?? list.length,
+    };
+}
+
 function deferred<T>(): Deferred<T> {
     let resolve!: (value: T) => void;
     let reject!: (reason: unknown) => void;
@@ -187,6 +205,12 @@ const getUserStoriesFilters = jest.fn();
 const getUserFilters = jest.fn();
 const storeUserFilters = jest.fn();
 const listUserStories = jest.fn();
+// M2: authoritative PAGINATED backlog list (reads x-pagination-next + the
+// Taiga-Info-Backlog-Total-Userstories total header).
+const listUnassignedUserStories = jest.fn();
+// C6: authoritative by-id detail + attachments fetched BEFORE opening edit.
+const getUserStory = jest.fn();
+const listUserStoryAttachments = jest.fn();
 const listMilestones = jest.fn();
 const bulkUpdateBacklogOrder = jest.fn();
 const bulkUpdateMilestone = jest.fn();
@@ -203,6 +227,9 @@ const fakeClient = {
     getUserFilters,
     storeUserFilters,
     listUserStories,
+    listUnassignedUserStories,
+    getUserStory,
+    listUserStoryAttachments,
     listMilestones,
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
@@ -257,6 +284,14 @@ beforeEach(() => {
     getUserFilters.mockResolvedValue({});
     storeUserFilters.mockResolvedValue(undefined);
     listUserStories.mockResolvedValue([us(10), us(11)]);
+    // M2: the paginated endpoint the hook actually calls (authoritative total 2).
+    listUnassignedUserStories.mockResolvedValue(page([us(10), us(11)], { backlogTotal: 2 }));
+    // C6: default detail mirrors the list row (no extra description) so the
+    // dirty-diff parity tests are unaffected; the C6 test overrides this.
+    getUserStory.mockImplementation((_pid: number, usId: number) =>
+        Promise.resolve(us(usId)),
+    );
+    listUserStoryAttachments.mockResolvedValue([]);
     listMilestones.mockImplementation((_pid: number, filters?: { closed?: boolean }) =>
         Promise.resolve(
             filters?.closed
@@ -384,7 +419,7 @@ describe("mount + authoritative load", () => {
     });
 
     it("never leaves the screen hanging when a downstream loader rejects", async () => {
-        listUserStories.mockRejectedValueOnce(new Error("boom"));
+        listUnassignedUserStories.mockRejectedValueOnce(new Error("boom"));
         const { result } = renderHook(() => useBacklogStories(context));
         await waitFor(() => expect(result.current.loading).toBe(false));
         expect(result.current.errorMessage).toBe(GENERIC_ERROR);
@@ -412,6 +447,38 @@ describe("permissions + activation", () => {
         getProjectBySlug.mockResolvedValueOnce(project({ is_backlog_activated: false }));
         const { result } = await renderLoaded();
         expect(result.current.isBacklogActivated).toBe(false);
+    });
+
+    // C5: a deactivated module must FAIL CLOSED — the screen loads the project
+    // (it must read the flag to gate on it) but fetches NO backlog data and opens
+    // NO WebSocket, mirroring the legacy `permissionDenied()` short-circuit in
+    // `BacklogController.loadProject`.
+    it("C5: fails closed when is_backlog_activated === false — no data fetch, no WebSocket", async () => {
+        getProjectBySlug.mockResolvedValueOnce(project({ is_backlog_activated: false }));
+        const { result } = await renderLoaded();
+
+        // The project WAS loaded (the flag must be read to gate on it)...
+        expect(getProjectBySlug).toHaveBeenCalledTimes(1);
+        // ...but NO backlog data was fetched.
+        expect(listUnassignedUserStories).not.toHaveBeenCalled();
+        expect(getProjectStats).not.toHaveBeenCalled();
+        expect(listMilestones).not.toHaveBeenCalled();
+        // ...and the WebSocket never subscribed.
+        expect(setupConnection).not.toHaveBeenCalled();
+        expect(mockedSubscribeToProject).not.toHaveBeenCalled();
+        // The screen still settles (it renders the placeholder, never hangs).
+        expect(result.current.loading).toBe(false);
+        expect(result.current.isBacklogActivated).toBe(false);
+    });
+
+    // Positive control: with the module ACTIVATED, the data path and WebSocket
+    // subscription both run — proving the C5 gate does not break the happy path.
+    it("C5: subscribes + loads data when is_backlog_activated === true", async () => {
+        const { result } = await renderLoaded();
+        expect(listUnassignedUserStories).toHaveBeenCalled();
+        expect(setupConnection).toHaveBeenCalledTimes(1);
+        expect(mockedSubscribeToProject).toHaveBeenCalledTimes(1);
+        expect(result.current.isBacklogActivated).toBe(true);
     });
 });
 
@@ -563,6 +630,39 @@ describe("moveToSprint / moveUsToTop", () => {
     });
 });
 
+describe("read-only project reorder guard (M4)", () => {
+    it("no-ops moveUs / moveToSprint on a read-only (archived_code) project — no bulk calls", async () => {
+        // The row/sprint drag sensors are gated on `canEditStory`; this pins the
+        // hook-level defense-in-depth guard that also refuses to persist a
+        // reorder or cross-sprint move if invoked programmatically on a
+        // read-only project. Mirrors the legacy `sortable.coffee` init guard.
+        getProjectBySlug.mockResolvedValue(project({ archived_code: "ARCH" }));
+        const { result } = await renderLoaded();
+
+        act(() => {
+            result.current.moveUs([us(11)], 0, null, null, us(10));
+        });
+        act(() => {
+            result.current.moveToSprint([us(10)], 5);
+        });
+        act(() => {
+            result.current.moveUsToTop(us(11));
+        });
+
+        // Neither frozen bulk endpoint may be reached.
+        expect(bulkUpdateBacklogOrder).not.toHaveBeenCalled();
+        expect(bulkUpdateMilestone).not.toHaveBeenCalled();
+    });
+
+    it("persists moveUs on a writable project (positive control)", async () => {
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.moveUs([us(11)], 0, null, null, us(10));
+        });
+        await waitFor(() => expect(bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1));
+    });
+});
+
 /* --------------------------------------------------------------------------- *
  * Inline editors + delete
  * --------------------------------------------------------------------------- */
@@ -589,11 +689,11 @@ describe("inline editors + delete", () => {
     it("updateUserStoryStatus reloads + surfaces an error on reject", async () => {
         const { result } = await renderLoaded();
         save.mockRejectedValueOnce(new Error("save failed"));
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         act(() => {
             result.current.updateUserStoryStatus(us(10), 2);
         });
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
         await waitFor(() => expect(result.current.errorMessage).toBe(GENERIC_ERROR));
     });
 
@@ -624,13 +724,37 @@ describe("inline editors + delete", () => {
         );
     });
 
-    it("deleteUserStory removes optimistically, toggles savingUs, then reloads after confirm", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
+    // C7: delete is now gated by the shared localized `ConfirmDeleteLightbox`,
+    // NOT the previous hard-coded English `window.confirm`. `deleteUserStory`
+    // only OPENS the modal; the DELETE runs on `confirmDelete`, and
+    // `cancelDelete` is a pure no-op.
+    it("deleteUserStory opens the localized confirmation modal and does NOT delete yet (C7 request path)", async () => {
+        const confirmSpy = jest.spyOn(window, "confirm");
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.deleteUserStory(us(10));
+        });
+
+        // The modal is open, labelled with the story subject; NO native
+        // window.confirm is used and NO request is issued yet.
+        expect(result.current.pendingDelete).not.toBeNull();
+        expect(result.current.pendingDelete?.subject).toBe("US 10");
+        expect(result.current.pendingDelete?.target.id).toBe(10);
+        expect(confirmSpy).not.toHaveBeenCalled();
+        expect(remove).not.toHaveBeenCalled();
+        expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11]);
+        confirmSpy.mockRestore();
+    });
+
+    it("confirmDelete removes optimistically, toggles savingUs, reloads, then closes the modal (C7 confirm path)", async () => {
         const { result } = await renderLoaded();
         listMilestones.mockClear();
         getProjectStats.mockClear();
         act(() => {
             result.current.deleteUserStory(us(10));
+        });
+        await act(async () => {
+            result.current.confirmDelete();
         });
         await waitFor(() => expect(remove).toHaveBeenCalledWith("userstories", 10));
         await waitFor(() =>
@@ -638,28 +762,35 @@ describe("inline editors + delete", () => {
         );
         await waitFor(() => expect(listMilestones).toHaveBeenCalled());
         await waitFor(() => expect(getProjectStats).toHaveBeenCalled());
-        // pending guard settled.
+        // pending guard settled + modal closed (legacy askResponse.finish()).
         await waitFor(() => expect(result.current.savingUs).toBe(false));
-        confirmSpy.mockRestore();
+        expect(result.current.pendingDelete).toBeNull();
     });
 
-    it("deleteUserStory is a no-op when the confirm dialog is dismissed", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(false);
+    it("cancelDelete closes the modal without deleting (C7 cancel path)", async () => {
         const { result } = await renderLoaded();
         act(() => {
             result.current.deleteUserStory(us(10));
         });
+        expect(result.current.pendingDelete).not.toBeNull();
+
+        act(() => {
+            result.current.cancelDelete();
+        });
+
+        expect(result.current.pendingDelete).toBeNull();
         expect(remove).not.toHaveBeenCalled();
         expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11]);
-        confirmSpy.mockRestore();
     });
 
-    it("deleteUserStory re-inserts the removed story + surfaces an error on reject (per-op rollback)", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
+    it("confirmDelete re-inserts the removed story + surfaces an error on reject, then closes (C7 error/rollback path)", async () => {
         remove.mockRejectedValueOnce(new Error("delete failed"));
         const { result } = await renderLoaded();
         act(() => {
             result.current.deleteUserStory(us(10));
+        });
+        await act(async () => {
+            result.current.confirmDelete();
         });
         await waitFor(() => expect(remove).toHaveBeenCalled());
         // The optimistically-removed story is restored to its original slot.
@@ -668,7 +799,7 @@ describe("inline editors + delete", () => {
         );
         expect(result.current.errorMessage).toBe(GENERIC_ERROR);
         await waitFor(() => expect(result.current.savingUs).toBe(false));
-        confirmSpy.mockRestore();
+        expect(result.current.pendingDelete).toBeNull();
     });
 });
 
@@ -702,12 +833,18 @@ describe("story lightboxes (C7)", () => {
         expect(result.current.activeLightbox).toEqual({ type: "bulk" });
     });
 
-    it("editUserStory opens the edit lightbox targeting the story id", async () => {
+    it("editUserStory opens the edit lightbox targeting the story id (C6: after detail fetch)", async () => {
         const { result } = await renderLoaded();
-        act(() => {
+        await act(async () => {
             result.current.editUserStory(us(11));
         });
-        expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 });
+        // C6: the detail + attachments are fetched BEFORE the lightbox opens.
+        expect(getUserStory).toHaveBeenCalledWith(7, 11);
+        expect(listUserStoryAttachments).toHaveBeenCalledWith(7, 11);
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
+        expect(result.current.editLoading).toBe(false);
     });
 
     it("closeLightbox clears the active lightbox", async () => {
@@ -724,7 +861,7 @@ describe("story lightboxes (C7)", () => {
     it("submitNewUs POSTs the built create payload, closes, and reloads (C7/M2)", async () => {
         const { result } = await renderLoaded();
         getProjectStats.mockClear();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         act(() => {
             result.current.addNewUs("standard");
         });
@@ -741,16 +878,19 @@ describe("story lightboxes (C7)", () => {
         const body = create.mock.calls[0][1] as Record<string, unknown>;
         expect(body).not.toHaveProperty("us_position");
         await waitFor(() => expect(result.current.activeLightbox).toBeNull());
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
         await waitFor(() => expect(getProjectStats).toHaveBeenCalled());
         await waitFor(() => expect(result.current.savingUs).toBe(false));
     });
 
     it("submitNewUs is a no-op unless a create lightbox is open", async () => {
         const { result } = await renderLoaded();
-        act(() => {
+        await act(async () => {
             result.current.editUserStory(us(11)); // wrong lightbox type
         });
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
         act(() => {
             result.current.submitNewUs(createEmptyStoryValues({ subject: "X" }));
         });
@@ -760,9 +900,12 @@ describe("story lightboxes (C7)", () => {
     it("submitEditUs PATCHes only the dirty diff, closes, and reloads", async () => {
         const { result } = await renderLoaded();
         const story = us(11);
-        act(() => {
+        await act(async () => {
             result.current.editUserStory(story);
         });
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
         const values = createEmptyStoryValues({
             ...storyToFormValues(story),
             subject: "US 11 edited",
@@ -782,9 +925,12 @@ describe("story lightboxes (C7)", () => {
     it("submitEditUs closes WITHOUT a request when nothing changed", async () => {
         const { result } = await renderLoaded();
         const story = us(11);
-        act(() => {
+        await act(async () => {
             result.current.editUserStory(story);
         });
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
         act(() => {
             result.current.submitEditUs(createEmptyStoryValues(storyToFormValues(story)));
         });
@@ -794,7 +940,7 @@ describe("story lightboxes (C7)", () => {
 
     it("submitBulkUs bulk-creates one story per line, closes, and reloads", async () => {
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         act(() => {
             result.current.addNewUs("bulk");
         });
@@ -811,7 +957,7 @@ describe("story lightboxes (C7)", () => {
         // no swimlane (isKanban=false), so the swimlane arg is null.
         expect(bulkCreateUserStories).toHaveBeenCalledWith(7, 1, "Story A\nStory B", null);
         await waitFor(() => expect(result.current.activeLightbox).toBeNull());
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
     });
 
     it("keeps the lightbox OPEN with a sanitized error when create rejects (M2)", async () => {
@@ -921,13 +1067,31 @@ describe("sprint lightbox", () => {
         expect(result.current.sprintLightbox.lastSprint?.id).toBe(5);
     });
 
-    it("createSprintFromForecasting opens the create lightbox", async () => {
+    it("createSprintFromForecasting moves the forecasted stories into the existing sprint with NO modal (M3, direct)", async () => {
         const { result } = await renderLoaded();
+        // Turn forecasting ON. The default fixture has an OPEN sprint (id 5,
+        // 8 pts) whose points are below the velocity (12.5), so the forecast row
+        // reads "Move to Current Sprint" (forecastNewSprint === false).
+        act(() => {
+            result.current.toggleVelocityForecasting();
+        });
+        expect(result.current.displayVelocity).toBe(true);
+        expect(result.current.forecastNewSprint).toBe(false);
+        bulkUpdateMilestone.mockClear();
         act(() => {
             result.current.createSprintFromForecasting();
         });
-        expect(result.current.sprintLightbox.open).toBe(true);
-        expect(result.current.sprintLightbox.mode).toBe("create");
+        // No modal — a direct move.
+        expect(result.current.sprintLightbox.open).toBe(false);
+        // Exactly ONE bulk-update-us-milestone targeting sprints[0] (id 5) with
+        // the forecasted backlog stories (10, 11) at their sprint_order.
+        await waitFor(() => expect(bulkUpdateMilestone).toHaveBeenCalledTimes(1));
+        expect(bulkUpdateMilestone).toHaveBeenCalledWith(7, 5, [
+            { us_id: 10, order: 10 },
+            { us_id: 11, order: 11 },
+        ]);
+        // Forecasting turned off after the move (legacy toggleVelocityForecasting).
+        await waitFor(() => expect(result.current.displayVelocity).toBe(false));
     });
 
     it("openEditSprint opens the edit lightbox for a sprint", async () => {
@@ -958,12 +1122,16 @@ describe("sprint lightbox", () => {
         });
         listMilestones.mockClear();
         getProjectStats.mockClear();
+        bulkUpdateMilestone.mockClear();
         act(() => {
             result.current.onSprintSaved();
         });
         expect(result.current.sprintLightbox.open).toBe(false);
         await waitFor(() => expect(listMilestones).toHaveBeenCalled());
         await waitFor(() => expect(getProjectStats).toHaveBeenCalled());
+        // M3: a NON-forecast save (opened via openCreateSprint) carries no
+        // pending forecast, so it must NOT move any stories.
+        expect(bulkUpdateMilestone).not.toHaveBeenCalled();
     });
 
     it("onSprintDeleted reloads everything and turns velocity off", async () => {
@@ -972,13 +1140,100 @@ describe("sprint lightbox", () => {
             result.current.toggleVelocityForecasting(); // velocity on
         });
         expect(result.current.displayVelocity).toBe(true);
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         act(() => {
             result.current.onSprintDeleted();
         });
         expect(result.current.sprintLightbox.open).toBe(false);
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
         await waitFor(() => expect(result.current.displayVelocity).toBe(false));
+    });
+});
+
+/* --------------------------------------------------------------------------- *
+ * Forecast story movement (M3) — the modal (create-new-sprint) path
+ * --------------------------------------------------------------------------- */
+
+describe("forecast story movement (M3)", () => {
+    // Return the given OPEN sprints from `listMilestones` (closed list stays
+    // empty). A first sprint that OVERFLOWS the velocity (points > speed 12.5)
+    // makes `forecastNewSprint` true so the forecast row reads "create sprint and
+    // add US" — the modal path.
+    function useOpenSprints(openSprints: Milestone[]): void {
+        listMilestones.mockImplementation((_pid: number, params?: { closed?: boolean }) =>
+            Promise.resolve(
+                params?.closed
+                    ? { milestones: [], closed: 0, open: 0 }
+                    : { milestones: openSprints, closed: 0, open: openSprints.length },
+            ),
+        );
+    }
+
+    it("opens the create modal carrying the forecast and moves NOTHING yet (M3)", async () => {
+        useOpenSprints([sprint(5, { total_points: 20 })]); // 20 > 12.5 => forecastNewSprint
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.toggleVelocityForecasting();
+        });
+        expect(result.current.forecastNewSprint).toBe(true);
+        bulkUpdateMilestone.mockClear();
+        act(() => {
+            result.current.createSprintFromForecasting();
+        });
+        // The create modal opens; no milestone move happens at this point.
+        expect(result.current.sprintLightbox.open).toBe(true);
+        expect(result.current.sprintLightbox.mode).toBe("create");
+        expect(bulkUpdateMilestone).not.toHaveBeenCalled();
+    });
+
+    it("moves the carried forecast stories into the just-created sprint on modal success (M3)", async () => {
+        useOpenSprints([sprint(5, { total_points: 20 })]);
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.toggleVelocityForecasting();
+        });
+        expect(result.current.forecastNewSprint).toBe(true);
+        act(() => {
+            result.current.createSprintFromForecasting();
+        });
+        expect(result.current.sprintLightbox.open).toBe(true);
+        // Simulate the sprint being created: the reload now returns the NEW
+        // sprint (id 9) as the FIRST open sprint.
+        useOpenSprints([sprint(9, { total_points: 0 }), sprint(5, { total_points: 20 })]);
+        bulkUpdateMilestone.mockClear();
+        act(() => {
+            result.current.onSprintSaved();
+        });
+        // The carried forecast stories (10, 11) are moved into the new sprint
+        // (id 9) with exactly ONE bulk-update-us-milestone (target sprints[0].id).
+        await waitFor(() => expect(bulkUpdateMilestone).toHaveBeenCalledTimes(1));
+        expect(bulkUpdateMilestone).toHaveBeenCalledWith(7, 9, [
+            { us_id: 10, order: 10 },
+            { us_id: 11, order: 11 },
+        ]);
+    });
+
+    it("consumes the pending forecast once — a later plain save moves nothing (M3)", async () => {
+        useOpenSprints([sprint(5, { total_points: 20 })]);
+        const { result } = await renderLoaded();
+        act(() => {
+            result.current.toggleVelocityForecasting();
+        });
+        act(() => {
+            result.current.createSprintFromForecasting();
+        });
+        useOpenSprints([sprint(9), sprint(5, { total_points: 20 })]);
+        act(() => {
+            result.current.onSprintSaved();
+        });
+        await waitFor(() => expect(bulkUpdateMilestone).toHaveBeenCalledTimes(1));
+        bulkUpdateMilestone.mockClear();
+        // Second save: the pending forecast was already consumed => no move.
+        act(() => {
+            result.current.onSprintSaved();
+        });
+        await waitFor(() => expect(listMilestones).toHaveBeenCalled());
+        expect(bulkUpdateMilestone).not.toHaveBeenCalled();
     });
 });
 
@@ -1042,13 +1297,15 @@ describe("toggles + search + preferences (M5)", () => {
         // open sprint contributes 0 points, so the running sum crosses 10 after the
         // third story (4+4+4 = 12 > 10). Legacy `calculateForecasting` keeps the
         // overflowing story and stops, so forecasting shows the leading THREE.
-        listUserStories.mockResolvedValue([
-            us(10, { backlog_order: 1, total_points: 4 }),
-            us(11, { backlog_order: 2, total_points: 4 }),
-            us(12, { backlog_order: 3, total_points: 4 }),
-            us(13, { backlog_order: 4, total_points: 4 }),
-            us(14, { backlog_order: 5, total_points: 4 }),
-        ]);
+        listUnassignedUserStories.mockResolvedValue(
+            page([
+                us(10, { backlog_order: 1, total_points: 4 }),
+                us(11, { backlog_order: 2, total_points: 4 }),
+                us(12, { backlog_order: 3, total_points: 4 }),
+                us(13, { backlog_order: 4, total_points: 4 }),
+                us(14, { backlog_order: 5, total_points: 4 }),
+            ]),
+        );
         getProjectStats.mockResolvedValue(statsFixture({ speed: 10 }));
         // Seed the accumulation with a zero-point open sprint so the reduction is
         // driven purely by the backlog points.
@@ -1088,11 +1345,13 @@ describe("toggles + search + preferences (M5)", () => {
         // Without a known velocity the legacy loop never breaks, so every story
         // stays visible even with forecasting toggled on (and the enable control is
         // hidden in the view — see Backlog.tsx).
-        listUserStories.mockResolvedValue([
-            us(10, { backlog_order: 1, total_points: 4 }),
-            us(11, { backlog_order: 2, total_points: 4 }),
-            us(12, { backlog_order: 3, total_points: 4 }),
-        ]);
+        listUnassignedUserStories.mockResolvedValue(
+            page([
+                us(10, { backlog_order: 1, total_points: 4 }),
+                us(11, { backlog_order: 2, total_points: 4 }),
+                us(12, { backlog_order: 3, total_points: 4 }),
+            ]),
+        );
         getProjectStats.mockResolvedValue(statsFixture({ speed: 0 }));
 
         const { result } = await renderLoaded();
@@ -1125,26 +1384,28 @@ describe("toggles + search + preferences (M5)", () => {
             result.current.changeQ("bug");
         });
         expect(result.current.filterQ).toBe("bug");
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         jest.useFakeTimers();
         act(() => {
             jest.advanceTimersByTime(600);
         });
         jest.useRealTimers();
         await waitFor(() =>
-            expect(listUserStories).toHaveBeenCalledWith(
-                expect.objectContaining({ q: "bug", milestone: "null" }),
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
+                expect.objectContaining({ q: "bug" }),
+                undefined,
             ),
         );
     });
 
     it("loadUserstories can be invoked directly", async () => {
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         act(() => {
             result.current.loadUserstories();
         });
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
     });
 });
 
@@ -1237,7 +1498,7 @@ describe("filters (C4)", () => {
 
     it("addFilter selects a category value: adds a chip, persists to backlog-filters, and reloads with the grouped param", async () => {
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
 
         await act(async () => {
             result.current.addFilter({ category: { dataType: "status" }, filter: { id: 1 } });
@@ -1257,15 +1518,17 @@ describe("filters (C4)", () => {
         expect(storedParams()).toEqual({ status: "1" });
         // Debounced list reload carries the grouped param (real ≤500ms debounce).
         await waitFor(() =>
-            expect(listUserStories).toHaveBeenCalledWith(
-                expect.objectContaining({ status: "1", milestone: "null" }),
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
+                expect.objectContaining({ status: "1" }),
+                undefined,
             ),
         );
     });
 
     it("addFilter in exclude mode uses the exclude_ param name", async () => {
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
 
         await act(async () => {
             result.current.addFilter({
@@ -1280,8 +1543,10 @@ describe("filters (C4)", () => {
         ]);
         expect(storedParams()).toEqual({ exclude_status: "2" });
         await waitFor(() =>
-            expect(listUserStories).toHaveBeenCalledWith(
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
                 expect.objectContaining({ exclude_status: "2" }),
+                undefined,
             ),
         );
     });
@@ -1294,7 +1559,7 @@ describe("filters (C4)", () => {
             ],
         });
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
 
         await act(async () => {
             result.current.addFilter({ category: { dataType: "status" }, filter: { id: 1 } });
@@ -1313,8 +1578,10 @@ describe("filters (C4)", () => {
         ).toEqual(["1", "2"]);
         // Flush the trailing coalesced reload.
         await waitFor(() =>
-            expect(listUserStories).toHaveBeenCalledWith(
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
                 expect.objectContaining({ status: "1,2" }),
+                undefined,
             ),
         );
     });
@@ -1327,7 +1594,7 @@ describe("filters (C4)", () => {
         expect(result.current.selectedFilters).toHaveLength(1);
         const chip = result.current.selectedFilters[0];
 
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         await act(async () => {
             result.current.removeFilter(chip);
         });
@@ -1335,8 +1602,9 @@ describe("filters (C4)", () => {
         expect(result.current.selectedFilters).toEqual([]);
         // The empty category key is deleted, not left as "".
         expect(storedParams()).toEqual({});
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
-        const lastCall = listUserStories.mock.calls[listUserStories.mock.calls.length - 1][0];
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
+        const lastCall =
+            listUnassignedUserStories.mock.calls[listUnassignedUserStories.mock.calls.length - 1][1];
         expect(lastCall).not.toHaveProperty("status");
     });
 
@@ -1395,7 +1663,7 @@ describe("filters (C4)", () => {
 
     it("selectCustomFilter replaces all applied params and persists + reloads with them", async () => {
         const { result } = await renderLoaded();
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
 
         await act(async () => {
             result.current.selectCustomFilter({
@@ -1411,8 +1679,10 @@ describe("filters (C4)", () => {
             result.current.selectedFilters.some((c) => c.dataType === "status" && c.id === "1"),
         ).toBe(true);
         await waitFor(() =>
-            expect(listUserStories).toHaveBeenCalledWith(
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
                 expect.objectContaining({ status: "1", exclude_tags: "foo" }),
+                undefined,
             ),
         );
     });
@@ -1422,10 +1692,12 @@ describe("filters (C4)", () => {
         const { result } = await renderLoaded();
 
         // Only VALID_QUERY_PARAMS are picked; the first list load already carries them.
-        expect(listUserStories).toHaveBeenCalledWith(
-            expect.objectContaining({ status: "1", exclude_tags: "foo", milestone: "null" }),
+        expect(listUnassignedUserStories).toHaveBeenCalledWith(
+            7,
+            expect.objectContaining({ status: "1", exclude_tags: "foo" }),
+            undefined,
         );
-        const firstCall = listUserStories.mock.calls[0][0];
+        const firstCall = listUnassignedUserStories.mock.calls[0][1];
         expect(firstCall).not.toHaveProperty("bogus");
         // Chips projected from the hydrated params.
         expect(
@@ -1441,10 +1713,12 @@ describe("filters (C4)", () => {
         const { result } = await renderLoaded();
 
         // `q` is dropped (legacy getFilters), only valid params applied.
-        expect(listUserStories).toHaveBeenCalledWith(
-            expect.objectContaining({ status: "2", milestone: "null" }),
+        expect(listUnassignedUserStories).toHaveBeenCalledWith(
+            7,
+            expect.objectContaining({ status: "2" }),
+            undefined,
         );
-        const firstCall = listUserStories.mock.calls[0][0];
+        const firstCall = listUnassignedUserStories.mock.calls[0][1];
         expect(firstCall.q).toBe("");
         expect(result.current.errorMessage).toBeNull();
     });
@@ -1462,7 +1736,7 @@ describe("filters (C4)", () => {
         // The chip was still applied optimistically (screen stays usable).
         expect(result.current.selectedFilters).toHaveLength(1);
         // Flush the trailing debounced reload so no update escapes act().
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
     });
 });
 
@@ -1481,7 +1755,7 @@ describe("websocket subscription", () => {
                 onMilestones: expect.any(Function),
             }),
         );
-        listUserStories.mockClear();
+        listUnassignedUserStories.mockClear();
         listMilestones.mockClear();
         jest.useFakeTimers();
         act(() => {
@@ -1489,7 +1763,7 @@ describe("websocket subscription", () => {
             jest.advanceTimersByTime(1100);
         });
         jest.useRealTimers();
-        await waitFor(() => expect(listUserStories).toHaveBeenCalled());
+        await waitFor(() => expect(listUnassignedUserStories).toHaveBeenCalled());
         await waitFor(() => expect(listMilestones).toHaveBeenCalled());
     });
 
@@ -1517,5 +1791,397 @@ describe("websocket subscription", () => {
         view.unmount();
         expect(capturedCleanup).toHaveBeenCalled();
         expect(stop).toHaveBeenCalled();
+    });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* M22 — localized page <title>/<meta description> on load + unmount cleanup   */
+/* (shares shared/meta/appMeta.ts with the Kanban screen).                     */
+/* -------------------------------------------------------------------------- */
+describe("useBacklogStories — page metadata (M22)", () => {
+    let headHtml: string;
+
+    beforeEach(() => {
+        // Preserve and seed the <head> the way index.jade ships it (a <title>).
+        headHtml = document.head.innerHTML;
+        document.head.innerHTML = "<title>Taiga</title>";
+    });
+
+    afterEach(() => {
+        document.head.innerHTML = headHtml;
+    });
+
+    it("sets the localized Backlog title + description once the project loads", async () => {
+        getProjectBySlug.mockResolvedValueOnce(
+            project({ name: "Alpha", description: "the alpha backlog" }),
+        );
+
+        const { result } = renderHook(() => useBacklogStories(context));
+        await waitFor(() => expect(result.current.loading).toBe(false));
+
+        // BACKLOG.PAGE_TITLE = "Backlog - {{projectName}}".
+        expect(document.head.querySelector("title")?.textContent).toBe("Backlog - Alpha");
+        // BACKLOG.PAGE_DESCRIPTION interpolates name + description.
+        const desc = document.head
+            .querySelector("meta[name='description']")
+            ?.getAttribute("content");
+        expect(desc).toBe(
+            "The backlog panel, with user stories and sprints of the project Alpha: the alpha backlog",
+        );
+        // The open-graph block is written too (full setAll parity).
+        expect(
+            document.head.querySelector("meta[property='og:title']")?.getAttribute("content"),
+        ).toBe("Backlog - Alpha");
+    });
+
+    it("restores the prior <head> tags on unmount (no stale title leak)", async () => {
+        getProjectBySlug.mockResolvedValueOnce(
+            project({ name: "Alpha", description: "the alpha backlog" }),
+        );
+
+        const { result, unmount } = renderHook(() => useBacklogStories(context));
+        await waitFor(() => expect(result.current.loading).toBe(false));
+        expect(document.head.querySelector("title")?.textContent).toBe("Backlog - Alpha");
+        expect(document.head.querySelector("meta[property='og:title']")).not.toBeNull();
+
+        act(() => {
+            unmount();
+        });
+
+        // Title restored; the screen-created og/twitter tags removed.
+        expect(document.head.querySelector("title")?.textContent).toBe("Taiga");
+        expect(document.head.querySelector("meta[property='og:title']")).toBeNull();
+        expect(document.head.querySelector("meta[name='twitter:card']")).toBeNull();
+    });
+
+    it("does not set a Backlog title when the initial project load fails", async () => {
+        getProjectBySlug.mockRejectedValueOnce(new ApiError(500, { _error_message: "boom" }));
+
+        const { result } = renderHook(() => useBacklogStories(context));
+        await waitFor(() => expect(result.current.loading).toBe(false));
+
+        // project stayed null -> no metadata written (parity with onInitialDataError).
+        expect(document.head.querySelector("title")?.textContent).toBe("Taiga");
+        expect(document.head.querySelector("meta[property='og:title']")).toBeNull();
+    });
+});
+
+/* --------------------------------------------------------------------------- *
+ * M9 — operation-generation guard (ignore superseded completions / rollbacks) *
+ * --------------------------------------------------------------------------- */
+
+describe("useBacklogStories — operation generation (M9, CWE-362)", () => {
+    it("a delete rollback that settles AFTER a slug-change reload is ignored", async () => {
+        // Deferred remove so we can settle it only AFTER the board reloads.
+        const removeD = deferred<void>();
+        remove.mockReturnValueOnce(removeD.promise);
+
+        const view = renderHook((ctx: MountContext) => useBacklogStories(ctx), {
+            initialProps: context,
+        });
+        await waitFor(() => expect(view.result.current.loading).toBe(false));
+        expect(view.result.current.userstories.map((u) => u.id)).toEqual([10, 11]);
+
+        // Confirm-delete 10 -> optimistic removal + a pending remove() request.
+        act(() => {
+            view.result.current.deleteUserStory(us(10));
+        });
+        await act(async () => {
+            view.result.current.confirmDelete();
+        });
+        expect(view.result.current.userstories.map((u) => u.id)).toEqual([11]);
+
+        // Slug change -> firstLoad cleanup bumps the generation and reloads a
+        // DIFFERENT backlog (10 legitimately absent on the new board).
+        listUnassignedUserStories.mockResolvedValue(page([us(50), us(51)]));
+        await act(async () => {
+            view.rerender({ ...context, projectSlug: "p2" });
+        });
+        await waitFor(() =>
+            expect(view.result.current.userstories.map((u) => u.id)).toEqual([50, 51]),
+        );
+
+        // The stale delete now FAILS: its rollback + error MUST be ignored so
+        // the reloaded board is not corrupted and no stale error surfaces.
+        await act(async () => {
+            removeD.reject(new ApiError(500, { _error_message: "stale delete failed" }));
+            await Promise.resolve();
+        });
+        expect(view.result.current.errorMessage).toBeNull();
+        expect(view.result.current.userstories.map((u) => u.id)).toEqual([50, 51]);
+    });
+
+    it("a create that resolves AFTER a slug-change reload does not reload the new board", async () => {
+        // Deferred create so it settles only AFTER the board reloads.
+        const createD = deferred<UserStory>();
+        create.mockReturnValueOnce(createD.promise);
+
+        const view = renderHook((ctx: MountContext) => useBacklogStories(ctx), {
+            initialProps: context,
+        });
+        await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+        // Open the create lightbox + submit -> pending create().
+        act(() => {
+            view.result.current.addNewUs("standard");
+        });
+        await act(async () => {
+            view.result.current.submitNewUs(
+                createEmptyStoryValues({ subject: "late story", status: 1 }),
+            );
+        });
+
+        // Reload (new slug) before the create resolves.
+        listUnassignedUserStories.mockResolvedValue(page([us(50), us(51)]));
+        await act(async () => {
+            view.rerender({ ...context, projectSlug: "p2" });
+        });
+        await waitFor(() =>
+            expect(view.result.current.userstories.map((u) => u.id)).toEqual([50, 51]),
+        );
+
+        // The stale create's post-create reload (loadUserstories) MUST be
+        // skipped by the generation guard, so listUnassignedUserStories is NOT called
+        // again and no stale error surfaces.
+        const callsBefore = listUnassignedUserStories.mock.calls.length;
+        await act(async () => {
+            createD.resolve(us(999, { subject: "late story" }));
+            await Promise.resolve();
+        });
+        expect(listUnassignedUserStories.mock.calls.length).toBe(callsBefore);
+        expect(view.result.current.errorMessage).toBeNull();
+        expect(view.result.current.userstories.map((u) => u.id)).toEqual([50, 51]);
+    });
+});
+
+/* --------------------------------------------------------------------------- *
+ * C6 — edit fetches AUTHORITATIVE by-id detail + attachments BEFORE opening    *
+ * --------------------------------------------------------------------------- */
+
+describe("useBacklogStories — edit fetches authoritative detail (C6)", () => {
+    it("fetches detail + attachments, reconciles into projections, then opens", async () => {
+        const { result } = await renderLoaded();
+        // The list projection for 11 omits the description.
+        expect(
+            result.current.userstories.find((u) => u.id === 11)?.description,
+        ).toBeUndefined();
+
+        // The authoritative detail carries the REAL description + version + attachments.
+        getUserStory.mockResolvedValueOnce(
+            us(11, { description: "authoritative body", version: 9 }),
+        );
+        const att = [{ id: 1, name: "spec.pdf" }];
+        listUserStoryAttachments.mockResolvedValueOnce(att);
+
+        await act(async () => {
+            result.current.editUserStory(us(11));
+        });
+
+        // Detail + attachments fetched BEFORE the lightbox opened.
+        expect(getUserStory).toHaveBeenCalledWith(7, 11);
+        expect(listUserStoryAttachments).toHaveBeenCalledWith(7, 11);
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
+        // The authoritative detail was reconciled into the backlog projection so
+        // the form seeds the REAL description (not a blank that a save would PATCH away).
+        const reconciled = result.current.userstories.find((u) => u.id === 11);
+        expect(reconciled?.description).toBe("authoritative body");
+        expect(reconciled?.version).toBe(9);
+        expect(reconciled?.attachments).toEqual(att);
+        expect(result.current.editLoading).toBe(false);
+    });
+
+    it("does NOT open a blank form when the detail fetch fails (FATAL)", async () => {
+        const { result } = await renderLoaded();
+        getUserStory.mockRejectedValueOnce(new ApiError(500, { _error_message: "boom" }));
+
+        await act(async () => {
+            result.current.editUserStory(us(11));
+        });
+
+        // No lightbox opened; a sanitized error surfaced; loading released.
+        expect(result.current.activeLightbox).toBeNull();
+        expect(result.current.errorMessage).not.toBeNull();
+        expect(result.current.editLoading).toBe(false);
+    });
+
+    it("opens even when the attachments fetch fails (NON-FATAL, degrades to [])", async () => {
+        const { result } = await renderLoaded();
+        getUserStory.mockResolvedValueOnce(us(11, { description: "body" }));
+        listUserStoryAttachments.mockRejectedValueOnce(
+            new ApiError(500, { _error_message: "no attachments" }),
+        );
+
+        await act(async () => {
+            result.current.editUserStory(us(11));
+        });
+
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
+        const reconciled = result.current.userstories.find((u) => u.id === 11);
+        expect(reconciled?.description).toBe("body");
+        expect(reconciled?.attachments).toEqual([]);
+    });
+
+    it("re-open guard ignores a second click while the first detail fetch is in flight", async () => {
+        const { result } = await renderLoaded();
+        const d = deferred<UserStory>();
+        getUserStory.mockReturnValueOnce(d.promise);
+
+        act(() => {
+            result.current.editUserStory(us(11));
+        });
+        // Second click while loading -> ignored (no duplicate fetch).
+        act(() => {
+            result.current.editUserStory(us(10));
+        });
+        expect(getUserStory).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+            d.resolve(us(11, { description: "body" }));
+            await Promise.resolve();
+        });
+        await waitFor(() =>
+            expect(result.current.activeLightbox).toEqual({ type: "edit", usId: 11 }),
+        );
+    });
+
+    it("discards a superseded edit-open (detail resolves AFTER a slug-change reload)", async () => {
+        const d = deferred<UserStory>();
+        getUserStory.mockReturnValueOnce(d.promise);
+
+        const view = renderHook((ctx: MountContext) => useBacklogStories(ctx), {
+            initialProps: context,
+        });
+        await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+        act(() => {
+            view.result.current.editUserStory(us(11));
+        });
+
+        // Slug change -> generation bump + reload before the detail resolves.
+        await act(async () => {
+            view.rerender({ ...context, projectSlug: "p2" });
+        });
+        await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+        // Stale detail resolves -> the edit-open MUST be discarded (no lightbox).
+        await act(async () => {
+            d.resolve(us(11, { description: "stale" }));
+            await Promise.resolve();
+        });
+        expect(view.result.current.activeLightbox).toBeNull();
+        expect(view.result.current.errorMessage).toBeNull();
+    });
+});
+
+/* --------------------------------------------------------------------------- *
+ * M2 — authoritative pagination + total headers                               *
+ * --------------------------------------------------------------------------- */
+
+describe("useBacklogStories — authoritative pagination (M2)", () => {
+    it("uses the AUTHORITATIVE Taiga-Info-Backlog-Total-Userstories total, not the loaded-row count", async () => {
+        // Only 2 rows loaded, but the backend reports 42 total in the backlog.
+        listUnassignedUserStories.mockResolvedValue(
+            page([us(10), us(11)], { backlogTotal: 42, hasNext: true }),
+        );
+        const { result } = await renderLoaded();
+        expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11]);
+        // The DEFECT this fixes: total was `list.length` (2); it must be 42.
+        expect(result.current.totalUserStories).toBe(42);
+        expect(result.current.hasMoreUserstories).toBe(true);
+    });
+
+    it("calls the paginated listUnassignedUserStories on mount (page 1, no x-disable-pagination)", async () => {
+        await renderLoaded();
+        expect(listUnassignedUserStories).toHaveBeenCalledWith(
+            7,
+            expect.objectContaining({ page: 1 }),
+            undefined,
+        );
+    });
+
+    it("loadMoreUserstories fetches the NEXT page and APPENDS (page advancement)", async () => {
+        listUnassignedUserStories
+            .mockResolvedValueOnce(page([us(10), us(11)], { backlogTotal: 4, hasNext: true }))
+            .mockResolvedValueOnce(page([us(12), us(13)], { backlogTotal: 4, hasNext: false }));
+
+        const { result } = await renderLoaded();
+        expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11]);
+        expect(result.current.hasMoreUserstories).toBe(true);
+
+        await act(async () => {
+            result.current.loadMoreUserstories();
+        });
+
+        // Page 2 was requested and its rows appended; no more pages remain.
+        expect(listUnassignedUserStories).toHaveBeenLastCalledWith(
+            7,
+            expect.objectContaining({ page: 2 }),
+            undefined,
+        );
+        expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11, 12, 13]);
+        expect(result.current.hasMoreUserstories).toBe(false);
+    });
+
+    it("loadMoreUserstories DEDUPES an overlapping row (WS/optimistic-safe append)", async () => {
+        listUnassignedUserStories
+            .mockResolvedValueOnce(page([us(10), us(11)], { backlogTotal: 3, hasNext: true }))
+            // Page 2 overlaps id 11 (e.g. a re-fetched range) -> must not duplicate.
+            .mockResolvedValueOnce(page([us(11), us(12)], { backlogTotal: 3, hasNext: false }));
+
+        const { result } = await renderLoaded();
+        await act(async () => {
+            result.current.loadMoreUserstories();
+        });
+        expect(result.current.userstories.map((u) => u.id)).toEqual([10, 11, 12]);
+    });
+
+    it("loadMoreUserstories is a no-op when there is no next page", async () => {
+        listUnassignedUserStories.mockResolvedValue(
+            page([us(10), us(11)], { hasNext: false }),
+        );
+        const { result } = await renderLoaded();
+        listUnassignedUserStories.mockClear();
+        await act(async () => {
+            result.current.loadMoreUserstories();
+        });
+        expect(listUnassignedUserStories).not.toHaveBeenCalled();
+    });
+
+    it("a post-mutation reload preserves the loaded page depth (reloadLoadedUserstories page_size)", async () => {
+        // Load two pages first (4 rows shown).
+        listUnassignedUserStories
+            .mockResolvedValueOnce(page([us(10), us(11)], { backlogTotal: 4, hasNext: true }))
+            .mockResolvedValueOnce(page([us(12), us(13)], { backlogTotal: 4, hasNext: false }));
+        const { result } = await renderLoaded();
+        await act(async () => {
+            result.current.loadMoreUserstories();
+        });
+        expect(result.current.userstories).toHaveLength(4);
+
+        // A create triggers reloadLoadedUserstories: it must refetch ALL loaded
+        // rows in ONE page (page_size = 4), not shrink back to page 1.
+        listUnassignedUserStories.mockClear();
+        listUnassignedUserStories.mockResolvedValue(
+            page([us(10), us(11), us(12), us(13)], { backlogTotal: 4, hasNext: false }),
+        );
+        act(() => {
+            result.current.addNewUs("standard");
+        });
+        await act(async () => {
+            result.current.submitNewUs(createEmptyStoryValues({ subject: "New" }));
+        });
+        await waitFor(() => expect(create).toHaveBeenCalled());
+        await waitFor(() =>
+            expect(listUnassignedUserStories).toHaveBeenCalledWith(
+                7,
+                expect.objectContaining({ page: 1 }),
+                4,
+            ),
+        );
     });
 });

@@ -34,9 +34,11 @@
  *     registered globally by `jest.setup.ts`.
  */
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { KanbanHeader } from "./KanbanHeader";
 import type { KanbanHeaderProps } from "./KanbanHeader";
+import { setTranslations } from "../shared/i18n/translate";
+import localeEn from "../../locales/taiga/locale-en.json";
 
 /**
  * Build a complete, valid {@link KanbanHeaderProps} object, overriding only the
@@ -225,5 +227,115 @@ describe("KanbanHeader — interactions", () => {
     expect(input!.value).toBe("typed");
     rerender(<KanbanHeader {...props} filterQ="ignored" />);
     expect(input!.value).toBe("typed");
+  });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* i18n — runtime locale parity (review finding M5)                            */
+/* -------------------------------------------------------------------------- */
+
+describe("KanbanHeader — i18n (M5)", () => {
+  // A NON-English table covering exactly the keys KanbanHeader resolves, so we
+  // can prove the header renders the ACTIVE locale (not hardcoded English and
+  // not raw dotted keys). `KanbanHeader` itself holds no `useTranslations`
+  // subscription (the board root drives re-render), so setting the table
+  // BEFORE render is the faithful unit assertion.
+  const ES = {
+    ZOOM: {
+      TITLE: "Zoom-ES:",
+      "ZOOM-1": "Compacto",
+      "ZOOM-2": "Predeterminado",
+      "ZOOM-3": "Detallado",
+      "ZOOM-4": "Expandido",
+    },
+    COMMON: {
+      FILTERS: {
+        INPUT_PLACEHOLDER: "asunto o referencia",
+        APPLIED_FILTERS_NUM: "filtros aplicados",
+      },
+    },
+    BACKLOG: {
+      FILTERS: { TITLE: "Filtros", HIDE_TITLE: "Ocultar filtros" },
+    },
+  };
+
+  afterEach(() => {
+    // Restore the compiled English bundle so later suites/tests resolve English.
+    // KanbanHeader carries no translation subscription, so this cannot re-render
+    // a still-mounted instance; the `act` wrapper is a defensive no-op flush.
+    act(() => {
+      setTranslations(localeEn as never);
+    });
+  });
+
+  it("renders localized strings from the active table, not hardcoded English", () => {
+    act(() => {
+      setTranslations(ES as never);
+    });
+
+    const { container } = render(
+      <KanbanHeader {...makeProps({ openFilter: true, selectedFiltersCount: 3, zoomLevel: 1 })} />,
+    );
+
+    // Filter toggle uses the localized HIDE label while the panel is open.
+    expect(container.querySelector("button.btn-filter span.text")!.textContent).toBe(
+      "Ocultar filtros",
+    );
+    // Applied-filters count uses the localized suffix + interpolated count.
+    expect(container.querySelector("button.btn-filter")!.getAttribute("title")).toBe(
+      "3 filtros aplicados",
+    );
+    // Search box placeholder + aria-label localized.
+    const input = container.querySelector<HTMLInputElement>(
+      "tg-input-search input[type='search']",
+    )!;
+    expect(input.getAttribute("placeholder")).toBe("asunto o referencia");
+    expect(input.getAttribute("aria-label")).toBe("asunto o referencia");
+    // Zoom title + the four zoom labels localized.
+    expect(container.querySelector(".board-zoom-title")!.textContent).toBe("Zoom-ES:");
+    const labels = Array.from(
+      container.querySelectorAll("tg-board-zoom .zoom-radio .checkmark span"),
+    ).map((el) => el.textContent);
+    expect(labels).toEqual(["Compacto", "Predeterminado", "Detallado", "Expandido"]);
+  });
+
+  it("closed filter panel uses the localized 'Filtros' label", () => {
+    act(() => {
+      setTranslations(ES as never);
+    });
+
+    const { container } = render(
+      <KanbanHeader {...makeProps({ openFilter: false, selectedFiltersCount: 0 })} />,
+    );
+
+    expect(container.querySelector("button.btn-filter span.text")!.textContent).toBe("Filtros");
+  });
+
+  it("leaks no raw dotted translation keys into the DOM (all keys resolve)", () => {
+    // Render with BOTH filter-label branches exercised across two renders and a
+    // non-zero applied-filters count, using the DEFAULT English table. If any
+    // `t()` call failed to resolve, the raw dotted key would appear verbatim.
+    const open = render(
+      <KanbanHeader {...makeProps({ openFilter: true, selectedFiltersCount: 3 })} />,
+    ).container.innerHTML;
+    const closed = render(
+      <KanbanHeader {...makeProps({ openFilter: false, selectedFiltersCount: 0 })} />,
+    ).container.innerHTML;
+    const html = `${open}\n${closed}`;
+
+    for (const key of [
+      "ZOOM.TITLE",
+      "ZOOM.ZOOM-1",
+      "ZOOM.ZOOM-2",
+      "ZOOM.ZOOM-3",
+      "ZOOM.ZOOM-4",
+      "COMMON.FILTERS.INPUT_PLACEHOLDER",
+      "COMMON.FILTERS.APPLIED_FILTERS_NUM",
+      "BACKLOG.FILTERS.TITLE",
+      "BACKLOG.FILTERS.HIDE_TITLE",
+    ]) {
+      expect(html).not.toContain(key);
+    }
   });
 });

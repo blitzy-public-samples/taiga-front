@@ -169,3 +169,31 @@ jobs:
           echo "FAIL: development React present in the served bundle"; exit 1;
         fi
         echo "Production React bundle OK: $BUNDLE ($(wc -c < "$BUNDLE") bytes)"
+
+    # Finding M28 + M25/M27 (E2E / visual acceptance — static gate). The LIVE
+    # Playwright parity + strict-visual run requires the full Taiga stack served
+    # at http://localhost:9000, which is stood up from the SIBLING `taiga-docker`
+    # submodule in the SUPERPROJECT — not from this `taiga-front` repo, so it is
+    # out of reach of this workflow's checkout (AAP §0.2.1 scopes the in-repo CI
+    # change to the Jest React gate). What CAN be enforced here WITHOUT the stack
+    # is that the entire Playwright suite still COMPILES and is discoverable: the
+    # ported kanban/backlog cases, the added negative / permission / rollback /
+    # a11y / keyboard-DnD / attachment cases (M25), and the strict
+    # `toHaveScreenshot` visual-parity gate (M27). `--list` transpiles every spec
+    # + fixture and LOADS `playwright.config.ts` (an invalid
+    # `expect.toHaveScreenshot` or `snapshotPathTemplate` option throws on load),
+    # so this step fails CI on any spec or comparator-config regression. It needs
+    # no browser (guaranteed repo-wide by PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD) and no
+    # running stack.
+    - name: verify Playwright parity suite compiles + collects (M25/M27)
+      run: npx playwright test --list
+
+    # STACK-DEPENDENT GATES (Docker build/start, live Playwright parity, strict
+    # visual comparison) are enforced in the SUPERPROJECT CI that owns the
+    # `taiga-docker` compose stack. Running them HERE would require this
+    # `taiga-front` checkout to `docker compose up` a sibling submodule it does
+    # not contain; per AAP §0.2.1 (in-repo CI change = the Jest React gate) the
+    # live gates live where the stack lives. The MECHANISM they enforce — the
+    # strict comparator, the AAP-grounded thresholds, and the frozen single spec
+    # set run against both temporal builds — is committed in
+    # `playwright.config.ts` + `e2e-react/**` and statically gated above.

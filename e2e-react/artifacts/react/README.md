@@ -11,7 +11,13 @@ The `react` project runs the *same* shared specs as the baseline (`../../kanban.
 
 ## Relationship to `../baseline/`
 
-The sibling `../baseline/` holds the pre-migration (stock-AngularJS) counterpart. Because the React screens emit the same DOM structure and CSS class names as the AngularJS originals, the identical specs run against both. Comparing this folder against `../baseline/` side-by-side demonstrates behavioral and visual parity.
+The sibling `../baseline/` holds the pre-migration (stock-AngularJS) counterpart. Because the React screens emit the same DOM structure and CSS class names as the AngularJS originals, the identical specs run against both, and the strict `toHaveScreenshot` comparator configured in `playwright.config.ts` (finding M27) pairs each React capture with the **same** project-independent reference the `baseline` project writes. That comparator — not a side-by-side eyeball — is the enforceable parity gate; read the validation-status note below before citing the committed media as proof.
+
+## Provenance and validation status (read before citing as proof)
+
+- **Root-cause corrections applied.** The remediation corrected the component / DOM / behavior differences that made earlier captures diverge from the baseline: authoritative shared-widget DOM and class names (M15); runtime i18n so text matches the active locale (M5); authoritative detail-fetch-before-edit, loading placeholder, and card image carousel (C6 / C8 / C9); and state / permission / drag parity (C5 / C7 / M4 / M9). React emits the same markup the preserved SCSS styles — the mechanism by which visual parity is achieved (AAP §0.1.1 / §0.7.1).
+- **Enforceable gate in place.** A strict `toHaveScreenshot` comparator with AAP-grounded thresholds (M27) plus a single frozen spec set shared by both temporal projects (M26) make parity machine-checkable rather than asserted by inspection.
+- **Recapture required before the committed PNGs are treated as proof.** The media currently committed here predates the remediation; it must be re-captured from a build that serves the **current** React sources and compared through the M27 gate. That recapture requires the full Taiga stack served at `http://localhost:9000` from a build-from-source image of this working tree — an environment / deployment step (AAP §0.6.2 / §0.6.6), not a source change. This README therefore does **not** claim the committed images already prove pixel parity.
 
 ## Single origin (a temporal, not spatial, distinction)
 

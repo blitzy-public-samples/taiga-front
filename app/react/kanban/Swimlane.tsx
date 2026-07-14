@@ -47,12 +47,12 @@
  *     is pure CSS, so no JavaScript hover handler is required for visual parity.
  *   - `ng-class` decisions become the local {@link cx} join helper.
  *   - The `tgSvg` directive output is reproduced inline by the local {@link Icon}
- *     helper (the React subtree is not AngularJS-compiled, so a bare `<tg-svg>`
- *     tag would be inert); the emitted `<svg class="icon icon-…">` keeps every
+ *     helper as `<tg-svg [class]><svg class="icon icon-…">…</tg-svg>` (review
+ *     finding M15): the `<tg-svg>` WRAPPER is emitted because the unchanged SCSS
+ *     styles it directly, and the legacy `fold-action` / `unfold-action` /
+ *     `default-swimlane-icon` modifier classes live ON the wrapper exactly as the
+ *     jade placed them. The inner `<svg class="icon icon-…">` keeps every
  *     `.icon-*` SCSS selector resolving against the global sprite in `index.jade`.
- *     The legacy `fold-action` / `unfold-action` / `default-swimlane-icon`
- *     classes lived on the `<tg-svg>` wrapper; since the wrapper is dropped they
- *     are passed through to the `<svg>` so the SCSS selectors still resolve.
  *   - `{{ swimlane.name }}` / `| translate` interpolations become plain, escaped
  *     JSX text; this file NEVER uses `dangerouslySetInnerHTML` (XSS-safety, per
  *     the migration rules). i18n strings are reproduced as English literals for
@@ -83,9 +83,29 @@ import type {
   Project,
   Swimlane as SwimlaneModel,
 } from "../shared/types";
+import { useDndContext } from "@dnd-kit/core";
+
 import { StatusColumn } from "./StatusColumn";
+import { useSwimlaneAutoExpand } from "./hooks/useSwimlaneAutoExpand";
 import type { CardMember } from "./Card";
 import { t } from "../shared/i18n/translate";
+
+/*
+ * JSX intrinsic-element augmentation for the authoritative `<tg-svg>` wrapper
+ * this component now emits (review finding M15). The right-hand side is kept
+ * byte-identical to every other kanban/backlog React file so the `declare
+ * global` blocks merge structurally with no TS2717 ("subsequent property
+ * declarations must have the same type") error when tsc compiles the whole
+ * bundle together.
+ */
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace JSX {
+    interface IntrinsicElements {
+      "tg-svg": React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & Record<string, unknown>;
+    }
+  }
+}
 
 /*
  * i18n labels. The migration reproduces the AngularJS `translate` output as
@@ -109,24 +129,33 @@ function cx(...tokens: Array<string | false | null | undefined>): string {
 }
 
 /**
- * Inline-SVG reproduction of the shared `tgSvg` directive output. The React
- * subtree is not AngularJS-compiled, so a bare `<tg-svg>` element would be inert;
- * emitting `<svg class="icon icon-…"><use xlink:href="#icon-…"></use></svg>`
- * keeps every `.icon-*` SCSS selector resolving against the global SVG sprite
- * declared in `index.jade`. `className` (optional) carries the legacy wrapper
- * modifier classes (`unfold-action`, `fold-action`, `default-swimlane-icon`) so
- * they land directly on the `<svg>` and the corresponding selectors still apply.
- * The icon is decorative here (the swimlane name provides the accessible label),
- * so it is marked `aria-hidden`.
+ * Faithful reproduction of the shared `tgSvg` directive output
+ * (`common.coffee` L342-363 — the directive has NO `replace`, so the rendered
+ * DOM is `<tg-svg [class]><svg class="icon icon-…"><use xlink:href="#icon-…"/>
+ * </svg></tg-svg>`). Emitting the `<tg-svg>` WRAPPER is REQUIRED for visual
+ * parity (review finding M15): `kanban-table.scss` targets the wrapper directly
+ * for state-dependent fills — e.g. `.folded tg-svg { fill }` and
+ * `.unclassified-us-info tg-svg { fill }` — and the global `tg-svg { display:
+ * flex }` base rule (`core/base.scss`) makes the modifier classes size the icon.
+ * The optional `className` carries the legacy wrapper modifier classes
+ * (`unfold-action`, `fold-action`, `default-swimlane-icon`) onto the `<tg-svg>`
+ * exactly where the jade placed them (`tg-svg.unfold-action(...)`); the inner
+ * `<svg>` gets `icon icon-<name>`. No `role`/`aria-hidden` is added — the
+ * authoritative directive emits neither, and the icons sit inside the labelled
+ * swimlane-title button, so they are already non-interactive decoration.
  */
 function Icon(props: { icon: string; className?: string }): JSX.Element {
+  // `class` (not `className`) is intentional: React 18 renders `className`
+  // on a hyphenated custom element (`tg-svg`) as the literal `classname`
+  // attribute, which would break the unchanged SCSS that styles the wrapper
+  // (e.g. `.add-action`, `.fold-action`, `.default-swimlane-icon`). The
+  // literal `class` prop is passed through verbatim as the real attribute.
   return (
-    <svg
-      className={`icon ${props.icon}${props.className ? " " + props.className : ""}`}
-      aria-hidden={true}
-    >
-      <use xlinkHref={`#${props.icon}`} />
-    </svg>
+    <tg-svg class={props.className}>
+      <svg className={`icon ${props.icon}`}>
+        <use xlinkHref={`#${props.icon}`} />
+      </svg>
+    </tg-svg>
   );
 }
 
@@ -196,8 +225,6 @@ export interface SwimlaneProps {
   onClickMoveToTop?: (id: number) => void;
   /** Ctrl/meta-click multi-select toggle; mirrors `toggleSelectedUs(usId)`. Forwarded to each column. */
   onToggleSelect: (id: number, event: React.MouseEvent) => void;
-  /** Optional WIP-limit edit affordance; mirrors the legacy `tg-kanban-wip-limit` commit. */
-  onEditWipLimit?: (statusId: number, wipLimit: number | null) => void;
 }
 
 /**
@@ -238,12 +265,26 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
     onClickAssignedTo,
     onClickMoveToTop,
     onToggleSelect,
-    onEditWipLimit,
   } = props;
 
   // The synthetic "unclassified" swimlane uses id -1; it carries the italic
   // title, the help tooltip, and the higher stacking context (`.unclassified-*`).
   const isUnclassified = swimlane.id === -1;
+
+  // M6 — hover-to-auto-expand a FOLDED swimlane while dragging a card. The
+  // "is a drag in progress" gate is the @dnd-kit `DndContext.active` state (the
+  // React equivalent of the legacy `tg-card.gu-mirror` presence check); the
+  // 1000ms timer + `pending-to-open` class + auto-unfold live in the dedicated
+  // {@link useSwimlaneAutoExpand} hook so the behavior is framework-pure and
+  // unit-tested. `useDndContext()` returns an inert default (active: null) when
+  // the swimlane is rendered outside a `DndContext`, so this is safe in
+  // isolation and simply never arms.
+  const { active } = useDndContext();
+  const autoExpand = useSwimlaneAutoExpand({
+    folded,
+    isDragging: active != null,
+    onExpand: () => onToggleSwimlane(swimlane.id),
+  });
 
   // Render-time i18n labels (the legacy `translate('KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP')`
   // and `translate('ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT')` calls).
@@ -265,8 +306,11 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
           "kanban-swimlane-title",
           isUnclassified && "unclassified-swimlane",
           folded && "folded",
+          autoExpand.pendingToOpen && "pending-to-open",
         )}
         onClick={() => onToggleSwimlane(swimlane.id)}
+        onMouseEnter={autoExpand.onMouseEnter}
+        onMouseLeave={autoExpand.onMouseLeave}
       >
         {/*
           * Fold/unfold toggle icon (from the jade): when the swimlane is NOT
@@ -327,7 +371,6 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                 onClickAssignedTo={onClickAssignedTo}
                 onClickMoveToTop={onClickMoveToTop}
                 onToggleSelect={onToggleSelect}
-                onEditWipLimit={onEditWipLimit}
               />
             ))}
           </div>

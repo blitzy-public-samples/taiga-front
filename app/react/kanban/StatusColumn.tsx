@@ -101,8 +101,11 @@ declare global {
  * directive template) with NO `translate` call and there is no `KANBAN.WIP_LIMIT`
  * catalogue key, so this stays a documented literal (faithful to the original).
  * The other two labels (`KANBAN.NUMBER_US`, `KANBAN.ARCHIVED`) ARE catalogue
- * keys and are resolved through the shared `t()` helper at render time (review
- * finding M7: "visible text is hard-coded. Use … the legacy i18n mechanism").
+ * keys and are resolved through the shared `t()` helper at render time (M5:
+ * replace visible literals with the exact legacy i18n keys/interpolation).
+ * "WIP Limit" is the one exception because the AngularJS original itself never
+ * localized it — reproducing the same English literal in ALL languages is the
+ * faithful, parity-preserving choice (routing it through `t()` would diverge).
  */
 const WIP_LIMIT_LABEL = "WIP Limit";
 
@@ -170,13 +173,6 @@ export interface StatusColumnProps {
   onClickMoveToTop?: (id: number) => void;
   /** Ctrl/meta-click multi-select toggle; mirrors `toggleSelectedUs(usId)`. */
   onToggleSelect: (id: number, event: React.MouseEvent) => void;
-  /**
-   * Optional WIP-limit edit affordance. When a WIP editor commits, the column
-   * calls this; the board wires it to `api.editStatus(statusId, wipLimit)`
-   * (`PATCH userstory-statuses/{id} { wip_limit }`). Not on the critical e2e
-   * path — the REQUIRED DOM is the counter + marker.
-   */
-  onEditWipLimit?: (statusId: number, wipLimit: number | null) => void;
 }
 
 /**
@@ -185,6 +181,31 @@ export interface StatusColumnProps {
  */
 function cx(...tokens: Array<string | false | null | undefined>): string {
   return tokens.filter((token): token is string => Boolean(token)).join(" ");
+}
+
+/**
+ * Render a TRUSTED i18n template that contains a single `<strong>…</strong>`
+ * span (only `KANBAN.US_NOT_FOUND_TEXT_P2` does) as real JSX nodes, so the
+ * `.card-placeholder.not-found strong` SCSS rule applies exactly as it did
+ * under the legacy `translate` directive (which, with the app's
+ * `escapeParameters` sanitize strategy, rendered template markup as HTML).
+ * Only the `<strong>` tag is interpreted; every other character is emitted as
+ * plain text, so no other markup a translation might contain can inject nodes
+ * — honoring the migration's no-`dangerouslySetInnerHTML` / XSS-safe convention.
+ */
+function renderStrongTemplate(text: string): React.ReactNode {
+  const match = /^([\s\S]*?)<strong>([\s\S]*?)<\/strong>([\s\S]*)$/.exec(text);
+  if (!match) {
+    return text;
+  }
+  const [, before, strong, after] = match;
+  return (
+    <>
+      {before}
+      <strong>{strong}</strong>
+      {after}
+    </>
+  );
 }
 
 /**
@@ -285,15 +306,17 @@ export function StatusColumn(props: StatusColumnProps): JSX.Element {
   const columnDomId =
     dataSwimlane === undefined ? `column-${status.id}` : `column-${dataSwimlane}-${status.id}`;
 
-  // Root class list. `task-column` is ADDED beyond the legacy classes: the e2e
-  // suite selects columns via `$$('.task-column')` and asserts exactly one
-  // `.vfold.task-column` per folded status. The board's header cell
-  // (`.task-colum-name`) also gets `vfold` but is NOT `.task-column`, so this
-  // body column is the single `.vfold.task-column` match.
+  // Root class list. The AUTHORITATIVE column DOM (`kanban-table.jade` L110:
+  // `div.kanban-uses-box.taskboard-column`) carries EXACTLY these two base
+  // classes; the previously-added `task-column` class was a test-only selector
+  // with no legacy or SCSS basis and is removed for DOM parity (review finding
+  // M15 — "remove test-only production markup"). The body column already
+  // distinguishes itself from the folded header cell (`.task-colum-name`, SIC)
+  // by its `.kanban-uses-box.taskboard-column` classes, so no extra hook is
+  // needed. `vfold`/`vunfold`/`target-drop` reproduce the legacy `ng-class`.
   const rootClassName = cx(
     "kanban-uses-box",
     "taskboard-column",
-    "task-column",
     folded && "vfold",
     unfold && "vunfold",
     isOver && "target-drop",
@@ -419,12 +442,50 @@ export function StatusColumn(props: StatusColumnProps): JSX.Element {
         </div>
       ) : null}
 
-      {/* Child 3 — empty-state card placeholder (rendered when the board asks). */}
+      {/* Child 3 — empty-state card placeholder. Faithful reproduction of
+          `common/components/kanban-placeholder.html` (C8): the `.card-placeholder`
+          wrapper gains `not-found` when `notFoundUserstories`, and its content
+          switches between the loading/empty SKELETON branch (decorative shimmer
+          blocks + the "This could be a user story" title/help) and the NOT-FOUND
+          branch (the localized no-results title + two help paragraphs, the second
+          carrying the trusted `<strong>Archived stories</strong>` span the SCSS
+          targets). The purely decorative skeleton wrappers are `aria-hidden` so
+          only the meaningful title/help text is announced by assistive tech. */}
       {showPlaceholder ? (
         <div className={cx("card-placeholder", notFoundUserstories && "not-found")}>
-          {/* Minimal reproduction of common/components/kanban-placeholder.html:
-              an empty-state / drag-here hint (exact template is not e2e-critical). */}
-          <div className="placeholder-hint" aria-hidden="true" />
+          {notFoundUserstories ? (
+            <>
+              <p className="title">{t("KANBAN.US_NOT_FOUND_TITLE")}</p>
+              <p>{t("KANBAN.US_NOT_FOUND_TEXT_P1")}</p>
+              <p>{renderStrongTemplate(t("KANBAN.US_NOT_FOUND_TEXT_P2"))}</p>
+            </>
+          ) : (
+            <>
+              <div className="placeholder-board-card" aria-hidden="true">
+                <div className="placeholder-board-row">
+                  <div className="placeholder-board-text small" />
+                  <div className="placeholder-board-text big" />
+                </div>
+                <div className="placeholder-board-row">
+                  <div className="placeholder-board-text" />
+                </div>
+                <div className="placeholder-board-row avatar">
+                  <div className="placeholder-board-avatar" />
+                  <div className="placeholder-board-user" />
+                </div>
+              </div>
+              <div className="placeholder-titles" aria-hidden="true">
+                <div className="text-small" />
+                <div className="text-large" />
+              </div>
+              <div className="placeholder-avatar" aria-hidden="true">
+                <div className="image" />
+                <div className="text" />
+              </div>
+              <p className="title">{t("KANBAN.PLACEHOLDER_CARD_TITLE")}</p>
+              <p>{t("KANBAN.PLACEHOLDER_CARD_TEXT")}</p>
+            </>
+          )}
         </div>
       ) : null}
 

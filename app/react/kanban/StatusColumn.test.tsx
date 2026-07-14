@@ -227,13 +227,16 @@ beforeEach(() => {
 // --- Phase B: root element / DOM shape -------------------------------------
 
 describe("StatusColumn — root element", () => {
-  it("renders div.kanban-uses-box.taskboard-column.task-column#column-<id> with data-status", () => {
+  it("renders div.kanban-uses-box.taskboard-column#column-<id> with data-status", () => {
     // Non-swimlane mode: the document id is the plain `column-<statusId>`.
     const { container } = renderColumn({ status: makeStatus({ id: 5 }) });
     const root = container.querySelector("#column-5") as HTMLElement;
     expect(root).toBeInTheDocument();
     expect(root.tagName.toLowerCase()).toBe("div");
-    expect(root).toHaveClass("kanban-uses-box", "taskboard-column", "task-column");
+    // M15: authoritative column classes ONLY (`kanban-table.jade` L110). The
+    // previously-added test-only `task-column` class has been removed.
+    expect(root).toHaveClass("kanban-uses-box", "taskboard-column");
+    expect(root).not.toHaveClass("task-column");
     expect(root).toHaveAttribute("data-status", "5");
   });
 
@@ -349,11 +352,15 @@ describe("StatusColumn — WIP counter (not folded)", () => {
 // --- Phase B: folded / collapsed placeholder -------------------------------
 
 describe("StatusColumn — folded state", () => {
-  it("adds vfold AND task-column so exactly .vfold.task-column matches, and shows the collapsed placeholder", () => {
+  it("adds vfold to the folded body column and shows the collapsed placeholder", () => {
     const { root } = renderColumn({ folded: true });
-    expect(root).toHaveClass("vfold", "task-column");
-    // The body column is the single .vfold.task-column match.
-    expect(root.matches(".vfold.task-column")).toBe(true);
+    // M15: `vfold` on the authoritative `.kanban-uses-box.taskboard-column`
+    // body column (no test-only `task-column` hook). The folded header cell
+    // (`.task-colum-name`) is a DIFFERENT element, so the body column is still
+    // uniquely identified by its `.kanban-uses-box` base class.
+    expect(root).toHaveClass("vfold");
+    expect(root).not.toHaveClass("task-column");
+    expect(root.matches(".vfold.kanban-uses-box.taskboard-column")).toBe(true);
     expect(root.querySelector(".placeholder-collapsed")).toBeInTheDocument();
     // The counter block is not rendered while folded.
     expect(root.querySelector(".kanban-task-counter")).not.toBeInTheDocument();
@@ -408,6 +415,70 @@ describe("StatusColumn — card placeholder", () => {
 
     const without = renderColumn({ showPlaceholder: true, notFoundUserstories: false });
     expect(without.root.querySelector(".card-placeholder")).not.toHaveClass("not-found");
+  });
+
+  // C8 — reproduce the COMPLETE authoritative placeholder DOM from
+  // `common/components/kanban-placeholder.html`, both state branches.
+  it("renders the full SKELETON branch DOM + title/help text when NOT not-found (C8)", () => {
+    const { root } = renderColumn({ showPlaceholder: true, notFoundUserstories: false });
+    const ph = root.querySelector(".card-placeholder") as HTMLElement;
+
+    // Skeleton board card: three rows (small+big, single, avatar row).
+    const boardCard = ph.querySelector(".placeholder-board-card") as HTMLElement;
+    expect(boardCard).toBeInTheDocument();
+    expect(boardCard.querySelectorAll(".placeholder-board-row").length).toBe(3);
+    expect(boardCard.querySelector(".placeholder-board-text.small")).toBeInTheDocument();
+    expect(boardCard.querySelector(".placeholder-board-text.big")).toBeInTheDocument();
+    expect(boardCard.querySelector(".placeholder-board-row.avatar")).toBeInTheDocument();
+    expect(boardCard.querySelector(".placeholder-board-avatar")).toBeInTheDocument();
+    expect(boardCard.querySelector(".placeholder-board-user")).toBeInTheDocument();
+
+    // Secondary skeleton blocks.
+    const titles = ph.querySelector(".placeholder-titles") as HTMLElement;
+    expect(titles).toBeInTheDocument();
+    expect(titles.querySelector(".text-small")).toBeInTheDocument();
+    expect(titles.querySelector(".text-large")).toBeInTheDocument();
+    const avatar = ph.querySelector(".placeholder-avatar") as HTMLElement;
+    expect(avatar).toBeInTheDocument();
+    expect(avatar.querySelector(".image")).toBeInTheDocument();
+    expect(avatar.querySelector(".text")).toBeInTheDocument();
+
+    // Localized title + help paragraph.
+    expect(ph.querySelector("p.title")).toHaveTextContent("This could be a user story");
+    expect(ph).toHaveTextContent(
+      "Create user stories here and change their status to track their progress.",
+    );
+
+    // The decorative skeleton wrappers are hidden from assistive tech.
+    expect(boardCard).toHaveAttribute("aria-hidden", "true");
+    expect(titles).toHaveAttribute("aria-hidden", "true");
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+
+    // The not-found branch must be absent here.
+    expect(ph).not.toHaveTextContent("No matching results found");
+  });
+
+  it("renders the NOT-FOUND branch (title + two help paragraphs, with a <strong> archived span) (C8)", () => {
+    const { root } = renderColumn({ showPlaceholder: true, notFoundUserstories: true });
+    const ph = root.querySelector(".card-placeholder") as HTMLElement;
+
+    expect(ph.querySelector("p.title")).toHaveTextContent("No matching results found");
+    expect(ph).toHaveTextContent(
+      "Try again using more general search terms or disabled some filters.",
+    );
+
+    // P2 carries the trusted <strong>Archived stories</strong> span the SCSS
+    // (`.card-placeholder.not-found strong`) targets — rendered as a real node.
+    const strong = ph.querySelector("strong") as HTMLElement;
+    expect(strong).toBeInTheDocument();
+    expect(strong).toHaveTextContent("Archived stories");
+    expect(ph).toHaveTextContent(
+      "Archived stories are not loaded by default. Unfold the archived statuses to expand your search.",
+    );
+
+    // The loading SKELETON must NOT appear in the not-found branch.
+    expect(ph.querySelector(".placeholder-board-card")).not.toBeInTheDocument();
+    expect(ph.querySelector(".placeholder-titles")).not.toBeInTheDocument();
   });
 });
 

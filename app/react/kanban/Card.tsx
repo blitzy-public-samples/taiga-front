@@ -74,6 +74,7 @@ import { useCardDraggable } from "./dnd/useCardDraggable";
 import { userStoryUrl, epicUrl, taskUrl } from "../shared/nav/routes";
 import { t } from "../shared/i18n/translate";
 import { DEFAULT_TAG_COLOR, IOCAINE_COLOR } from "../shared/theme/colors";
+import { canEditStory, canDeleteStory } from "../shared/permissions";
 
 /**
  * Custom-element JSX typing. `Card` emits one literal custom-element tag,
@@ -219,23 +220,167 @@ function getTagColor(color: string | null): string {
 }
 
 /**
- * Inline reproduction of the AngularJS `tgSvg` directive output
- * (`common.coffee` L344-363): `<svg class="icon icon-<name>"><use
- * xlink:href="#<name>"/></svg>`. Rendering the `<svg>` directly (rather than a
- * bare, inert `<tg-svg>`) lets the global SVG sprite resolve and keeps every
- * `.icon-*` SCSS selector applying unchanged. React 18 JSX uses `xlinkHref`
- * (camelCase) for the `xlink:href` attribute.
+ * Faithful reproduction of the shared card `svg()` template helper output used
+ * throughout the card sub-templates (`card-data.jade`, `card-actions.jade`,
+ * `card-title.jade`, `card-assigned-to.jade`: `<%= svg({svgIcon, svgTitle,
+ * svgFill}) %>`). Unlike the board chrome — which reproduces the `tgSvg`
+ * DIRECTIVE and therefore keeps the `<tg-svg>` wrapper — the card icons are
+ * emitted by the raw `svg()` HELPER, which renders a BARE `<svg class="icon
+ * icon-<name>"><use xlink:href="#<name>"><title?/></use></svg>` with NO wrapper
+ * and NO `role`/`aria-hidden` (review finding M15: reproduce the authoritative
+ * shared-widget DOM exactly — the differing wrapper vs. the board icons is
+ * intentional and source-faithful, not an inconsistency to "fix"). The optional
+ * `<title>` is nested INSIDE `<use>` exactly as the directive template places it
+ * (`common.coffee` L345-347). React 18 JSX uses `xlinkHref` (camelCase) for the
+ * `xlink:href` attribute.
  */
 function Icon(props: { icon: string; className?: string; title?: string }): JSX.Element {
   return (
-    <svg
-      className={`icon ${props.icon}${props.className ? " " + props.className : ""}`}
-      role="img"
-      aria-hidden={props.title ? undefined : true}
-    >
-      {props.title ? <title>{props.title}</title> : null}
-      <use xlinkHref={`#${props.icon}`} />
+    <svg className={`icon ${props.icon}${props.className ? " " + props.className : ""}`}>
+      <use xlinkHref={`#${props.icon}`}>
+        {props.title ? <title>{props.title}</title> : null}
+      </use>
     </svg>
+  );
+}
+
+/**
+ * Resolve the legacy spinner asset path. `tgPreloadImage` built it as
+ * `window._version + "/svg/spinner-circle.svg"`; the React bundle runs in the
+ * same page, so the same global is read (defaulting to "" when it is absent,
+ * e.g. under jsdom).
+ */
+function spinnerSrc(): string {
+  const version = (window as unknown as { _version?: string })._version ?? "";
+  return `${version}/svg/spinner-circle.svg`;
+}
+
+/**
+ * Single slideshow image with the legacy `tgPreloadImage` behavior (C9): the
+ * `<img>` is hidden until it finishes loading; a `.loading-spinner` is shown
+ * ONLY if the load takes longer than 200 ms (so fast loads never flash a
+ * spinner), then removed on load. `tgPreloadImage` bound no error handler, so a
+ * failed image left the spinner spinning forever and the picture hidden; C9
+ * asks for defined error behavior, so on error the spinner is cleared and the
+ * `<img>` is revealed (the browser then shows its own broken-image affordance)
+ * rather than hanging. The wrapping `<div>` mirrors the directive's
+ * `replace: true` template (`<div><img/></div>`).
+ */
+function CardSlideImage(props: { src: string }): JSX.Element {
+  const { src } = props;
+  const [loaded, setLoaded] = useState<boolean>(false);
+  const [showSpinner, setShowSpinner] = useState<boolean>(false);
+
+  useEffect(() => {
+    setLoaded(false);
+    setShowSpinner(false);
+    // Spinner only appears after the same 200 ms grace period the directive used.
+    const timer = window.setTimeout(() => setShowSpinner(true), 200);
+    const image = new Image();
+    image.onload = (): void => {
+      window.clearTimeout(timer);
+      setShowSpinner(false);
+      setLoaded(true);
+    };
+    image.onerror = (): void => {
+      // C9 error behavior: stop the spinner and reveal the <img> so a broken
+      // image shows instead of an eternal spinner (the legacy directive hung).
+      window.clearTimeout(timer);
+      setShowSpinner(false);
+      setLoaded(true);
+    };
+    image.src = src;
+    return () => window.clearTimeout(timer);
+  }, [src]);
+
+  return (
+    <div>
+      {showSpinner && !loaded ? (
+        <img className="loading-spinner" src={spinnerSrc()} alt="loading..." />
+      ) : null}
+      {/* Hidden (display:none) until loaded, mirroring the directive's
+          `image.hide()` / `image.show()` jQuery calls. */}
+      <img src={src} alt="" style={loaded ? undefined : { display: "none" }} />
+    </div>
+  );
+}
+
+/**
+ * Card image carousel (C9) — a faithful port of the shared
+ * `tg-card-slideshow` component (`card-slideshow.jade` +
+ * `card-slideshow.controller.coffee`). Exactly ONE image is shown at a time
+ * (the legacy `ng-if="$index == vm.index"`); the left/right arrows appear only
+ * when there is more than one image (`ng-if="vm.images.size > 1"`) and rotate
+ * `index` with wraparound (`next`: `index++ % size`; `previous`: wraps to
+ * `size - 1`). The arrows are rendered as focusable `role="button"` SVGs
+ * (keeping the exact `.slideshow-icon.slideshow-left/right` classes the SCSS
+ * positions) with localized accessible names and Enter/Space activation, adding
+ * the keyboard access C9 requires without altering the styled DOM.
+ *
+ * @param props.images - the card's image attachments (each with a
+ *   `thumbnail_card_url`), already filtered by the caller.
+ */
+function CardSlideshow(props: { images: CardImage[] }): JSX.Element | null {
+  const { images } = props;
+  const count = images.length;
+  const [index, setIndex] = useState<number>(0);
+
+  // Clamp defensively if the image set shrinks (e.g. an attachment is removed
+  // via a real-time update) so the active index never points past the array.
+  const activeIndex = count > 0 ? index % count : 0;
+
+  const previous = (): void => setIndex((i) => (count === 0 ? 0 : (i - 1 + count) % count));
+  const next = (): void => setIndex((i) => (count === 0 ? 0 : (i + 1) % count));
+
+  if (count === 0) {
+    return null;
+  }
+
+  const active = images[activeIndex];
+  const activeSrc = active.thumbnail_card_url ?? "";
+  const PREVIOUS = t("COMMON.PREVIOUS");
+  const NEXT = t("COMMON.NEXT");
+
+  const onArrowKeyDown = (
+    event: React.KeyboardEvent<SVGSVGElement>,
+    action: () => void,
+  ): void => {
+    if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+      event.preventDefault();
+      action();
+    }
+  };
+
+  return (
+    <div className="card-slideshow">
+      {count > 1 ? (
+        <>
+          <svg
+            className="icon icon-arrow-left slideshow-icon slideshow-left"
+            role="button"
+            tabIndex={0}
+            aria-label={PREVIOUS}
+            onClick={previous}
+            onKeyDown={(event) => onArrowKeyDown(event, previous)}
+          >
+            <use xlinkHref="#icon-arrow-left" />
+          </svg>
+          <svg
+            className="icon icon-arrow-right slideshow-icon slideshow-right"
+            role="button"
+            tabIndex={0}
+            aria-label={NEXT}
+            onClick={next}
+            onKeyDown={(event) => onArrowKeyDown(event, next)}
+          >
+            <use xlinkHref="#icon-arrow-right" />
+          </svg>
+        </>
+      ) : null}
+      <div className="card-slideshow-wrapper">
+        <CardSlideImage key={active.id ?? activeIndex} src={activeSrc} />
+      </div>
+    </div>
   );
 }
 
@@ -271,14 +416,21 @@ export function Card(props: CardProps): JSX.Element {
   // Widen the raw story to read the presentation-only fields (see CardStory).
   const item = story as CardStory;
 
-  // Permission gates (display-only; the backend is the single enforcement point).
-  const canModify = project.my_permissions.includes("modify_us");
-  const canDelete = project.my_permissions.includes("delete_us");
+  // Permission gates (display-only; the backend is the single enforcement point,
+  // constraint C-1). M4: the authoritative edit/delete gates come from ONE shared
+  // helper that combines the raw permission with the project read-only
+  // (`archived_code`) state AND the per-card archived flag, so the edit control,
+  // the edit/delete menu items, the assign action, the `readonly` class and the
+  // drag sensor can never drift apart (previously only drag combined them, while
+  // edit/delete used bare `modify_us`/`delete_us`).
+  const canEdit = canEditStory(project, { archived });
+  const canRemove = canDeleteStory(project, { archived });
   const canViewTasks = project.my_permissions.includes("view_tasks");
 
-  // Drag eligibility reproduces the sortable.coffee init guards: draggable only
-  // with modify_us, on a non-archived project, and not a per-card archived story.
-  const canDrag = canModify && !project.archived_code && !archived;
+  // Drag eligibility now consults the SAME authoritative gate (identical to the
+  // legacy `sortable.coffee` init guard: modify_us AND not archived_code AND not
+  // per-card archived).
+  const canDrag = canEdit;
   const { setNodeRef, attributes, listeners, isDragging } = useCardDraggable(story.id, {
     disabled: !canDrag,
   });
@@ -470,7 +622,7 @@ export function Card(props: CardProps): JSX.Element {
     // is the `.gu-mirror` DragOverlay clone (KanbanDndProvider); the source is
     // never CSS-translated (that would break domGeometry's drop-position math).
     isDragging && "gu-transit",
-    !canModify && "readonly",
+    !canEdit && "readonly",
   );
 
   const cardInnerClassName = cx(
@@ -524,13 +676,14 @@ export function Card(props: CardProps): JSX.Element {
           ) : null}
 
           {/* 2. Card actions */}
-          {zoomLevel > 0 && (canModify || canDelete) ? (
+          {zoomLevel > 0 && (canEdit || canRemove) ? (
             <div className="card-actions">
               <button
                 ref={menuTriggerRef}
                 className="js-popup-button"
                 type="button"
                 title={ACTIONS_LABEL}
+                aria-label={ACTIONS_LABEL}
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
                 onClick={() => setMenuOpen((open) => !open)}
@@ -539,7 +692,7 @@ export function Card(props: CardProps): JSX.Element {
               </button>
               {menuOpen ? (
                 <div ref={menuRef} className="card-actions-menu" role="menu">
-                  {canModify ? (
+                  {canEdit ? (
                     <button
                       className="card-action-edit"
                       type="button"
@@ -552,7 +705,14 @@ export function Card(props: CardProps): JSX.Element {
                       {EDIT_LABEL}
                     </button>
                   ) : null}
-                  {onClickMoveToTop ? (
+                  {/* M4: "move to top" is a REORDER (modify) action, so it is
+                      gated on the authoritative `canEdit` — NOT merely on the
+                      callback's presence. Otherwise a user with `delete_us` but
+                      without `modify_us` (whose card-actions container shows
+                      because `canRemove`) would see an unauthorized reorder
+                      action. Mirrors the legacy `tg-check-permission="modify_us"`
+                      on the move-to-top control. */}
+                  {canEdit && onClickMoveToTop ? (
                     <button
                       className="card-action-move-to-top"
                       type="button"
@@ -565,7 +725,7 @@ export function Card(props: CardProps): JSX.Element {
                       {MOVE_TO_TOP_LABEL}
                     </button>
                   ) : null}
-                  {canDelete ? (
+                  {canRemove ? (
                     <button
                       className="card-action-delete"
                       type="button"
@@ -742,15 +902,14 @@ export function Card(props: CardProps): JSX.Element {
             ) : null}
           </div>
 
-          {/* 6. Slideshow (simplified: thumbnail list; full carousel is out of the critical path) */}
+          {/* 6. Slideshow — full single-active-image carousel (C9), a faithful
+              port of the shared `tg-card-slideshow` component: one visible image
+              at a time, wraparound prev/next controls (only with >1 image), and
+              `tgPreloadImage` load/error behavior. Only images that actually
+              have a `thumbnail_card_url` participate (matching the legacy
+              `vm.images`, which held the card's image attachments). */}
           {isSlideshowVisible && canViewTasks ? (
-            <div className="card-slideshow">
-              {images.map((image, index) =>
-                image.thumbnail_card_url ? (
-                  <img key={image.id ?? index} src={image.thumbnail_card_url} alt="" />
-                ) : null,
-              )}
-            </div>
+            <CardSlideshow images={images.filter((image) => Boolean(image.thumbnail_card_url))} />
           ) : null}
 
           {/* 7. Card tasks */}
@@ -780,7 +939,14 @@ export function Card(props: CardProps): JSX.Element {
               title={ASSIGN_LABEL}
               onClick={(event) => {
                 event.preventDefault();
-                onClickAssignedTo(story.id);
+                // M4: assigning is a modify action, so it is gated on the SAME
+                // authoritative `canEdit` as the edit control. The owner name
+                // still DISPLAYS for everyone (the anchor is always rendered so
+                // e2e selectors + the layout are preserved); only the assign
+                // ACTION is suppressed on read-only projects / archived cards.
+                if (canEdit) {
+                  onClickAssignedTo(story.id);
+                }
               }}
             >
               {/*
@@ -796,7 +962,7 @@ export function Card(props: CardProps): JSX.Element {
                 {assigneeDisplayName || NOT_ASSIGNED}
               </span>
             </a>
-            {canModify ? (
+            {canEdit ? (
               <a
                 href=""
                 className="e2e-edit edit-story"

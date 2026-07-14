@@ -659,6 +659,35 @@ export function setUserstories(state: BacklogState, userstories: UserStory[]): B
 }
 
 /**
+ * Producer: APPEND a freshly-fetched backlog page onto the currently-loaded
+ * list (finding M2 — infinite-scroll page advancement). Mirrors the legacy
+ * `parseLoadUserstoriesResponse`' `@scope.userstories.concat(...)`, but DEDUPES
+ * by id so a story that a WebSocket event or an optimistic drag already inserted
+ * (or that overlaps a re-fetched range) is not duplicated — the freshly fetched
+ * copy WINS. The merged list is re-sorted by `backlog_order` so it stays
+ * globally ordered regardless of how many pages are loaded, and `backlogOrder`
+ * is rebuilt. This is what keeps DnD/WS reconciliation correct for PARTIALLY
+ * LOADED lists: the reconcilers operate on `userstories` whatever its length,
+ * and appending never drops or duplicates an already-present row.
+ */
+export function appendUserstories(state: BacklogState, page: UserStory[]): BacklogState {
+    const byId = new Map<number, UserStory>();
+    for (const it of state.userstories) {
+        byId.set(it.id, it);
+    }
+    for (const it of page) {
+        byId.set(it.id, it);
+    }
+    const merged = Array.from(byId.values()).sort(
+        (a, b) => (a.backlog_order ?? 0) - (b.backlog_order ?? 0),
+    );
+    return produce(state, (draft: Draft<BacklogState>) => {
+        draft.userstories = merged;
+        draft.backlogOrder = buildBacklogOrder(merged);
+    });
+}
+
+/**
  * Producer: store the open `sprints`, sorting each sprint's `user_stories` by
  * `sprint_order`, then rebuild `milestonesOrder`. Mirrors `loadSprints`'
  * `sprint.user_stories = _.sortBy(sprint.user_stories, "sprint_order")` +

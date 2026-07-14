@@ -20,6 +20,7 @@ import {
     createEmptyStoryValues,
     validateStoryForm,
     isStoryFormValid,
+    isStoryFormDirty,
     storyToFormValues,
     type StoryFormValues,
 } from "./storyForm";
@@ -38,6 +39,13 @@ describe("storyForm — createEmptyStoryValues", () => {
             swimlane: null,
             is_blocked: false,
             blocked_note: "",
+            // Finding M1 additions:
+            due_date: null,
+            team_requirement: false,
+            client_requirement: false,
+            attachments: [],
+            attachmentsToAdd: [],
+            attachmentsToDelete: [],
             us_position: "bottom",
         });
     });
@@ -91,6 +99,10 @@ describe("storyForm — storyToFormValues", () => {
             swimlane: 8,
             is_blocked: true,
             blocked_note: "waiting",
+            due_date: "2021-05-01",
+            team_requirement: true,
+            client_requirement: false,
+            attachments: [{ id: 9, name: "spec.pdf" }],
         });
         expect(projected).toEqual({
             subject: "Existing",
@@ -103,6 +115,15 @@ describe("storyForm — storyToFormValues", () => {
             swimlane: 8,
             is_blocked: true,
             blocked_note: "waiting",
+            // Finding M1: due date + requirement flags projected through; the
+            // existing attachments are seeded, while the pending-change queues
+            // always start empty on (re)seed.
+            due_date: "2021-05-01",
+            team_requirement: true,
+            client_requirement: false,
+            attachments: [{ id: 9, name: "spec.pdf" }],
+            attachmentsToAdd: [],
+            attachmentsToDelete: [],
         });
     });
 
@@ -125,5 +146,60 @@ describe("storyForm — storyToFormValues", () => {
         expect(storyToFormValues({ subject: "s" }).is_blocked).toBe(false);
         expect(storyToFormValues({ subject: "s", is_blocked: null }).is_blocked).toBe(false);
         expect(storyToFormValues({ subject: "s", is_blocked: true }).is_blocked).toBe(true);
+    });
+});
+
+
+describe("storyForm — isStoryFormDirty (M1 dirty-close guard)", () => {
+    const base = createEmptyStoryValues({ status: 1, subject: "Seed" });
+
+    it("is false when nothing changed relative to the seed", () => {
+        expect(isStoryFormDirty(base, base)).toBe(false);
+        expect(isStoryFormDirty({ ...base }, base)).toBe(false);
+    });
+
+    it("flags scalar edits (subject, description, due_date, blocked_note)", () => {
+        expect(isStoryFormDirty({ ...base, subject: "Changed" }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, description: "x" }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, due_date: "2021-01-01" }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, blocked_note: "n" }, base)).toBe(true);
+    });
+
+    it("flags the team/client requirement + is_blocked toggles", () => {
+        expect(isStoryFormDirty({ ...base, team_requirement: true }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, client_requirement: true }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, is_blocked: true }, base)).toBe(true);
+    });
+
+    it("flags tag changes by name AND colour (order-insensitive)", () => {
+        const withTag = { ...base, tags: [["urgent", "#ff0000"]] as StoryFormValues["tags"] };
+        expect(isStoryFormDirty(withTag, base)).toBe(true);
+        // Same tag names but a different colour still counts as dirty.
+        const recolored = { ...withTag, tags: [["urgent", "#00ff00"]] as StoryFormValues["tags"] };
+        expect(isStoryFormDirty(recolored, withTag)).toBe(true);
+        // Re-ordered identical tags are NOT dirty.
+        const seed = {
+            ...base,
+            tags: [["a", null], ["b", "#111"]] as StoryFormValues["tags"],
+        };
+        const reordered = {
+            ...base,
+            tags: [["b", "#111"], ["a", null]] as StoryFormValues["tags"],
+        };
+        expect(isStoryFormDirty(reordered, seed)).toBe(false);
+    });
+
+    it("flags assignee-set and estimation-map changes (order-insensitive sets)", () => {
+        expect(isStoryFormDirty({ ...base, assigned_users: [1] }, base)).toBe(true);
+        const seed = { ...base, assigned_users: [1, 2] };
+        const reordered = { ...base, assigned_users: [2, 1] };
+        expect(isStoryFormDirty(reordered, seed)).toBe(false);
+        expect(isStoryFormDirty({ ...base, points: { "1": 3 } }, base)).toBe(true);
+    });
+
+    it("flags a pending attachment add or delete (safer than legacy isModified)", () => {
+        const file = new File(["x"], "a.txt", { type: "text/plain" });
+        expect(isStoryFormDirty({ ...base, attachmentsToAdd: [file] }, base)).toBe(true);
+        expect(isStoryFormDirty({ ...base, attachmentsToDelete: [7] }, base)).toBe(true);
     });
 });

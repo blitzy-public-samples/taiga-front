@@ -82,6 +82,7 @@ export {
   restoreBacklogStories,
     reinsertBacklogStory,
   setUserstories,
+  appendUserstories,
   setSprints,
   setClosedSprints,
   moveMetadata,

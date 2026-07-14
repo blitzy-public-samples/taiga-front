@@ -486,6 +486,9 @@ test.describe("backlog", () => {
   // in its top-level `before`.
   test("capture backlog screen", async ({ taiga }) => {
     await taiga.screenshot("backlog");
+    // M27: strict visual-parity gate on the main backlog workspace (baseline
+    // writes the reference; react compares against it and fails on drift).
+    await taiga.expectVisualParity("backlog");
   });
 
   /* ----------------------------------------------------------------------- *

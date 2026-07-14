@@ -25,6 +25,17 @@ export interface RequestOptions {
      * calling hook distinguishes from a real failure and ignores.
      */
     signal?: AbortSignal;
+    /**
+     * Optional multipart body (finding M1: attachment upload). When present the
+     * request is sent as `multipart/form-data`: the {@link FormData} instance is
+     * handed to `fetch` UNSERIALIZED and the JSON `Content-Type` the trusted
+     * header builder adds for mutations is dropped, so the browser can set the
+     * correct `multipart/form-data; boundary=...` header itself. This mirrors the
+     * legacy `attachmentsService.upload` `FormData` POST. When set, {@link body}
+     * is ignored. The trusted bearer / session / negotiation headers (finding
+     * M10) are still merged last and remain immutable.
+     */
+    formData?: FormData;
 }
 
 export interface HttpResponse<T> {
@@ -329,7 +340,15 @@ export const request = async <T>(
     }
 
     const init: RequestInit = { method, headers };
-    if (options.body !== undefined) {
+    if (options.formData !== undefined) {
+        // M1 multipart upload: send the FormData verbatim and DROP the JSON
+        // Content-Type the trusted builder added for this mutation, so the
+        // browser sets `multipart/form-data` with the correct boundary. The
+        // bearer / session / negotiation headers stay merged-last + immutable
+        // (M10); only the transport-owned body content-type is adjusted here.
+        delete headers["Content-Type"];
+        init.body = options.formData;
+    } else if (options.body !== undefined) {
         init.body = JSON.stringify(options.body);
     }
     if (options.signal) {

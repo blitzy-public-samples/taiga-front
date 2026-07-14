@@ -60,6 +60,14 @@ export interface TaigaHarness {
   gotoBacklog(slug: string): Promise<void>;
   /** Capture a screenshot into the active project's git-tracked output dir. */
   screenshot(name: string): Promise<void>;
+  /**
+   * Deterministic strict VISUAL-PARITY gate (review finding M27): assert the
+   * current page matches the shared, project-independent reference snapshot via
+   * `toHaveScreenshot`. On the `baseline` project run this WRITES the reference;
+   * on the `react` run it COMPARES and FAILS on drift beyond the AAP-grounded
+   * tolerance configured centrally in `playwright.config.ts`.
+   */
+  expectVisualParity(name: string): Promise<void>;
 }
 
 /**
@@ -231,6 +239,19 @@ function makeHarness(page: Page, testInfo: TestInfo): TaigaHarness {
         path: testInfo.outputPath(`${name}.png`),
         fullPage: false,
       });
+    },
+
+    async expectVisualParity(name: string): Promise<void> {
+      // Deterministic strict visual-parity gate (review finding M27). Uses
+      // Playwright's `toHaveScreenshot` comparator with the AAP-grounded strict
+      // tolerance + determinism controls (animations disabled, caret hidden, css
+      // scale) configured centrally in `playwright.config.ts`, and the shared,
+      // project-INDEPENDENT `snapshotPathTemplate` so the `baseline` project
+      // WRITES the reference and the `react` project COMPARES against that same
+      // committed baseline (rather than against itself). Complements
+      // `screenshot(name)`, which still writes the raw human-review evidence PNG
+      // into the per-project artifacts folder; a parity checkpoint calls both.
+      await expect(page).toHaveScreenshot(`${name}.png`, { fullPage: false });
     },
   };
 

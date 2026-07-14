@@ -30,7 +30,7 @@
  *     precisely and no `DndContext` provider is required to render a card.
  */
 
-import { fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render } from "@testing-library/react";
 
 import { Card } from "./Card";
 import type { CardProps, CardMember } from "./Card";
@@ -446,7 +446,7 @@ describe("Card — tasks, slideshow and unfold (zoom 3)", () => {
     expect(container.querySelector(".card-tasks")).toBeNull();
   });
 
-  it("renders the slideshow thumbnails when attachments have thumbnails", () => {
+  it("renders the single active slideshow image with NO arrows for one attachment (C9)", () => {
     const { container } = renderCard({
       zoomLevel: 3,
       zoom: ZOOM3,
@@ -454,7 +454,15 @@ describe("Card — tasks, slideshow and unfold (zoom 3)", () => {
     });
     const slideshow = container.querySelector(".card-slideshow");
     expect(slideshow).toBeInTheDocument();
-    expect(slideshow!.querySelector("img")).toHaveAttribute("src", "/thumb/1.png");
+    // The single active image is present (the preload <img> carries the src even
+    // while hidden until load).
+    expect(slideshow!.querySelector(".card-slideshow-wrapper img")).toHaveAttribute(
+      "src",
+      "/thumb/1.png",
+    );
+    // With a single image the legacy `ng-if="vm.images.size > 1"` hides both arrows.
+    expect(slideshow!.querySelector(".slideshow-left")).toBeNull();
+    expect(slideshow!.querySelector(".slideshow-right")).toBeNull();
   });
 
   it("renders .card-unfold when unfold is visible and there are tasks", () => {
@@ -666,6 +674,10 @@ describe("Card — defensive value states and partial-permission menu", () => {
 
     // Edit is gated on modify_us and must be absent; delete is present.
     expect(container.querySelector(".card-action-edit")).toBeNull();
+    // M4: "move to top" is a REORDER (modify) action, so a delete_us-only user
+    // (who sees the actions trigger BECAUSE of delete) must NOT get it. Before
+    // the fix it rendered on mere callback presence, leaking an owner action.
+    expect(container.querySelector(".card-action-move-to-top")).toBeNull();
     fireEvent.click(container.querySelector(".card-action-delete") as HTMLElement);
     expect(onClickDelete).toHaveBeenCalledWith(42);
     expect(onClickEdit).not.toHaveBeenCalled();
@@ -830,7 +842,9 @@ describe("Card — additional branch coverage", () => {
     expect(container.querySelector(".card-action-delete")).toBeInTheDocument();
   });
 
-  it("renders only the thumbnailed slideshow images, skipping thumbnail-less ones", () => {
+  it("shows ONE active image at a time and rotates with wraparound arrows (C9)", () => {
+    // Three attachments, two of which carry a thumbnail: only the thumbnailed
+    // two participate in the carousel (matching legacy `vm.images`).
     const { container } = renderCard({
       zoomLevel: 3,
       zoom: ZOOM3,
@@ -843,14 +857,56 @@ describe("Card — additional branch coverage", () => {
       }),
     });
 
-    const slideshow = container.querySelector(".card-slideshow");
+    const slideshow = container.querySelector(".card-slideshow") as HTMLElement;
     expect(slideshow).toBeInTheDocument();
 
-    // Only the two images that carry a thumbnail_card_url render an <img>.
-    const imgs = slideshow!.querySelectorAll("img");
-    expect(imgs).toHaveLength(2);
-    expect(imgs[0]).toHaveAttribute("src", "/thumb/1.png");
-    expect(imgs[1]).toHaveAttribute("src", "/thumb/3.png");
+    const activeSrc = (): string | null =>
+      slideshow.querySelector(".card-slideshow-wrapper img")!.getAttribute("src");
+
+    // Exactly one image is shown at a time (single `.card-slideshow-wrapper`).
+    expect(slideshow.querySelectorAll(".card-slideshow-wrapper")).toHaveLength(1);
+    expect(activeSrc()).toBe("/thumb/1.png");
+
+    // With >1 image both arrows render with localized accessible names.
+    const left = slideshow.querySelector(".slideshow-left") as HTMLElement;
+    const right = slideshow.querySelector(".slideshow-right") as HTMLElement;
+    expect(left).toHaveAttribute("aria-label", "Previous");
+    expect(right).toHaveAttribute("aria-label", "Next");
+    expect(right).toHaveAttribute("role", "button");
+    expect(right).toHaveAttribute("tabindex", "0");
+
+    // next(): advance to the second thumbnailed image.
+    fireEvent.click(right);
+    expect(activeSrc()).toBe("/thumb/3.png");
+    // next() wraps back to the first (index++ % size).
+    fireEvent.click(right);
+    expect(activeSrc()).toBe("/thumb/1.png");
+    // previous() wraps to the last (index-- -> size - 1).
+    fireEvent.click(left);
+    expect(activeSrc()).toBe("/thumb/3.png");
+  });
+
+  it("activates the slideshow arrows via keyboard (Enter/Space) (C9)", () => {
+    const { container } = renderCard({
+      zoomLevel: 3,
+      zoom: ZOOM3,
+      story: makeStory({
+        images: [
+          { id: 1, thumbnail_card_url: "/thumb/1.png" },
+          { id: 3, thumbnail_card_url: "/thumb/3.png" },
+        ],
+      }),
+    });
+    const slideshow = container.querySelector(".card-slideshow") as HTMLElement;
+    const right = slideshow.querySelector(".slideshow-right") as HTMLElement;
+    const activeSrc = (): string | null =>
+      slideshow.querySelector(".card-slideshow-wrapper img")!.getAttribute("src");
+
+    expect(activeSrc()).toBe("/thumb/1.png");
+    fireEvent.keyDown(right, { key: "Enter" });
+    expect(activeSrc()).toBe("/thumb/3.png");
+    fireEvent.keyDown(right, { key: " " });
+    expect(activeSrc()).toBe("/thumb/1.png");
   });
 
   it("shows the lock indicator and .card-blocked modifier together for a blocked story", () => {
@@ -1038,5 +1094,181 @@ describe("Card — theme-token colours (M4)", () => {
     const path = container.querySelector(".card-iocaine-user-bg svg path") as SVGPathElement;
     expect(path).toHaveAttribute("fill", "#B400D1");
     expect(path).toHaveAttribute("fill-opacity", ".5");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4 — authoritative canEdit/canRemove gating. Raw permissions must be
+// combined with project read-only (`archived_code`) and per-card archived
+// state at EVERY control/menu/link/action so no owner affordance leaks onto a
+// read-only project or an archived card.
+// ---------------------------------------------------------------------------
+describe("Card — authoritative edit/delete gating (M4)", () => {
+  const openMenu = (container: HTMLElement): void => {
+    const trigger = container.querySelector(".js-popup-button");
+    if (trigger) {
+      fireEvent.click(trigger as HTMLElement);
+    }
+  };
+
+  it("shows the move-to-top action for a user WITH modify_us (positive control)", () => {
+    const { container } = renderCard({ zoomLevel: 1, zoom: ZOOM1 });
+    openMenu(container);
+    expect(container.querySelector(".card-action-move-to-top")).toBeInTheDocument();
+    expect(container.querySelector(".card-action-edit")).toBeInTheDocument();
+    expect(container.querySelector(".card-action-delete")).toBeInTheDocument();
+  });
+
+  it("hides ALL card actions on a read-only (archived_code) project even with full perms", () => {
+    const { root, container } = renderCard({
+      zoomLevel: 1,
+      zoom: ZOOM1,
+      project: makeProject({ archived_code: "ARCH" }),
+    });
+    // canEdit === canRemove === false -> the whole actions container is gone.
+    expect(container.querySelector(".card-actions")).toBeNull();
+    // …and the card is marked readonly.
+    expect(root).toHaveClass("readonly");
+  });
+
+  it("hides ALL card actions when the card itself is archived even with full perms", () => {
+    const { container } = renderCard({ zoomLevel: 1, zoom: ZOOM1, archived: true });
+    expect(container.querySelector(".card-actions")).toBeNull();
+  });
+
+  it("hides the inline .e2e-edit link on a read-only project even with modify_us", () => {
+    const { container } = renderCard({
+      project: makeProject({ archived_code: "ARCH" }),
+    });
+    expect(container.querySelector(".e2e-edit")).toBeNull();
+    // The assign affordance element is still present (owner name always shows).
+    expect(container.querySelector(".e2e-assign")).toBeInTheDocument();
+  });
+
+  it("suppresses the assign ACTION on a read-only project (element present, click inert)", () => {
+    const onClickAssignedTo = jest.fn();
+    const { container } = renderCard({
+      onClickAssignedTo,
+      project: makeProject({ archived_code: "ARCH" }),
+    });
+    const assign = container.querySelector(".e2e-assign") as HTMLElement;
+    expect(assign).toBeInTheDocument();
+    fireEvent.click(assign);
+    // canEdit is false -> the assign lightbox action must NOT fire.
+    expect(onClickAssignedTo).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the assign ACTION on an archived card even with modify_us", () => {
+    const onClickAssignedTo = jest.fn();
+    const { container } = renderCard({ onClickAssignedTo, archived: true });
+    const assign = container.querySelector(".e2e-assign") as HTMLElement;
+    fireEvent.click(assign);
+    expect(onClickAssignedTo).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C9 — slideshow preload/error behavior (`CardSlideImage`, porting the legacy
+// `tgPreloadImage` directive). The <img> stays hidden until the load settles; a
+// `.loading-spinner` appears ONLY after a 200 ms grace period, then is removed
+// on load; on error the spinner is cleared and the <img> is revealed (defined
+// error behavior C9 adds over the legacy directive, which hung on error).
+// ---------------------------------------------------------------------------
+describe("Card — slideshow preload/error behavior (C9)", () => {
+  // A controllable Image stand-in: each construction records the instance so the
+  // test can fire onload / onerror deterministically (jsdom never loads real
+  // network images).
+  class FakeImage {
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    private _src = "";
+    static instances: FakeImage[] = [];
+    constructor() {
+      FakeImage.instances.push(this);
+    }
+    set src(value: string) {
+      this._src = value;
+    }
+    get src(): string {
+      return this._src;
+    }
+  }
+
+  const OriginalImage = global.Image;
+
+  beforeEach(() => {
+    FakeImage.instances = [];
+    jest.useFakeTimers();
+    (global as unknown as { Image: unknown }).Image = FakeImage as unknown;
+  });
+
+  afterEach(() => {
+    // Drop any still-pending 200ms spinner timer WITHOUT running it, so no
+    // post-test setState escapes act() and trips the fail-on-console guard.
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    (global as unknown as { Image: unknown }).Image = OriginalImage;
+  });
+
+  const renderSlideshow = () =>
+    renderCard({
+      zoomLevel: 3,
+      zoom: ZOOM3,
+      story: makeStory({ images: [{ id: 1, thumbnail_card_url: "/thumb/1.png" }] }),
+    });
+
+  it("hides the <img> until load and shows NO spinner before the 200ms grace period", () => {
+    const { container } = renderSlideshow();
+    const img = container.querySelector(".card-slideshow-wrapper img:not(.loading-spinner)") as HTMLElement;
+    // Hidden until loaded (mirrors the directive's image.hide()).
+    expect(img.style.display).toBe("none");
+    // No spinner yet (the 200ms timer has not fired).
+    expect(container.querySelector(".loading-spinner")).toBeNull();
+  });
+
+  it("shows the .loading-spinner after 200ms while the image is still loading", () => {
+    const { container } = renderSlideshow();
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    const spinner = container.querySelector(".loading-spinner") as HTMLElement;
+    expect(spinner).toBeInTheDocument();
+    expect(spinner).toHaveAttribute("src", expect.stringContaining("/svg/spinner-circle.svg"));
+    // The picture is still hidden.
+    expect((container.querySelector(".card-slideshow-wrapper img:not(.loading-spinner)") as HTMLElement).style.display).toBe(
+      "none",
+    );
+  });
+
+  it("removes the spinner and reveals the <img> on load", () => {
+    const { container } = renderSlideshow();
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    expect(container.querySelector(".loading-spinner")).toBeInTheDocument();
+    // Fire the captured Image onload.
+    act(() => {
+      FakeImage.instances[FakeImage.instances.length - 1].onload?.();
+    });
+    expect(container.querySelector(".loading-spinner")).toBeNull();
+    expect((container.querySelector(".card-slideshow-wrapper img:not(.loading-spinner)") as HTMLElement).style.display).toBe(
+      "",
+    );
+  });
+
+  it("clears the spinner and reveals the <img> on error (defined C9 error behavior)", () => {
+    const { container } = renderSlideshow();
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    expect(container.querySelector(".loading-spinner")).toBeInTheDocument();
+    act(() => {
+      FakeImage.instances[FakeImage.instances.length - 1].onerror?.();
+    });
+    // Error path stops the spinner instead of hanging forever, and reveals the img.
+    expect(container.querySelector(".loading-spinner")).toBeNull();
+    expect((container.querySelector(".card-slideshow-wrapper img:not(.loading-spinner)") as HTMLElement).style.display).toBe(
+      "",
+    );
   });
 });

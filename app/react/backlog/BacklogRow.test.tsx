@@ -614,3 +614,31 @@ describe("BacklogRow — permission gating", () => {
         expect(container.querySelector(".move-to-top")).not.toBeNull();
     });
 });
+
+// ---------------------------------------------------------------------------
+// M4 — the authoritative edit gate must combine the raw `modify_us` /
+// `delete_us` permission with the project read-only (`archived_code`) state.
+// The existing suite covers the permission-absent case; these pin the NEW
+// read-only-project dimension: full perms but an archived (read-only) project
+// must render the row exactly as a no-permission row (no drag handle, no
+// checkbox, no options popup, `readonly` class).
+// ---------------------------------------------------------------------------
+describe("BacklogRow — read-only project gating (M4)", () => {
+    const readOnlyProject = { ...project, archived_code: "ARCH" } as unknown as Project;
+
+    it("marks the row readonly and removes ALL mutating controls on a read-only project (full perms)", () => {
+        const container = renderRow({ project: readOnlyProject });
+        expect(container.querySelector("div.row.us-item-row")).toHaveClass("readonly");
+        // No options popup trigger, no drag handle, no selection checkbox.
+        expect(container.querySelector(".us-option")).toBeNull();
+        expect(container.querySelector(".draggable-us-row")).toBeNull();
+        expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+    });
+
+    it("renders the drag handle + options popup on a writable project (positive control)", () => {
+        const container = renderRow();
+        expect(container.querySelector("div.row.us-item-row")).not.toHaveClass("readonly");
+        expect(container.querySelector(".draggable-us-row")).not.toBeNull();
+        expect(container.querySelector(".us-option")).not.toBeNull();
+    });
+});

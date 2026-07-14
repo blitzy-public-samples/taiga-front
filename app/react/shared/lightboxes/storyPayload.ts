@@ -121,6 +121,19 @@ export function buildCreateStoryPayload(
             payload.blocked_note = values.blocked_note;
         }
     }
+    // Finding M1: due date + team/client requirement flags. Included only when
+    // set/true (the backend defaults an omitted flag to false and an omitted
+    // due_date to null), matching the "defined/non-empty fields only" convention
+    // used above for is_blocked.
+    if (values.due_date) {
+        payload.due_date = values.due_date;
+    }
+    if (values.team_requirement) {
+        payload.team_requirement = true;
+    }
+    if (values.client_requirement) {
+        payload.client_requirement = true;
+    }
     return payload;
 }
 
@@ -166,5 +179,48 @@ export function diffStoryValues(
     if (values.is_blocked && values.blocked_note !== (story.blocked_note ?? "")) {
         modified.blocked_note = values.blocked_note;
     }
+    // Finding M1: due date is already stored formatted as `YYYY-MM-DD` (or null),
+    // mirroring the legacy `moment(obj.due_date).format("YYYY-MM-DD")` reshape
+    // applied before save; pass the changed value straight through.
+    if (values.due_date !== (story.due_date ?? null)) {
+        modified.due_date = values.due_date;
+    }
+    if (values.team_requirement !== Boolean(story.team_requirement)) {
+        modified.team_requirement = values.team_requirement;
+    }
+    if (values.client_requirement !== Boolean(story.client_requirement)) {
+        modified.client_requirement = values.client_requirement;
+    }
     return modified;
+}
+
+
+/**
+ * Run the attachment add/delete lifecycle for a saved story (finding M1),
+ * reproducing the legacy `CreateEditDirective` submit tail
+ * (`common/lightboxes.coffee` L790): `deleteAttachments(data).then(->
+ * createAttachments(data))`. Deletions complete BEFORE uploads start; within
+ * each phase the requests run in parallel (legacy `$q.all`). Both phases are
+ * no-ops when their queue is empty, so an ordinary attachment-free create/edit
+ * incurs no extra request.
+ *
+ * The two persistence functions are injected (the screen hooks pass
+ * `apiClient.createUserStoryAttachment` / `.deleteUserStoryAttachment`) so this
+ * module stays framework- and client-agnostic like the rest of the file.
+ */
+export async function applyStoryAttachments(
+    values: StoryFormValues,
+    projectId: number,
+    userStoryId: number,
+    createAttachment: (projectId: number, userStoryId: number, file: File) => Promise<unknown>,
+    deleteAttachment: (attachmentId: number) => Promise<void>,
+): Promise<void> {
+    if (values.attachmentsToDelete.length > 0) {
+        await Promise.all(values.attachmentsToDelete.map((id) => deleteAttachment(id)));
+    }
+    if (values.attachmentsToAdd.length > 0) {
+        await Promise.all(
+            values.attachmentsToAdd.map((file) => createAttachment(projectId, userStoryId, file)),
+        );
+    }
 }

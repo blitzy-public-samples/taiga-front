@@ -49,3 +49,28 @@
 // effect so both tags are defined before AngularJS bootstraps and routes to the
 // templates that contain them (load-order contract above).
 import "./bootstrap";
+
+// M24 hashbang -> HTML5 compatibility bridge: normalize an inbound
+// `#!/project/<slug>/{kanban,backlog}` checkpoint/bookmark URL to its
+// authoritative HTML5 pathname BEFORE AngularJS bootstraps (this bundle is
+// loaded ahead of `app.js` by app-loader.coffee), so the routed template that
+// hosts the `<tg-react-*>` Custom Element actually renders and the React
+// screen mounts. Changes no frozen Angular route; only unambiguous `#!` route
+// hashbangs are touched (AAP §0.6.1).
+import { applyHashbangCompatibility } from "./shared/nav/hashbangBridge";
+
+// M5 runtime i18n bridge: resolve the deployment's active language (from
+// `localStorage.userInfo.lang` / `window.taigaConfig.defaultLanguage`, both
+// already populated by the app-loader BEFORE this bundle evaluates) and load its
+// message bundle into the shared resolver, then watch `<html lang>` for live
+// language switches. Starting it here (module-evaluation, before `app.js`) is
+// safe because — unlike `window.taiga.sessionId`, which `app.js` sets later —
+// `taigaConfig` and `localStorage` are available at this point. Idempotent.
+import { startLocaleBridge } from "./shared/i18n/localeBridge";
+
+// Run the hashbang compatibility rewrite FIRST so any inbound `#!` route is
+// already an HTML5 path before the rest of the bundle (and, shortly after,
+// AngularJS) reads `window.location`.
+applyHashbangCompatibility();
+
+startLocaleBridge();

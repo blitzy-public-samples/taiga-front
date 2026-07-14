@@ -263,6 +263,43 @@ interface ChartSeries {
  * authoritative `/stats` `milestones` array. Returns `null` when there is no
  * milestone data to plot (the container stays empty, exactly as Flot would draw
  * nothing).
+ *
+ * ---------------------------------------------------------------------------
+ * Finding M16 — documented rendering-parity deviation (AAP-approved).
+ * ---------------------------------------------------------------------------
+ * The AngularJS chart was jQuery-Flot (`element.plot(data, options)`,
+ * `TgBurndownBacklogGraphDirective`, main.coffee L1217-1338) drawn on a
+ * `<canvas>`. Reproducing Flot's EXACT output — its canvas anti-aliasing and its
+ * `jquery.flot.tooltip` hover-tooltip DOM — is only possible by vendoring
+ * jQuery + jquery.flot (+ the tooltip/axislabels plugins) INTO the React bundle.
+ * The AAP forbids exactly that, and by D1 precedence an explicit AAP constraint
+ * outranks a finding's suggested resolution:
+ *   - §0.7.2 Minimal Change Clause — prefer the smallest change; do NOT add
+ *     dependencies beyond the two screens' framework transition.
+ *   - §0.5.1 frozen dependency inventory — the approved ADDED set is
+ *     react / react-dom / immer / @dnd-kit*; jQuery and Flot are NOT added, and
+ *     "Removed packages: none". Pulling jQuery+Flot into `app/react/**` would
+ *     violate this inventory.
+ *   - §0.2.1 isolation — new code lives under `app/react/**` and must not import
+ *     the AngularJS/jQuery machinery.
+ *   - §0.6.5 shared-component boundary — React RE-RENDERS shared widgets' DOM
+ *     (the burndown among them) rather than importing them.
+ *
+ * Resolution taken = the finding's second sanctioned branch: reproduce the
+ * chart with an isolated SVG that maximizes fidelity, and gate the residual
+ * pixel-level difference with the strict M27 visual comparator (Phase 7) for
+ * explicit stakeholder approval. Fidelity that IS reproduced exactly:
+ *   - series math (optimal; evolution null-skipped; client-increment =
+ *     -(team+client); team-increment = -team) — main.coffee L1231-1256;
+ *   - colours + area fills (`BURNDOWN_CHART_COLORS` == the Flot `colors` +
+ *     per-series `fillColor`), the `#D8DEE9` grid colour;
+ *   - the 6:1 aspect ratio (`element.height(width/6)`);
+ *   - point radius 4 + line width 2 (Flot `points.radius:4`, `lineWidth:2`);
+ *   - tooltip TEXT: identical i18n keys (OPTIMAL/REAL/INCREMENT_CLIENT/
+ *     INCREMENT_TEAM) and the identical `Math.abs(yval*10)/10` value formula.
+ * Accepted residual deviation (the documented gap): `<canvas>` anti-aliasing vs
+ * SVG vector edges, and the Flot tooltip-plugin popup vs the native SVG
+ * `<title>` hover — neither closable without the forbidden jQuery+Flot vendor.
  */
 function BurndownChart({ milestones }: { milestones: BurndownMilestoneStat[] }): JSX.Element | null {
     if (!milestones || milestones.length === 0) {
@@ -333,8 +370,10 @@ function BurndownChart({ milestones }: { milestones: BurndownMilestoneStat[] }):
             if (value == null) {
                 return;
             }
-            // Tooltip value mirrors the legacy `Math.abs(datapoint[1] * 10) / 10`.
-            const displayValue = Math.abs(Math.round(value * 10) / 10);
+            // Tooltip value reproduces the legacy Flot `tooltipOpts.content`
+            // formula VERBATIM (`Math.abs(yval * 10) / 10`, main.coffee L1305) so
+            // the hover text is byte-identical to the AngularJS chart.
+            const displayValue = Math.abs(value * 10) / 10;
             points.push({
                 x: xAt(index),
                 y: yAt(value),
@@ -416,7 +455,7 @@ function BurndownChart({ milestones }: { milestones: BurndownMilestoneStat[] }):
                                 key={pi}
                                 cx={p.x}
                                 cy={p.y}
-                                r={3}
+                                r={4}
                                 fill={s.line}
                             >
                                 <title>{p.tooltip}</title>

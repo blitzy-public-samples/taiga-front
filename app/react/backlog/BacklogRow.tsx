@@ -89,7 +89,16 @@ import type { CSSProperties } from "react";
 import type { UserStory, Project, Status, Tag } from "../shared/types";
 import { userStoryUrl } from "../shared/nav/routes";
 import { t } from "../shared/i18n/translate";
+
+/**
+ * Accessible name for the icon-only row-options trigger (Edit / Delete / Move
+ * to top menu). The legacy `us-edit-popover` trigger carried no title/aria-label;
+ * this mirrors the kanban Card `ACTIONS_LABEL` so both screens announce their
+ * action-menu triggers identically (M19).
+ */
+const ROW_OPTIONS_LABEL = "Actions";
 import { usePopover } from "../shared/popover/usePopover";
+import { canEditStory, canDeleteStory } from "../shared/permissions";
 import {
   UNESTIMATED,
   buildPointsById,
@@ -232,9 +241,15 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
 
   // --- Permission gating (mirrors `tg-check-permission` / `tg-class-permission`).
   // There is NO parallel authorization: these flags only gate which controls
-  // render; the backend remains the single enforcement point (AAP §0.6.4). ---
-  const modifyUs = project.my_permissions.indexOf("modify_us") !== -1;
-  const canDelete = project.my_permissions.indexOf("delete_us") !== -1;
+  // render; the backend remains the single enforcement point (AAP §0.6.4).
+  //
+  // M4: the authoritative edit/delete gates are centralized in
+  // `shared/permissions/storyPermissions`, combining the raw `modify_us` /
+  // `delete_us` permission with project read-only state (`archived_code`). The
+  // backlog has no per-story archived flag (unlike the Kanban swimlanes), so no
+  // per-row `archived` context is supplied here. ---
+  const canEdit = canEditStory(project);
+  const canRemove = canDeleteStory(project);
 
   // --- Derived projections ---
   const statusById = new Map<number, Status>(props.statuses.map((status) => [status.id, status]));
@@ -258,7 +273,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
   const showRoleSplit = headerRoleId !== null && computableRoles.length > 1;
   // The points editor is not clickable with no modify permission or no
   // computable roles (legacy `roles.length == 0 -> addClass("not-clickable")`).
-  const pointsNotClickable = !modifyUs || computableRoles.length === 0;
+  const pointsNotClickable = !canEdit || computableRoles.length === 0;
 
   // --- Shared inline popovers (status / points / options). The hook enforces a
   // GLOBAL single-active invariant and provides outside-click / Escape / focus. ---
@@ -274,7 +289,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
   /** Toggle the STATUS popover (no-op without modify permission or while saving). */
   const onStatusTriggerClick = (event: React.MouseEvent): void => {
     event.preventDefault();
-    if (!modifyUs || saving) {
+    if (!canEdit || saving) {
       return;
     }
     statusPop.toggle();
@@ -320,7 +335,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
     "row us-item-row" +
     (us.is_blocked ? " blocked" : "") +
     (isNew ? " new" : "") +
-    (!modifyUs ? " readonly" : "") +
+    (!canEdit ? " readonly" : "") +
     (props.dnd?.isDragging ? " dragging" : "");
 
   return (
@@ -332,17 +347,22 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
       data-id={String(us.id)}
     >
       <div className="us-item-row-left">
-        {modifyUs ? (
+        {canEdit ? (
           <div
             className="draggable-us-row"
             ref={props.dnd?.setActivatorNodeRef}
             {...(props.dnd?.attributes ?? {})}
             {...(props.dnd?.listeners ?? {})}
+            // M19: the icon-only drag handle carried no accessible name. The
+            // `@dnd-kit` sortable `attributes` mark it `role="button"` (keyboard
+            // pickup — M18), so give it a localized name (COMMON.DRAG = "Drag").
+            // Placed AFTER the attribute spread so it is not overwritten.
+            aria-label={t("COMMON.DRAG")}
           >
             <Icon name="icon-draggable" svgClass="icon-drag" />
           </div>
         ) : null}
-        {modifyUs ? (
+        {canEdit ? (
           <div className="input">
             <div
               className="custom-checkbox"
@@ -364,6 +384,11 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
                 type="checkbox"
                 name="filter-mode"
                 id={`us-check-${us.ref}`}
+                // M19: the associated `<label>` is EMPTY in the legacy markup, so
+                // the multiselect checkbox had no accessible name. Name it after
+                // the story it selects (`#<ref> <subject>`) so assistive-tech
+                // users know which story the "move to sprint" selection targets.
+                aria-label={`#${us.ref ?? ""} ${us.subject ?? ""}`.trim()}
                 checked={props.selected}
                 disabled={saving}
                 onChange={(event) => {
@@ -414,7 +439,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
           ref={(el) => {
             statusPop.triggerRef.current = el;
           }}
-          className={"us-status" + (!modifyUs || saving ? " not-clickable" : "")}
+          className={"us-status" + (!canEdit || saving ? " not-clickable" : "")}
           href=""
           title={t("BACKLOG.STATUS_NAME")}
           aria-haspopup="true"
@@ -424,7 +449,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
           onClick={onStatusTriggerClick}
         >
           <span className="us-status-bind">{currentStatus?.name ?? ""}</span>
-          {modifyUs ? <Icon name="icon-arrow-down" /> : null}
+          {canEdit ? <Icon name="icon-arrow-down" /> : null}
         </a>
         {statusPop.open ? (
           <ul
@@ -551,7 +576,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
       </div>
 
       {/* ROW OPTIONS POPUP (tg-us-edit-selector + us-edit-popover) — gated on modify_us */}
-      {modifyUs ? (
+      {canEdit ? (
         <div className="us-option">
           <button
             ref={(el) => {
@@ -564,6 +589,12 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
             disabled={saving}
             aria-haspopup="true"
             aria-expanded={optionsPop.open}
+            // M19: the icon-only row-options trigger (legacy `us-edit-popover`
+            // button carried no title/aria-label) had no accessible name. Name
+            // it after the actions its menu exposes (Edit / Delete / Move to
+            // top) — mirrors the kanban Card `ACTIONS_LABEL` ("Actions")
+            // precedent so BOTH screens' icon-menu triggers announce identically.
+            aria-label={ROW_OPTIONS_LABEL}
             onClick={onOptionsTriggerClick}
           >
             <Icon name="icon-more-vertical" />
@@ -588,7 +619,7 @@ export function BacklogRow(props: BacklogRowProps): JSX.Element {
                   <span>{t("COMMON.EDIT")}</span>
                 </button>
               </li>
-              {canDelete ? (
+              {canRemove ? (
                 <li>
                   <button
                     type="button"

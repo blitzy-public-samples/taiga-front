@@ -467,4 +467,18 @@ describe("readMountContext", () => {
         expect(ctx.eventsUrl).toBeNull();
         expect(ctx.language).toBe("en");
     });
+
+    it("resolves language from userInfo.lang over the deployment default (M5)", () => {
+        // The runtime locale bridge (`resolveActiveLanguage`) mirrors
+        // `app.coffee` L796: the logged-in user's stored language preference
+        // wins over the deployment default, so the mount context must surface
+        // the user's language, not `taigaConfig.defaultLanguage`.
+        bridgeWindow.taigaConfig = { defaultLanguage: "en" };
+        localStorage.setItem("userInfo", JSON.stringify({ lang: "es" }));
+
+        const host = document.createElement("div");
+        host.setAttribute("project-slug", "p");
+
+        expect(readMountContext(host).language).toBe("es");
+    });
 });

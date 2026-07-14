@@ -90,6 +90,46 @@ export default defineConfig({
     trace: "off",
   },
 
+  // ---------------------------------------------------------------------------
+  // Deterministic strict VISUAL-PARITY gate (review finding M27).
+  // ---------------------------------------------------------------------------
+  // Previously this config captured raw evidence only (video/screenshot on) with
+  // NO comparator, threshold, or gate. `toHaveScreenshot` (used by the specs via
+  // `taiga.expectVisualParity(...)`) adds a real pixel comparison. The parity
+  // workflow (AAP §0.6.2) is:
+  //   1. `--project=baseline` runs FIRST against the stock AngularJS screens.
+  //      With no reference present yet, Playwright WRITES the reference snapshot
+  //      into the shared, project-independent `snapshotPathTemplate` below and
+  //      passes; a human reviews + commits that reference (the required
+  //      human-approval checkpoint the finding asks for).
+  //   2. `--project=react` runs AFTER migration and COMPARES the React render
+  //      against that committed baseline, FAILING on any drift beyond the
+  //      AAP-grounded tolerance below.
+  // `snapshotPathTemplate` intentionally omits `{projectName}` (and `{platform}`
+  // — both projects run on the SAME CI platform / trusted Chrome), so the two
+  // TEMPORAL projects resolve to the SAME reference file and the react run is
+  // diffed against the baseline capture rather than against itself.
+  snapshotPathTemplate: "e2e-react/artifacts/parity-snapshots/{testFilePath}/{arg}{ext}",
+  expect: {
+    toHaveScreenshot: {
+      // The migration's contract is pixel parity (AAP §0.1.1, §0.7.1): React
+      // emits the same DOM + class names so the UNCHANGED SCSS paints it
+      // identically. The tolerance is therefore STRICT — a small per-pixel YIQ
+      // `threshold` absorbs only sub-pixel font-hinting/anti-aliasing differences
+      // between the two temporal builds (never a design change), and at most
+      // 0.5%% of pixels may differ before the gate fails. There is NO performance
+      // SLA (assumption A-2); this is a purely visual gate.
+      threshold: 0.15,
+      maxDiffPixelRatio: 0.005,
+      // Determinism: freeze CSS animations/transitions, hide the text caret, and
+      // compare in CSS pixels so device-pixel-ratio differences cannot mask or
+      // inflate a diff.
+      animations: "disabled",
+      caret: "hide",
+      scale: "css",
+    },
+  },
+
   // Human-readable console output plus a self-contained HTML report written into
   // the tracked artifacts tree. `open: "never"` keeps CI non-interactive.
   reporter: [

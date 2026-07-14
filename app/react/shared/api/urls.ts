@@ -22,6 +22,10 @@ export const URL_TEMPLATES = {
     refresh: "/auth/refresh",
     projects: "/projects",
     userstories: "/userstories",
+    // Attachments list/detail for a user story (legacy resources.coffee L160
+    // "attachments/us" -> "/userstories/attachments"). Contract-preserving (C-1):
+    // the same frozen endpoint the AngularJS attachments resource called.
+    "us-attachments": "/userstories/attachments",
     "userstories-filters": "/userstories/filters_data",
     "bulk-create-us": "/userstories/bulk_create",
     "bulk-update-us-kanban-order": "/userstories/bulk_update_kanban_order",

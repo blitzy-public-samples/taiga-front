@@ -6,27 +6,46 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Lightbox } from "./Lightbox";
+import { ConfirmAskLightbox } from "./ConfirmAskLightbox";
 import { t } from "../i18n/translate";
 import {
     createEmptyStoryValues,
+    isStoryFormDirty,
     isStoryFormValid,
     validateStoryForm,
     SUBJECT_MAX_LENGTH,
     type StoryFormValues,
 } from "./storyForm";
-import type { Point, ProjectMember, Role, Status, Swimlane, Tag } from "../types";
+import type { Attachment, Point, ProjectMember, Role, Status, Swimlane, Tag } from "../types";
 
 /**
  * Shared create/edit user-story lightbox reproducing the legacy
  * `lb-create-edit.jade` (+ `lb-create-edit-us.jade`) DOM and behaviour, closing
- * finding C2 (complete, source-compatible story form) and prepared for reuse by
- * the Backlog screen (finding C7). It is framework-agnostic: all data and the
- * persistence callback are injected, and i18n goes through the shared `t()`
- * mechanism (finding M7). The form BODY mounts only while the lightbox is open
- * (via {@link Lightbox}), so its state resets on each open exactly like the
- * legacy `form(ng-if="lightboxOpen")`.
+ * finding C2 (complete, source-compatible story form) and reused by BOTH
+ * migrated screens (finding C7). Finding M1 completes the previously-omitted
+ * fields and widgets so the form is at full legacy parity:
+ *
+ *   - tag autocomplete + colour management (`tg-tag-line-common` +
+ *     `tg-tags-dropdown` + `tg-color-selector`),
+ *   - due-date control (`tg-due-date-popover`, `format="button"`),
+ *   - team-requirement / client-requirement toggles (`lb-create-edit-us.jade`),
+ *   - attachment add/delete lifecycle (`tg-attachments-simple` +
+ *     `attachmentsService`), applied AFTER save by the owning hook,
+ *   - a localized, themed dirty-close confirmation (`$confirm.ask(
+ *     "LIGHTBOX.CREATE_EDIT.CONFIRM_CLOSE")` → `.lightbox-generic-ask`),
+ *     replacing the previous English `window.confirm` substitute.
+ *
+ * It stays framework-agnostic: all data and the persistence callback are
+ * injected, and i18n goes through the shared `t()` mechanism (finding M7). The
+ * form BODY mounts only while the lightbox is open (via {@link Lightbox}), so
+ * its state resets on each open exactly like the legacy `form(ng-if=
+ * "lightboxOpen")`.
+ *
+ * `is_iocaine` is intentionally ABSENT: it exists ONLY in the legacy TASK form
+ * (`lb-create-edit-task.jade`), never the user-story form — the legacy US
+ * template renders no `.iocaine` control (D1: the legacy source is the contract).
  */
 export interface StoryFormLightboxProps {
     /** Whether the lightbox is open. */
@@ -51,6 +70,13 @@ export interface StoryFormLightboxProps {
     defaultSwimlaneId: number | null;
     /** Whether to show the kanban-only swimlane selector. */
     isKanban: boolean;
+    /**
+     * Project tag palette (`project.tags_colors`) as a `name -> color` map, used
+     * for tag autocomplete suggestions and to auto-assign a known tag's colour
+     * (finding M1, mirroring `TagLineCommonController.addNewTag`). Optional; when
+     * absent the tag input still works (new tags get the picked/none colour).
+     */
+    projectTagsColors?: Record<string, string | null>;
     /** Prefill (edit) / target (create) values. */
     initialValues?: Partial<StoryFormValues>;
     /** True while the persistence call is in flight (disables submit). */
@@ -61,10 +87,42 @@ export interface StoryFormLightboxProps {
     canSubmit: boolean;
 }
 
+/** Internal props for the mounted-while-open body (adds the dirty bridge). */
+interface StoryFormBodyProps extends StoryFormLightboxProps {
+    /** Reports the body's dirty state up so the parent can guard the close (M1). */
+    onDirtyChange: (dirty: boolean) => void;
+}
+
 const TITLE_ID = "lb-create-edit-us-title";
 
+/**
+ * Default tag colour palette — the legacy `taiga.getDefaulColorList()`
+ * (`app/coffee/utils.coffee` `DEFAULT_COLOR_LIST`), reproduced verbatim so the
+ * new-tag colour selector offers the identical swatches (finding M1).
+ */
+const DEFAULT_COLOR_LIST: string[] = [
+    "#D35163", "#D351CF", "#AC51D3", "#8151D3", "#5551D3", "#5178D3", "#78D351",
+    "#51D355", "#51D381", "#51D3AC", "#51CFD3", "#51A3D3", "#A3D350", "#CFD350",
+    "#D3AC50", "#D38050", "#D35450", "#E44057", "#4C566A", "#70728F", "#A9AABC",
+];
+
+/** Human-readable byte size for a queued upload (legacy `sizeFormat`). */
+function formatSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+        return "";
+    }
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+    }
+    return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
 /** The mounted-while-open form body; its state initialises fresh on each open. */
-function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
+function StoryFormBody(props: StoryFormBodyProps): React.ReactElement {
     const {
         mode,
         onClose,
@@ -76,28 +134,50 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
         swimlanes,
         defaultSwimlaneId,
         isKanban,
+        projectTagsColors,
         initialValues,
         saving,
         errorMessage,
         canSubmit,
+        onDirtyChange,
     } = props;
 
     // Seed once (on mount == on open). Create defaults the status to the target
-    // (or the first status) and the swimlane to the project default.
-    const [values, setValues] = useState<StoryFormValues>(() =>
-        createEmptyStoryValues({
-            status: statuses[0]?.id ?? null,
-            swimlane: defaultSwimlaneId,
-            ...initialValues,
-        }),
+    // (or the first status) and the swimlane to the project default. The same
+    // seed is retained as the dirty-comparison baseline (finding M1).
+    const initialSeed = useMemo<StoryFormValues>(
+        () =>
+            createEmptyStoryValues({
+                status: statuses[0]?.id ?? null,
+                swimlane: defaultSwimlaneId,
+                ...initialValues,
+            }),
+        // Seed ONCE on mount; the body remounts (new key) when the target
+        // changes, which re-runs this with the new inputs.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [],
     );
+    const [values, setValues] = useState<StoryFormValues>(() => initialSeed);
     const [subjectTouched, setSubjectTouched] = useState<boolean>(false);
     const [statusOpen, setStatusOpen] = useState<boolean>(false);
+    const [tagInputOpen, setTagInputOpen] = useState<boolean>(false);
     const [tagDraft, setTagDraft] = useState<string>("");
+    const [tagColor, setTagColor] = useState<string | null>(null);
+    const [colorListOpen, setColorListOpen] = useState<boolean>(false);
+    const [dueDateOpen, setDueDateOpen] = useState<boolean>(false);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
 
     const errors = validateStoryForm(values);
     const showSubjectError = subjectTouched && errors.subject !== undefined;
     const submittable = canSubmit && !saving && isStoryFormValid(values);
+
+    // Report dirty state up so the parent can gate Escape / close / Cancel.
+    const dirty = isStoryFormDirty(values, initialSeed);
+    useEffect(() => {
+        onDirtyChange(dirty);
+    }, [dirty, onDirtyChange]);
+    // Reset the reported dirty state when the body unmounts (lightbox closed).
+    useEffect(() => () => onDirtyChange(false), [onDirtyChange]);
 
     const selectedStatus = useMemo<Status | undefined>(
         () => statuses.find((status) => status.id === values.status),
@@ -108,6 +188,22 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
         [roles],
     );
 
+    // Tag autocomplete suggestions: project tags whose name contains the draft
+    // (case-insensitive) and are not already added (mirrors `tg-tags-dropdown`).
+    const tagSuggestions = useMemo<Tag[]>(() => {
+        if (projectTagsColors === undefined) {
+            return [];
+        }
+        const draft = tagDraft.trim().toLowerCase();
+        if (draft.length === 0) {
+            return [];
+        }
+        const added = new Set(values.tags.map((tag) => tag[0].toLowerCase()));
+        return Object.keys(projectTagsColors)
+            .filter((name) => name.toLowerCase().indexOf(draft) !== -1 && !added.has(name.toLowerCase()))
+            .map((name) => [name, projectTagsColors[name]] as Tag);
+    }, [projectTagsColors, tagDraft, values.tags]);
+
     const setField = useCallback(
         <K extends keyof StoryFormValues>(key: K, value: StoryFormValues[K]): void => {
             setValues((prev) => ({ ...prev, [key]: value }));
@@ -115,18 +211,30 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
         [],
     );
 
-    const addTag = useCallback((): void => {
-        const name = tagDraft.trim();
-        if (name.length === 0) {
-            return;
-        }
-        setValues((prev) =>
-            prev.tags.some((tag) => tag[0] === name)
-                ? prev
-                : { ...prev, tags: [...prev.tags, [name, null] as Tag] },
-        );
-        setTagDraft("");
-    }, [tagDraft]);
+    // Add a tag with a resolved colour (finding M1): a known project tag keeps
+    // its palette colour; otherwise the picked colour (or none) is used. Mirrors
+    // `TagLineCommonController.addNewTag`.
+    const addTag = useCallback(
+        (rawName: string, color: string | null): void => {
+            const name = rawName.trim().toLowerCase();
+            if (name.length === 0) {
+                return;
+            }
+            const resolvedColor =
+                projectTagsColors !== undefined && projectTagsColors[name] !== undefined
+                    ? projectTagsColors[name]
+                    : color;
+            setValues((prev) =>
+                prev.tags.some((tag) => tag[0] === name)
+                    ? prev
+                    : { ...prev, tags: [...prev.tags, [name, resolvedColor] as Tag] },
+            );
+            setTagDraft("");
+            setTagColor(null);
+            setColorListOpen(false);
+        },
+        [projectTagsColors],
+    );
 
     const removeTag = useCallback((name: string): void => {
         setValues((prev) => ({ ...prev, tags: prev.tags.filter((tag) => tag[0] !== name) }));
@@ -151,6 +259,39 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
         }));
     }, []);
 
+    // Queue newly selected files for upload AFTER save (legacy attachmentsToAdd).
+    const queueAttachments = useCallback((fileList: FileList | null): void => {
+        if (fileList === null || fileList.length === 0) {
+            return;
+        }
+        const added = Array.from(fileList);
+        setValues((prev) => ({ ...prev, attachmentsToAdd: [...prev.attachmentsToAdd, ...added] }));
+    }, []);
+
+    // Remove a still-queued (not-yet-uploaded) file (legacy: drop from add list).
+    const removeQueuedAttachment = useCallback((index: number): void => {
+        setValues((prev) => ({
+            ...prev,
+            attachmentsToAdd: prev.attachmentsToAdd.filter((_, i) => i !== index),
+        }));
+    }, []);
+
+    // Queue a persisted attachment for deletion AFTER save (legacy
+    // attachmentsToDelete): hide it now, delete it on submit.
+    const deleteExistingAttachment = useCallback((attachment: Attachment): void => {
+        if (attachment.id === undefined) {
+            return;
+        }
+        const id = attachment.id;
+        setValues((prev) => ({
+            ...prev,
+            attachments: prev.attachments.filter((a) => a.id !== id),
+            attachmentsToDelete: prev.attachmentsToDelete.includes(id)
+                ? prev.attachmentsToDelete
+                : [...prev.attachmentsToDelete, id],
+        }));
+    }, []);
+
     const handleSubmit = useCallback(
         (event: React.FormEvent): void => {
             event.preventDefault();
@@ -162,6 +303,8 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
         },
         [canSubmit, saving, values, onSubmit],
     );
+
+    const attachmentCount = values.attachments.length + values.attachmentsToAdd.length;
 
     return (
         <form
@@ -209,35 +352,125 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
 
                     <fieldset>
                         <div className="tags-block">
-                            <ul className="tags-list">
+                            <div className="tags-container">
                                 {values.tags.map((tag) => (
-                                    <li key={tag[0]} className="tag">
-                                        <span className="tag-name">{tag[0]}</span>
+                                    <div key={tag[0]} className="tag-wrapper">
+                                        <div
+                                            className="tag"
+                                            style={{ backgroundColor: tag[1] ?? undefined }}
+                                        >
+                                            <span>{tag[0]}</span>
+                                            <button
+                                                type="button"
+                                                className="icon icon-close e2e-delete-tag"
+                                                title={t("COMMON.TAGS.DELETE")}
+                                                aria-label={t("COMMON.TAGS.DELETE")}
+                                                onClick={() => removeTag(tag[0])}
+                                            >
+                                                <span className="icon icon-close" aria-hidden="true" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+
+                                {!tagInputOpen ? (
+                                    <button
+                                        type="button"
+                                        className="btn-filter ng-animate-disabled e2e-show-tag-input"
+                                        title={t("COMMON.TAGS.ADD")}
+                                        onClick={() => setTagInputOpen(true)}
+                                    >
+                                        <span className="add-tag-text">{t("COMMON.TAGS.ADD")}</span>
+                                        <span className="icon icon-add" aria-hidden="true" />
+                                    </button>
+                                ) : (
+                                    <div className="add-tag-input">
+                                        <input
+                                            type="text"
+                                            className="tag-input e2e-add-tag-input"
+                                            placeholder={t("COMMON.TAGS.PLACEHOLDER")}
+                                            aria-label={t("COMMON.TAGS.ADD")}
+                                            value={tagDraft}
+                                            autoFocus
+                                            onChange={(event) => setTagDraft(event.target.value)}
+                                            onKeyDown={(event) => {
+                                                if (event.key === "Enter") {
+                                                    event.preventDefault();
+                                                    addTag(tagDraft, tagColor);
+                                                }
+                                            }}
+                                        />
+
+                                        {tagSuggestions.length > 0 ? (
+                                            <ul className="tags-dropdown">
+                                                {tagSuggestions.map((suggestion) => (
+                                                    <li
+                                                        key={suggestion[0]}
+                                                        onClick={() => addTag(suggestion[0], suggestion[1])}
+                                                    >
+                                                        <div className="tags-dropdown-option">
+                                                            <span className="tags-dropdown-name">
+                                                                {suggestion[0]}
+                                                            </span>
+                                                            {suggestion[1] ? (
+                                                                <span
+                                                                    className="tags-dropdown-color"
+                                                                    title={suggestion[1] ?? undefined}
+                                                                    style={{ background: suggestion[1] ?? undefined }}
+                                                                />
+                                                            ) : null}
+                                                        </div>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        ) : null}
+
+                                        <div className="color-selector">
+                                            <div
+                                                className={`tag-color e2e-open-color-selector${tagColor ? "" : " empty-color"}`}
+                                                title={tagColor ?? undefined}
+                                                style={{ background: tagColor ?? undefined }}
+                                                onClick={() => setColorListOpen((prev) => !prev)}
+                                            />
+                                            {colorListOpen ? (
+                                                <div className="color-selector-dropdown">
+                                                    <ul className="color-selector-dropdown-list e2e-color-dropdown">
+                                                        {DEFAULT_COLOR_LIST.map((color) => (
+                                                            <li
+                                                                key={color}
+                                                                className="color-selector-option"
+                                                                title={color}
+                                                                style={{ background: color }}
+                                                                onClick={() => {
+                                                                    setTagColor(color);
+                                                                    setColorListOpen(false);
+                                                                }}
+                                                            />
+                                                        ))}
+                                                        <li
+                                                            className="empty-color"
+                                                            onClick={() => {
+                                                                setTagColor(null);
+                                                                setColorListOpen(false);
+                                                            }}
+                                                        />
+                                                    </ul>
+                                                </div>
+                                            ) : null}
+                                        </div>
+
                                         <button
                                             type="button"
-                                            className="tag-remove"
-                                            title={t("COMMON.DELETE")}
-                                            aria-label={t("COMMON.DELETE")}
-                                            onClick={() => removeTag(tag[0])}
+                                            className="save icon icon-save"
+                                            title={t("COMMON.TAGS.ADD")}
+                                            aria-label={t("COMMON.TAGS.ADD")}
+                                            onClick={() => addTag(tagDraft, tagColor)}
                                         >
-                                            <span className="icon icon-close" aria-hidden="true" />
+                                            <span className="icon icon-save" aria-hidden="true" />
                                         </button>
-                                    </li>
-                                ))}
-                            </ul>
-                            <input
-                                type="text"
-                                className="tag-input"
-                                placeholder={t("COMMON.TAGS.ADD")}
-                                value={tagDraft}
-                                onChange={(event) => setTagDraft(event.target.value)}
-                                onKeyDown={(event) => {
-                                    if (event.key === "Enter") {
-                                        event.preventDefault();
-                                        addTag();
-                                    }
-                                }}
-                            />
+                                    </div>
+                                )}
+                            </div>
                         </div>
                     </fieldset>
 
@@ -251,6 +484,90 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
                             onChange={(event) => setField("description", event.target.value)}
                         />
                     </fieldset>
+
+                    <section className="attachments attachment-simple">
+                        <div className="attachments-header">
+                            <h3 className="attachments-title">
+                                <span className="attachments-num">{attachmentCount}</span>{" "}
+                                <span className="attachments-text">{t("ATTACHMENT.SECTION_NAME")}</span>
+                            </h3>
+                            <div className="add-attach" id="a11y-add-attach" title={t("ATTACHMENT.ADD").replace("{{maxFileSizeMsg}}", "")}>
+                                <button
+                                    type="button"
+                                    className="btn-icon add-attachment-button"
+                                    onClick={() => fileInputRef.current?.click()}
+                                >
+                                    <span className="icon icon-add" aria-hidden="true" />
+                                </button>
+                                <input
+                                    ref={fileInputRef}
+                                    aria-label={t("ATTACHMENT.ADD").replace("{{maxFileSizeMsg}}", "")}
+                                    id="add-attach"
+                                    type="file"
+                                    multiple
+                                    style={{ display: "none" }}
+                                    onChange={(event) => {
+                                        queueAttachments(event.target.files);
+                                        // Allow re-selecting the same file after a remove.
+                                        event.target.value = "";
+                                    }}
+                                />
+                            </div>
+                        </div>
+
+                        {attachmentCount === 0 ? (
+                            <div className="attachments-empty">
+                                <div>{t("ATTACHMENT.DROP")}</div>
+                            </div>
+                        ) : null}
+
+                        <div className="attachment-body attachment-list">
+                            {values.attachments.map((attachment) => (
+                                <div key={`existing-${attachment.id}`} className="single-attachment">
+                                    <div className="attachment-name">
+                                        <span className="icon icon-attachment" aria-hidden="true" />
+                                        <span>{attachment.name ?? ""}</span>
+                                    </div>
+                                    <div className="attachment-size">
+                                        <span />
+                                    </div>
+                                    <div className="attachment-settings">
+                                        <button
+                                            type="button"
+                                            className="settings attachment-delete"
+                                            title={t("COMMON.DELETE")}
+                                            aria-label={t("COMMON.DELETE")}
+                                            onClick={() => deleteExistingAttachment(attachment)}
+                                        >
+                                            <span className="icon icon-trash" aria-hidden="true" />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                            {values.attachmentsToAdd.map((file, index) => (
+                                <div key={`queued-${index}-${file.name}`} className="single-attachment">
+                                    <div className="attachment-name">
+                                        <span className="icon icon-attachment" aria-hidden="true" />
+                                        <span>{file.name}</span>
+                                    </div>
+                                    <div className="attachment-size">
+                                        <span>{formatSize(file.size)}</span>
+                                    </div>
+                                    <div className="attachment-settings">
+                                        <button
+                                            type="button"
+                                            className="settings attachment-delete"
+                                            title={t("COMMON.DELETE")}
+                                            aria-label={t("COMMON.DELETE")}
+                                            onClick={() => removeQueuedAttachment(index)}
+                                        >
+                                            <span className="icon icon-trash" aria-hidden="true" />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </section>
                 </div>
 
                 <div className="sidebar ticket-data">
@@ -384,6 +701,79 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
                     ) : null}
 
                     <fieldset className="ticket-detail-settings">
+                        <div className="due-date-button-wrapper">
+                            <button
+                                type="button"
+                                className={`btn-icon due-date-button is-editable date-picker-popover-trigger${values.due_date ? " date-set active" : ""}`}
+                                title={
+                                    values.due_date
+                                        ? t("COMMON.CARD.DUE_DATE").replace("{{date}}", values.due_date)
+                                        : t("COMMON.DUE_DATE.TITLE_ACTION_SET_DUE_DATE")
+                                }
+                                aria-label={t("COMMON.DUE_DATE.TITLE_ACTION_SET_DUE_DATE")}
+                                aria-expanded={dueDateOpen ? "true" : "false"}
+                                onClick={() => setDueDateOpen((prev) => !prev)}
+                            >
+                                <span className="icon icon-clock" aria-hidden="true" />
+                            </button>
+                            {dueDateOpen ? (
+                                <div className="date-picker-popover" style={{ display: "block" }}>
+                                    <div className="date-picker-container">
+                                        <input
+                                            type="date"
+                                            className="due-date"
+                                            aria-label={t("COMMON.DUE_DATE.TITLE_ACTION_SET_DUE_DATE")}
+                                            value={values.due_date ?? ""}
+                                            onChange={(event) =>
+                                                setField(
+                                                    "due_date",
+                                                    event.target.value === "" ? null : event.target.value,
+                                                )
+                                            }
+                                        />
+                                    </div>
+                                    {values.due_date ? (
+                                        <div className="date-picker-popover-footer">
+                                            <a
+                                                href="#"
+                                                className="date-picker-clean"
+                                                title={t("LIGHTBOX.SET_DUE_DATE.TITLE_ACTION_DELETE_DUE_DATE")}
+                                                aria-label={t("LIGHTBOX.SET_DUE_DATE.TITLE_ACTION_DELETE_DUE_DATE")}
+                                                onClick={(event) => {
+                                                    event.preventDefault();
+                                                    setField("due_date", null);
+                                                }}
+                                            >
+                                                <span className="icon icon-trash" aria-hidden="true" />
+                                            </a>
+                                        </div>
+                                    ) : null}
+                                </div>
+                            ) : null}
+                        </div>
+
+                        <button
+                            type="button"
+                            className={`btn-icon team-requirement${values.team_requirement ? " active" : ""}`}
+                            aria-label={t("COMMON.TEAM_REQUIREMENT")}
+                            aria-pressed={values.team_requirement ? "true" : "false"}
+                            title={t("COMMON.TEAM_REQUIREMENT")}
+                            onClick={() => setField("team_requirement", !values.team_requirement)}
+                        >
+                            <span className="icon icon-team-requirement" aria-hidden="true" />
+                        </button>
+
+                        <button
+                            type="button"
+                            className={`btn-icon client-requirement${values.client_requirement ? " active" : ""}`}
+                            aria-label={t("COMMON.CLIENT_REQUIREMENT")}
+                            aria-pressed={values.client_requirement ? "true" : "false"}
+                            title={t("COMMON.CLIENT_REQUIREMENT")}
+                            onClick={() => setField("client_requirement", !values.client_requirement)}
+                        >
+                            <span className="icon icon-client-requirement" aria-hidden="true" />
+                        </button>
+
                         <button
                             type="button"
                             className={`btn-icon is-blocked ${values.is_blocked ? "item-unblock" : "item-block"}`}
@@ -466,6 +856,46 @@ function StoryFormBody(props: StoryFormLightboxProps): React.ReactElement {
 }
 
 export function StoryFormLightbox(props: StoryFormLightboxProps): React.ReactElement {
+    const { open, onClose } = props;
+
+    // Dirty-close guard (finding M1): the body reports its dirty state here; the
+    // close request (Escape / the close control routed through <Lightbox onClose>,
+    // and the Cancel button) is intercepted — a pristine form closes immediately,
+    // a dirty one opens the localized themed ask dialog, reproducing the legacy
+    // `CreateEditDirective.checkClose` → `$confirm.ask(CONFIRM_CLOSE)` flow.
+    const dirtyRef = useRef<boolean>(false);
+    const [askOpen, setAskOpen] = useState<boolean>(false);
+
+    const handleDirtyChange = useCallback((dirty: boolean): void => {
+        dirtyRef.current = dirty;
+    }, []);
+
+    const requestClose = useCallback((): void => {
+        if (dirtyRef.current) {
+            setAskOpen(true);
+        } else {
+            onClose();
+        }
+    }, [onClose]);
+
+    const confirmDiscard = useCallback((): void => {
+        setAskOpen(false);
+        dirtyRef.current = false;
+        onClose();
+    }, [onClose]);
+
+    const cancelDiscard = useCallback((): void => {
+        setAskOpen(false);
+    }, []);
+
+    // If the lightbox is closed from outside (e.g. a successful submit sets
+    // open=false), drop any pending ask so it never lingers on the next open.
+    useEffect(() => {
+        if (!open) {
+            setAskOpen(false);
+        }
+    }, [open]);
+
     // Remount key: the inner form seeds its field state ONCE (on mount), so when
     // the target changes WITHOUT closing the lightbox first (e.g. create -> edit,
     // or editing a different story), the key change forces a remount that re-seeds
@@ -474,16 +904,29 @@ export function StoryFormLightbox(props: StoryFormLightboxProps): React.ReactEle
     // unchanged, so ordinary typing never triggers a remount.
     const bodyKey = `${props.mode}:${JSON.stringify(props.initialValues ?? {})}`;
     return (
-        <Lightbox
-            open={props.open}
-            onClose={props.onClose}
-            className="lightbox-generic-form lightbox-create-edit"
-            markerAttr="tg-lb-create-edit-userstory"
-            labelledById={TITLE_ID}
-            initialFocusSelector="input[name='subject']"
-        >
-            <StoryFormBody key={bodyKey} {...props} />
-        </Lightbox>
+        <>
+            <Lightbox
+                open={open}
+                onClose={requestClose}
+                className="lightbox-generic-form lightbox-create-edit"
+                markerAttr="tg-lb-create-edit-userstory"
+                labelledById={TITLE_ID}
+                initialFocusSelector="input[name='subject']"
+            >
+                <StoryFormBody
+                    key={bodyKey}
+                    {...props}
+                    onClose={requestClose}
+                    onDirtyChange={handleDirtyChange}
+                />
+            </Lightbox>
+            <ConfirmAskLightbox
+                open={askOpen}
+                title={t("LIGHTBOX.CREATE_EDIT.CONFIRM_CLOSE")}
+                onConfirm={confirmDiscard}
+                onCancel={cancelDiscard}
+            />
+        </>
     );
 }
 

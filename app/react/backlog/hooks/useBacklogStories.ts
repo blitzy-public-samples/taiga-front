@@ -37,6 +37,7 @@ import type {
     Project,
     Milestone,
     UserStory,
+    Attachment,
     Status,
     Point,
     Role,
@@ -45,6 +46,11 @@ import type { ApiClient, BulkStoryOrder, ProjectStats } from "../../shared/api";
 import { createApiClient, sanitizeErrorMessage } from "../../shared/api";
 import { generateHash } from "../../shared/storage/legacyStorage";
 import { t } from "../../shared/i18n/translate";
+import {
+    setAll as setAppMeta,
+    snapshotManagedMeta,
+    restoreManagedMeta,
+} from "../../shared/meta/appMeta";
 import { createEventsClient, subscribeToProject } from "../../shared/ws/events";
 import type { EventsClient } from "../../shared/ws/events";
 import {
@@ -64,14 +70,19 @@ import {
     reinsertBacklogStory,
     moveMetadata,
     prepareBulkUpdateData,
+    appendUserstories,
 } from "../../shared/state";
 import type { BacklogState, PendingDragItem, BacklogPositionDelta } from "../../shared/state";
 import type { BacklogStats, BurndownMilestoneStat } from "../BurndownSummary";
 import type { StoryFormValues, BulkStoryValues } from "../../shared/lightboxes/storyForm";
+import { usePendingDelete } from "../../shared/lightboxes";
+import type { PendingDelete } from "../../shared/lightboxes";
+import { isProjectWritable } from "../../shared/permissions";
 import {
     Savable,
     buildCreateStoryPayload,
     diffStoryValues,
+    applyStoryAttachments,
 } from "../../shared/lightboxes/storyPayload";
 
 /* ------------------------------------------------------------------------- *
@@ -603,6 +614,47 @@ function getLastSprint(openSprints: Milestone[]): Milestone | null {
 }
 
 /**
+ * Compute the FORECASTED story subset (finding M3) — the leading ordered
+ * backlog stories that fit within the next sprint's remaining velocity capacity.
+ * This is the EXACT projection the legacy `calculateForecasting` stored on
+ * `$ctrl.forecastedStories` and that the `.forecasting-add-sprint` handler moved
+ * into a sprint (main.coffee L245-263, L878-894). Extracted to a pure helper so
+ * the visible-story memo AND the forecast add-sprint action share ONE source of
+ * truth (they must agree on which stories are being moved).
+ *
+ * With `speed <= 0` the legacy accumulation loop never broke, so EVERY story is
+ * forecast (the enable control is anyway hidden until a velocity exists).
+ * Otherwise the running total is seeded with the first open sprint's points —
+ * unless that sprint alone already exceeds the velocity, in which case a brand
+ * new sprint is forecast and the sum restarts at zero — then each ordered story
+ * is kept until the total FIRST exceeds `speed` (the overflowing story is still
+ * included, matching the legacy post-push `break`).
+ */
+function computeForecastedStories(
+    userstories: UserStory[],
+    sprints: Milestone[],
+    speed: number,
+): UserStory[] {
+    if (!(speed > 0)) {
+        return userstories;
+    }
+    let backlogPointsSum = 0;
+    if (sprints.length > 0) {
+        const firstPoints = sprints[0].total_points ?? 0;
+        backlogPointsSum = firstPoints > speed ? 0 : firstPoints;
+    }
+    const forecasted: UserStory[] = [];
+    for (const us of userstories) {
+        backlogPointsSum += us.total_points ?? 0;
+        forecasted.push(us);
+        if (backlogPointsSum > speed) {
+            break;
+        }
+    }
+    return forecasted;
+}
+
+/**
  * The sprint whose [estimated_start, estimated_finish] window contains "now"
  * (legacy `findCurrentSprint`, main.coffee L696). Returns `null` when none match.
  */
@@ -708,6 +760,12 @@ export interface BacklogVM {
     errorMessage: string | null;
     /** True while a story delete is awaiting the server (M2 pending guard). */
     savingUs: boolean;
+    /**
+     * True while the edit opener is fetching the AUTHORITATIVE by-id detail +
+     * attachments before opening the form (C6). Drives an accessible board
+     * status region and prevents a blank-content edit.
+     */
+    editLoading: boolean;
     project: Project | null;
     projectId: number;
     userstories: UserStory[];
@@ -717,6 +775,10 @@ export interface BacklogVM {
     totalMilestones: number;
     totalClosedMilestones: number;
     totalUserStories: number;
+    /** M2: another backlog page is available (backend `X-Pagination-Next`). */
+    hasMoreUserstories: boolean;
+    /** M2: true while an infinite-scroll "load more" (append) fetch is running. */
+    loadingMore: boolean;
     currentSprint: Milestone | null;
     stats: BacklogStats | null;
     showGraphPlaceholder: boolean;
@@ -740,6 +802,8 @@ export interface BacklogVM {
     hasPermission: (perm: string) => boolean;
     isBacklogActivated: boolean;
     loadUserstories: () => void;
+    /** M2: fetch + APPEND the next backlog page (infinite scroll / "load more"). */
+    loadMoreUserstories: () => void;
     changeQ: (q: string) => void;
     /** Apply a filter option ({category:{dataType}, filter:{id}, mode?}); legacy `addFilterBacklog`. */
     addFilter: (newFilter: unknown) => void;
@@ -767,6 +831,11 @@ export interface BacklogVM {
     updateUserStoryStatus: (us: UserStory, statusId: number) => void;
     updateUserStoryPoints: (us: UserStory, roleId: number | null, pointId: number) => void;
     deleteUserStory: (us: UserStory) => void;
+    /* C7: delete confirmation (localized modal, replacing `window.confirm`) */
+    pendingDelete: PendingDelete<UserStory> | null;
+    deleteBusy: boolean;
+    confirmDelete: () => void;
+    cancelDelete: () => void;
     addNewUs: (type: "standard" | "bulk") => void;
     editUserStory: (us: UserStory) => void;
     /** The active story lightbox (create/edit/bulk), or null when closed. */
@@ -811,6 +880,11 @@ export function useBacklogStories(context: MountContext): BacklogVM {
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     // M2: pending guard for the (confirm-gated) delete flow.
     const [savingUs, setSavingUs] = useState<boolean>(false);
+    // C6: the edit opener fetches authoritative detail + attachments BEFORE
+    // opening the form. `editLoading` surfaces that fetch; `editLoadingRef`
+    // re-open-guards a rapid second click from firing a duplicate fetch.
+    const [editLoading, setEditLoading] = useState<boolean>(false);
+    const editLoadingRef = useRef<boolean>(false);
     // Active story lightbox (create/edit/bulk). `activeLightboxRef` mirrors it so
     // the awaited submit handlers read the CURRENT target without a stale closure;
     // `editStoryRef` captures the exact story object passed to `editUserStory`
@@ -827,6 +901,13 @@ export function useBacklogStories(context: MountContext): BacklogVM {
     const [totalMilestones, setTotalMilestones] = useState<number>(0);
     const [totalClosedMilestones, setTotalClosedMilestones] = useState<number>(0);
     const [totalUserStories, setTotalUserStories] = useState<number>(0);
+    // M2: infinite-scroll pagination. `hasMoreUserstories` reflects the backend
+    // `X-Pagination-Next` header (there is another page to load); `loadingMore`
+    // is true only while an APPEND (next-page) fetch is in flight so the
+    // incremental status region and the scroll trigger stay independent of the
+    // main initial-load `loading` flag.
+    const [hasMoreUserstories, setHasMoreUserstories] = useState<boolean>(false);
+    const [loadingMore, setLoadingMore] = useState<boolean>(false);
     const [currentSprint, setCurrentSprint] = useState<Milestone | null>(null);
     const [stats, setStats] = useState<BacklogStats | null>(null);
     const [showGraphPlaceholder, setShowGraphPlaceholder] = useState<boolean>(true);
@@ -873,6 +954,28 @@ export function useBacklogStories(context: MountContext): BacklogVM {
     // `refreshStats` recomputes the derived BacklogStats from this ref; a
     // server mutation refreshes it via `reloadStats`.
     const projectStatsRef = useRef<ProjectStats | null>(null);
+    // M2: pagination cursor. `pageRef` is the NEXT page to request (legacy
+    // `@.page`, starting at 1 and advanced when `X-Pagination-Next` is present);
+    // `hasMoreRef`/`loadingMoreRef` mirror the state for use inside async
+    // callbacks and the scroll trigger without stale closures.
+    const pageRef = useRef<number>(1);
+    const hasMoreRef = useRef<boolean>(false);
+    const loadingMoreRef = useRef<boolean>(false);
+    // M3: forecast story carry. When the forecast "add sprint" action opens the
+    // create-sprint modal (no sprint exists yet), the forecasted stories are
+    // parked here and moved into the sprint once it is created + the sprint list
+    // reloads (legacy `sprintform:create` -> `sprintform:create:success:callback`
+    // -> `moveToCurrentSprint(ussToMove)`). `null` when no forecast move is
+    // pending (a plain / edit sprint save must NOT move anything).
+    const pendingForecastMoveRef = useRef<UserStory[] | null>(null);
+    // M9: operation-generation guard. Non-abortable in-flight mutations
+    // (create/edit/delete/move/forecast) capture this counter at start and
+    // re-check it after every `await`; a slug change / unmount / board reload
+    // bumps it (see the mount-effect cleanup), so a completion or rollback that
+    // resolves AFTER the board has moved on is IGNORED rather than mutating (or
+    // rolling back) the freshly-loaded board. Mirrors the kanban precedent
+    // (`useKanbanStories.ts` `opGenerationRef`).
+    const opGenerationRef = useRef<number>(0);
     // M1: per-operation rollback. Instead of snapshotting the WHOLE state at
     // batch start (which erases newer concurrent changes on rollback — CWE-362),
     // we capture the FIRST pre-move position delta per involved story id and, on
@@ -1027,30 +1130,117 @@ export function useBacklogStories(context: MountContext): BacklogVM {
     );
 
     /**
-     * Load the backlog (unassigned) user stories. Legacy filter is
-     * `{ project, milestone: "null" }` (string "null") plus the current search
-     * `q`. React `listUserStories` returns only an array (no
-     * `Taiga-Info-Backlog-Total-Userstories` header), so `list.length` is the
-     * faithful POC substitute for `totalUserStories`.
+     * Load the backlog (unassigned) user stories from the AUTHORITATIVE PAGINATED
+     * endpoint (finding M2). Mirrors legacy `BacklogController#loadUserstories`
+     * (`resources/userstories.coffee#listUnassigned` via `queryMany` WITHOUT
+     * `x-disable-pagination`):
+     *   - `resetPagination` (default `true`) resets the cursor to page 1 and
+     *     REPLACES the list; `false` fetches the tracked next page and APPENDS
+     *     (dedup + re-sort) so infinite scroll accumulates pages.
+     *   - `pageSize` is forwarded to the backend `page_size` (used by
+     *     `reloadLoadedUserstories` to refetch every loaded story in one page).
+     *   - `totalUserStories` is set from the AUTHORITATIVE
+     *     `Taiga-Info-Backlog-Total-Userstories` header (NOT `list.length`,
+     *     which only counted the loaded rows — the defect this fixes); it falls
+     *     back to the page length only if the header is somehow absent.
+     *   - `X-Pagination-Next` drives `hasMore` + page advancement (legacy
+     *     `if header('x-pagination-next'): @.page++`).
+     * The applied filter params + search `q` are merged into every request
+     * (C4). M9: a slug change / reload that supersedes this fetch is discarded.
      */
-    const loadUserstories = useCallback(async (): Promise<void> => {
-        const pid = projectIdRef.current;
-        if (!pid) {
+    const loadUserstories = useCallback(
+        async (resetPagination = true, pageSize?: number): Promise<void> => {
+            const pid = projectIdRef.current;
+            if (!pid) {
+                return;
+            }
+            if (resetPagination) {
+                pageRef.current = 1;
+            }
+            const page = pageRef.current;
+            const gen = opGenerationRef.current;
+            // C4: merge the applied filter params (`status`, `tags`, `exclude_*`,
+            // …) into the list request — the data reload the legacy
+            // `loadUserstories` performed via
+            // `_.pick(location.search(), validQueryParams)`. `milestone:"null"`
+            // is supplied by the client (the unassigned/backlog draw).
+            const result = await apiClient.listUnassignedUserStories(
+                pid,
+                {
+                    ...appliedParamsRef.current,
+                    q: filterQRef.current,
+                    page,
+                },
+                pageSize,
+            );
+            // M9: ignore a load whose board was superseded by a slug change.
+            if (opGenerationRef.current !== gen) {
+                return;
+            }
+            const sortedPage = [...result.userStories].sort(
+                (a, b) => (a.backlog_order ?? 0) - (b.backlog_order ?? 0),
+            );
+            setState((current) =>
+                resetPagination
+                    ? setUserstories(current, sortedPage)
+                    : appendUserstories(current, sortedPage),
+            );
+            // M2: AUTHORITATIVE total from the header, not the loaded-row count.
+            setTotalUserStories(
+                result.backlogTotal !== null
+                    ? result.backlogTotal
+                    : result.userStories.length,
+            );
+            // M2: advance the cursor + track "has more" from `X-Pagination-Next`.
+            hasMoreRef.current = result.hasNext;
+            setHasMoreUserstories(result.hasNext);
+            if (result.hasNext) {
+                pageRef.current = page + 1;
+            }
+        },
+        [apiClient],
+    );
+
+    /**
+     * Fetch the NEXT backlog page and APPEND it (finding M2 — infinite scroll /
+     * "load more"). No-op when there is no next page or an append is already in
+     * flight. `loadingMore` drives the incremental `role=status` region while
+     * the fetch runs; DnD/WS reconciliation is preserved because
+     * `appendUserstories` dedups against the already-loaded (possibly
+     * optimistically-moved) rows.
+     */
+    const loadMoreUserstories = useCallback(async (): Promise<void> => {
+        if (!hasMoreRef.current || loadingMoreRef.current) {
             return;
         }
-        // C4: merge the applied filter params (`status`, `tags`, `exclude_*`, …)
-        // into the list request — the data reload the legacy `loadUserstories`
-        // performed via `_.pick(location.search(), validQueryParams)`.
-        const list = await apiClient.listUserStories({
-            project: pid,
-            milestone: "null",
-            ...appliedParamsRef.current,
-            q: filterQRef.current,
-            page: 1,
+        loadingMoreRef.current = true;
+        setLoadingMore(true);
+        try {
+            await loadUserstories(false);
+        } catch (e) {
+            reportError(e);
+        } finally {
+            loadingMoreRef.current = false;
+            setLoadingMore(false);
+        }
+    }, [loadUserstories, reportError]);
+
+    /**
+     * Reload EVERY currently-loaded story in a SINGLE request (finding M2).
+     * Mirrors legacy `reloadLoadedUserstories`: it refetches with
+     * `page_size = <loaded count>` and `resetPagination = true` so a refresh
+     * after a mutation / WebSocket event does not SHRINK a list the user
+     * scrolled to expand, then RESTORES the page cursor so the next "load more"
+     * continues from the right place. Falls back to the default page size when
+     * nothing is loaded yet.
+     */
+    const reloadLoadedUserstories = useCallback((): Promise<void> => {
+        const savedPage = pageRef.current;
+        const loaded = stateRef.current.userstories.length;
+        return loadUserstories(true, loaded > 0 ? loaded : undefined).then(() => {
+            pageRef.current = savedPage;
         });
-        setState((s) => setUserstories(s, list));
-        setTotalUserStories(list.length);
-    }, [apiClient]);
+    }, [loadUserstories]);
 
     /**
      * Recompute the derived {@link BacklogStats} from the cached AUTHORITATIVE
@@ -1117,10 +1307,27 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                     return;
                 }
                 const pid = runtime.id;
-                setProjectId(pid);
-                projectIdRef.current = pid;
                 projectRef.current = runtime;
                 setProject(runtime);
+
+                // C5: module-activation VIEW gate (the backend remains the single
+                // authorization enforcement point, constraint C-1). The legacy
+                // `BacklogController.loadProject` called
+                // `errorHandlingService.permissionDenied()` and did NOT proceed to
+                // load any backlog data when `is_backlog_activated` was false. We
+                // fail CLOSED with the same intent: publish `project` so the screen
+                // can render the deactivated placeholder, but do NOT set `projectId`
+                // (so the WebSocket effect below — guarded on `projectId` — never
+                // subscribes) and RETURN before fetching statuses / sprints /
+                // stories / stats. The `finally` block still clears `loading`.
+                // Mirrors the kanban precedent in `useKanbanStories.ts`, which
+                // early-returns after the project load when `is_kanban_activated`
+                // is false.
+                if (runtime.is_backlog_activated === false) {
+                    return;
+                }
+                setProjectId(pid);
+                projectIdRef.current = pid;
 
                 // M5: legacy `showTags` preference (taiga.generateHash key, JSON
                 // boolean). Default TRUE; flip to false ONLY when the stored value
@@ -1179,11 +1386,48 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         })();
         return () => {
             cancelled = true;
+            // M9: advance the operation generation so any mutation still in
+            // flight (its completion/rollback) is ignored after this reload.
+            opGenerationRef.current += 1;
         };
         // Loaders are stable (memoized on apiClient); re-running only on the slug
         // avoids reload loops while still reacting to project navigation.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [context.projectSlug]);
+
+    /* --------------------------------------------------------------------- *
+     * M22 — localized page <title>/<meta> (mirror BacklogController first-load
+     * `loadInitialData().then` -> appMetaService.setAll, backlog/main.coffee
+     * L105-110). Written once the AUTHORITATIVE project detail (name +
+     * description) is loaded, so the browser tab reads "Backlog - <projectName>"
+     * instead of the previous screen's stale title. The prior <head> tags are
+     * snapshotted first and restored on unmount / slug change, so navigating
+     * back to an AngularJS screen does not leak the Backlog title (the AngularJS
+     * controllers still overwrite on their own load — restore is a safe
+     * superset). Shares the exact `shared/meta/appMeta.ts` helper the Kanban
+     * screen uses (`useKanbanStories.ts`).
+     *
+     * Keyed on the identifying project fields (slug/name/description) — NOT the
+     * object identity — so an in-place `setProject` merge does not re-run it. On
+     * a first-load ERROR `project` stays null, so no misleading Backlog title is
+     * written (parity with `onInitialDataError`, which set no metadata).
+     * --------------------------------------------------------------------- */
+    useEffect(() => {
+        if (project == null) {
+            return;
+        }
+        const projectName = project.name ?? "";
+        const projectDescription = project.description ?? "";
+        const snapshot = snapshotManagedMeta();
+        setAppMeta(
+            t("BACKLOG.PAGE_TITLE", { projectName }),
+            t("BACKLOG.PAGE_DESCRIPTION", { projectName, projectDescription }),
+        );
+        return () => {
+            restoreManagedMeta(snapshot);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [project?.slug, project?.name, project?.description]);
 
     /* --------------------------------------------------------------------- *
      * WebSocket effect — keyed [projectId], only when truthy (mirrors kanban).
@@ -1195,13 +1439,19 @@ export function useBacklogStories(context: MountContext): BacklogVM {
      * onUserStories + onMilestones (never onProjects).
      * --------------------------------------------------------------------- */
     useEffect(() => {
-        if (!projectId) {
+        // C5: fail closed. `projectId` is only set once the project loaded AND
+        // `is_backlog_activated` was true (see the load effect), so a deactivated
+        // module leaves `projectId` null and never reaches here. The explicit
+        // activation re-check is defensive — it keeps the WebSocket subscription
+        // gated even if a future refactor sets `projectId` earlier.
+        if (!projectId || projectRef.current?.is_backlog_activated === false) {
             return;
         }
         const client = createEventsClient(context);
         eventsClientRef.current = client;
         const onUserStories = debounceTrailing(randomInt(700, 1000), (): void => {
-            void loadUserstories();
+            // M2: WS reload preserves the loaded page depth (partial-list safe).
+            void reloadLoadedUserstories();
             void loadSprints(projectId);
         });
         const onMilestones = debounceTrailing(randomInt(700, 1000), (): void => {
@@ -1242,6 +1492,9 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         if (!head) {
             return;
         }
+        // M9: capture the operation generation; a board reload during this
+        // bulk-order call bumps it, so the completion/rollback below is ignored.
+        const gen = opGenerationRef.current;
         const meta = moveMetadata(head.usList, head.newSprintId);
         const pid = projectIdRef.current;
         apiClient
@@ -1253,6 +1506,10 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                 meta.bulkUserstories,
             )
             .then((updated) => {
+                // M9: a reload superseded this move — do not touch the fresh board.
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // Reconcile from server truth + shift the queue. We compute the
                 // next state from `stateRef.current` (the authoritative in-flight
                 // value) and sync the ref SYNCHRONOUSLY here — the `[state]`
@@ -1286,6 +1543,11 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                 }
             })
             .catch((err: unknown) => {
+                // M9: a reload superseded this move — do not roll back the fresh
+                // board (its state no longer contains this batch's optimistic move).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // MANDATED per-operation ROLLBACK (AAP 0.6.3; M1 CWE-362 fix):
                 // restore ONLY the stories this batch moved onto the CURRENT state
                 // (never a stale whole-state snapshot), clear the queue, then
@@ -1320,6 +1582,15 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             previousUs: UserStory | null,
             nextUs: UserStory | null,
         ): void => {
+            // M4 (defense-in-depth hook guard): a read-only / archived project
+            // accepts NO reorder. The row/sprint drag sensors are already gated
+            // on `canEditStory`, so this only fires on programmatic misuse; it
+            // mirrors the legacy `sortable.coffee` init guard. The backend stays
+            // the single enforcement point (constraint C-1).
+            const activeProject = projectRef.current;
+            if (activeProject && !isProjectWritable(activeProject)) {
+                return;
+            }
             const item: PendingDragItem = {
                 usList,
                 newUsIndex,
@@ -1357,7 +1628,18 @@ export function useBacklogStories(context: MountContext): BacklogVM {
      */
     const moveToSprint = useCallback(
         (usList: UserStory[], sprintId: number): void => {
+            // M4 (defense-in-depth hook guard): a read-only / archived project
+            // accepts NO cross-sprint move. Sprint/row drag sensors are gated on
+            // `canEditStory`; this only fires on programmatic misuse and mirrors
+            // the legacy `sortable.coffee` init guard. Backend stays the single
+            // enforcement point (constraint C-1).
+            const activeProject = projectRef.current;
+            if (activeProject && !isProjectWritable(activeProject)) {
+                return;
+            }
             const pid = projectIdRef.current;
+            // M9: a board reload during the milestone-move supersedes it.
+            const gen = opGenerationRef.current;
             // M1: capture pre-move positions before the optimistic cross-container
             // move so a rejected `bulk-update-us-milestone` restores ONLY these
             // stories onto the CURRENT state.
@@ -1381,12 +1663,18 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             apiClient
                 .bulkUpdateMilestone(pid, sprintId, bulk)
                 .then(() => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     clearBatchDeltas();
                     void loadSprints(pid);
                     void loadClosedSprints(pid);
                     void reloadStats(pid);
                 })
                 .catch((err: unknown) => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     // M1 per-op rollback: restore only the moved stories onto the
                     // CURRENT state; M2: surface a sanitized message.
                     rollbackBatch();
@@ -1429,6 +1717,8 @@ export function useBacklogStories(context: MountContext): BacklogVM {
      */
     const updateUserStoryStatus = useCallback(
         (us: UserStory, statusId: number): void => {
+            // M9: ignore this inline edit's completion/recovery after a reload.
+            const gen = opGenerationRef.current;
             setState((s) =>
                 setUserstories(
                     s,
@@ -1439,6 +1729,9 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             apiClient
                 .save("userstories", { ...us, status: statusId }, { status: statusId })
                 .then((updated) => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     // Replace the local story with the server truth returned by the
                     // PATCH, INCLUDING the incremented `version`. Without this merge a
                     // SECOND inline edit to the same story sends the stale pre-PATCH
@@ -1456,12 +1749,15 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                     void reloadStats(projectIdRef.current);
                 })
                 .catch((err: unknown) => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     // Recover server truth + surface a sanitized message (M2).
-                    void loadUserstories();
+                    void reloadLoadedUserstories();
                     reportError(err);
                 });
         },
-        [apiClient, loadUserstories, reloadStats, clearError, reportError],
+        [apiClient, reloadLoadedUserstories, reloadStats, clearError, reportError],
     );
 
     /**
@@ -1483,6 +1779,8 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                 }
             }
             const patched = { ...us, points: newPoints };
+            // M9: ignore this inline points edit after a board reload.
+            const gen = opGenerationRef.current;
             setState((s) =>
                 setUserstories(
                     s,
@@ -1493,6 +1791,9 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             apiClient
                 .save("userstories", patched, { points: newPoints })
                 .then((updated) => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     // Merge the PATCH response (incl. the new `version`) into state so
                     // a subsequent edit to the SAME story sends the current version
                     // (optimistic-concurrency contract — M1/M2). Mirrors the Kanban
@@ -1508,41 +1809,53 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                     void reloadStats(projectIdRef.current);
                 })
                 .catch((err: unknown) => {
-                    void loadUserstories();
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                    void reloadLoadedUserstories();
                     reportError(err);
                 });
         },
-        [apiClient, loadUserstories, reloadStats, clearError, reportError],
+        [apiClient, reloadLoadedUserstories, reloadStats, clearError, reportError],
     );
 
     /**
-     * Delete a story after confirmation (legacy `$confirm.askOnDelete`;
-     * `window.confirm` is the POC substitute): optimistic remove, DELETE, then
-     * reload stats + sprints; rollback the removal on reject.
+     * Perform the story delete (C7 INTERNAL mutation): optimistic remove, DELETE,
+     * then reload stats + sprints; rollback the removal on reject.
+     *
+     * This runs ONLY after the user confirms in the shared
+     * `ConfirmDeleteLightbox` — it replaces the previous hard-coded English
+     * `window.confirm` (a non-localized substitute the review flagged, C7) with
+     * the localized modal, faithfully restoring the legacy `$confirm.askOnDelete`
+     * flow. It returns the settle promise so the confirmation controller can show
+     * the busy state and close the modal once the delete resolves/rejects; it
+     * never rejects (it owns its rollback + `reportError`).
      */
-    const deleteUserStory = useCallback(
-        (us: UserStory): void => {
-            const ok =
-                typeof window.confirm === "function"
-                    ? window.confirm("Delete this user story?")
-                    : true;
-            if (!ok) {
-                return;
-            }
+    const performDeleteUserStory = useCallback(
+        (us: UserStory): Promise<void> => {
             // M1: capture the FULL story so failure re-inserts exactly this
             // story onto the CURRENT state (targeted, not a stale whole-state
             // snapshot). M2: pending guard + sanitized error.
             const removed = us;
+            // M9: ignore this delete's completion/rollback after a board reload
+            // (the fresh board no longer contains the optimistically-removed row).
+            const gen = opGenerationRef.current;
             setSavingUs(true);
             clearError();
             setState((s) => setUserstories(s, s.userstories.filter((u) => u.id !== us.id)));
-            apiClient
+            return apiClient
                 .remove("userstories", us.id)
                 .then(() => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     void loadSprints(projectIdRef.current);
                     void reloadStats(projectIdRef.current);
                 })
                 .catch((err: unknown) => {
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
                     const restored = reinsertBacklogStory(stateRef.current, removed);
                     stateRef.current = restored;
                     setState(restored);
@@ -1553,6 +1866,30 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                 });
         },
         [apiClient, loadSprints, reloadStats, clearError, reportError],
+    );
+
+    // C7: confirm-before-delete gate — SHARED with Kanban via `usePendingDelete`
+    // + `ConfirmDeleteLightbox`. This replaces the previous hard-coded English
+    // `window.confirm` with the localized modal (legacy `$confirm.askOnDelete`).
+    const {
+        pending: pendingDelete,
+        busy: deleteBusy,
+        request: requestDeleteUserStory,
+        cancel: cancelDelete,
+        confirm: confirmDelete,
+    } = usePendingDelete<UserStory>(performDeleteUserStory);
+
+    /**
+     * Request deletion of a story (finding C7): OPENS the confirmation modal
+     * labelled with the story subject; nothing is mutated until the user
+     * confirms. Signature unchanged (`(us) => void`) so `BacklogRow`'s wiring is
+     * untouched.
+     */
+    const deleteUserStory = useCallback(
+        (us: UserStory): void => {
+            requestDeleteUserStory(us, us.subject ?? "");
+        },
+        [requestDeleteUserStory],
     );
 
     /**
@@ -1574,16 +1911,86 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         [clearError],
     );
 
-    /** Open the shared React edit story lightbox for `us` (finding C7). */
+    /**
+     * Open the shared React edit story lightbox for `us` (findings C6 + C7).
+     *
+     * C6 ROOT-CAUSE FIX: the backlog LIST serializer omits `description` (and
+     * lacks the authoritative optimistic-concurrency `version` and the
+     * attachments), so seeding the edit form from the list row `us` renders
+     * BLANK content that a subsequent save would PATCH away, and attachments
+     * could not be managed. Mirroring the legacy US-detail load (and the Kanban
+     * `editUs` fix), the opener now fetches the AUTHORITATIVE by-id detail FIRST
+     * (FATAL: a failure surfaces a sanitized message and does NOT open a blank
+     * form) plus the attachments (NON-FATAL: a failure degrades to `[]`, as the
+     * legacy attachments load was independent of the story load), reconciles the
+     * full model into every projection (`reinsertBacklogStory` places it back
+     * into the backlog list OR its owning sprint, preserving order), and only
+     * THEN opens the lightbox seeded from that authoritative model. `submitEditUs`
+     * diffs against THIS model, so the dirty-PATCH carries the correct `version`
+     * and never blanks the description.
+     */
     const editUserStory = useCallback(
         (us: UserStory): void => {
-            const next: BacklogLightboxState = { type: "edit", usId: us.id };
-            activeLightboxRef.current = next;
-            editStoryRef.current = us;
-            setActiveLightbox(next);
+            // C6: re-open guard — a rapid second click must not fire a duplicate
+            // detail fetch or open two forms.
+            if (editLoadingRef.current) {
+                return;
+            }
+            editLoadingRef.current = true;
+            setEditLoading(true);
             clearError();
+            // M9: ignore this edit-open entirely if a board reload supersedes it.
+            const gen = opGenerationRef.current;
+            void (async (): Promise<void> => {
+                const pid = projectIdRef.current;
+                if (!pid) {
+                    // No resolved project yet -> nothing to edit; release guard.
+                    editLoadingRef.current = false;
+                    setEditLoading(false);
+                    return;
+                }
+                try {
+                    // Authoritative detail is FATAL: without it the form cannot
+                    // safely seed description/version.
+                    const detail = await apiClient.getUserStory(pid, us.id);
+                    // Attachments are NON-FATAL: degrade to none rather than
+                    // blocking the edit (legacy loaded them independently).
+                    let attachments: Attachment[] = [];
+                    try {
+                        attachments = await apiClient.listUserStoryAttachments(pid, us.id);
+                    } catch {
+                        attachments = [];
+                    }
+                    // M9: a reload superseded this edit-open -> discard the fetched
+                    // detail and do NOT open a lightbox for the old board.
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                    const full: UserStory = { ...detail, attachments };
+                    // Reconcile the authoritative detail into every projection so
+                    // the backlog row / sprint row reflects it too.
+                    const next = reinsertBacklogStory(stateRef.current, full);
+                    stateRef.current = next;
+                    setState(next);
+                    const lb: BacklogLightboxState = { type: "edit", usId: us.id };
+                    activeLightboxRef.current = lb;
+                    editStoryRef.current = full;
+                    setActiveLightbox(lb);
+                } catch (e) {
+                    // M9: suppress a superseded edit-open's error (stale board).
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                    // Do NOT open a blank form: surface the sanitized error and
+                    // leave the board as-is (parity with a failed detail load).
+                    reportError(e);
+                } finally {
+                    editLoadingRef.current = false;
+                    setEditLoading(false);
+                }
+            })();
         },
-        [clearError],
+        [apiClient, clearError, reportError],
     );
 
     /** Close the active story lightbox and clear the captured edit target. */
@@ -1614,22 +2021,47 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             savingUsRef.current = true;
             setSavingUs(true);
             clearError();
+            // M9: capture the operation generation so a create that resolves
+            // AFTER a board reload neither closes a fresh lightbox nor reports a
+            // stale error onto the new board.
+            const gen = opGenerationRef.current;
             try {
                 const pid = projectIdRef.current;
                 const fallbackStatusId = projectRef.current?.us_statuses?.[0]?.id ?? 0;
                 const payload = buildCreateStoryPayload(pid, fallbackStatusId, values);
-                await apiClient.create<UserStory>("userstories", payload);
+                const created = await apiClient.create<UserStory>("userstories", payload);
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
+                // M1: run the queued attachment add/delete lifecycle AFTER the
+                // story exists (legacy `createAttachments(data)` tail). No-op when
+                // no attachments are queued (the common new-story case).
+                if (pid != null) {
+                    await applyStoryAttachments(
+                        values,
+                        pid,
+                        created.id,
+                        apiClient.createUserStoryAttachment,
+                        apiClient.deleteUserStoryAttachment,
+                    );
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                }
                 closeLightbox();
-                await loadUserstories();
+                // M2: reload EVERY loaded story (preserve scroll depth) + authoritative total.
+                await reloadLoadedUserstories();
                 await reloadStats(pid);
             } catch (e) {
-                reportError(e);
+                if (opGenerationRef.current === gen) {
+                    reportError(e);
+                }
             } finally {
                 savingUsRef.current = false;
                 setSavingUs(false);
             }
         },
-        [apiClient, clearError, closeLightbox, loadUserstories, reloadStats, reportError],
+        [apiClient, clearError, closeLightbox, reloadLoadedUserstories, reloadStats, reportError],
     );
 
     /**
@@ -1659,6 +2091,8 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             savingUsRef.current = true;
             setSavingUs(true);
             clearError();
+            // M9: ignore an edit that resolves after a board reload.
+            const gen = opGenerationRef.current;
             try {
                 const pid = projectIdRef.current;
                 await apiClient.save<Savable<UserStory>>(
@@ -1666,17 +2100,38 @@ export function useBacklogStories(context: MountContext): BacklogVM {
                     story as Savable<UserStory>,
                     modified,
                 );
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
+                // M1: apply queued attachment add/delete AFTER the save (legacy
+                // `deleteAttachments(data).then(createAttachments(data))`). No-op
+                // when nothing is queued.
+                if (pid != null) {
+                    await applyStoryAttachments(
+                        values,
+                        pid,
+                        story.id,
+                        apiClient.createUserStoryAttachment,
+                        apiClient.deleteUserStoryAttachment,
+                    );
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                }
                 closeLightbox();
-                await loadUserstories();
+                // M2: reload EVERY loaded story (preserve scroll depth) + authoritative total.
+                await reloadLoadedUserstories();
                 await reloadStats(pid);
             } catch (e) {
-                reportError(e);
+                if (opGenerationRef.current === gen) {
+                    reportError(e);
+                }
             } finally {
                 savingUsRef.current = false;
                 setSavingUs(false);
             }
         },
-        [apiClient, clearError, closeLightbox, loadUserstories, reloadStats, reportError],
+        [apiClient, clearError, closeLightbox, reloadLoadedUserstories, reloadStats, reportError],
     );
 
     /**
@@ -1697,21 +2152,29 @@ export function useBacklogStories(context: MountContext): BacklogVM {
             savingUsRef.current = true;
             setSavingUs(true);
             clearError();
+            // M9: ignore a bulk-create that resolves after a board reload.
+            const gen = opGenerationRef.current;
             try {
                 const pid = projectIdRef.current;
                 const statusId = values.status ?? projectRef.current?.us_statuses?.[0]?.id ?? null;
                 await apiClient.bulkCreateUserStories(pid, statusId, values.bulk, values.swimlane);
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 closeLightbox();
-                await loadUserstories();
+                // M2: reload EVERY loaded story (preserve scroll depth) + authoritative total.
+                await reloadLoadedUserstories();
                 await reloadStats(pid);
             } catch (e) {
-                reportError(e);
+                if (opGenerationRef.current === gen) {
+                    reportError(e);
+                }
             } finally {
                 savingUsRef.current = false;
                 setSavingUs(false);
             }
         },
-        [apiClient, clearError, closeLightbox, loadUserstories, reloadStats, reportError],
+        [apiClient, clearError, closeLightbox, reloadLoadedUserstories, reloadStats, reportError],
     );
 
     /** Toggle a story's membership in the multi-select set (bulk toolbar). */
@@ -1780,15 +2243,57 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         });
     }, []);
 
-    /** The forecasting flow simply opens the create lightbox. */
+    /**
+     * Forecast "add sprint" action (finding M3) — the React reproduction of the
+     * legacy `.forecasting-add-sprint` click handler (main.coffee L878-894). The
+     * forecasted stories (the visible velocity projection) are ACTUALLY MOVED
+     * into a sprint; the previous implementation only opened a modal and dropped
+     * the stories on the floor.
+     *
+     *   - When a sprint already exists (`!forecastNewSprint` => the row reads
+     *     "Move to Current Sprint"): move the forecasted stories straight into
+     *     the sprint with NO modal (legacy `moveToCurrentSprint(ussToMove)`).
+     *   - Otherwise (`forecastNewSprint` => "create sprint and add US"): open the
+     *     create-sprint lightbox CARRYING the forecasted stories in
+     *     `pendingForecastMoveRef`; `onSprintSaved` moves them once the sprint is
+     *     created and the list reloads (legacy `sprintform:create` ->
+     *     `sprintform:create:success:callback`).
+     *
+     * Either branch issues exactly ONE `bulk-update-us-milestone` request via
+     * `moveToSprint` (== legacy `moveUssToSprint` -> `bulkUpdateMilestone`, target
+     * `sprints[0].id`), which reconciles every story copy + reloads stats, and
+     * then forecasting is turned off (legacy `moveUssToSprint` called
+     * `toggleVelocityForecasting`).
+     */
     const createSprintFromForecasting = useCallback((): void => {
+        const speed = statsRef.current?.speed ?? 0;
+        const forecasted = computeForecastedStories(
+            stateRef.current.userstories,
+            stateRef.current.sprints,
+            speed,
+        );
+        if (!forecastNewSprint) {
+            // A sprint exists: move the forecasted stories into it directly.
+            if (!forecasted.length) {
+                return;
+            }
+            const target = stateRef.current.sprints[0];
+            if (!target) {
+                return;
+            }
+            moveToSprint(forecasted, target.id);
+            setDisplayVelocity(false);
+            return;
+        }
+        // No usable sprint yet: carry the forecasted stories through the modal.
+        pendingForecastMoveRef.current = forecasted;
         setSprintLightbox({
             open: true,
             mode: "create",
             sprint: null,
             lastSprint: getLastSprint(stateRef.current.sprints),
         });
-    }, []);
+    }, [forecastNewSprint, moveToSprint]);
 
     const openEditSprint = useCallback((sprint: Milestone): void => {
         setSprintLightbox({
@@ -1803,12 +2308,44 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         setSprintLightbox((lb) => ({ ...lb, open: false }));
     }, []);
 
-    /** Close + reload after a sprint is created/edited (loadSprints + stats). */
+    /**
+     * Close + reload after a sprint is created/edited (loadSprints + stats).
+     *
+     * Finding M3: when the create modal was opened FROM the forecast action
+     * (`pendingForecastMoveRef` is set), move the carried forecast stories into
+     * the just-created sprint once the sprint list reloads — the React
+     * reproduction of the legacy `sprintform:create:success` handler, which ran
+     * `loadSprints().then(=> broadcast "sprintform:create:success:callback",
+     * ussToMove)` and whose callback invoked `moveToCurrentSprint(ussToMove)`
+     * (main.coffee L170, L815). A plain / edit sprint save leaves the ref null
+     * and therefore moves nothing.
+     */
     const onSprintSaved = useCallback((): void => {
         setSprintLightbox((lb) => ({ ...lb, open: false }));
-        void loadSprints(projectIdRef.current);
-        void reloadStats(projectIdRef.current);
-    }, [loadSprints, reloadStats]);
+        const pid = projectIdRef.current;
+        const pendingForecast = pendingForecastMoveRef.current;
+        pendingForecastMoveRef.current = null;
+        const sprintsPromise = loadSprints(pid);
+        void reloadStats(pid);
+        if (pendingForecast && pendingForecast.length) {
+            void sprintsPromise.then((milestones) => {
+                // `loadSprints` has QUEUED a `setState`; in this microtask
+                // `stateRef` may still lack the new sprint. Reconcile the
+                // reloaded sprints into `stateRef` NOW so the optimistic move in
+                // `moveToSprint` can find the just-created target sprint (else
+                // `applyOptimisticMove` would silently drop the stories until the
+                // move's own reload). Target `sprints[0]` exactly like the legacy
+                // `bulkUpdateMilestone(project.id, sprints[0].id, ...)`.
+                const reconciled = setSprints(stateRef.current, milestones);
+                stateRef.current = reconciled;
+                const target = reconciled.sprints[0];
+                if (target) {
+                    moveToSprint(pendingForecast, target.id);
+                }
+                setDisplayVelocity(false);
+            });
+        }
+    }, [loadSprints, reloadStats, moveToSprint]);
 
     /**
      * Close + full reload after a sprint is removed (loadSprints + closed +
@@ -1820,11 +2357,12 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         const pid = projectIdRef.current;
         void loadSprints(pid);
         void loadClosedSprints(pid);
-        void loadUserstories();
+        // M2: preserve loaded page depth after a sprint delete returns its stories.
+        void reloadLoadedUserstories();
         void reloadStats(pid);
         // displayVelocity is EPHEMERAL (M5): reset in-memory only, never persist.
         setDisplayVelocity((v) => (v ? false : v));
-    }, [loadSprints, loadClosedSprints, loadUserstories, reloadStats]);
+    }, [loadSprints, loadClosedSprints, reloadLoadedUserstories, reloadStats]);
 
     /* --------------------------------------------------------------------- *
      * Toggles + search
@@ -2122,32 +2660,16 @@ export function useBacklogStories(context: MountContext): BacklogVM {
      * the exposed `userstories` here only affects what the table renders.
      * --------------------------------------------------------------------- */
     const visibleUserstories = useMemo<UserStory[]>(() => {
-        const all = state.userstories;
         if (!displayVelocity) {
-            return all;
+            return state.userstories;
         }
-        const speed = stats?.speed ?? 0;
-        if (!(speed > 0)) {
-            return all;
-        }
-        let backlogPointsSum = 0;
-        const openSprints = state.sprints;
-        if (openSprints.length > 0) {
-            const firstPoints = openSprints[0].total_points ?? 0;
-            // Legacy: if the first sprint already exceeds the velocity we forecast
-            // a NEW sprint (restart the sum); otherwise the backlog tops up the
-            // CURRENT sprint on top of its existing points.
-            backlogPointsSum = firstPoints > speed ? 0 : firstPoints;
-        }
-        const forecasted: UserStory[] = [];
-        for (const us of all) {
-            backlogPointsSum += us.total_points ?? 0;
-            forecasted.push(us);
-            if (backlogPointsSum > speed) {
-                break;
-            }
-        }
-        return forecasted;
+        // Same projection the forecast add-sprint action moves (M3) — via the
+        // shared `computeForecastedStories` helper so the two never diverge.
+        return computeForecastedStories(
+            state.userstories,
+            state.sprints,
+            stats?.speed ?? 0,
+        );
     }, [displayVelocity, state.userstories, state.sprints, stats]);
 
     /* --------------------------------------------------------------------- *
@@ -2159,6 +2681,7 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         loading,
         errorMessage,
         savingUs,
+        editLoading,
         project,
         projectId,
         // The VISIBLE projection: identical to the fetched list unless velocity
@@ -2171,6 +2694,8 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         totalMilestones,
         totalClosedMilestones,
         totalUserStories,
+        hasMoreUserstories,
+        loadingMore,
         currentSprint,
         stats,
         showGraphPlaceholder,
@@ -2191,6 +2716,7 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         hasPermission,
         isBacklogActivated,
         loadUserstories,
+        loadMoreUserstories,
         changeQ,
         addFilter,
         removeFilter,
@@ -2207,6 +2733,10 @@ export function useBacklogStories(context: MountContext): BacklogVM {
         updateUserStoryStatus,
         updateUserStoryPoints,
         deleteUserStory,
+        pendingDelete,
+        deleteBusy,
+        confirmDelete,
+        cancelDelete,
         addNewUs,
         editUserStory,
         activeLightbox,

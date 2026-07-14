@@ -18,7 +18,7 @@
  *
  * They exercise the file's Phase A (compile/types — implicitly, via ts-jest),
  * Phase B (DOM / e2e selector parity) and Phase C (behaviour) validation
- * checklists and every branch of `KanbanBoard.tsx` (module-disabled guard,
+ * checklists and every branch of `KanbanBoard.tsx` (module-activation guard,
  * loading vs. loaded, filter open/closed, swimlane vs. non-swimlane, the
  * swimlane-add gate across its three conditions, the permission gate on
  * add/bulk, all four lightbox states, the drag-end wiring, and the
@@ -130,7 +130,7 @@ jest.mock("./StatusColumn", () => {
       minimized?: boolean;
     }) =>
       react.createElement("div", {
-        className: "kanban-uses-box taskboard-column task-column mock-status-column",
+        className: "kanban-uses-box taskboard-column mock-status-column",
         "data-testid": "status-column",
         "data-status-id": String(props.status.id),
         "data-story-ids": (props.storyIds || []).join(","),
@@ -291,10 +291,14 @@ function makeKb(overrides: ProjectOverrides = {}) {
     addNewUs: jest.fn(),
     editUs: jest.fn(),
     deleteUs: jest.fn(),
+    // C7: delete-confirmation surface (closed by default in the fixture).
+    pendingDelete: null,
+    deleteBusy: false,
+    confirmDelete: jest.fn(),
+    cancelDelete: jest.fn(),
     changeUsAssignedUsers: jest.fn(),
     moveToTopDropdown: jest.fn(),
     toggleSelectedUs: jest.fn(),
-    editWipLimit: jest.fn(),
     showArchivedStatus: jest.fn(),
     setColumnMode: jest.fn(),
     isMaximized: jest.fn(() => false),
@@ -354,13 +358,22 @@ afterEach(() => {
 /* -------------------------------------------------------------------------- */
 
 describe("KanbanBoard — module activation + loading", () => {
-  it("renders a minimal disabled placeholder when the kanban module is deactivated", () => {
+  it("renders the authoritative permission-denied page when the kanban module is deactivated (M5)", () => {
     mockedUseKanbanStories.mockReturnValue(
       makeKb({ project: makeProject({ is_kanban_activated: false }) }),
     );
     const { container } = renderBoard();
 
-    expect(container.querySelector(".module-disabled")).toBeInTheDocument();
+    // M5: reproduce the legacy permission-denied.jade DOM (`.error-main`) with
+    // the exact legacy i18n keys resolved through `t()` (English in tests).
+    const errorMain = container.querySelector(".error-main");
+    expect(errorMain).toBeInTheDocument();
+    expect(errorMain?.querySelector("h1.logo")?.textContent).toBe(
+      "Permission denied",
+    );
+    expect(errorMain?.querySelector("p")?.textContent).toBe(
+      "You don't have permission to access this page.",
+    );
     // No board, no lightbox hosts in the disabled placeholder branch.
     expect(container.querySelector(".kanban-table")).not.toBeInTheDocument();
     expect(container.querySelector("[tg-lb-create-edit-userstory]")).not.toBeInTheDocument();
@@ -383,6 +396,53 @@ describe("KanbanBoard — module activation + loading", () => {
 
     expect(container.querySelector(".kanban-table")).not.toBeInTheDocument();
     expect(container.querySelector(".kanban-table-loading")).toBeInTheDocument();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Phase B — C7 delete confirmation modal                                      */
+/* -------------------------------------------------------------------------- */
+
+describe("KanbanBoard — C7 delete confirmation modal", () => {
+  it("keeps the delete-confirm lightbox host present but CLOSED when there is no pending delete", () => {
+    const { container } = renderBoard();
+    const host = container.querySelector(".lightbox-generic-delete");
+    // The shared Lightbox host is always mounted (marker attr resolves) ...
+    expect(host).toBeInTheDocument();
+    expect(host).toHaveAttribute("tg-lb-generic-delete");
+    // ... but it is NOT open, and the confirm/cancel controls (content renders
+    // only while open) are absent.
+    expect(host).not.toHaveClass("open");
+    expect(container.querySelector(".lightbox-generic-delete .js-confirm")).toBeNull();
+  });
+
+  it("opens the localized modal with the subject and wires confirm/cancel when a delete is pending", () => {
+    const confirmDelete = jest.fn();
+    const cancelDelete = jest.fn();
+    mockedUseKanbanStories.mockReturnValue(
+      makeKb({
+        pendingDelete: { target: 101, subject: "Delete this US" },
+        confirmDelete,
+        cancelDelete,
+      }),
+    );
+    const { container } = renderBoard();
+
+    const host = container.querySelector(".lightbox-generic-delete");
+    expect(host).toHaveClass("open");
+    // Legacy DOM: h2.title + span.subtitle + span.message (the subject).
+    expect(container.querySelector(".lightbox-generic-delete .title")?.textContent).toBe(
+      "Delete user story",
+    );
+    expect(container.querySelector(".lightbox-generic-delete .message")?.textContent).toBe(
+      "Delete this US",
+    );
+
+    fireEvent.click(container.querySelector(".lightbox-generic-delete .js-confirm")!);
+    expect(confirmDelete).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(container.querySelector(".lightbox-generic-delete .js-cancel")!);
+    expect(cancelDelete).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -606,6 +666,15 @@ describe("KanbanBoard — header row + options ordering", () => {
     expect(optionEls[0].querySelector("tg-svg > svg.icon.icon-add")).toBeInTheDocument();
     expect(optionEls[1].querySelector("tg-svg")).toBeInTheDocument();
     expect(optionEls[1].querySelector("tg-svg > svg.icon.icon-bulk")).toBeInTheDocument();
+    // M15: the authoritative `tg-svg.add-action` / `tg-svg.bulk-action` wrapper
+    // modifier classes (`kanban-table.jade` L37,L46) must render as REAL `class`
+    // attributes on the `<tg-svg>` element — `.add-action` is styled by the
+    // unchanged `kanban-table.scss` (fill + right margin). React 18 renders a
+    // `className` prop on a custom element as the literal `classname` attribute,
+    // so the source passes the `class` prop; assert the wrappers are selectable
+    // by their real class (they would NOT be if the quirk regressed).
+    expect(optionEls[0].querySelector("tg-svg.add-action")).toBeInTheDocument();
+    expect(optionEls[1].querySelector("tg-svg.bulk-action")).toBeInTheDocument();
   });
 
   it("hides the add + bulk buttons when the add_us permission is absent", () => {
@@ -848,7 +917,17 @@ describe("KanbanBoard — story lightboxes (C2 real integration)", () => {
     );
     expect(kb.submitEditUs).not.toHaveBeenCalled();
 
+    // M1: the form is now DIRTY (subject was typed and the board never clears
+    // it before persistence), so the close affordances route through the
+    // localized dirty-close confirm (reproducing the legacy
+    // `CreateEditDirective.checkClose` -> `$confirm.ask(CONFIRM_CLOSE)`). Cancel
+    // opens the ask dialog rather than closing immediately.
     fireEvent.click(host.querySelector("button.cancel") as Element);
+    expect(kb.closeLightbox).not.toHaveBeenCalled();
+    const ask = container.querySelector("[tg-lb-generic-ask]") as HTMLElement;
+    expect(ask).toHaveClass("open");
+    // Confirming the discard performs the actual close.
+    fireEvent.click(ask.querySelector(".js-confirm") as Element);
     expect(kb.closeLightbox).toHaveBeenCalledTimes(1);
   });
 

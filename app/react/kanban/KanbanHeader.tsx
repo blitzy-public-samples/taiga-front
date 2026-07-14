@@ -48,6 +48,12 @@
 import type * as React from "react";
 import { useEffect, useState } from "react";
 
+// M5: resolve visible text through the shared i18n resolver at RENDER time so
+// the active-language bundle (loaded at runtime by `localeBridge.ts`) is used.
+// These MUST be called inside the component (not at module scope) so a language
+// switch re-renders the resolved strings.
+import { t } from "../shared/i18n/translate";
+
 /**
  * Custom-element JSX typing. AngularJS custom elements (`tg-*`) that this
  * component emits are unknown to React's intrinsic element table, so we augment
@@ -73,8 +79,13 @@ declare global {
  */
 function Icon(props: { name: string; className?: string; fill?: string; title?: string }) {
   const { name, className, fill, title } = props;
+  // `class` (not `className`) is intentional: React 18 renders `className`
+  // on a hyphenated custom element (`tg-svg`) as the literal `classname`
+  // attribute, which would break the unchanged SCSS that styles the wrapper
+  // (e.g. `.add-action`, `.fold-action`, `.default-swimlane-icon`). The
+  // literal `class` prop is passed through verbatim as the real attribute.
   return (
-    <tg-svg className={className}>
+    <tg-svg class={className}>
       <svg className={`icon ${name}`} style={fill ? { fill } : undefined}>
         <use xlinkHref={`#${name}`}>{title ? <title>{title}</title> : null}</use>
       </svg>
@@ -83,24 +94,15 @@ function Icon(props: { name: string; className?: string; fill?: string; title?: 
 }
 
 /**
- * Zoom radio labels, in ascending zoom order (index 0..3). Sourced from the
- * `ZOOM.ZOOM-1..4` keys of `app/locales/taiga/locale-en.json` so the visible text
- * matches the AngularJS `board-zoom.jade` output for pixel parity. The four
- * entries correspond exactly to the four `value="0".."3"` radios of the legacy
- * template.
+ * The Kanban zoom radios (index 0..3) map to the `ZOOM.ZOOM-1..4` keys and the
+ * title to `ZOOM.TITLE`; the filter/search affordances map to
+ * `BACKLOG.FILTERS.{TITLE,HIDE_TITLE}` and
+ * `COMMON.FILTERS.{INPUT_PLACEHOLDER,APPLIED_FILTERS_NUM}` — the EXACT keys the
+ * legacy `kanban.jade` (L18-60) and `board-zoom.jade` referenced. They are
+ * resolved via `t(...)` INSIDE the component render (M5) rather than captured in
+ * module-scope constants, so a runtime language switch produces the correct
+ * localized text instead of frozen English.
  */
-const ZOOM_LABELS: readonly string[] = ["Compact", "Default", "Detailed", "Expanded"];
-
-/** `ZOOM.TITLE` from locale-en.json. */
-const ZOOM_TITLE = "Zoom:";
-/** `COMMON.FILTERS.INPUT_PLACEHOLDER` from locale-en.json. */
-const SEARCH_PLACEHOLDER = "subject or reference";
-/** `COMMON.FILTERS.APPLIED_FILTERS_NUM` from locale-en.json (suffix of the button title). */
-const APPLIED_FILTERS_SUFFIX = "filters applied";
-/** `BACKLOG.FILTERS.TITLE` from locale-en.json. */
-const FILTER_TITLE = "Filters";
-/** `BACKLOG.FILTERS.HIDE_TITLE` from locale-en.json. */
-const FILTER_HIDE_TITLE = "Hide filters";
 
 /**
  * Props contract for {@link KanbanHeader}.
@@ -174,13 +176,23 @@ export function KanbanHeader(props: KanbanHeaderProps) {
   // while the filter panel is open (mirrors `ng-class="{active: ctrl.openFilter}"`).
   const filterButtonClassName = `btn-filter e2e-open-filter${openFilter ? " active" : ""}`;
 
+  // M5: zoom radio labels resolved at render time (index 0..3 -> ZOOM.ZOOM-1..4),
+  // so a runtime language switch localizes them. Order matches the four
+  // `value="0".."3"` radios of the legacy `board-zoom.jade`.
+  const zoomLabels: readonly string[] = [
+    t("ZOOM.ZOOM-1"),
+    t("ZOOM.ZOOM-2"),
+    t("ZOOM.ZOOM-3"),
+    t("ZOOM.ZOOM-4"),
+  ];
+
   return (
     <div className="taskboard-actions">
       <div className="kanban-table-options-start">
         <button
           type="button"
           className={filterButtonClassName}
-          title={`${selectedFiltersCount} ${APPLIED_FILTERS_SUFFIX}`}
+          title={`${selectedFiltersCount} ${t("COMMON.FILTERS.APPLIED_FILTERS_NUM")}`}
           onClick={onToggleFilter}
         >
           <Icon name="icon-filters" />
@@ -188,7 +200,7 @@ export function KanbanHeader(props: KanbanHeaderProps) {
             Legacy renders two mutually-exclusive `span.text` via ng-if; a single
             span whose content swaps on `openFilter` is DOM-equivalent for styling.
           */}
-          <span className="text">{openFilter ? FILTER_HIDE_TITLE : FILTER_TITLE}</span>
+          <span className="text">{openFilter ? t("BACKLOG.FILTERS.HIDE_TITLE") : t("BACKLOG.FILTERS.TITLE")}</span>
           {selectedFiltersCount > 0 ? (
             <span className="selected-filters">{selectedFiltersCount}</span>
           ) : null}
@@ -202,7 +214,8 @@ export function KanbanHeader(props: KanbanHeaderProps) {
         <tg-input-search>
           <input
             type="search"
-            placeholder={SEARCH_PLACEHOLDER}
+            placeholder={t("COMMON.FILTERS.INPUT_PLACEHOLDER")}
+            aria-label={t("COMMON.FILTERS.INPUT_PLACEHOLDER")}
             value={searchText}
             onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
               handleSearchChange(event.target.value)
@@ -229,13 +242,14 @@ export function KanbanHeader(props: KanbanHeaderProps) {
           `className`.
         */}
         <tg-board-zoom class="board-zoom">
-          <div className="board-zoom-title">{ZOOM_TITLE}</div>
-          {ZOOM_LABELS.map((label, index) => (
+          <div className="board-zoom-title">{t("ZOOM.TITLE")}</div>
+          {zoomLabels.map((label, index) => (
             <label className="zoom-radio" key={index} title={label}>
               <input
                 type="radio"
                 name="kanban-zoom"
                 value={index}
+                aria-label={label}
                 checked={zoomLevel === index}
                 onChange={() => onSetZoom(index)}
               />

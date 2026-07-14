@@ -377,5 +377,61 @@ describe("http.request — token recovery (C3)", () => {
     });
 });
 
+
+describe("http.request — multipart FormData (M1 attachment uploads)", () => {
+    const fetchMock = jest.fn();
+
+    beforeEach(() => {
+        fetchMock.mockReset();
+        global.fetch = fetchMock as unknown as typeof fetch;
+        localStorage.clear();
+        localStorage.setItem("token", JSON.stringify("test-token-value"));
+    });
+
+    afterEach(() => localStorage.clear());
+
+    const lastInit = (): RequestInit => {
+        const { calls } = fetchMock.mock;
+        const [, init] = calls[calls.length - 1] as [string, RequestInit];
+        return init;
+    };
+    const lastHeaders = (): Record<string, string> =>
+        (lastInit().headers ?? {}) as Record<string, string>;
+
+    it("sends the FormData instance verbatim and DROPS Content-Type (browser sets the boundary)", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({ id: 7 }, 201));
+
+        const form = new FormData();
+        form.append("attached_file", new File(["x"], "a.txt", { type: "text/plain" }));
+
+        await request(baseContext, "POST", "http://localhost:8000/api/v1/userstories/attachments", {
+            formData: form,
+        });
+
+        // The exact FormData object is forwarded (no JSON.stringify).
+        expect(lastInit().body).toBe(form);
+        // Content-Type is removed so fetch can inject the multipart boundary.
+        expect(lastHeaders()["Content-Type"]).toBeUndefined();
+        // Trusted transport headers survive.
+        expect(lastHeaders().Authorization).toBe("Bearer test-token-value");
+        expect(lastHeaders()["X-Session-Id"]).toBe("test-session-id");
+    });
+
+    it("prefers formData over a JSON body when both are (mis)supplied", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({ id: 8 }, 201));
+
+        const form = new FormData();
+        form.append("k", "v");
+
+        await request(baseContext, "POST", "http://localhost:8000/api/v1/userstories/attachments", {
+            formData: form,
+            body: { should: "be ignored" },
+        });
+
+        expect(lastInit().body).toBe(form);
+        expect(lastHeaders()["Content-Type"]).toBeUndefined();
+    });
+});
+
 /** True when a fetch call URL targets the refresh endpoint. */
 const isRefreshCall = (url: string): boolean => url.indexOf("/auth/refresh") !== -1;

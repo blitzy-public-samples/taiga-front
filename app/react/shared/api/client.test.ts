@@ -120,6 +120,10 @@ describe("urls.resolveUrl", () => {
                 "refresh",
                 "resolver",
                 "swimlanes",
+                // Frozen `/userstories/attachments` endpoint (C6: fetch story
+                // detail + attachments before edit) — mirrors resources.coffee
+                // "attachments/us", contract-preserving.
+                "us-attachments",
                 "user-storage",
                 "userstories",
                 "userstories-filters",
@@ -261,6 +265,65 @@ describe("apiClient endpoints", () => {
         expect(url).toBe("http://localhost:8000/api/v1/userstory-statuses/7");
         expect(init.method).toBe("PATCH");
         expect(lastBody()).toEqual({ wip_limit: 5 });
+    });
+
+    it("getUserStory GETs /userstories/{id}?project=<pid> (authoritative detail, C6)", async () => {
+        fetchMock.mockResolvedValueOnce(
+            mockResponse({ id: 42, subject: "s", description: "real content", version: 3 }),
+        );
+        const client = createApiClient(baseContext);
+        const us = await client.getUserStory(3, 42);
+        const [url, init] = lastCall();
+        expect(url).toBe("http://localhost:8000/api/v1/userstories/42?project=3");
+        expect(init.method ?? "GET").toBe("GET");
+        expect(us.description).toBe("real content");
+        expect(us.version).toBe(3);
+    });
+
+    it("listUserStoryAttachments GETs /userstories/attachments?object_id&project (C6)", async () => {
+        fetchMock.mockResolvedValueOnce(
+            mockResponse([{ id: 1, name: "a.png", url: "http://x/a.png" }]),
+        );
+        const client = createApiClient(baseContext);
+        const attachments = await client.listUserStoryAttachments(3, 42);
+        const [url, init] = lastCall();
+        expect(url).toBe("http://localhost:8000/api/v1/userstories/attachments?object_id=42&project=3");
+        expect(init.method ?? "GET").toBe("GET");
+        expect(attachments).toHaveLength(1);
+        expect(attachments[0].name).toBe("a.png");
+    });
+
+    it("createUserStoryAttachment POSTs multipart FormData to /userstories/attachments (M1)", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse({ id: 9, name: "up.txt" }));
+        const client = createApiClient(baseContext);
+        const file = new File(["hello"], "up.txt", { type: "text/plain" });
+        const created = await client.createUserStoryAttachment(3, 42, file);
+
+        const [url, init] = lastCall();
+        expect(url).toBe("http://localhost:8000/api/v1/userstories/attachments");
+        expect(init.method).toBe("POST");
+
+        // The body is a raw FormData (never JSON) carrying the frozen field names.
+        const form = init.body as unknown as FormData;
+        expect(form).toBeInstanceOf(FormData);
+        expect(form.get("project")).toBe("3");
+        expect(form.get("object_id")).toBe("42");
+        expect(form.get("from_comment")).toBe("false");
+        expect(form.get("attached_file")).toBe(file);
+
+        // Content-Type is dropped so fetch injects the multipart boundary.
+        expect(lastHeaders()["Content-Type"]).toBeUndefined();
+        expect(created.id).toBe(9);
+    });
+
+    it("deleteUserStoryAttachment DELETEs /userstories/attachments/{id} (M1)", async () => {
+        fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status: 204 }));
+        const client = createApiClient(baseContext);
+        await client.deleteUserStoryAttachment(9);
+
+        const [url, init] = lastCall();
+        expect(url).toBe("http://localhost:8000/api/v1/userstories/attachments/9");
+        expect(init.method).toBe("DELETE");
     });
 
     it("listMilestones parses the Taiga-Info total headers", async () => {

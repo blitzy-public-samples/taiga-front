@@ -6,7 +6,13 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { t, setTranslations, hasTranslation } from "./translate";
+import {
+    t,
+    setTranslations,
+    hasTranslation,
+    subscribeToTranslations,
+    getTranslationsVersion,
+} from "./translate";
 
 describe("shared/i18n/translate", () => {
     // Restore the bundled English table after any test that overrides it.
@@ -51,5 +57,48 @@ describe("shared/i18n/translate", () => {
     it("leaves unknown tokens untouched", () => {
         setTranslations({ X: { Y: "{{ known }} {{ unknown }}" } } as never);
         expect(t("X.Y", { known: "A" })).toBe("A {{ unknown }}");
+    });
+});
+
+describe("shared/i18n/translate — change subscription (M5)", () => {
+    const RESTORE = { KANBAN: { SECTION_NAME: "Kanban" } };
+    afterEach(() => {
+        setTranslations(RESTORE as never);
+    });
+
+    it("notifies subscribers and bumps the version when the table is swapped", () => {
+        const listener = jest.fn();
+        const before = getTranslationsVersion();
+        const unsubscribe = subscribeToTranslations(listener);
+
+        setTranslations({ X: { Y: "hi" } } as never);
+
+        expect(listener).toHaveBeenCalledTimes(1);
+        expect(getTranslationsVersion()).toBe(before + 1);
+        unsubscribe();
+    });
+
+    it("stops notifying after unsubscribe", () => {
+        const listener = jest.fn();
+        const unsubscribe = subscribeToTranslations(listener);
+        unsubscribe();
+
+        setTranslations({ X: { Y: "hi" } } as never);
+
+        expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("supports multiple independent subscribers", () => {
+        const a = jest.fn();
+        const b = jest.fn();
+        const unsubA = subscribeToTranslations(a);
+        const unsubB = subscribeToTranslations(b);
+
+        setTranslations({ X: { Y: "hi" } } as never);
+
+        expect(a).toHaveBeenCalledTimes(1);
+        expect(b).toHaveBeenCalledTimes(1);
+        unsubA();
+        unsubB();
     });
 });

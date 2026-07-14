@@ -25,7 +25,7 @@
  *     modal itself (form state, validation) is covered by its own suite.
  *   - `BacklogRow`, `SprintList`/`Sprint`/`SprintHeader` and `BurndownSummary`
  *     are kept REAL so the container's composition is genuinely exercised: the
- *     `.backlog-table-body > div[ng-repeat]` rows, the `<aside>` sidebar
+ *     `.backlog-table-body > div[ng-repeat]` rows, the `<sidebar>` sidebar
  *     `div[tg-backlog-sprint="sprint"]` cards, and the `.summary .data .number`
  *     burndown figure are the ACTUAL child output, not stand-ins.
  *   - `@dnd-kit` is left REAL. Its `DndContext`/`SortableContext`/`useSortable`/
@@ -46,6 +46,7 @@
  */
 
 import { render, fireEvent } from "@testing-library/react";
+import { PointerSensor, KeyboardSensor } from "@dnd-kit/core";
 import { Backlog } from "./Backlog";
 import { useBacklogStories } from "./hooks/useBacklogStories";
 import type { BacklogVM } from "./hooks/useBacklogStories";
@@ -143,6 +144,13 @@ jest.mock("../shared/lightboxes", () => {
 // end-to-end. The wrapper still renders the real context, so the existing
 // DOM-only tests are unaffected.
 let mockCapturedOnDragEnd: ((event: unknown) => void) | undefined;
+// M18: also capture the FULL props handed to `DndContext` so the keyboard-DnD
+// tests can assert the registered sensors (Pointer + Keyboard) and the
+// screen-reader `accessibility.announcements`. `useSensor`/`useSensors` stay
+// REAL, so `props.sensors` is the genuine `SensorDescriptor[]` whose entries
+// expose `.sensor` (the sensor class) — no need to mock the sensor factories.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let mockCapturedDndProps: any;
 jest.mock("@dnd-kit/core", () => {
   const actual = jest.requireActual("@dnd-kit/core");
   const ActualDndContext = actual.DndContext;
@@ -151,6 +159,7 @@ jest.mock("@dnd-kit/core", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     DndContext: (props: any) => {
       mockCapturedOnDragEnd = props.onDragEnd;
+      mockCapturedDndProps = props;
       return <ActualDndContext {...props} />;
     },
   };
@@ -204,6 +213,7 @@ function makeVM() {
     loading: false,
     errorMessage: null,
     savingUs: false,
+    editLoading: false,
     project: {
       id: 7,
       slug: "proj",
@@ -244,6 +254,8 @@ function makeVM() {
     totalMilestones: 1,
     totalClosedMilestones: 0,
     totalUserStories: 2,
+    hasMoreUserstories: false,
+    loadingMore: false,
     currentSprint: null,
     stats: {
       total_points: 100,
@@ -274,6 +286,7 @@ function makeVM() {
     hasPermission: jest.fn((perm: string) => vm.project.my_permissions.includes(perm)),
     isBacklogActivated: true,
     loadUserstories: jest.fn(),
+    loadMoreUserstories: jest.fn(),
     changeQ: jest.fn(),
     addFilter: jest.fn(),
     removeFilter: jest.fn(),
@@ -290,6 +303,11 @@ function makeVM() {
     updateUserStoryStatus: jest.fn(),
     updateUserStoryPoints: jest.fn(),
     deleteUserStory: jest.fn(),
+    // C7: delete-confirmation surface (closed by default in the fixture).
+    pendingDelete: null,
+    deleteBusy: false,
+    confirmDelete: jest.fn(),
+    cancelDelete: jest.fn(),
     addNewUs: jest.fn(),
     editUserStory: jest.fn(),
     closeLightbox: jest.fn(),
@@ -330,6 +348,25 @@ afterEach(() => {
   __resetPopoverRegistry();
 });
 
+// React 18 warns EXACTLY ONCE per unrecognized hyphen-less tag name per module
+// lifetime (`Warning: The tag <sidebar> is unrecognized in this browser.`). The
+// board reproduces the AUTHORITATIVE non-standard `<sidebar>` element from
+// `backlog.jade` verbatim for DOM parity (review finding M15); that dev-only
+// warning is stripped from the production (NODE_ENV=production) bundle. Prime
+// React's dedup cache here — with `console.error` silenced — so the one warning
+// is emitted (and swallowed) BEFORE the M10 fail-on-console guard installs its
+// per-test recorder, keeping every test order-independent.
+beforeAll(() => {
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    const { unmount } = render(<sidebar className="sidebar" />);
+    unmount();
+  } finally {
+    console.error = originalError;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -340,14 +377,78 @@ describe("Backlog — root shell", () => {
 
     expect(container.querySelector("main.main.scrum")).toBeInTheDocument();
     expect(container.querySelector("section.backlog")).toBeInTheDocument();
-    // M7: the legacy non-standard `<sidebar>` tag (a React "unrecognized tag"
-    // warning) is emitted as the semantic HTML5 `<aside class="sidebar">`, which
-    // carries the same `.sidebar` class the theme targets AND exposes a
-    // `complementary` landmark. There must be NO invalid `<sidebar>` element.
-    expect(container.querySelector("sidebar")).toBeNull();
-    const sidebar = container.querySelector("aside.sidebar");
+    // M15: the sprint sidebar reproduces the AUTHORITATIVE non-standard
+    // `<sidebar class="sidebar">` element from `backlog.jade` L193
+    // (`sidebar.sidebar`) verbatim — NOT a substituted `<aside>`. The browser
+    // upgrades the unknown tag to an inert `HTMLUnknownElement`, exactly as
+    // AngularJS rendered it, and the `.sidebar` theme applies unchanged.
+    expect(container.querySelector("aside")).toBeNull();
+    const sidebar = container.querySelector("sidebar.sidebar");
     expect(sidebar).toBeInTheDocument();
-    expect(sidebar?.tagName).toBe("ASIDE");
+    expect(sidebar?.tagName).toBe("SIDEBAR");
+  });
+});
+
+describe("Backlog — module-activation guard (C5)", () => {
+  it("renders the authoritative permission-denied page (NOT the board) when is_backlog_activated is false (C5, M5)", () => {
+    vm.project.is_backlog_activated = false;
+    const { container } = renderBacklog();
+
+    // M5: the deactivated branch reproduces the legacy permission-denied.jade
+    // DOM (`.error-main > .error-container`, a real not-found.scss class) with
+    // the EXACT legacy i18n keys resolved through `t()` (English in tests).
+    const errorMain = container.querySelector(".error-main");
+    expect(errorMain).toBeInTheDocument();
+    expect(errorMain?.querySelector("h1.logo")?.textContent).toBe(
+      "Permission denied",
+    );
+    expect(errorMain?.querySelector("p")?.textContent).toBe(
+      "You don't have permission to access this page.",
+    );
+    expect(errorMain?.querySelector("a")?.textContent?.trim()).toBe(
+      "Take me home",
+    );
+    // ...and the actual board / sprint sidebar are NOT rendered (fail-closed
+    // view; the hook also fetches nothing when the module is off).
+    expect(container.querySelector("section.backlog")).toBeNull();
+    expect(container.querySelector("aside.sidebar")).toBeNull();
+  });
+
+  it("renders the full board when is_backlog_activated is true (positive control)", () => {
+    const { container } = renderBacklog();
+    expect(container.querySelector(".error-main")).toBeNull();
+    expect(container.querySelector("section.backlog")).toBeInTheDocument();
+  });
+});
+
+describe("Backlog — C7 delete confirmation modal", () => {
+  it("keeps the delete-confirm lightbox host present but CLOSED with no pending delete", () => {
+    const { container } = renderBacklog();
+    const host = container.querySelector(".lightbox-generic-delete");
+    expect(host).toBeInTheDocument();
+    expect(host).toHaveAttribute("tg-lb-generic-delete");
+    expect(host).not.toHaveClass("open");
+    expect(container.querySelector(".lightbox-generic-delete .js-confirm")).toBeNull();
+  });
+
+  it("opens the localized modal with the subject and wires confirm/cancel when a delete is pending", () => {
+    vm.pendingDelete = { target: { id: 101, subject: "Backlog US to delete" }, subject: "Backlog US to delete" };
+    const { container } = renderBacklog();
+
+    const host = container.querySelector(".lightbox-generic-delete");
+    expect(host).toHaveClass("open");
+    expect(container.querySelector(".lightbox-generic-delete .title")?.textContent).toBe(
+      "Delete user story",
+    );
+    expect(container.querySelector(".lightbox-generic-delete .message")?.textContent).toBe(
+      "Backlog US to delete",
+    );
+
+    fireEvent.click(container.querySelector(".lightbox-generic-delete .js-confirm")!);
+    expect(vm.confirmDelete).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(container.querySelector(".lightbox-generic-delete .js-cancel")!);
+    expect(vm.cancelDelete).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -650,6 +751,24 @@ describe("Backlog — M2 user-visible error + pending surface", () => {
     const region = container.querySelector(".backlog-board-status");
     expect(region).toBeInTheDocument();
     expect(region?.textContent).toBe("");
+  });
+
+  it("surfaces a localized loading status in the board-status region while the edit detail is fetching (C6)", () => {
+    // editLoading takes precedence over any stale error so the edit never
+    // appears to hang and never opens a blank form.
+    vm.editLoading = true;
+    vm.errorMessage = "some stale error";
+
+    const { container } = renderBacklog();
+
+    const region = container.querySelector(".backlog-board-status");
+    expect(region).toBeInTheDocument();
+    expect(region).toHaveAttribute("role", "status");
+    const spinner = region?.querySelector(".loading-spinner[data-type='loading']");
+    expect(spinner).toBeInTheDocument();
+    expect(spinner).toHaveTextContent(t("COMMON.LOADING"));
+    // The stale error text is NOT shown while loading.
+    expect(region?.textContent).not.toContain("stale error");
   });
 
   it("marks the main region aria-busy while a story delete is in flight (savingUs)", () => {
@@ -1261,5 +1380,236 @@ describe("Backlog — shift-range multiselect (M4)", () => {
     fireEvent.click(container.querySelector("input#us-check-2")!, { shiftKey: true });
     expect(vm.toggleSelectedUs).toHaveBeenCalledTimes(1);
     expect(vm.toggleSelectedUs).toHaveBeenCalledWith(vm.userstories[1], true);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// M20 — readable loading status (role=status / aria-live), initial + incremental
+// ---------------------------------------------------------------------------
+describe("Backlog — loading status (M20)", () => {
+  it("announces a localized initial-load status instead of a silent empty shell", () => {
+    // Cold load: project not yet resolved, no error.
+    vm.project = null;
+    vm.loading = true;
+    vm.errorMessage = null;
+    const { container } = renderBacklog();
+
+    const status = container.querySelector(".backlog-table-loading");
+    expect(status).not.toBeNull();
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    // Localized text (t() returns the key when translations are not loaded).
+    expect(status).toHaveTextContent(t("COMMON.LOADING"));
+  });
+
+  it("does not render the loading status once the project has resolved (only the error, if any)", () => {
+    vm.project = null;
+    vm.loading = false;
+    vm.errorMessage = "Boom";
+    const { container } = renderBacklog();
+    // With an error and no project, the alert region is shown, NOT the loader.
+    expect(container.querySelector(".backlog-table-loading")).toBeNull();
+    const alert = container.querySelector(".backlog-board-status[role='alert']");
+    expect(alert).not.toBeNull();
+  });
+
+  it("announces a localized incremental-fetch status with role=status", () => {
+    // Project resolved AND an in-flight incremental (append) page fetch. The
+    // `.backlog-table-loading-more` region is the infinite-scroll spinner and is
+    // driven by `loadingMore` (NOT the initial-load `loading`), matching the
+    // legacy `tg-loading="ctrl.loadingUserstories"` inside `.backlog-table-body`.
+    vm.loadingMore = true;
+    const { container } = renderBacklog();
+    const more = container.querySelector(".backlog-table-loading-more");
+    expect(more).not.toBeNull();
+    expect(more).toHaveAttribute("role", "status");
+    expect(more).toHaveAttribute("aria-live", "polite");
+    expect(more).toHaveTextContent(t("COMMON.LOADING"));
+  });
+
+  it("leaves the incremental-fetch region empty (no text) when idle", () => {
+    vm.loadingMore = false;
+    const { container } = renderBacklog();
+    const more = container.querySelector(".backlog-table-loading-more");
+    expect(more).not.toBeNull();
+    expect(more).toHaveTextContent("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2 — infinite-scroll pagination trigger (window scroll -> append next page)
+// ---------------------------------------------------------------------------
+describe("Backlog — infinite-scroll pagination (M2)", () => {
+  // jsdom performs no layout, so `document.documentElement.scrollHeight` is 0
+  // while `window.innerHeight` defaults to 768; the "near the bottom"
+  // arithmetic (`scrollTop + viewport >= scrollHeight - threshold`) is
+  // therefore trivially satisfied. That lets these tests exercise the GUARD
+  // flags (hasMoreUserstories / loadingMore / loading) that gate the append
+  // fetch — precisely the legacy `infinite-scroll-disabled="ctrl.disablePagination
+  // || !ctrl.firstLoadComplete"` semantics.
+  it("loads the next page on window scroll when another page is available", () => {
+    vm.hasMoreUserstories = true;
+    vm.loadingMore = false;
+    vm.loading = false;
+    renderBacklog();
+    // No fetch on mount (legacy `infinite-scroll-immediate-check='false'`).
+    expect(vm.loadMoreUserstories).not.toHaveBeenCalled();
+    fireEvent.scroll(window);
+    expect(vm.loadMoreUserstories).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT load more when there is no next page (hasMoreUserstories=false)", () => {
+    vm.hasMoreUserstories = false;
+    renderBacklog();
+    fireEvent.scroll(window);
+    expect(vm.loadMoreUserstories).not.toHaveBeenCalled();
+  });
+
+  it("does NOT load more while an append is already in flight (loadingMore=true)", () => {
+    vm.hasMoreUserstories = true;
+    vm.loadingMore = true;
+    renderBacklog();
+    fireEvent.scroll(window);
+    expect(vm.loadMoreUserstories).not.toHaveBeenCalled();
+  });
+
+  it("does NOT load more while the INITIAL load is still running (loading=true)", () => {
+    // Mirrors legacy `!ctrl.firstLoadComplete`: the initial page must resolve
+    // before infinite scroll may request page 2.
+    vm.hasMoreUserstories = true;
+    vm.loading = true;
+    renderBacklog();
+    fireEvent.scroll(window);
+    expect(vm.loadMoreUserstories).not.toHaveBeenCalled();
+  });
+
+  it("removes the window scroll listener on unmount (no post-unmount fetch)", () => {
+    vm.hasMoreUserstories = true;
+    const { unmount } = renderBacklog();
+    unmount();
+    fireEvent.scroll(window);
+    expect(vm.loadMoreUserstories).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M19 — accessible names for search, drag handles, checkboxes, options triggers
+// ---------------------------------------------------------------------------
+describe("Backlog — accessible names (M19)", () => {
+  it("gives the filter search box a localized placeholder AND accessible name", () => {
+    const { container } = renderBacklog();
+    const search = container.querySelector<HTMLInputElement>("input[type='search'].e2e-search");
+    expect(search).not.toBeNull();
+    const name = search!.getAttribute("aria-label");
+    expect(name).toBeTruthy();
+    expect(name).toBe(t("COMMON.FILTERS.INPUT_PLACEHOLDER"));
+    expect(search!.getAttribute("placeholder")).toBe(t("COMMON.FILTERS.INPUT_PLACEHOLDER"));
+  });
+
+  it("names the row drag handle (COMMON.DRAG)", () => {
+    const { container } = renderBacklog();
+    const handle = container.querySelector(".draggable-us-row");
+    expect(handle).not.toBeNull();
+    expect(handle).toHaveAttribute("aria-label", t("COMMON.DRAG"));
+  });
+
+  it("names each multiselect checkbox after the story it selects (empty legacy label)", () => {
+    const { container } = renderBacklog();
+    // Fixture story #1 = "US one".
+    const checkbox = container.querySelector<HTMLInputElement>("input#us-check-1");
+    expect(checkbox).not.toBeNull();
+    const name = checkbox!.getAttribute("aria-label");
+    expect(name).toBeTruthy();
+    expect(name).toContain("#1");
+    expect(name).toContain("US one");
+  });
+
+  it("names the icon-only row-options trigger", () => {
+    const { container } = renderBacklog();
+    const trigger = container.querySelector(".us-option-popup-button");
+    expect(trigger).not.toBeNull();
+    expect(trigger!.getAttribute("aria-label")).toBeTruthy();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// M18 — keyboard drag-and-drop accessibility.
+//
+// The backlog previously registered ONLY a `PointerSensor`, so a focused drag
+// handle could not be picked up with the keyboard (the Kanban board could).
+// These tests assert the container now (a) registers a `KeyboardSensor`
+// alongside the pointer sensor, and (b) supplies `accessibility.announcements`
+// that name the dragged story — the screen-reader feedback that makes keyboard
+// DnD usable and that dnd-kit also fires for Escape-cancellation. The captured
+// `DndContext` props expose the REAL sensor descriptors + the announcements.
+// ---------------------------------------------------------------------------
+describe("Backlog — keyboard drag-and-drop (M18)", () => {
+  const sensorClasses = (): unknown[] =>
+    (mockCapturedDndProps.sensors as Array<{ sensor: unknown }>).map((d) => d.sensor);
+
+  it("registers BOTH a PointerSensor and a KeyboardSensor", () => {
+    renderBacklog();
+    const classes = sensorClasses();
+    expect(classes).toContain(PointerSensor);
+    expect(classes).toContain(KeyboardSensor);
+  });
+
+  it("configures the PointerSensor with the 8px activation distance", () => {
+    renderBacklog();
+    const pointer = (mockCapturedDndProps.sensors as Array<{ sensor: unknown; options: unknown }>).find(
+      (d) => d.sensor === PointerSensor,
+    );
+    expect((pointer!.options as { activationConstraint: { distance: number } }).activationConstraint.distance).toBe(8);
+  });
+
+  it("gives the KeyboardSensor a sortable coordinate getter (arrow-key moves)", () => {
+    renderBacklog();
+    const keyboard = (mockCapturedDndProps.sensors as Array<{ sensor: unknown; options: unknown }>).find(
+      (d) => d.sensor === KeyboardSensor,
+    );
+    expect(typeof (keyboard!.options as { coordinateGetter: unknown }).coordinateGetter).toBe("function");
+  });
+
+  it("exposes announcements that name the dragged story by subject", () => {
+    renderBacklog();
+    const a11y = mockCapturedDndProps.accessibility as {
+      announcements: {
+        onDragStart: (a: { active: { id: number } }) => string;
+        onDragOver: (a: { active: { id: number }; over: unknown }) => string;
+        onDragEnd: (a: { active: { id: number }; over: unknown }) => string;
+        onDragCancel: (a: { active: { id: number } }) => string;
+      };
+    };
+    // Fixture backlog story #101 = "US one".
+    expect(a11y.announcements.onDragStart({ active: { id: 101 } })).toContain("US one");
+    expect(a11y.announcements.onDragOver({ active: { id: 101 }, over: { id: 102 } })).toContain(
+      "over a drop target",
+    );
+    expect(a11y.announcements.onDragOver({ active: { id: 101 }, over: null })).toContain(
+      "no longer over a drop target",
+    );
+    expect(a11y.announcements.onDragEnd({ active: { id: 101 }, over: { id: 102 } })).toContain(
+      "was dropped",
+    );
+    expect(a11y.announcements.onDragEnd({ active: { id: 101 }, over: null })).toContain(
+      "outside a drop target",
+    );
+    expect(a11y.announcements.onDragCancel({ active: { id: 101 } })).toContain("cancelled");
+  });
+
+  it("resolves sprint story subjects and falls back to #id for unknown ids", () => {
+    vm.sprints = [
+      { id: 3, name: "S1", closed: false, user_stories: [{ id: 301, ref: 301, subject: "Sprint story", status: 1, tags: [] }] },
+    ];
+    renderBacklog();
+    const ann = (mockCapturedDndProps.accessibility as {
+      announcements: { onDragStart: (a: { active: { id: number } }) => string };
+    }).announcements;
+    // Sprint story subject is resolved (not just backlog rows).
+    expect(ann.onDragStart({ active: { id: 301 } })).toContain("Sprint story");
+    // Unknown id falls back to "#<id>".
+    expect(ann.onDragStart({ active: { id: 9999 } })).toContain("#9999");
   });
 });

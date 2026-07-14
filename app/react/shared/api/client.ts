@@ -9,6 +9,7 @@
 import type {
     MountContext,
     UserStory,
+    Attachment,
     Milestone,
     SprintListResult,
     Status,
@@ -16,7 +17,7 @@ import type {
     Swimlane,
 } from "../types";
 import { resolveUrl, buildUrl, type EndpointKey, type QueryParams } from "./urls";
-import { httpGet, httpPost, httpPatch, request, parseHeaderInt } from "./http";
+import { httpGet, httpPost, httpPatch, httpDelete, request, parseHeaderInt } from "./http";
 import { generateHash } from "../storage/legacyStorage";
 
 /** A single {us_id, order} pair used by the milestone/move bulk payloads. */
@@ -66,6 +67,19 @@ export interface UnassignedUserStoriesResult {
     count: number;
     current: number;
     paginatedBy: number;
+    /**
+     * M2: `true` when the backend advertises a NEXT page via the
+     * `X-Pagination-Next` header (legacy `header('x-pagination-next')`), driving
+     * the Backlog's page advancement / infinite-scroll "load more".
+     */
+    hasNext: boolean;
+    /**
+     * M2: the AUTHORITATIVE backlog total from `Taiga-Info-Backlog-Total-Userstories`
+     * (taiga-back sets it ONLY when `milestone=null`, which the backlog list
+     * always requests — see `userstories/api.py#_add_taiga_info_headers`).
+     * `null` when the header is absent so callers fall back to the page length.
+     */
+    backlogTotal: number | null;
 }
 
 /**
@@ -138,6 +152,62 @@ export const createApiClient = (context: MountContext) => {
             return response.data;
         },
 
+        /**
+         * List the attachments of a user story (finding C6). Mirrors the legacy
+         * attachments resource `list("us", objId, projectId)` -> GET
+         * `/userstories/attachments?object_id=<usId>&project=<projectId>`
+         * (`resources.coffee` "attachments/us"). Contract-preserving (C-1): the
+         * same frozen endpoint and query shape the AngularJS US-detail screen
+         * used (`attachments.service` `loadAttachments`). The edit flow fetches
+         * these BEFORE opening the form so attachments are seeded on the model
+         * rather than silently dropped.
+         */
+        listUserStoryAttachments: async (
+            projectId: number,
+            usId: number,
+        ): Promise<Attachment[]> => {
+            const url = buildUrl(resolve("us-attachments"), { object_id: usId, project: projectId });
+            const response = await httpGet<Attachment[]>(context, url);
+            return response.data;
+        },
+
+        /**
+         * Upload one attachment for a user story (finding M1). Mirrors the legacy
+         * `attachmentsService.upload(file, objectId, project, "us")` ->
+         * `attachments-resource.service` `create`, which POSTs a
+         * `multipart/form-data` body of `{project, object_id, attached_file,
+         * from_comment}` to `/userstories/attachments`. The `FormData` is handed
+         * to the transport via `options.formData` so it is sent unserialized and
+         * the browser sets the multipart boundary (see http.ts M1 branch); the
+         * bearer / session headers stay merged-last + immutable (M10).
+         * Contract-preserving (C-1): identical endpoint, verb, and field names.
+         */
+        createUserStoryAttachment: async (
+            projectId: number,
+            usId: number,
+            file: File,
+        ): Promise<Attachment> => {
+            const form = new FormData();
+            form.append("project", String(projectId));
+            form.append("object_id", String(usId));
+            form.append("attached_file", file);
+            form.append("from_comment", "false");
+            const response = await httpPost<Attachment>(context, resolve("us-attachments"), undefined, {
+                formData: form,
+            });
+            return response.data;
+        },
+
+        /**
+         * Delete one user-story attachment by id (finding M1). Mirrors the legacy
+         * `attachmentsService.delete("us", id)` -> DELETE
+         * `/userstories/attachments/{id}`. Contract-preserving (C-1).
+         */
+        deleteUserStoryAttachment: async (attachmentId: number): Promise<void> => {
+            const url = `${resolve("us-attachments")}/${attachmentId}`;
+            await httpDelete<null>(context, url);
+        },
+
         getUserStoriesFilters: async (params: QueryParams = {}): Promise<unknown> => {
             const url = buildUrl(resolve("userstories-filters"), params);
             const response = await httpGet<unknown>(context, url);
@@ -171,11 +241,17 @@ export const createApiClient = (context: MountContext) => {
             });
             const response = await httpGet<UserStory[]>(context, url, { enablePagination: true });
             const rawCurrent = response.headers.get("x-pagination-current");
+            // M2: `X-Pagination-Next` carries the next-page URL when more pages
+            // exist; its mere PRESENCE is the "has more" signal (legacy checked
+            // `if header('x-pagination-next')`).
+            const rawTotal = response.headers.get("Taiga-Info-Backlog-Total-Userstories");
             return {
                 userStories: response.data,
                 count: parseHeaderInt(response.headers, "x-pagination-count"),
                 current: rawCurrent ? parseHeaderInt(response.headers, "x-pagination-current") : 1,
                 paginatedBy: parseHeaderInt(response.headers, "x-paginated-by"),
+                hasNext: response.headers.get("x-pagination-next") !== null,
+                backlogTotal: rawTotal !== null ? parseInt(rawTotal, 10) : null,
             };
         },
 

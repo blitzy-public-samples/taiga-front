@@ -35,7 +35,7 @@
  *     and independent of the real `@dnd-kit` droppable wiring it pulls in.
  */
 
-import { fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render } from "@testing-library/react";
 
 import { Swimlane } from "./Swimlane";
 import type { SwimlaneProps } from "./Swimlane";
@@ -78,6 +78,19 @@ jest.mock("./StatusColumn", () => {
         "data-show-placeholder": String(!!props.showPlaceholder),
         "data-not-found": String(!!props.notFoundUserstories),
       }),
+  };
+});
+
+// Control the @dnd-kit `useDndContext().active` state Swimlane reads for the M6
+// hover-to-auto-expand gate. The holder is `mock`-prefixed so the hoisted
+// `jest.mock` factory may reference it; it defaults to `null` (no active drag),
+// so every non-M6 spec behaves exactly as before this mock was added.
+let mockActiveDrag: { id: number } | null = null;
+jest.mock("@dnd-kit/core", () => {
+  const actual = jest.requireActual("@dnd-kit/core");
+  return {
+    ...actual,
+    useDndContext: () => ({ ...actual.useDndContext, active: mockActiveDrag }),
   };
 });
 
@@ -194,9 +207,12 @@ describe("Swimlane — DOM parity (Phase B)", () => {
   it("shows the unfold-action icon (#icon-unfolded-swimlane) when NOT folded and omits the folded class", () => {
     const { title, container } = renderSwimlane({ folded: false });
     expect(title).not.toHaveClass("folded");
+    // M15: the modifier class lives on the authoritative `<tg-svg>` WRAPPER;
+    // the inner `<svg>` carries `icon icon-<name>` (the `tgSvg` directive output).
     const unfold = container.querySelector(".unfold-action");
     expect(unfold).toBeInTheDocument();
-    expect(unfold).toHaveClass("icon", "icon-unfolded-swimlane");
+    expect(unfold!.tagName).toBe("TG-SVG");
+    expect(unfold!.querySelector("svg")).toHaveClass("icon", "icon-unfolded-swimlane");
     expect(iconUseHref(unfold)).toBe("#icon-unfolded-swimlane");
     // The fold-action icon must NOT be present in the expanded state.
     expect(container.querySelector(".fold-action")).toBeNull();
@@ -207,7 +223,8 @@ describe("Swimlane — DOM parity (Phase B)", () => {
     expect(title).toHaveClass("folded");
     const fold = container.querySelector(".fold-action");
     expect(fold).toBeInTheDocument();
-    expect(fold).toHaveClass("icon", "icon-folded-swimlane");
+    expect(fold!.tagName).toBe("TG-SVG");
+    expect(fold!.querySelector("svg")).toHaveClass("icon", "icon-folded-swimlane");
     expect(iconUseHref(fold)).toBe("#icon-folded-swimlane");
     expect(container.querySelector(".unfold-action")).toBeNull();
   });
@@ -253,7 +270,8 @@ describe("Swimlane — DOM parity (Phase B)", () => {
     const def = container.querySelector(".default-swimlane");
     expect(def).toBeInTheDocument();
     const star = def!.querySelector(".default-swimlane-icon");
-    expect(star).toHaveClass("icon", "icon-star");
+    expect(star!.tagName).toBe("TG-SVG");
+    expect(star!.querySelector("svg")).toHaveClass("icon", "icon-star");
     expect(iconUseHref(star)).toBe("#icon-star");
     expect(def!.querySelector(".default-text")).toHaveTextContent("Default");
   });
@@ -413,5 +431,97 @@ describe("Swimlane — behaviour (Phase C)", () => {
     const column = container.querySelector(".mock-status-column");
     expect(column).toHaveAttribute("data-render-in-progress", "true");
     expect(column).toHaveAttribute("data-not-found", "true");
+  });
+});
+
+// --- M6: hover-to-auto-expand a folded swimlane during a drag --------------
+
+describe("Swimlane — drag-hover auto-expand (M6)", () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    mockActiveDrag = null;
+  });
+
+  it("adds pending-to-open to the FOLDED title on hover and auto-unfolds after 1000ms while dragging", () => {
+    mockActiveDrag = { id: 1 };
+    const onToggleSwimlane = jest.fn();
+    const { title } = renderSwimlane({
+      swimlane: makeSwimlane({ id: 7 }),
+      folded: true,
+      onToggleSwimlane,
+    });
+
+    expect(title).toHaveClass("folded");
+    expect(title).not.toHaveClass("pending-to-open");
+
+    act(() => {
+      fireEvent.mouseEnter(title);
+    });
+    expect(title).toHaveClass("pending-to-open");
+    expect(onToggleSwimlane).not.toHaveBeenCalled();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(onToggleSwimlane).toHaveBeenCalledTimes(1);
+    expect(onToggleSwimlane).toHaveBeenCalledWith(7);
+    expect(title).not.toHaveClass("pending-to-open");
+  });
+
+  it("cancels the pending expansion when the pointer leaves before 1000ms", () => {
+    mockActiveDrag = { id: 1 };
+    const onToggleSwimlane = jest.fn();
+    const { title } = renderSwimlane({ folded: true, onToggleSwimlane });
+
+    act(() => {
+      fireEvent.mouseEnter(title);
+    });
+    expect(title).toHaveClass("pending-to-open");
+
+    act(() => {
+      fireEvent.mouseLeave(title);
+    });
+    expect(title).not.toHaveClass("pending-to-open");
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(onToggleSwimlane).not.toHaveBeenCalled();
+  });
+
+  it("does NOT auto-expand when no drag is in progress (active === null)", () => {
+    mockActiveDrag = null; // no drag
+    const onToggleSwimlane = jest.fn();
+    const { title } = renderSwimlane({ folded: true, onToggleSwimlane });
+
+    act(() => {
+      fireEvent.mouseEnter(title);
+    });
+    expect(title).not.toHaveClass("pending-to-open");
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(onToggleSwimlane).not.toHaveBeenCalled();
+  });
+
+  it("does NOT auto-expand an already-expanded swimlane even while dragging", () => {
+    mockActiveDrag = { id: 1 };
+    const onToggleSwimlane = jest.fn();
+    const { title } = renderSwimlane({ folded: false, onToggleSwimlane });
+
+    act(() => {
+      fireEvent.mouseEnter(title);
+    });
+    expect(title).not.toHaveClass("pending-to-open");
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(onToggleSwimlane).not.toHaveBeenCalled();
   });
 });

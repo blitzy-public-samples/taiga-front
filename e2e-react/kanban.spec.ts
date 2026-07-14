@@ -114,6 +114,7 @@ const k = {
   headerColumns: ".task-colum-name", // sic: one "m" — shipped DOM, do not "fix"
   columns: ".taskboard-column", // status/body column (was stale `.task-column`)
   title: ".card-subject", // card story-subject text (shipped span.card-subject; was stale `.e2e-title`)
+  ref: ".card-ref", // card story-ref number (shipped span.card-ref); visible at zoom >= 0, present at the default zoom 1
   card: "tg-card",
   ownerActions: ".card-owner-actions", // card e2e hover zone holding the edit/assign hooks
   popupButton: ".js-popup-button", // opens the in-place .card-actions-menu (edit/move-to-top/delete)
@@ -219,6 +220,9 @@ test.describe("kanban", () => {
   test("kanban", async ({ page, taiga }) => {
     await expect(page.locator(k.card).first()).toBeVisible();
     await taiga.screenshot("kanban");
+    // M27: strict visual-parity gate on the main board (baseline writes the
+    // reference; react compares against it and fails on drift).
+    await taiga.expectVisualParity("kanban");
   });
 
   // 2) zoom — cycle the board zoom control through levels 1..4, keeping the
@@ -290,32 +294,46 @@ test.describe("kanban", () => {
 
       await taiga.screenshot("create-us-filled");
 
-      // Capture column 0's card count immediately before submitting, mirroring
-      // the sibling bulk-create test's relative-delta approach.
+      // Capture column 0's card count immediately before submitting, so the
+      // growth assertion below is RELATIVE (robust to the seeded data).
       const before = await getBoxUss(page, 0).count();
 
       // Submit and wait for the lightbox to close.
       await page.locator(`${lb} ${k.submit}`).click();
       await lightbox(page).close(lb);
 
-      // The stock create flow adds the story to the board optimistically: a new
-      // card appears in column 0 at once. Assert that deterministic board
-      // signal — column 0 gained exactly one card.
-      //
-      // We intentionally do NOT assert the new card's SUBJECT text. The story
-      // IS persisted with its subject server-side (verified live: the create
-      // POST returns 201 and `GET /userstories` echoes the subject), but the
-      // stock board renders a freshly-created card as a shell whose
-      // `.card-subject` stays empty until a server MODEL re-fetch binds its full
-      // display data — a refetch normally driven by the live WebSocket "create"
-      // push, which is explicitly out of scope for this checkpoint (the events
-      // service delivers zero frames in this environment, and a plain reload
-      // does not bind it either — both verified live). This is exactly how the
-      // harness's sibling bulk-create test asserts (column count delta only).
-      // The legacy Protractor check here was the no-op tautology
-      // `indexOf(subject) !== 1` (true for every index except 1), so this count
-      // assertion is strictly stronger than the behavior it replaces.
+      // M8 — assert the FULL card projection, not merely count growth. Both the
+      // stock AngularJS `usform:new:success` handler and the React
+      // `submitNewUs` add the created story's FULL model to the board at once
+      // (the create POST returns the complete user-story serializer), so the
+      // new card renders with its subject, ref and status column immediately —
+      // it is NOT an empty shell. `project-4` is a flat board (0 swimlanes), so
+      // membership in column 0 (the status the create lightbox targeted) is the
+      // status/placement signal.
       await expect(getBoxUss(page, 0)).toHaveCount(before + 1);
+
+      // The new card is locatable BY its unique subject inside column 0, proving
+      // subject + status placement are populated immediately.
+      const created = getBoxUss(page, 0).filter({ hasText: subject });
+      await expect(created).toHaveCount(1);
+      await expect(created.locator(k.title)).toHaveText(subject);
+      // Its ref is bound (a non-empty `.card-ref`) — the definitive proof the
+      // card is a full projection rather than a shell.
+      await expect(created.locator(k.ref)).toBeVisible();
+      await expect(created.locator(k.ref)).not.toHaveText("");
+
+      await taiga.screenshot("create-us-board");
+
+      // M8 — reload the board (fresh server fetch, no optimistic state) and
+      // assert the created card is STILL present in column 0 with its subject
+      // and ref, proving server persistence AND that a cold load binds the full
+      // display model (the WS/refetch reconciliation path).
+      await taiga.gotoKanban("project-4");
+      const reloaded = getBoxUss(page, 0).filter({ hasText: subject });
+      await expect(reloaded).toHaveCount(1);
+      await expect(reloaded.locator(k.title)).toHaveText(subject);
+      await expect(reloaded.locator(k.ref)).toBeVisible();
+      await expect(reloaded.locator(k.ref)).not.toHaveText("");
     });
   });
 

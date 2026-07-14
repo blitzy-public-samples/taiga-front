@@ -61,6 +61,7 @@ import { Backlog } from "./backlog/Backlog";
 import type { MountContext } from "./shared/types";
 import { readLiveToken } from "./shared/auth/token";
 import { AUTH_CHANGED_EVENT, AUTH_LOST_EVENT } from "./shared/auth/authEvents";
+import { resolveActiveLanguage } from "./shared/i18n/localeBridge";
 
 /**
  * Custom-element tag names. Declared once so the `customElements.get(...)`
@@ -150,7 +151,12 @@ export function readMountContext(host: HTMLElement): MountContext {
             .taigaConfig ?? {};
     const apiUrl = String(cfg.api ?? "");
     const eventsUrl = (cfg.eventsUrl as string | null) ?? null;
-    const language = String(cfg.defaultLanguage ?? "en");
+    // M5: resolve the ACTIVE language with the same precedence AngularJS uses
+    // (`app.coffee` L796): the logged-in user's stored `userInfo.lang` wins over
+    // `taigaConfig.defaultLanguage`, then "en". Previously only the deployment
+    // default was read, so a user whose account language differed from the
+    // default mounted with the wrong locale.
+    const language = resolveActiveLanguage();
 
     return { projectSlug, token, sessionId, apiUrl, eventsUrl, language };
 }

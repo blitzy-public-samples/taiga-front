@@ -94,6 +94,8 @@ describe("api barrel (index.ts) public surface", () => {
             count: 0,
             current: 1,
             paginatedBy: 30,
+            hasNext: false,
+            backlogTotal: 0,
         };
         const order: BulkStoryOrder = { us_id: 1, order: 2 };
         const savable: SavableEntity = { id: 1 };

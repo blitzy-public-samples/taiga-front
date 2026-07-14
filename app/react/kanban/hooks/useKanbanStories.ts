@@ -35,6 +35,12 @@ import { produce } from "immer";
 import { createApiClient, sanitizeErrorMessage } from "../../shared/api";
 import type { QueryParams } from "../../shared/api";
 import { createEventsClient, subscribeToProject } from "../../shared/ws/events";
+import { t } from "../../shared/i18n/translate";
+import {
+    setAll as setAppMeta,
+    snapshotManagedMeta,
+    restoreManagedMeta,
+} from "../../shared/meta/appMeta";
 import {
     createInitialKanbanState,
     init,
@@ -70,10 +76,14 @@ import type {
     DataCollection,
 } from "../../shared/filters/panels";
 import type { StoryFormValues, BulkStoryValues } from "../../shared/lightboxes/storyForm";
+import { usePendingDelete } from "../../shared/lightboxes";
+import type { PendingDelete } from "../../shared/lightboxes";
+import { isProjectWritable } from "../../shared/permissions";
 import {
     Savable,
     buildCreateStoryPayload as buildCreatePayload,
     diffStoryValues,
+    applyStoryAttachments,
 } from "../../shared/lightboxes/storyPayload";
 import type {
     MountContext,
@@ -81,6 +91,7 @@ import type {
     Status,
     Swimlane,
     UserStory,
+    Attachment,
     Point,
     Role,
 } from "../../shared/types";
@@ -165,6 +176,12 @@ export interface UseKanbanStoriesResult {
     errorMessage: string | null;
     /** True while a create/bulk-create save is in flight (finding M2). */
     savingUs: boolean;
+    /**
+     * C6: true while the edit flow is fetching the AUTHORITATIVE story detail
+     * (+ attachments) before opening the edit lightbox. The board surfaces an
+     * accessible loading status and the trigger is re-open guarded.
+     */
+    editLoading: boolean;
 
     /* Board data */
     usStatusList: Status[];
@@ -210,10 +227,14 @@ export interface UseKanbanStoriesResult {
     addNewUs: (type: "standard" | "bulk", statusId: number) => void;
     editUs: (usId: number) => void;
     deleteUs: (usId: number) => void;
+    /* C7: delete confirmation (localized modal, replacing the immediate delete) */
+    pendingDelete: PendingDelete<number> | null;
+    deleteBusy: boolean;
+    confirmDelete: () => void;
+    cancelDelete: () => void;
     changeUsAssignedUsers: (usId: number) => void;
     moveToTopDropdown: (usId: number) => void;
     toggleSelectedUs: (usId: number, event?: unknown) => void;
-    editWipLimit: (statusId: number, wipLimit: number | null) => void;
     showArchivedStatus: (statusId: number) => void;
     setColumnMode: (statusId: number, mode: "max" | "min" | undefined) => void;
 
@@ -579,6 +600,8 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
     // raw thrown value); and a lightbox save-in-flight guard.
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     const [savingUs, setSavingUs] = useState<boolean>(false);
+    // C6: fetch-detail-before-edit loading flag (+ ref for the re-open guard).
+    const [editLoading, setEditLoading] = useState<boolean>(false);
 
     /* ---------------------------------------------------------------------- */
     /* Refs — the "latest value" pattern for async callbacks (no re-render).   */
@@ -605,9 +628,21 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
     const columnModesRef = useRef<Record<number, "max" | "min" | undefined>>(columnModes);
     const isFirstLoadRef = useRef<boolean>(true);
     const pendingProjectRefreshRef = useRef<boolean>(false);
-    // M2 pending guards: a create/bulk save in flight, and per-status WIP saves.
+    // M2 pending guard: a create/bulk save in flight.
     const savingUsRef = useRef<boolean>(false);
-    const wipPendingRef = useRef<Record<number, boolean>>({});
+    const editLoadingRef = useRef<boolean>(false);
+    /**
+     * M9 (CWE-362): operation generation. Every teardown/reload of the board
+     * (the `firstLoad` effect cleanup — a slug change, project switch, auth
+     * remount, or unmount) bumps this counter. A NON-abortable mutation
+     * (bulk-order POST, PATCH, create, delete) captures the generation at
+     * start and IGNORES its own completion OR rollback if the generation has
+     * since moved on, so stale async work never writes onto (or rolls back)
+     * a board that has already been reloaded for a different project. The
+     * transport `AbortSignal` (Phase 3) covers abortable GET loads; this
+     * covers the mutations that cannot be safely aborted mid-flight.
+     */
+    const opGenerationRef = useRef<number>(0);
 
     // Keep the refs in sync with committed state (backstop; some handlers also
     // update the relevant ref synchronously before an immediate async read).
@@ -992,10 +1027,47 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
 
         return () => {
             cancelled = true;
+            // M9: supersede any in-flight non-abortable mutation from this load
+            // generation so its completion/rollback is ignored after a reload.
+            opGenerationRef.current += 1;
         };
         // Keyed on the project slug: a slug change is a full board reload.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [context.projectSlug]);
+
+    /* ---------------------------------------------------------------------- */
+    /* M22 — localized page <title>/<meta> (mirror KanbanController.firstLoad   */
+    /* `.then` -> appMetaService.setAll, kanban/main.coffee L112-125). Written   */
+    /* once the AUTHORITATIVE project detail (name + description) is loaded, so  */
+    /* the browser tab reads "Kanban - <projectName>" instead of the previous    */
+    /* screen's stale title. The prior <head> tags are snapshotted first and     */
+    /* restored on unmount / slug change, so navigating back to an AngularJS     */
+    /* screen does not leak the Kanban title (the AngularJS controllers still    */
+    /* overwrite on their own load — restore is a safe superset).                */
+    /*                                                                           */
+    /* Keyed on the identifying project fields (slug/name/description) — NOT the */
+    /* object identity — so the in-place `setProject(rt)` swimlane merge does not */
+    /* re-run it. On a first-load ERROR `project` stays null, so no misleading    */
+    /* Kanban title is written (parity with `onInitialDataError`, which set no    */
+    /* metadata); a navigational error unmounts the element and the cleanup       */
+    /* restores the prior tags.                                                   */
+    /* ---------------------------------------------------------------------- */
+    useEffect(() => {
+        if (project == null) {
+            return;
+        }
+        const projectName = project.name ?? "";
+        const projectDescription = project.description ?? "";
+        const snapshot = snapshotManagedMeta();
+        setAppMeta(
+            t("KANBAN.PAGE_TITLE", { projectName }),
+            t("KANBAN.PAGE_DESCRIPTION", { projectName, projectDescription }),
+        );
+        return () => {
+            restoreManagedMeta(snapshot);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [project?.slug, project?.name, project?.description]);
 
 
     /* ---------------------------------------------------------------------- */
@@ -1118,6 +1190,19 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             previousCard: number | null,
             nextCard: number | null,
         ): Promise<void> => {
+            // M4 (defense-in-depth hook guard): a read-only / archived project
+            // accepts NO reorder mutation. The card drag sensors (`disabled:
+            // !canDrag`) and the move-to-top menu item are already gated on the
+            // authoritative `canEdit`, so this only fires on programmatic misuse.
+            // It mirrors the legacy `sortable.coffee` init guard that refused to
+            // arm dragula on an archived project. The backend stays the single
+            // enforcement point (constraint C-1).
+            const activeProject = projectRef.current;
+            if (activeProject && !isProjectWritable(activeProject)) {
+                return;
+            }
+            // M9: pin this mutation to the current load generation.
+            const gen = opGenerationRef.current;
             const snapshot = stateRef.current; // pre-move KanbanState (for rollback)
             const { state: next, result } = move(
                 snapshot,
@@ -1164,10 +1249,20 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                     result.beforeUserstoryId,
                     result.bulkUserstories,
                 );
+                // M9: a reload superseded this move -> ignore its completion.
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // Success: WIP counters derive from usByStatus lengths (already
                 // updated). Clear the moved highlight (parity with redraw:wip).
                 window.setTimeout(() => setMovedUs([]), 300);
             } catch (e) {
+                // M9: a reload superseded this move -> ignore its rollback so the
+                // stale deltas never corrupt the reloaded board, and suppress the
+                // now-irrelevant error (it belongs to a board no longer shown).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // M1 ROLLBACK: reverse ONLY this move's position changes against
                 // the CURRENT state, preserving any real-time updates that landed
                 // meanwhile (AAP §0.6.3 mandates rollback; legacy had none).
@@ -1358,42 +1453,6 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         [],
     );
 
-    /**
-     * Edit a status's WIP limit optimistically, persisting through the API and
-     * rolling back the `usStatusList` snapshot on failure.
-     */
-    const editWipLimit = useCallback(
-        async (statusId: number, wipLimit: number | null): Promise<void> => {
-            // M2 pending guard: ignore a second edit to the same column while its
-            // save is still in flight.
-            if (wipPendingRef.current[statusId]) {
-                return;
-            }
-            const snapshot = usStatusListRef.current;
-            const priorWip = snapshot.find((s) => s.id === statusId)?.wip_limit ?? null;
-            const optimistic = snapshot.map((s) =>
-                s.id === statusId ? { ...s, wip_limit: wipLimit } : s,
-            );
-            usStatusListRef.current = optimistic;
-            setUsStatusList(optimistic);
-            wipPendingRef.current[statusId] = true;
-            try {
-                await apiRef.current.editStatus(statusId, wipLimit);
-            } catch (e) {
-                // M1: revert ONLY this status against the CURRENT list, so a
-                // concurrent WIP change to another column is not clobbered.
-                const reverted = usStatusListRef.current.map((s) =>
-                    s.id === statusId ? { ...s, wip_limit: priorWip } : s,
-                );
-                usStatusListRef.current = reverted;
-                setUsStatusList(reverted);
-                reportError(e);
-            } finally {
-                delete wipPendingRef.current[statusId];
-            }
-        },
-        [reportError],
-    );
 
     /** Persist and set a column display mode (squish/maximize parity). */
     const applyColumnMode = useCallback(
@@ -1422,10 +1481,82 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         setActiveLightbox({ type: type === "bulk" ? "bulk" : "create", statusId });
     }, []);
 
-    /** Open the userstory edit lightbox. */
-    const editUs = useCallback((usId: number): void => {
-        setActiveLightbox({ type: "edit", usId });
-    }, []);
+    /**
+     * Open the userstory edit lightbox (finding C6). The kanban LIST serializer
+     * omits `description` (and never carries attachments), so seeding the form
+     * from the board projection would show a BLANK description over real content
+     * and use a possibly-stale `version` for the optimistic-concurrency PATCH.
+     * This fetches the AUTHORITATIVE detail (`GET /userstories/{id}` — the same
+     * serializer `by_ref` returns, with `description` + current `version`) AND
+     * the story's attachments (`GET /userstories/attachments`) BEFORE opening,
+     * reconciles the full model into ALL projections (so `usMap[usId]` — the
+     * form seed source — now has the real description/version/attachments), then
+     * opens the lightbox. Mirrors the legacy US-detail load order
+     * (`loadUs().then(loadAttachments)`), adapted to the edit-lightbox entry.
+     *
+     * Loading/error parity: the trigger is re-open guarded (`editLoadingRef`),
+     * `editLoading` drives an accessible board status while fetching, the detail
+     * fetch is FATAL (a failure surfaces a sanitized message and does NOT open a
+     * blank form), and the attachments fetch is NON-FATAL (degrades to `[]`, as
+     * the legacy attachments load was independent of the story load).
+     */
+    const editUs = useCallback(
+        (usId: number): void => {
+            if (editLoadingRef.current) {
+                return;
+            }
+            editLoadingRef.current = true;
+            setEditLoading(true);
+            setErrorMessage(null);
+            const gen = opGenerationRef.current;
+            void (async (): Promise<void> => {
+                const pid = projectIdRef.current;
+                if (pid == null) {
+                    // No resolved project yet -> nothing to edit; release the guard.
+                    editLoadingRef.current = false;
+                    setEditLoading(false);
+                    return;
+                }
+                try {
+                    // Detail is authoritative + FATAL: without it the form cannot
+                    // safely seed the description/version.
+                    const detail = await apiRef.current.getUserStory(pid, usId);
+                    // Attachments are NON-FATAL: a failure degrades to none rather
+                    // than blocking the edit (legacy loaded them independently).
+                    let attachments: Attachment[] = [];
+                    try {
+                        attachments = await apiRef.current.listUserStoryAttachments(pid, usId);
+                    } catch {
+                        attachments = [];
+                    }
+                    // M9: a reload superseded this edit-open -> discard the
+                    // fetched detail and do NOT open a lightbox for the old board.
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                    const full: UserStory = { ...detail, attachments };
+                    // Reconcile the authoritative detail into every projection so
+                    // the board seed (`usMap[usId]`) and any open card reflect it.
+                    const next = replaceModel(stateRef.current, full);
+                    stateRef.current = next;
+                    setState(next);
+                    setActiveLightbox({ type: "edit", usId });
+                } catch (e) {
+                    // M9: suppress a superseded edit-open's error (stale board).
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                    // Do NOT open a blank form: surface the sanitized error and
+                    // leave the board as-is (parity with a failed detail load).
+                    reportError(e);
+                } finally {
+                    editLoadingRef.current = false;
+                    setEditLoading(false);
+                }
+            })();
+        },
+        [reportError],
+    );
 
     /** Open the assigned-users lightbox for a story. */
     const changeUsAssignedUsers = useCallback((usId: number): void => {
@@ -1468,17 +1599,44 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             savingUsRef.current = true;
             setSavingUs(true);
             setErrorMessage(null);
+            const gen = opGenerationRef.current;
             try {
                 const payload = buildCreatePayload(projectIdRef.current, lb.statusId, values);
                 const created = await apiRef.current.create<UserStory>("userstories", payload);
+                // M9: a reload superseded this create -> ignore its completion
+                // (the reloaded board's WS refetch will surface the new story).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 const next = add(stateRef.current, created);
                 stateRef.current = next;
                 setState(next);
+                // M1: run the queued attachment add/delete lifecycle AFTER the
+                // story exists (legacy `createAttachments(data)` tail). No-op when
+                // no attachments are queued (the common new-story case).
+                const pidNew = projectIdRef.current;
+                if (pidNew != null) {
+                    await applyStoryAttachments(
+                        values,
+                        pidNew,
+                        created.id,
+                        apiRef.current.createUserStoryAttachment,
+                        apiRef.current.deleteUserStoryAttachment,
+                    );
+                    // M9: re-check after the async attachment phase.
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                }
                 closeLightbox();
                 if (values.us_position === "top") {
                     moveToTopDropdown(created.id);
                 }
             } catch (e) {
+                // M9: suppress a superseded create's error (stale board).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // Keep the lightbox OPEN so the typed values are preserved; surface
                 // the sanitized message instead of clearing the form (finding M2).
                 reportError(e);
@@ -1523,15 +1681,37 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             savingUsRef.current = true;
             setSavingUs(true);
             setErrorMessage(null);
+            const gen = opGenerationRef.current;
             try {
                 const updated = await apiRef.current.save<Savable<UserStory>>(
                     "userstories",
                     story as Savable<UserStory>,
                     modified,
                 );
+                // M9: a reload superseded this edit -> ignore its completion.
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 const next = replaceModel(stateRef.current, updated);
                 stateRef.current = next;
                 setState(next);
+                // M1: apply queued attachment add/delete AFTER the save (legacy
+                // `deleteAttachments(data).then(createAttachments(data))`). No-op
+                // when nothing is queued.
+                const pidEdit = projectIdRef.current;
+                if (pidEdit != null) {
+                    await applyStoryAttachments(
+                        values,
+                        pidEdit,
+                        updated.id,
+                        apiRef.current.createUserStoryAttachment,
+                        apiRef.current.deleteUserStoryAttachment,
+                    );
+                    // M9: re-check after the async attachment phase.
+                    if (opGenerationRef.current !== gen) {
+                        return;
+                    }
+                }
                 closeLightbox();
                 if (statusChanged) {
                     const swimlaneId = updated.swimlane ?? null;
@@ -1552,6 +1732,10 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                     );
                 }
             } catch (e) {
+                // M9: suppress a superseded edit's error (stale board).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 reportError(e);
             } finally {
                 savingUsRef.current = false;
@@ -1582,6 +1766,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             savingUsRef.current = true;
             setSavingUs(true);
             setErrorMessage(null);
+            const gen = opGenerationRef.current;
             try {
                 const created = await apiRef.current.bulkCreateUserStories(
                     projectIdRef.current as number,
@@ -1589,6 +1774,10 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                     values.bulk,
                     swimlaneId,
                 );
+                // M9: a reload superseded this bulk create -> ignore completion.
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 const next = add(stateRef.current, created);
                 stateRef.current = next;
                 setState(next);
@@ -1608,6 +1797,10 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                     }
                 }
             } catch (e) {
+                // M9: suppress a superseded bulk create's error (stale board).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 // Keep the lightbox OPEN so the typed lines are preserved.
                 reportError(e);
             } finally {
@@ -1639,6 +1832,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             savingUsRef.current = true;
             setSavingUs(true);
             setErrorMessage(null);
+            const gen = opGenerationRef.current;
             try {
                 const updated = await apiRef.current.save<Savable<UserStory>>(
                     "userstories",
@@ -1648,11 +1842,19 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
                         assigned_to: assignedTo,
                     },
                 );
+                // M9: a reload superseded this assignment -> ignore completion.
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 const next = replaceModel(stateRef.current, updated);
                 stateRef.current = next;
                 setState(next);
                 closeLightbox();
             } catch (e) {
+                // M9: suppress a superseded assignment's error (stale board).
+                if (opGenerationRef.current !== gen) {
+                    return;
+                }
                 reportError(e);
             } finally {
                 savingUsRef.current = false;
@@ -1662,13 +1864,27 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         [closeLightbox, reportError],
     );
 
-    /** Delete a userstory optimistically, rolling back the state on failure. */
-    const deleteUs = useCallback(async (usId: number): Promise<void> => {
+    /**
+     * Perform the delete optimistically, rolling back the state on failure.
+     *
+     * C7: this is the INTERNAL mutation. It is no longer wired directly to the
+     * card menu — it runs ONLY after the user confirms in the shared
+     * `ConfirmDeleteLightbox` (see `deleteUs` / `confirmDelete` below), matching
+     * the legacy `$confirm.askOnDelete(...).then -> @repo.remove` flow. It never
+     * rejects: it owns its own rollback + `reportError`, so the confirmation
+     * controller simply closes the modal once it settles (legacy
+     * `askResponse.finish()` on success and `finish(false)` + error notify on
+     * failure).
+     */
+    const performDeleteUs = useCallback(async (usId: number): Promise<void> => {
         const snapshot = stateRef.current;
         const us = snapshot.usMap[usId];
         if (!us) {
             return;
         }
+        // M9: pin the delete to the current load generation so a reload that
+        // arrives before the request settles does not roll back onto a fresh board.
+        const gen = opGenerationRef.current;
         const priorOrder = snapshot.order[usId] ?? 0;
         const nextState = remove(snapshot, { id: usId, status: us.status });
         stateRef.current = nextState;
@@ -1676,6 +1892,11 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         try {
             await apiRef.current.remove("userstories", usId);
         } catch (e) {
+            // M9: a reload superseded this delete -> ignore its rollback (stale
+            // deltas must not corrupt the reloaded board) and suppress the error.
+            if (opGenerationRef.current !== gen) {
+                return;
+            }
             // M1: re-insert ONLY the deleted story into the CURRENT state (never a
             // stale whole-state snapshot), then restore its prior column position,
             // so concurrent real-time changes to other stories are preserved.
@@ -1688,6 +1909,34 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
             reportError(e);
         }
     }, [reportError]);
+
+    // C7: confirm-before-delete gate. The card delete control now OPENS a
+    // localized confirmation modal instead of mutating immediately; the delete
+    // runs only on `confirm`. Reproduces the legacy `$confirm.askOnDelete`.
+    const {
+        pending: pendingDelete,
+        busy: deleteBusy,
+        request: requestDeleteUs,
+        cancel: cancelDelete,
+        confirm: confirmDelete,
+    } = usePendingDelete<number>(performDeleteUs);
+
+    /**
+     * Request deletion of a userstory (finding C7). This OPENS the confirmation
+     * modal labelled with the story's subject; nothing is mutated until the user
+     * confirms. Signature is unchanged (`(usId) => void`) so the card control
+     * wiring is untouched.
+     */
+    const deleteUs = useCallback(
+        (usId: number): void => {
+            const story = stateRef.current.usMap[usId];
+            if (!story) {
+                return;
+            }
+            requestDeleteUs(usId, story.subject ?? "");
+        },
+        [requestDeleteUs],
+    );
 
     /**
      * Toggle a story's multi-select membership. The board gates on ctrl/meta;
@@ -1975,6 +2224,7 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         error,
         errorMessage,
         savingUs,
+        editLoading,
 
         /* Board data */
         usStatusList,
@@ -2020,10 +2270,13 @@ export function useKanbanStories(context: MountContext): UseKanbanStoriesResult 
         addNewUs,
         editUs,
         deleteUs,
+        pendingDelete,
+        deleteBusy,
+        confirmDelete,
+        cancelDelete,
         changeUsAssignedUsers,
         moveToTopDropdown,
         toggleSelectedUs,
-        editWipLimit,
         showArchivedStatus,
         setColumnMode: applyColumnMode,
 

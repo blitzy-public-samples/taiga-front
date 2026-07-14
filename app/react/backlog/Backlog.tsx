@@ -51,6 +51,7 @@ import type * as React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
+  KeyboardSensor,
   PointerSensor,
   useSensor,
   useSensors,
@@ -58,9 +59,14 @@ import {
   pointerWithin,
   closestCenter,
 } from "@dnd-kit/core";
-import type { DragEndEvent, CollisionDetection } from "@dnd-kit/core";
+import type {
+  DragEndEvent,
+  CollisionDetection,
+  Announcements,
+} from "@dnd-kit/core";
 import {
   SortableContext,
+  sortableKeyboardCoordinates,
   verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable";
@@ -75,12 +81,26 @@ import { BurndownSummary } from "./BurndownSummary";
 import { CreateEditSprint } from "./lightboxes/CreateEditSprint";
 import { useBacklogStories } from "./hooks/useBacklogStories";
 import { BacklogFilterPanel } from "./BacklogFilterPanel";
-import { StoryFormLightbox, BulkStoryLightbox } from "../shared/lightboxes";
+import { StoryFormLightbox, BulkStoryLightbox, ConfirmDeleteLightbox } from "../shared/lightboxes";
 import { storyToFormValues } from "../shared/lightboxes/storyForm";
 import { adminModulesUrl as buildAdminModulesUrl } from "../shared/nav/routes";
 import { t } from "../shared/i18n/translate";
+import { useTranslations } from "../shared/i18n/useTranslations";
 import { usePopover } from "../shared/popover/usePopover";
 import { computableRoles } from "../shared/estimation/points";
+import { canEditStory } from "../shared/permissions";
+
+/**
+ * Placeholder shown when `is_backlog_activated === false`.
+ *
+ * Mirrors the kanban precedent (`KanbanBoard.tsx`): the legacy app gated a
+ * deactivated module at the ROUTE/menu level: `BacklogController.loadProject`
+ * calls `errorHandlingService.permissionDenied()` when `is_backlog_activated` is
+ * false (legacy `backlog/main.coffee` L472), rendering the GLOBAL permission-
+ * denied page (`app/partials/error/permission-denied.jade`). The React
+ * fail-closed branch reproduces that page's authoritative DOM and exact i18n keys
+ * (M5) rather than an invented `.module-disabled` element with a made-up literal.
+ */
 
 /**
  * Pointer-based collision detection for the Backlog / Sprint-Planning DnD (C8
@@ -111,6 +131,19 @@ import { computableRoles } from "../shared/estimation/points";
  */
 const POST_DRAG_CLICK_SUPPRESS_MS = 400;
 
+/**
+ * Distance (px) from the bottom of the scrolled document at which the backlog
+ * begins fetching the NEXT page (finding M2 — infinite scroll). The legacy
+ * `infinite-scroll` directive on `.backlog-table-body`
+ * (`app/partials/includes/modules/backlog-table.jade`) used ng-infinite-scroll's
+ * default distance (0 => fire when the element's bottom edge reaches the
+ * viewport bottom). A small positive threshold preloads the next page slightly
+ * before the very end so scrolling stays smooth; `loadMoreUserstories` is itself
+ * idempotently guarded (hasMore/loadingMore), so an eager threshold cannot
+ * double-fetch.
+ */
+const INFINITE_SCROLL_THRESHOLD_PX = 200;
+
 const backlogCollisionDetection: CollisionDetection = (args) => {
   const containers = args.droppableContainers.filter(
     (container) => container.id !== args.active.id,
@@ -128,8 +161,8 @@ const backlogCollisionDetection: CollisionDetection = (args) => {
  *     `Card.tsx`, `KanbanHeader.tsx`) so the merged `declare global` blocks agree
  *     on its type (TypeScript requires type identity for a property declared in
  *     multiple augmentations, not merely byte-identity).
- *   (The sprint sidebar is emitted as a semantic `<aside class="sidebar">`; see
- *   the note on the sidebar render below.)
+ *   (The sprint sidebar is emitted as the authoritative `<sidebar class="sidebar">`
+ *   element; see the note on the sidebar render below.)
  */
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -138,6 +171,13 @@ declare global {
       "tg-svg": React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> &
         Record<string, unknown>;
       "tg-input-search": React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> &
+        Record<string, unknown>;
+      // Authoritative non-standard element from `backlog.jade` L193
+      // (`sidebar.sidebar`). Reproduced verbatim for DOM parity (review finding
+      // M15) — the browser upgrades it to an inert `HTMLUnknownElement` exactly
+      // as AngularJS did, and the `.sidebar` theme + the `tg-svg` descendant
+      // rules apply unchanged.
+      sidebar: React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> &
         Record<string, unknown>;
     }
   }
@@ -210,7 +250,14 @@ interface SortableBacklogRowProps {
  * type widens to `unknown`, so it needs no cast.
  */
 function SortableBacklogRow(rp: SortableBacklogRowProps): JSX.Element {
-  const s = useSortable({ id: rp.us.id });
+  // M4: gate the drag/drop sensor on the SAME authoritative editability the card
+  // controls use. A read-only project (`archived_code`) or a user lacking
+  // `modify_us` leaves the row with NO active drag listeners and NO drop target
+  // (`disabled` turns off both), reproducing the legacy read-only behaviour
+  // instead of retaining live listeners. The backend stays the single
+  // enforcement point (constraint C-1).
+  const canDrag = canEditStory(rp.project);
+  const s = useSortable({ id: rp.us.id, disabled: !canDrag });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(s.transform),
     transition: s.transition,
@@ -257,7 +304,11 @@ function SortableBacklogRow(rp: SortableBacklogRowProps): JSX.Element {
  * `SortableContext` (which registers its `id`).
  */
 function SortableSprintStoryRow(rp: { us: UserStory; project: Project }): JSX.Element {
-  const s = useSortable({ id: rp.us.id });
+  // M4: same authoritative gate as the backlog rows — a read-only project or a
+  // user without `modify_us` disables the sprint story row's drag AND drop, so
+  // sprint rows no longer retain live drag listeners in read-only mode.
+  const canDrag = canEditStory(rp.project);
+  const s = useSortable({ id: rp.us.id, disabled: !canDrag });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(s.transform),
     transition: s.transition,
@@ -287,18 +338,34 @@ function SortableSprintStoryRow(rp: { us: UserStory; project: Project }): JSX.El
  *   API/WebSocket clients and all screen state.
  */
 export function Backlog(props: { context: MountContext }): JSX.Element {
+  // M5: subscribe to i18n table changes so the whole backlog subtree re-renders
+  // when `localeBridge.ts` loads the active-language bundle (async) or the user
+  // switches language live. No `React.memo` exists in this tree, so re-rendering
+  // here cascades to every descendant that calls `t(...)`.
+  useTranslations();
+
   // The hook owns ALL data access, immer state, the WebSocket subscription and
   // the `pendingDrag` bulk-order queue. This container is a pure projection of
   // its view-model plus the `@dnd-kit` drag wiring.
   const vm = useBacklogStories(props.context);
   const project = vm.project;
 
-  // Single pointer sensor with an 8px activation distance: clicks on the row
-  // checkbox / status / points / options controls still fire, and a drag only
-  // begins after the pointer moves 8px — the React equivalent of dragula's
-  // handle-based drag start (`app/coffee/modules/backlog/sortable.coffee`).
+  // Pointer + keyboard sensors (M18). The `PointerSensor`'s 8px activation
+  // distance lets clicks on the row checkbox / status / points / options
+  // controls still fire, with a drag beginning only after the pointer moves 8px
+  // — the React equivalent of dragula's handle-based drag start
+  // (`app/coffee/modules/backlog/sortable.coffee`). The `KeyboardSensor` gives
+  // the backlog the SAME keyboard drag-and-drop the Kanban board has (see
+  // `kanban/dnd/KanbanDndProvider`): a focused drag handle (`role="button"` +
+  // `tabIndex` come from the sortable `attributes`) is picked up with
+  // Space/Enter, the arrow keys move it between rows/sprints via
+  // `sortableKeyboardCoordinates` (the sortable-aware coordinate getter), a
+  // second Space/Enter drops it and Escape cancels — with the
+  // `accessibility.announcements` below narrating each step, and dnd-kit
+  // restoring focus to the handle (via `setActivatorNodeRef`) when the drag ends.
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   // Backlog list container droppable (C8): lets a story from a sprint be dropped
@@ -376,6 +443,46 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
       document.removeEventListener("click", suppressPostDragLinkClick, true);
     };
   }, []);
+
+  // M2: infinite-scroll pagination trigger. The legacy `backlog-table.jade`
+  // wired `infinite-scroll="ctrl.loadUserstories()"` on `.backlog-table-body`,
+  // guarded by `infinite-scroll-disabled="ctrl.disablePagination ||
+  // !ctrl.firstLoadComplete"` with `infinite-scroll-immediate-check='false'`.
+  // ng-infinite-scroll listens on the WINDOW by default (no
+  // `infinite-scroll-container` was set), so reproduce that: on window scroll,
+  // when the document is scrolled within THRESHOLD px of its bottom AND another
+  // page exists (`hasMoreUserstories` ~ !disablePagination) AND neither an
+  // append (`loadingMore`) nor the initial load (`loading` ~ !firstLoadComplete)
+  // is running, append the next page. `hasMoreUserstories`/`loadingMore`/
+  // `loading` are read through a ref so the listener is registered ONCE
+  // (`loadMoreUserstories` is a stable callback) yet always sees fresh values;
+  // `loadMoreUserstories` is itself idempotently guarded inside the hook, so a
+  // burst of scroll events cannot double-fetch.
+  const canLoadMore =
+    vm.hasMoreUserstories && !vm.loadingMore && !vm.loading;
+  const canLoadMoreRef = useRef<boolean>(canLoadMore);
+  canLoadMoreRef.current = canLoadMore;
+  const loadMoreUserstories = vm.loadMoreUserstories;
+  useEffect(() => {
+    const onScroll = (): void => {
+      if (!canLoadMoreRef.current) {
+        return;
+      }
+      const doc = document.documentElement;
+      const scrollTop =
+        window.scrollY != null ? window.scrollY : doc.scrollTop;
+      const viewport =
+        window.innerHeight != null ? window.innerHeight : doc.clientHeight;
+      const full = doc.scrollHeight;
+      if (scrollTop + viewport >= full - INFINITE_SCROLL_THRESHOLD_PX) {
+        loadMoreUserstories();
+      }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+    };
+  }, [loadMoreUserstories]);
 
   /**
    * Maps a completed drag to exactly ONE backend bulk call, reproducing the
@@ -512,15 +619,61 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
           <div className="backlog-board-status" role="alert" aria-live="assertive">
             {vm.errorMessage}
           </div>
-        ) : null}
+        ) : (
+          /* M20: a cold load previously rendered a SILENT empty `main.scrum`
+             shell. The legacy screen relied on the global `tgLoader` overlay;
+             reproduce a readable, screen-reader-announced status so the load is
+             conveyed to assistive tech rather than an empty region. `role=status`
+             + polite matches the kanban `.kanban-table-loading` precedent and
+             preserves the visual authority of the surrounding SCSS. */
+          <div className="backlog-table-loading" role="status" aria-live="polite">
+            {t("COMMON.LOADING")}
+          </div>
+        )}
       </main>
+    );
+  }
+
+  // --- Module-activation guard (mirrors `is_backlog_activated`) ---------------
+  // C5: when the module is deactivated we render a minimal placeholder rather
+  // than the backlog board (show/hide only — no parallel authorization; the
+  // backend stays the single enforcement point, constraint C-1). The hook fails
+  // closed upstream (no data fetch, no WebSocket subscription) when the flag is
+  // false; this is the matching view. Mirrors `KanbanBoard.tsx`'s
+  // `.module-disabled` branch.
+  if (!project.is_backlog_activated) {
+    // Reproduce the legacy global permission-denied page
+    // (permission-denied.jade) that `errorHandlingService.permissionDenied()`
+    // triggers when the module is deactivated. `.error-main` is a full-screen
+    // fixed overlay (not-found.scss); text uses the EXACT legacy keys (M5).
+    const version =
+      (window as unknown as { _version?: string })._version ?? "";
+    return (
+      <div className="error-main">
+        <div className="error-container">
+          <img className="logo-svg" src={`${version}/svg/logo.svg`} alt="TAIGA" />
+          <h1 className="logo">{t("ERROR.PERMISSION_DENIED")}</h1>
+          <p>{t("ERROR.PERMISSION_DENIED_TEXT")}</p>
+          <a href="/" title="">
+            {t("COMMON.GO_HOME")}
+          </a>
+        </div>
+      </div>
     );
   }
 
   // Permission gates — mirror the AngularJS `tg-check-permission` directives.
   // The backend remains the single enforcement point (constraint C-1); these
   // only hide controls the user cannot use.
-  const modifyUs = project.my_permissions.indexOf("modify_us") !== -1;
+  //
+  // M4: `modifyUs` is the AUTHORITATIVE edit gate (`canEditStory` = `modify_us`
+  // AND a writable / non-archived project). This MUST match the per-row gate in
+  // `BacklogRow`/`SortableBacklogRow`, otherwise the backlog-table HEADER spacer
+  // columns (`.draggable-us-column` + `.input`, gated below on `modifyUs`) would
+  // render on a read-only project while the rows — gated on the same
+  // `canEditStory` — drop their drag handle and checkbox, misaligning every
+  // column. `addUs` stays a raw `add_us` check (a distinct permission surface).
+  const modifyUs = canEditStory(project);
   const addUs = project.my_permissions.indexOf("add_us") !== -1;
 
   // Move-to-sprint toolbar buttons are hidden by default (`.btn-filter
@@ -597,12 +750,58 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
       ? storyToFormValues(targetStory)
       : { status: project.us_statuses?.[0]?.id ?? undefined };
 
+  // M18: screen-reader announcements for drag-and-drop. `@dnd-kit` calls these
+  // for BOTH pointer and keyboard drags — they are the required a11y feedback
+  // that makes the new `KeyboardSensor` usable, narrating pick-up, move-over,
+  // drop and Escape-cancel. Each message names the moved story by its subject
+  // (resolved across the backlog + open/closed sprints, with a `#id` fallback),
+  // mirroring the Kanban board's announcements (`KanbanDndProvider`).
+  const announceSubjectOf = (id: number | string): string => {
+    const numericId = Number(id);
+    if (Number.isNaN(numericId)) {
+      return `#${id}`;
+    }
+    const all: UserStory[] = [
+      ...vm.userstories,
+      ...vm.sprints.flatMap((sprint) => sprint.user_stories ?? []),
+      ...vm.closedSprints.flatMap((sprint) => sprint.user_stories ?? []),
+    ];
+    const story = all.find((it) => it.id === numericId);
+    const subject = story?.subject;
+    if (typeof subject === "string" && subject.trim().length > 0) {
+      return subject;
+    }
+    return `#${id}`;
+  };
+
+  const announcements: Announcements = {
+    onDragStart({ active }) {
+      return `Picked up user story ${announceSubjectOf(active.id)}.`;
+    },
+    onDragOver({ active, over }) {
+      if (over) {
+        return `User story ${announceSubjectOf(active.id)} is over a drop target.`;
+      }
+      return `User story ${announceSubjectOf(active.id)} is no longer over a drop target.`;
+    },
+    onDragEnd({ active, over }) {
+      if (over) {
+        return `User story ${announceSubjectOf(active.id)} was dropped.`;
+      }
+      return `User story ${announceSubjectOf(active.id)} was dropped outside a drop target.`;
+    },
+    onDragCancel({ active }) {
+      return `Dragging user story ${announceSubjectOf(active.id)} was cancelled.`;
+    },
+  };
+
   return (
     <DndContext
       sensors={sensors}
       collisionDetection={backlogCollisionDetection}
       autoScroll
       onDragEnd={onDragEnd}
+      accessibility={{ announcements }}
     >
       <main className="main scrum" aria-busy={vm.savingUs || undefined}>
         <section className="backlog">
@@ -623,7 +822,17 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
               announced without stealing focus; empty (renders nothing) on the
               happy path. Mirrors the kanban `.kanban-board-status` region. */}
           <div className="backlog-board-status" role="status" aria-live="polite">
-            {vm.errorMessage ? <span>{vm.errorMessage}</span> : null}
+            {vm.editLoading ? (
+              /* C6: the edit flow is fetching the AUTHORITATIVE story detail +
+                 attachments before opening the lightbox. Announce a localized
+                 loading status (parity with the legacy trigger spinner) so the
+                 edit does not appear to hang and cannot open a blank form. */
+              <span className="loading-spinner" data-type="loading">
+                {t("COMMON.LOADING")}
+              </span>
+            ) : vm.errorMessage ? (
+              <span>{vm.errorMessage}</span>
+            ) : null}
           </div>
 
           {/* .backlog-summary is reproduced ENTIRELY by BurndownSummary
@@ -640,19 +849,24 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
               <div className="backlog-menu">
                 <div className="backlog-header">
                   <div className="backlog-header-title">
-                    <h2>Backlog</h2>
+                    {/* M5: legacy `backlog.jade` renders `h2 Backlog` as a
+                      HARD-CODED literal (no `translate=`), so it is "Backlog" in
+                      every language; reproducing it verbatim is the faithful
+                      parity choice (routing it through `t()` would DIVERGE from
+                      AngularJS in non-English). */}
+                  <h2>Backlog</h2>
                     {vm.selectedFilters.length ? (
                       <>
                         <span className="backlog-stories-number squared">
                           {vm.userstories.length}
                         </span>
                         <span className="backlog-stories-number">
-                          {"of " + vm.totalUserStories + " user stories"}
+                          {t("BACKLOG.TOTAL_STORIES_FILTERED", { totalUserStories: vm.totalUserStories })}
                         </span>
                       </>
                     ) : (
                       <span className="backlog-stories-number">
-                        {vm.totalUserStories + " user stories"}
+                        {t("BACKLOG.TOTAL_STORIES", { totalUserStories: vm.totalUserStories })}
                       </span>
                     )}
                   </div>
@@ -671,14 +885,14 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                           }}
                         >
                           <Icon name="icon-add" />
-                          <span className="text">user story</span>
+                          <span className="text">{t("US.ADD")}</span>
                         </a>
                       ) : null}
                       {addUs ? (
                         <a
                           className="btn-icon"
                           href=""
-                          aria-label="Add some new user stories in bulk"
+                          aria-label={t("US.ADD_BULK")}
                           onClick={(e) => {
                             e.preventDefault();
                             vm.addNewUs("bulk");
@@ -703,7 +917,7 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                     >
                       <Icon name="icon-filters" />
                       <span className="text">
-                        {vm.activeFilters ? "Hide filters" : "Filters"}
+                        {vm.activeFilters ? t("BACKLOG.FILTERS.HIDE_TITLE") : t("BACKLOG.FILTERS.TITLE")}
                       </span>
                       {vm.selectedFilters.length ? (
                         <span className="selected-filters">
@@ -716,9 +930,17 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                         fixture target `tg-input-search input`); `change` ->
                         `changeQ`, mirroring the `input-search.component` binding. */}
                     <tg-input-search>
+                      {/* M19/M5: the legacy `tg-input-search` component rendered a
+                          localized placeholder (COMMON.FILTERS.INPUT_PLACEHOLDER =
+                          "subject or reference"). Reproduce it AND expose the same
+                          string as the accessible name so the search box is
+                          reachable by assistive tech (it previously had neither a
+                          placeholder nor a name). */}
                       <input
                         type="search"
                         className="e2e-search e2e-filter-q"
+                        placeholder={t("COMMON.FILTERS.INPUT_PLACEHOLDER")}
+                        aria-label={t("COMMON.FILTERS.INPUT_PLACEHOLDER")}
                         value={vm.filterQ}
                         onChange={(e) => vm.changeQ(e.target.value)}
                       />
@@ -742,7 +964,7 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                           />
                           <div />
                         </div>
-                        <label htmlFor="show-tags-input">tags</label>
+                        <label htmlFor="show-tags-input">{t("BACKLOG.TAGS.SHOW")}</label>
                       </div>
                     ) : null}
                   </div>
@@ -751,23 +973,23 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                     {vm.currentSprint ? (
                       <button
                         className="btn-filter move-to-current-sprint move-to-sprint e2e-move-to-sprint"
-                        title="Move to Current Sprint"
+                        title={t("BACKLOG.MOVE_US_TO_CURRENT_SPRINT")}
                         id="move-to-current-sprint"
                         style={{ display: showMoveToSprint ? "flex" : "none" }}
                         onClick={() => vm.moveSelectedToCurrentSprint()}
                       >
-                        <span className="text">Move to Current Sprint</span>
+                        <span className="text">{t("BACKLOG.MOVE_US_TO_CURRENT_SPRINT")}</span>
                         <Icon name="icon-add-to-sprint" />
                       </button>
                     ) : (
                       <button
                         className="btn-filter move-to-latest-sprint move-to-sprint e2e-move-to-sprint"
-                        title="Move to latest Sprint"
+                        title={t("BACKLOG.MOVE_US_TO_LATEST_SPRINT")}
                         id="move-to-latest-sprint"
                         style={{ display: showMoveToSprint ? "flex" : "none" }}
                         onClick={() => vm.moveSelectedToLatestSprint()}
                       >
-                        <span className="text">Move to latest Sprint</span>
+                        <span className="text">{t("BACKLOG.MOVE_US_TO_LATEST_SPRINT")}</span>
                         <Icon name="icon-add-to-sprint" />
                       </button>
                     )}
@@ -962,8 +1184,19 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                         />
                       ))}
                     </SortableContext>
-                    {/* tg-loading placeholder for the infinite-scroll fetch. */}
-                    <div>{vm.loading ? "…" : null}</div>
+                    {/* M20: incremental (infinite-scroll) fetch status. The
+                        legacy `tg-loading` placeholder was a bare ellipsis that
+                        conveyed nothing to assistive tech; render localized,
+                        screen-reader-announced text inside a `role=status`
+                        polite live region so an in-progress page load is
+                        readable. Empty (renders no text) when idle. */}
+                    <div
+                      className="backlog-table-loading-more"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {vm.loadingMore ? t("COMMON.LOADING") : null}
+                    </div>
                   </div>
 
                   {vm.displayVelocity ? (
@@ -973,8 +1206,8 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                     >
                       <span className="forecasting-text">
                         {vm.forecastNewSprint
-                          ? "create sprint and add US"
-                          : "Move to Current Sprint"}
+                          ? t("BACKLOG.FORECASTING.ADD_NEW_SPRINT")
+                          : t("BACKLOG.MOVE_US_TO_CURRENT_SPRINT")}
                       </span>
                       <input className="e2e-sprint-name" defaultValue="" />
                     </div>
@@ -989,8 +1222,8 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                     (vm.userstories.length || !vm.filterQ.length ? " hidden" : "")
                   }
                 >
-                  <p className="no-match">No matches</p>
-                  <p className="no-match-help">Try again with a different search</p>
+                  <p className="no-match">{t("BACKLOG.NO_MATCH", { q: vm.filterQ })}</p>
+                  <p className="no-match-help">{t("BACKLOG.NO_MATCH_HELP")}</p>
                 </div>
                 <div
                   className={
@@ -998,15 +1231,15 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
                     (vm.userstories.length || vm.filterQ.length ? " hidden" : "")
                   }
                 >
-                  <p className="title">The backlog is empty!</p>
+                  <p className="title">{t("BACKLOG.EMPTY")}</p>
                   {addUs ? (
                     <button
                       className="btn-small"
-                      title="Create a new user story"
+                      title={t("BACKLOG.CREATE_NEW_US")}
                       onClick={() => vm.addNewUs("standard")}
                     >
                       <Icon name="icon-add" />
-                      <span className="text">Add a user story</span>
+                      <span className="text">{t("BACKLOG.CREATE_NEW_US_EMPTY_HELP")}</span>
                     </button>
                   ) : null}
                 </div>
@@ -1015,14 +1248,16 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
           </div>
         </section>
 
-        {/* Sprint sidebar (`backlog.jade` -> `sidebar.sidebar` -> the `sprints`
-            include, reproduced by SprintList). The legacy `sidebar` element is
-            a non-standard tag that React flags as unrecognized (finding M7); we
-            emit the HTML5 `<aside>` — the authoritative semantic element for
-            complementary/sidebar content, carrying the SAME `.sidebar` class the
-            (class-based) theme targets — so the styling is identical, the markup
-            is valid, and the region exposes a proper `complementary` landmark. */}
-        <aside className="sidebar">
+        {/* Sprint sidebar (`backlog.jade` L193 -> `sidebar.sidebar` -> the
+            `sprints` include, reproduced by SprintList). The AUTHORITATIVE DOM
+            is the non-standard `<sidebar class="sidebar">` element, so it is
+            reproduced verbatim (review finding M15 — "reproduce authoritative
+            shared-widget DOM/classes exactly"). The browser upgrades the unknown
+            tag to an inert `HTMLUnknownElement` — identical to how AngularJS
+            rendered it — and the `.sidebar` theme plus the SCSS `sidebar`-scoped
+            `tg-svg` rules apply unchanged. It is declared in the module
+            `JSX.IntrinsicElements` augmentation above. */}
+        <sidebar className="sidebar">
           <SprintList
             project={project}
             openSprints={vm.sprints}
@@ -1037,7 +1272,7 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
               <SortableSprintStoryRow key={us.id} us={us} project={project} />
             )}
           />
-        </aside>
+        </sidebar>
       </main>
 
       {/* Story create/edit/bulk lightboxes (finding C7): the SAME shared React
@@ -1058,6 +1293,7 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
         defaultSwimlaneId={null}
         isKanban={false}
         initialValues={storyInitialValues}
+        projectTagsColors={project?.tags_colors}
         saving={vm.savingUs}
         errorMessage={vm.errorMessage}
         canSubmit={activeLightboxType === "edit" ? modifyUs : addUs}
@@ -1090,6 +1326,18 @@ export function Backlog(props: { context: MountContext }): JSX.Element {
         onClose={vm.closeSprintLightbox}
         onSaved={vm.onSprintSaved}
         onDeleted={vm.onSprintDeleted}
+      />
+
+      {/* C7: localized delete confirmation. `BacklogRow`'s delete control opens
+          this modal (via `vm.deleteUserStory`); the story is removed only after
+          the user confirms, replacing the previous hard-coded `window.confirm`
+          and reproducing the legacy `$confirm.askOnDelete` flow. */}
+      <ConfirmDeleteLightbox
+        open={vm.pendingDelete !== null}
+        subject={vm.pendingDelete?.subject ?? ""}
+        busy={vm.deleteBusy}
+        onConfirm={vm.confirmDelete}
+        onCancel={vm.cancelDelete}
       />
     </DndContext>
   );
