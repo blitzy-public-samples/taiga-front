@@ -18,9 +18,18 @@
 //     mocking the sibling `../api/userstories` module;
 //   • the DndProvider component: the permission gate (inert pass-through when
 //     disabled) and, when enabled, the full drag-handler lifecycle (activeId
-//     tracking, NormalizedDragEnd shape, applyDrop wiring, promise-safe error
-//     handling), asserted deterministically by stubbing `@dnd-kit/core` so the
-//     captured handlers can be invoked without the sensor machinery.
+//     tracking, NormalizedDragEnd shape, applyDrop wiring), the two configured
+//     sensors (PointerSensor + accessible KeyboardSensor), the RECOVERABLE
+//     failure-signaling contract (onPersistError on both async-reject and
+//     sync-throw, with console.error only as a fallback — M-41), and hooks
+//     stability across an enabled/disabled/enabled gate flip (M-42) — all
+//     asserted deterministically by stubbing `@dnd-kit/core` so the captured
+//     handlers can be invoked without the sensor machinery.
+//
+// The REAL @dnd-kit/core public contract (mounting a genuine DndContext, real
+// useDraggable/useDroppable registration, and a full KEYBOARD drag driving
+// resolveDrop -> applyDrop -> persist -> onPersistError) is proven separately in
+// the un-mocked integration suite `DndProvider.integration.test.tsx` (M-43).
 //
 // TEST-INDEPENDENCE: the neighbor / skip / mapping expectations below are pinned
 // as INDEPENDENT literals derived from the authoritative CoffeeScript sources
@@ -104,6 +113,7 @@ jest.mock("@dnd-kit/core", () => {
         DragOverlay: (props: { children?: ReactNode }) =>
             react.createElement("div", { "data-testid": "drag-overlay" }, props.children),
         PointerSensor: { sensorName: "PointerSensor" },
+        KeyboardSensor: { sensorName: "KeyboardSensor" },
         useSensor: (sensor: unknown, options: unknown) => ({ sensor, options }),
         useSensors: (...descriptors: unknown[]) => descriptors,
     };
@@ -468,7 +478,7 @@ describe("DndProvider — configuration", () => {
         expect(screen.getByTestId("dnd-context")).toHaveAttribute("data-autoscroll", "false");
     });
 
-    it("configures the PointerSensor with the default 5px activation distance", () => {
+    it("configures a PointerSensor (5px activation) AND a KeyboardSensor for accessible DnD", () => {
         render(
             <DndProvider project={enabledProject} resolveDrop={() => null} persist={() => undefined}>
                 <div>board</div>
@@ -477,11 +487,13 @@ describe("DndProvider — configuration", () => {
 
         const sensors = mockCaptured.sensors as Array<{
             sensor: { sensorName: string };
-            options: { activationConstraint: { distance: number } };
+            options?: { activationConstraint?: { distance?: number } };
         }>;
-        expect(sensors).toHaveLength(1);
+        // Two sensors: pointer (mouse/touch/pen) + keyboard (WCAG-accessible DnD).
+        expect(sensors).toHaveLength(2);
         expect(sensors[0].sensor.sensorName).toBe("PointerSensor");
-        expect(sensors[0].options.activationConstraint.distance).toBe(5);
+        expect(sensors[0].options?.activationConstraint?.distance).toBe(5);
+        expect(sensors[1].sensor.sensorName).toBe("KeyboardSensor");
     });
 
     it("honors a custom activationDistance", () => {
@@ -588,7 +600,9 @@ describe("DndProvider — drag lifecycle", () => {
         expect(persist).not.toHaveBeenCalled();
     });
 
-    it("logs (never throws) when an async persist rejects", async () => {
+    it("never throws out of the drag handler when persist rejects", async () => {
+        // Silence the expected fallback diagnostic (no onPersistError handler here);
+        // the failure-signaling behavior itself is asserted in the M-41 suite below.
         const errorSpy = jest
             .spyOn(console, "error")
             .mockImplementation(() => undefined);
@@ -605,16 +619,180 @@ describe("DndProvider — drag lifecycle", () => {
         );
 
         await act(async () => {
-            mockCaptured.onDragEnd?.({ active: { id: "20" }, over: { id: "col:2" } });
-            // Flush the microtask queue so the .catch handler runs.
+            expect(() => {
+                mockCaptured.onDragEnd?.({ active: { id: "20" }, over: { id: "col:2" } });
+            }).not.toThrow();
+            // Flush the microtask queue so the rejection settles inside `act`.
             await new Promise((resolve) => setTimeout(resolve, 0));
         });
 
         expect(persist).toHaveBeenCalledTimes(1);
+        errorSpy.mockRestore();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// M-41: recoverable persistence-failure signaling (NOT log-only)
+//
+// The provider does not own the board state, so on a failed persist it must
+// SIGNAL the consuming screen (via `onPersistError`) with the error AND the
+// exact resolved drop, enabling the screen to restore its optimistic state and
+// show a user-facing error. Logging is only a FALLBACK when no handler is given.
+// These tests deliberately reject the log-only oracle the old suite canonized.
+// ---------------------------------------------------------------------------
+
+describe("DndProvider — persistence failure recovery (M-41)", () => {
+    it("invokes onPersistError with the error AND the resolved drop when an async persist REJECTS (enables rollback)", async () => {
+        const resolved = makeResolved();
+        const error = new Error("network down");
+        const persist = jest.fn().mockRejectedValue(error);
+        const onPersistError = jest.fn();
+        const errorSpy = jest
+            .spyOn(console, "error")
+            .mockImplementation(() => undefined);
+
+        render(
+            <DndProvider
+                project={enabledProject}
+                resolveDrop={() => resolved}
+                persist={persist}
+                onPersistError={onPersistError}
+            >
+                <div>board</div>
+            </DndProvider>,
+        );
+
+        await act(async () => {
+            mockCaptured.onDragEnd?.({ active: { id: "20" }, over: { id: "col:2" } });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+
+        expect(persist).toHaveBeenCalledTimes(1);
+        // Recovery contract: the consumer receives the error and the EXACT resolved
+        // drop (by reference) so it can reverse the optimistic move + show feedback.
+        expect(onPersistError).toHaveBeenCalledTimes(1);
+        expect(onPersistError).toHaveBeenCalledWith(error, resolved);
+        // With a handler present, the provider does NOT fall back to console logging.
+        expect(errorSpy).not.toHaveBeenCalled();
+
+        errorSpy.mockRestore();
+    });
+
+    it("routes a SYNCHRONOUS persist throw through onPersistError too and never throws", () => {
+        const resolved = makeResolved();
+        const error = new Error("sync boom");
+        const persist = jest.fn(() => {
+            throw error;
+        });
+        const onPersistError = jest.fn();
+
+        render(
+            <DndProvider
+                project={enabledProject}
+                resolveDrop={() => resolved}
+                persist={persist}
+                onPersistError={onPersistError}
+            >
+                <div>board</div>
+            </DndProvider>,
+        );
+
+        expect(() => {
+            act(() => {
+                mockCaptured.onDragEnd?.({ active: { id: "20" }, over: { id: "col:2" } });
+            });
+        }).not.toThrow();
+
+        expect(persist).toHaveBeenCalledTimes(1);
+        expect(onPersistError).toHaveBeenCalledTimes(1);
+        expect(onPersistError).toHaveBeenCalledWith(error, resolved);
+    });
+
+    it("falls back to a single diagnostic console.error (and never throws) when NO onPersistError is supplied", async () => {
+        const persist = jest.fn().mockRejectedValue(new Error("network down"));
+        const errorSpy = jest
+            .spyOn(console, "error")
+            .mockImplementation(() => undefined);
+
+        render(
+            <DndProvider
+                project={enabledProject}
+                resolveDrop={() => makeResolved()}
+                persist={persist}
+            >
+                <div>board</div>
+            </DndProvider>,
+        );
+
+        await act(async () => {
+            mockCaptured.onDragEnd?.({ active: { id: "20" }, over: { id: "col:2" } });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+
+        expect(persist).toHaveBeenCalledTimes(1);
+        // The safety net remains: a failure is never silently swallowed. This is a
+        // FALLBACK now, not the primary contract (see the onPersistError tests).
+        expect(errorSpy).toHaveBeenCalledTimes(1);
         expect(errorSpy).toHaveBeenCalledWith(
             "[taiga-react] drag-and-drop order persistence failed",
             expect.any(Error),
         );
+
+        errorSpy.mockRestore();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// M-42: hooks stability across the permission gate
+//
+// The provider calls ALL hooks (useState / useSensors / useCallback)
+// UNCONDITIONALLY before the permission gate, so hook order stays stable even
+// when `project` flips the gate on a live instance. React emits a hooks-order
+// error to console.error if that invariant is broken; this asserts NONE is
+// emitted across an enabled → disabled → enabled rerender of the SAME instance.
+// ---------------------------------------------------------------------------
+
+describe("DndProvider — hooks stability across the permission gate (M-42)", () => {
+    it("survives enabled -> disabled -> enabled rerenders on the SAME instance with no hook-order warning", () => {
+        const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+        const resolveDrop = (): null => null;
+        const persist = (): void => undefined;
+
+        const { rerender } = render(
+            <DndProvider project={enabledProject} resolveDrop={resolveDrop} persist={persist}>
+                <div data-testid="board">board</div>
+            </DndProvider>,
+        );
+        expect(screen.getByTestId("dnd-context")).toBeInTheDocument();
+        expect(screen.getByTestId("board")).toBeInTheDocument();
+
+        // Gate OFF on the same instance (e.g. permissions reload / project archived).
+        rerender(
+            <DndProvider project={disabledProject} resolveDrop={resolveDrop} persist={persist}>
+                <div data-testid="board">board</div>
+            </DndProvider>,
+        );
+        expect(screen.queryByTestId("dnd-context")).not.toBeInTheDocument();
+        expect(screen.getByTestId("board")).toBeInTheDocument();
+
+        // Gate back ON.
+        rerender(
+            <DndProvider project={enabledProject} resolveDrop={resolveDrop} persist={persist}>
+                <div data-testid="board">board</div>
+            </DndProvider>,
+        );
+        expect(screen.getByTestId("dnd-context")).toBeInTheDocument();
+        expect(screen.getByTestId("board")).toBeInTheDocument();
+
+        // The crux: no React hooks-order / rules-of-hooks warning across the flips.
+        const hookWarnings = errorSpy.mock.calls.filter((callArgs) => {
+            const first = callArgs[0];
+            return (
+                typeof first === "string" &&
+                /rendered (more|fewer) hooks|order of Hooks|rules of hooks/i.test(first)
+            );
+        });
+        expect(hookWarnings).toEqual([]);
 
         errorSpy.mockRestore();
     });

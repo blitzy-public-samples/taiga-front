@@ -61,6 +61,7 @@ import type { ReactNode } from "react";
 import {
     DndContext,
     DragOverlay,
+    KeyboardSensor,
     PointerSensor,
     useSensor,
     useSensors,
@@ -183,6 +184,26 @@ export interface DndProviderProps {
     activationDistance?: number;
     /** Optional pass-through for dnd-kit autoScroll (default `true` — built-in autoscroll enabled). */
     autoScroll?: boolean;
+    /**
+     * Optional RECOVERABLE-FAILURE-SIGNALING hook. Invoked when the drop's
+     * {@link persist} REJECTS (async) OR throws synchronously.
+     *
+     * The provider is intentionally screen-agnostic and does NOT own the board
+     * state (the consumer's {@link resolveDrop} does), so it cannot roll back an
+     * optimistic move itself. Instead it hands the consuming screen the `error`
+     * and the exact {@link ResolvedDrop} that failed, so the screen can:
+     *   1. restore its optimistic board state (reverse the move using
+     *      `resolved.origin` / `resolved.target` / `resolved.orderedIds` /
+     *      `resolved.draggedIds`), and
+     *   2. surface a user-facing error (translated toast, inline message, etc.).
+     *
+     * When omitted, the provider falls back to a single diagnostic
+     * `console.error` so a persistence failure is NEVER silently swallowed — but
+     * it still never throws. `resolved` is `null` only in the (unreachable for a
+     * genuine persistence failure) case where the drop was aborted before
+     * persistence; consumers should treat a `null` resolved defensively.
+     */
+    onPersistError?: (error: unknown, resolved: ResolvedDrop | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,12 +391,18 @@ const DEFAULT_ACTIVATION_DISTANCE = 5;
  * behaves exactly like the legacy directives, which simply never initialized the
  * dragula drake without the `modify_us` permission.
  *
- * When permitted it wires a single `PointerSensor`, tracks the active dragged id
+ * When permitted it wires a `PointerSensor` (mouse/touch/pen) AND a
+ * `KeyboardSensor` (accessible keyboard-only drag), tracks the active dragged id
  * for the optional `DragOverlay`, and on drop delegates ordering + persistence to
  * {@link applyDrop} (which itself uses the injected `resolveDrop` / `persist`
  * callbacks). Auto-scroll during drag uses dnd-kit's BUILT-IN autoscroll (the
  * `autoScroll` prop, enabled by default) — the legacy `dom-autoscroller` is
  * deliberately not reintroduced.
+ *
+ * On a persistence FAILURE the provider signals the consuming screen via the
+ * optional {@link DndProviderProps.onPersistError} callback (so the screen can
+ * roll back its optimistic state and show a user-facing error); it never throws
+ * and never renders error UI itself.
  */
 export function DndProvider(props: DndProviderProps): JSX.Element {
     const {
@@ -386,6 +413,7 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         renderDragOverlay,
         activationDistance,
         autoScroll,
+        onPersistError,
     } = props;
 
     // Hooks are intentionally called UNCONDITIONALLY, before the permission gate
@@ -395,12 +423,21 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
     // returned JSX. The sensor/state are simply left unused when DnD is disabled.
     const [activeId, setActiveId] = useState<number | null>(null);
 
+    // Two sensors so the board is operable by BOTH pointer and keyboard:
+    //   • PointerSensor — mouse / touch / pen, with a small activation distance
+    //     so a plain click is not misread as a drag (mirrors dragula's implicit
+    //     click/drag distinction).
+    //   • KeyboardSensor — accessible, keyboard-only drag-and-drop (Space/Enter to
+    //     pick up, arrow keys to move, Space/Enter to drop, Esc to cancel). The
+    //     legacy imperative `dragula` drake had no keyboard affordance; adding the
+    //     KeyboardSensor is required for WCAG-compatible keyboard DnD.
     const sensors = useSensors(
         useSensor(PointerSensor, {
             activationConstraint: {
                 distance: activationDistance ?? DEFAULT_ACTIVATION_DISTANCE,
             },
         }),
+        useSensor(KeyboardSensor),
     );
 
     const handleDragStart = useCallback((event: DragStartEvent): void => {
@@ -422,26 +459,48 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
                 event,
             };
 
-            // Clear the overlay id immediately; the persistence below is fire-and-
-            // forget from the provider's perspective (the consuming screen owns any
-            // user-facing success/error handling and optimistic-state reconciliation).
+            // Clear the overlay id immediately.
             setActiveId(null);
 
-            // `applyDrop` may return void (skipped / null) or a promise (async
-            // persist). Wrapping in `Promise.resolve(...)` normalizes both cases and
-            // the leading `void` discards the promise so a rejection cannot surface
-            // as an unhandled rejection. We do NOT render app-specific error UI here.
-            void Promise.resolve(applyDrop(resolveDrop(normalized), persist)).catch(
-                (error: unknown): void => {
-                    // eslint-disable-next-line no-console
-                    console.error(
-                        "[taiga-react] drag-and-drop order persistence failed",
-                        error,
-                    );
-                },
-            );
+            // Resolve the drop UP-FRONT so the resolved payload is available to the
+            // failure-recovery contract below. The consuming screen needs the exact
+            // origin / target / orderedIds to restore its optimistic board state
+            // when persistence fails.
+            const resolved = resolveDrop(normalized);
+
+            // Centralized, promise- AND throw-safe failure recovery. When the
+            // consumer supplies `onPersistError` it OWNS the recovery: reverse the
+            // optimistic move and surface a user-facing error (RECOVERABLE FAILURE
+            // SIGNALING). When it does not, we fall back to a single diagnostic log
+            // so a failure is never silently swallowed. Either way the provider
+            // NEVER throws and NEVER renders app-specific error UI itself (it is a
+            // generic, screen-agnostic provider).
+            const handleFailure = (error: unknown): void => {
+                if (onPersistError) {
+                    onPersistError(error, resolved);
+                    return;
+                }
+                // eslint-disable-next-line no-console
+                console.error(
+                    "[taiga-react] drag-and-drop order persistence failed",
+                    error,
+                );
+            };
+
+            try {
+                // `applyDrop` may return void (skipped / null) or a promise (async
+                // persist). `Promise.resolve(...)` normalizes both; the leading
+                // `void` discards the promise so a rejection cannot surface as an
+                // unhandled rejection — it is routed to `handleFailure` instead.
+                void Promise.resolve(applyDrop(resolved, persist)).catch(handleFailure);
+            } catch (error) {
+                // A SYNCHRONOUS throw from `persist` (i.e. it threw instead of
+                // returning a rejected promise) is routed through the SAME recovery
+                // path, guaranteeing the drag handler never throws.
+                handleFailure(error);
+            }
         },
-        [resolveDrop, persist],
+        [resolveDrop, persist, onPersistError],
     );
 
     // Permission gate: inert pass-through when DnD is disabled (no DndContext,
