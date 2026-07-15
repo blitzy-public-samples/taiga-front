@@ -40,6 +40,17 @@
  * cases the way the hosting screen does). React is NOT imported (automatic
  * `react-jsx` runtime); `jest` is a global; jest-dom matchers are registered
  * globally via jest.config `setupFilesAfterEnv`.
+ *
+ * DRIFT-GUARD (verified against SprintHeader.tsx on disk — disk WINS over the
+ * plan's assumed surface): the component is driven by a FLAT prop object, NOT a
+ * nested `sprint` record. Every assertion below targets the on-disk
+ * `SprintHeaderProps` contract — `name`, `estimatedStart`, `estimatedFinish`,
+ * `closedPoints`, `totalPoints`, `taskboardUrl`, `isVisible`, `isEditable`,
+ * `isOpen`, `onToggleFold`, `onEdit` — so there is deliberately NO `makeSprint`
+ * object helper; `renderHeader` spreads the flat props directly. The pre-resolved
+ * `taskboardUrl` and the two boolean permission gates arrive as props (the parent
+ * `Sprint.tsx` owns navUrl resolution and the my_permissions/archived_code
+ * checks), mirroring the directive `ctx` in sprints.coffee:88-96.
  */
 
 import { render, screen, fireEvent } from '@testing-library/react';
@@ -58,7 +69,10 @@ const EN = {
   GO_TO_TASKBOARD_EMPTY: 'Go to the taskboard of ',
   CLOSED: 'closed',
   TOTAL: 'total',
-  // moment.format('DD MMM YYYY') for the two default fixture dates.
+  // moment.format('DD MMM YYYY') for the two default fixture dates, joined by a
+  // literal hyphen with NO surrounding spaces — parity with the sprints.coffee
+  // date range (sprints.coffee:83-86 `estimatedDateRange = "#{start}-#{finish}"`;
+  // a naive ' - ' join would break visual parity with the AngularJS template).
   DATE_RANGE: '01 Jan 2021-15 Jan 2021',
 };
 
@@ -149,6 +163,13 @@ describe('SprintHeader — structure', () => {
   });
 });
 
+// Permission gates reproduced from the AngularJS directive (sprints.coffee):
+//  - isVisible  = my_permissions.indexOf("view_milestones") != -1  (sprints.coffee:76-77)
+//    -> gates the taskboard name link.
+//  - isEditable = !project.archived_code && my_permissions.indexOf("modify_milestone") != -1
+//    (sprints.coffee:73-74) -> gates the edit pencil.
+// The edit-pencil click reproduces sprints.coffee:49-53 (event.preventDefault()
+// then the "sprintform:edit" broadcast, expressed here as the onEdit callback).
 describe('SprintHeader — permission gating (sprints.coffee isVisible / isEditable)', () => {
   it('renders the taskboard link with the sprint name when isVisible', () => {
     const { container } = renderHeader({ isVisible: true, name: 'Sprint 42' });
@@ -220,6 +241,7 @@ describe('SprintHeader — i18n English defaults (F32)', () => {
     // GO_TO_TASKBOARD renders with an EMPTY name (trailing space) — legacy parity.
     expect(taskboardLink(container)).toHaveAttribute('title', EN.GO_TO_TASKBOARD_EMPTY);
     expect(descriptions(container)).toEqual([EN.CLOSED, EN.TOTAL]);
+    // literal hyphen, no spaces — parity with sprints.coffee date range
     expect(dateEl(container)?.textContent).toBe(EN.DATE_RANGE);
   });
 
