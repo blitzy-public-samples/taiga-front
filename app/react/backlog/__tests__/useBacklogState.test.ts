@@ -582,16 +582,50 @@ describe("useBacklogState.setStats", () => {
         expect(s.showGraphPlaceholder).toBe(false);
     });
 
-    it("falls back to defined_points and yields 0% when there are no points", () => {
+    it("uses the total_points || defined_points fallback and flags the placeholder when total_points is null", () => {
         const { result } = renderHook(() => useBacklogState());
 
         act(() => {
             result.current.setStats(
-                makeStats({ total_points: 0, defined_points: 0, closed_points: 0 }),
+                makeStats({
+                    total_points: null,
+                    defined_points: 80,
+                    closed_points: 40,
+                    total_milestones: null,
+                }),
             );
         });
 
+        const s = result.current.state;
+        // total_points is null → fall back to defined_points (80), so
+        // Math.round(100 * 40 / 80) === 50 (legacy main.coffee:L259,L262).
+        expect(s.stats?.completedPercentage).toBe(50);
+        // total_points == null → showGraphPlaceholder stays true even though
+        // `stats` itself is non-null (legacy main.coffee:L266).
+        expect(s.showGraphPlaceholder).toBe(true);
+    });
+
+    it("yields 0% (never NaN) when there are no points at all", () => {
+        const { result } = renderHook(() => useBacklogState());
+
+        act(() => {
+            result.current.setStats(
+                makeStats({
+                    total_points: 0,
+                    defined_points: 0,
+                    closed_points: 0,
+                    total_milestones: 1,
+                }),
+            );
+        });
+
+        // total_points || defined_points === 0 → the guard yields 0, never NaN.
         expect(result.current.state.stats?.completedPercentage).toBe(0);
+        expect(
+            Number.isNaN(
+                result.current.state.stats?.completedPercentage as number,
+            ),
+        ).toBe(false);
     });
 
     it("clears stats and shows the placeholder when passed null", () => {
