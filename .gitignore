@@ -17,3 +17,6 @@ e2e/screenshots/
 e2e/reports/
 app/modules/compile-modules/
 yarn.lock
+# Playwright baseline & post-migration parity artifacts are a COMMITTED deliverable
+# (see e2e-react/). Never ignore them; do NOT use Playwright's default test-results/ dir.
+!e2e-react/artifacts/
