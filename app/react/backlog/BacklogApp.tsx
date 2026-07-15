@@ -329,7 +329,12 @@ function applyOptimisticMove(
         collections.userstories.find((u) => u.id === draggedId) ??
         collections.sprints
             .concat(collections.closedSprints)
-            .flatMap((s) => s.user_stories)
+            // F-B: `.reduce` (ES2018) rather than `.flatMap` (ES2019). tsconfig
+            // declares `lib: es2018`; `@types/node` transitively widens the lib
+            // set so tsc would otherwise accept the ES2019 method and silently
+            // break the declared type-gate. `Sprint.user_stories` is always a
+            // `UserStory[]`, so this is behavior-identical (order preserved).
+            .reduce<UserStory[]>((acc, s) => acc.concat(s.user_stories), [])
             .find((u) => u.id === draggedId);
     if (!dragged) {
         return null;

@@ -843,10 +843,33 @@ test("onMoveToTop reorders via bulkUpdateBacklogOrder(project, null, null, nextU
 test("clicking Add broadcasts a standard create and does NOT open the bulk lightbox", async () => {
     const { container } = await renderApp();
 
+    // F-M2: install an Angular injector spy BEFORE the click so the standard
+    // "Add" path is asserted at the bridge level. `broadcastToAngular` reads
+    // `window.angular` at call time (see the edit-broadcast test above), and
+    // beforeEach() deletes it, so this stays local to this test.
+    const broadcast = jest.fn();
+    const applyAsync = jest.fn();
+    (window as unknown as { angular?: unknown }).angular = {
+        element: () => ({
+            injector: () => ({
+                get: () => ({ $broadcast: broadcast, $applyAsync: applyAsync }),
+            }),
+        }),
+    };
+
     await act(async () => {
         fireEvent.click(container.querySelector(".new-us .btn-small") as HTMLElement);
     });
 
+    // Assert the broadcast NAME + payload — not merely that the React bulk
+    // lightbox stayed closed. A mutation renaming "genericform:new" (or routing
+    // "standard" into the bulk path) would leave `bulkProps.open === false`
+    // and thus survive the old assertion; it now fails here.
+    expect(broadcast).toHaveBeenCalledWith(
+        "genericform:new",
+        expect.objectContaining({ objType: "us" }),
+    );
+    expect(applyAsync).toHaveBeenCalled();
     expect(mockCaptured.bulkProps?.open).toBe(false);
 });
 
@@ -1783,4 +1806,32 @@ test("onLoadMore requests the next page (reset:false) via the userstories endpoi
     await waitFor(() =>
         expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
     );
+});
+
+/* ========================================================================== */
+/* F-PAG: pagination "has next page" header drives canLoadMore                */
+/* ========================================================================== */
+
+test("canLoadMore is true when the userstories response carries x-pagination-next", async () => {
+    // Every other fixture returns empty headers, so the truthy branch of
+    // `if (header('x-pagination-next'))` — hasNextPage -> disablePagination=false
+    // -> canLoadMore=true — is otherwise never observed, and a mutation flipping
+    // that condition survives. Set the header BEFORE the initial reset-load.
+    currentUsHeaders = {
+        "x-pagination-next": "1",
+        "Taiga-Info-Backlog-Total-Userstories": "1",
+    };
+
+    await renderApp();
+
+    await waitFor(() => expect(mockCaptured.backlogTableProps?.canLoadMore).toBe(true));
+});
+
+test("canLoadMore is false when x-pagination-next is absent", async () => {
+    // Default fixture: no x-pagination-next -> hasNextPage false ->
+    // disablePagination true -> canLoadMore false.
+    await renderApp();
+
+    await waitFor(() => expect(mockCaptured.backlogTableProps).not.toBeNull());
+    expect(mockCaptured.backlogTableProps?.canLoadMore).toBe(false);
 });

@@ -27,8 +27,13 @@ module.exports = {
         }]
     },
 
-    // @testing-library/jest-dom v6 auto-registers matchers when required
-    setupFilesAfterEnv: ["@testing-library/jest-dom"],
+    // @testing-library/jest-dom v6 auto-registers matchers when required.
+    // consoleErrorGuard (F-A) suppresses ONLY the benign React "<sidebar> is
+    // unrecognized" warning and fails any test that leaks another console.error.
+    setupFilesAfterEnv: [
+        "@testing-library/jest-dom",
+        "<rootDir>/app/react/__tests__/setup/consoleErrorGuard.ts"
+    ],
 
     moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json"],
 

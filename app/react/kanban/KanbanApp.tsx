@@ -8,11 +8,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import sortBy from "lodash/sortBy";
-import { httpDelete, httpGet } from "../shared/api/httpClient";
+import { httpDelete, httpGet, HttpError } from "../shared/api/httpClient";
 import type { QueryParams } from "../shared/api/httpClient";
 import {
     bulkCreate,
     bulkUpdateKanbanOrder,
+    filtersData,
     listUserstories,
 } from "../shared/api/userstories";
 import { createEventsClient } from "../shared/events/websocket";
@@ -208,7 +209,11 @@ export function resolveKanbanDrop(
     };
 }
 
-function buildUserstoriesParams(level: number, query: string): QueryParams {
+function buildUserstoriesParams(
+    level: number,
+    query: string,
+    selected: KanbanSelectedFilter[] = [],
+): QueryParams {
     const params: QueryParams = { status__is_archived: false };
     if (level >= 2) {
         params.include_attachments = 1;
@@ -217,6 +222,9 @@ function buildUserstoriesParams(level: number, query: string): QueryParams {
     if (query) {
         params.q = query;
     }
+    // Merge the sidebar filter selection (tags / assigned_users / role / owner /
+    // epic — status is intentionally excluded) into the list request.
+    Object.assign(params, pickSelectedFilterParams(selected));
     return params;
 }
 
@@ -230,6 +238,314 @@ function buildUsersById(project: KanbanProject): UsersById {
         }
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Filter model — the in-board reimplementation of the shared `tg-filter`
+// directive. The Kanban board whitelists FIVE categories (tags, assigned
+// users, role, owner/created-by, epic) — it deliberately OMITS "status"
+// because the columns ARE the statuses (the AngularJS controller set
+// `excludeFilters: ["status"]`, and `validQueryParams` carried no `status`).
+// Types are declared LOCALLY so the Kanban module stays self-contained (no
+// value/type coupling to the Backlog module).
+// ---------------------------------------------------------------------------
+
+/** A single selectable value within a {@link KanbanFilterCategory}. */
+interface KanbanFilterOption {
+    id: string;
+    name: string;
+    color?: string;
+    count?: number;
+}
+
+/** A group of filter options (e.g. "Tags", "Assigned to"). */
+interface KanbanFilterCategory {
+    title: string;
+    dataType: string;
+    content: KanbanFilterOption[];
+}
+
+/** A filter value the user has currently applied. */
+interface KanbanSelectedFilter {
+    id: string;
+    name: string;
+    dataType: string;
+    color?: string;
+}
+
+type KanbanFilters = KanbanFilterCategory[];
+
+/**
+ * URL query keys the Kanban controller whitelisted (`validQueryParams`,
+ * kanban/main.coffee L59-L70). NOTE the deliberate ABSENCE of
+ * `status` / `exclude_status`: the board's columns ARE the statuses, so status
+ * is never offered as a sidebar filter (the controller's `excludeFilters`
+ * carried `"status"`).
+ */
+const KANBAN_VALID_QUERY_PARAMS: ReadonlySet<string> = new Set<string>([
+    "tags",
+    "exclude_tags",
+    "assigned_users",
+    "exclude_assigned_users",
+    "role",
+    "exclude_role",
+    "owner",
+    "exclude_owner",
+    "epic",
+    "exclude_epic",
+]);
+
+type RawFilterItem = Record<string, unknown>;
+
+/** Coerce an unknown `filters_data` field into an array of raw filter items. */
+function asRawItems(value: unknown): RawFilterItem[] {
+    return Array.isArray(value) ? (value as RawFilterItem[]) : [];
+}
+
+/** Read an optional numeric field (e.g. `count`). */
+function readNumber(value: unknown): number | undefined {
+    return typeof value === "number" ? value : undefined;
+}
+
+/** Read a string field or a fallback. */
+function readStringField(value: unknown, fallback = ""): string {
+    return typeof value === "string" ? value : fallback;
+}
+
+/**
+ * Build the FIVE Kanban filter categories from a `filters_data` payload,
+ * reproducing the id/name transforms of `generateFilters`
+ * (controllerMixins.coffee) MINUS the status category (see
+ * {@link KANBAN_VALID_QUERY_PARAMS}). i18n categories: TAGS, ASSIGNED_TO, ROLE,
+ * CREATED_BY, EPIC — in that exact order.
+ */
+export function buildKanbanFilterCategories(
+    data: Record<string, unknown>,
+): KanbanFilters {
+    const categories: KanbanFilterCategory[] = [];
+
+    // Tags — `it.id = it.name`.
+    categories.push({
+        title: "Tags",
+        dataType: "tags",
+        content: asRawItems(data.tags).map((it) => ({
+            id: readStringField(it.name),
+            name: readStringField(it.name),
+            color: typeof it.color === "string" ? it.color : undefined,
+            count: readNumber(it.count),
+        })),
+    });
+
+    // Assigned to — `it.id ? id.toString() : "null"`, name = full_name || "Unassigned".
+    categories.push({
+        title: "Assigned to",
+        dataType: "assigned_users",
+        content: asRawItems(data.assigned_users).map((it) => ({
+            id: it.id != null ? String(it.id) : "null",
+            name: readStringField(it.full_name) || "Unassigned",
+            count: readNumber(it.count),
+        })),
+    });
+
+    // Role — `it.id ? id.toString() : "null"`, name = name || "Unassigned".
+    categories.push({
+        title: "Role",
+        dataType: "role",
+        content: asRawItems(data.roles).map((it) => ({
+            id: it.id != null ? String(it.id) : "null",
+            name: readStringField(it.name) || "Unassigned",
+            count: readNumber(it.count),
+        })),
+    });
+
+    // Created by (owner) — `it.id = id.toString()`, name = full_name.
+    categories.push({
+        title: "Created by",
+        dataType: "owner",
+        content: asRawItems(data.owners).map((it) => ({
+            id: String(it.id),
+            name: readStringField(it.full_name),
+            count: readNumber(it.count),
+        })),
+    });
+
+    // Epic — with-id: name = "#{ref} {subject}"; no-id: "null" / "Not in an epic".
+    categories.push({
+        title: "Epic",
+        dataType: "epic",
+        content: asRawItems(data.epics).map((it) => {
+            if (it.id != null) {
+                return {
+                    id: String(it.id),
+                    name: `#${readStringField(it.ref, String(it.ref))} ${readStringField(
+                        it.subject,
+                    )}`.trim(),
+                    count: readNumber(it.count),
+                };
+            }
+            return { id: "null", name: "Not in an epic", count: readNumber(it.count) };
+        }),
+    });
+
+    return categories;
+}
+
+/**
+ * Translate the currently-selected filters into endpoint query params, grouping
+ * ids by `dataType` (comma-joined) and whitelisting via
+ * {@link KANBAN_VALID_QUERY_PARAMS}.
+ */
+export function pickSelectedFilterParams(
+    selected: KanbanSelectedFilter[],
+): QueryParams {
+    const groups: Record<string, string[]> = {};
+    for (const filter of selected) {
+        const key = filter.dataType;
+        if (!KANBAN_VALID_QUERY_PARAMS.has(key)) {
+            continue;
+        }
+        (groups[key] ??= []).push(String(filter.id));
+    }
+    const params: QueryParams = {};
+    for (const key of Object.keys(groups)) {
+        params[key] = groups[key].join(",");
+    }
+    return params;
+}
+
+/**
+ * The one unavoidable coupling to AngularJS: dispatch a `$rootScope` broadcast
+ * so the SURVIVING generic-form lightbox still opens. `common/lightboxes.coffee`
+ * handles `genericform:new` (L622) and `genericform:edit` (L638) — those events
+ * are owned by a COMMON module that is NOT part of the migrated Kanban
+ * controller, so the bridge remains valid. SAFE NO-OP when Angular / its
+ * injector is absent (e.g. under jsdom in unit tests) because the whole body is
+ * guarded.
+ */
+function broadcastToAngular(name: string, payload: unknown): void {
+    try {
+        const ng = (
+            window as unknown as {
+                angular?: {
+                    element: (d: Document) => {
+                        injector: () => {
+                            get: (s: string) => {
+                                $broadcast: (n: string, p: unknown) => void;
+                                $applyAsync: () => void;
+                            };
+                        };
+                    };
+                };
+            }
+        ).angular;
+        if (!ng) {
+            return; // no-op in jsdom / tests
+        }
+        const rootScope = ng.element(document).injector().get("$rootScope");
+        rootScope.$broadcast(name, payload);
+        rootScope.$applyAsync();
+    } catch {
+        /* no-op when Angular / injector is absent */
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KanbanFilterPanel — in-board reimplementation of the shared `tg-filter`
+// directive. The root carries `.kanban-filter` so the already-compiled SCSS
+// themes it unchanged, and so the toggle contract (`.kanban-filter` present iff
+// the panel is open) is preserved.
+// ---------------------------------------------------------------------------
+
+interface KanbanFilterPanelProps {
+    filters: KanbanFilters;
+    selectedFilters: KanbanSelectedFilter[];
+    onAddFilter: (category: KanbanFilterCategory, option: KanbanFilterOption) => void;
+    onRemoveFilter: (filter: KanbanSelectedFilter) => void;
+}
+
+function KanbanFilterPanel(props: KanbanFilterPanelProps): JSX.Element {
+    const { filters, selectedFilters, onAddFilter, onRemoveFilter } = props;
+    const isSelected = (dataType: string, id: string): boolean =>
+        selectedFilters.some(
+            (f) => f.dataType === dataType && String(f.id) === String(id),
+        );
+
+    return (
+        <div className="kanban-filter" id="kanban-filter">
+            {selectedFilters.length > 0 ? (
+                <div className="filters-applied">
+                    {selectedFilters.map((filter) => (
+                        <button
+                            type="button"
+                            key={`${filter.dataType}:${filter.id}`}
+                            className="filter-applied"
+                            onClick={() => onRemoveFilter(filter)}
+                            title="Remove filter"
+                        >
+                            <span className="name">{filter.name}</span>
+                        </button>
+                    ))}
+                </div>
+            ) : null}
+
+            <div className="filters-cats">
+                {filters.map((category) => (
+                    <div
+                        className="filter-category"
+                        key={category.dataType}
+                        data-type={category.dataType}
+                    >
+                        <h4 className="filters-title">{category.title}</h4>
+                        <ul className="filter-list">
+                            {category.content.map((option) => {
+                                const selected = isSelected(
+                                    category.dataType,
+                                    option.id,
+                                );
+                                return (
+                                    <li
+                                        key={String(option.id)}
+                                        className={
+                                            "single-filter" +
+                                            (selected ? " active" : "")
+                                        }
+                                    >
+                                        <button
+                                            type="button"
+                                            className="filter-name"
+                                            onClick={() =>
+                                                selected
+                                                    ? onRemoveFilter({
+                                                          id: option.id,
+                                                          name: option.name,
+                                                          dataType: category.dataType,
+                                                          color: option.color,
+                                                      })
+                                                    : onAddFilter(category, option)
+                                            }
+                                        >
+                                            {option.color ? (
+                                                <span
+                                                    className="color-bullet"
+                                                    style={{ background: option.color }}
+                                                />
+                                            ) : null}
+                                            <span className="name">{option.name}</span>
+                                            {typeof option.count === "number" ? (
+                                                <span className="number">
+                                                    {option.count}
+                                                </span>
+                                            ) : null}
+                                        </button>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -286,19 +602,38 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const [folds, setFolds] = useState<Record<number, boolean>>({});
     const [unfold, setUnfold] = useState<number | null>(null);
     const [foldedSwimlane, setFoldedSwimlane] = useState<Record<number, boolean>>({});
-    const [selectedUss] = useState<Record<number, boolean>>({});
+    // F5 / multi-select: the AngularJS board supported multi-card selection for
+    // group drag (`ui-multisortable-multiple`). That interaction is intentionally
+    // NOT reproduced in the React port — it is absent from the AAP §0.1.1
+    // functional surface, and no selection affordance exists. The leaf
+    // `Card` / `KanbanColumn` / `KanbanBoard` retain an OPTIONAL `selected` prop
+    // that simply defaults to `false`, so no inert, always-empty selection map is
+    // threaded through the tree (which would imply an unimplemented capability).
     const [movedUs, setMovedUs] = useState<number[]>([]);
     const [notFound, setNotFound] = useState(false);
     const [projectLoaded, setProjectLoaded] = useState<KanbanProject | null>(null);
     const [permissionDenied, setPermissionDenied] = useState(false);
     const [loadError, setLoadError] = useState(false);
 
+    // Sidebar filter state (F2). `filters` are the five category widgets built
+    // from `filters_data`; `selectedFilters` are the user's active choices and
+    // feed every `listUserstories` request via `pickSelectedFilterParams`.
+    const [filters, setFilters] = useState<KanbanFilters>([]);
+    const [selectedFilters, setSelectedFilters] = useState<KanbanSelectedFilter[]>(
+        [],
+    );
+
     const projectRef = useRef<KanbanProject | null>(null);
     const zoomLevelRef = useRef(zoomLevel);
     const filterQRef = useRef(filterQ);
+    const selectedFiltersRef = useRef(selectedFilters);
     const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Unmount guard: async resolvers must not `setState` after the root has been
+    // unmounted (F-C). Mirrors the Backlog root's `aliveRef` pattern.
+    const aliveRef = useRef<boolean>(true);
     zoomLevelRef.current = zoomLevel;
     filterQRef.current = filterQ;
+    selectedFiltersRef.current = selectedFilters;
 
     // -----------------------------------------------------------------------
     // Data loading (deferred until projectId is finite)
@@ -315,13 +650,47 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const level = levelOverride ?? zoomLevelRef.current;
         const query = queryOverride ?? filterQRef.current;
         const [usResponse, swimlaneResponse] = await Promise.all([
-            listUserstories(projectId, buildUserstoriesParams(level, query)),
+            listUserstories(
+                projectId,
+                buildUserstoriesParams(level, query, selectedFiltersRef.current),
+            ),
             httpGet<Swimlane[]>("/swimlanes", { project: projectId }),
         ]);
+        if (!aliveRef.current) {
+            return;
+        }
         const userstories = (usResponse.data as unknown as UserStoryModel[]) ?? [];
         kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
         kanban.setUserstories(userstories);
         setNotFound(userstories.length === 0 && !!query);
+    };
+
+    /**
+     * Fetch the `filters_data` metadata (scoped to the current selection) and
+     * build the five Kanban category widgets. Guarded by `Number.isFinite` (so
+     * a transient-NaN projectId issues no request) and by `aliveRef` (so a late
+     * resolve after unmount does not `setState`). A failure leaves the existing
+     * categories intact — filters are auxiliary, never fatal to the board.
+     */
+    const loadFilters = async (
+        overrideSelected?: KanbanSelectedFilter[],
+    ): Promise<void> => {
+        if (!Number.isFinite(projectId)) {
+            return;
+        }
+        const selected = overrideSelected ?? selectedFiltersRef.current;
+        try {
+            const response = await filtersData({
+                project: projectId,
+                ...pickSelectedFilterParams(selected),
+            });
+            if (!aliveRef.current) {
+                return;
+            }
+            setFilters(buildKanbanFilterCategories(response.data));
+        } catch {
+            /* filters are auxiliary; a failure must not blank the board */
+        }
     };
 
     const loadInitialData = async (): Promise<void> => {
@@ -332,6 +701,9 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             const projectResponse = await httpGet<KanbanProject>(
                 `/projects/${projectId}`,
             );
+            if (!aliveRef.current) {
+                return;
+            }
             const project = projectResponse.data;
             // Module gate — mirrors loadProject's is_kanban_activated check.
             if (!project.is_kanban_activated) {
@@ -348,16 +720,39 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             const [usResponse, swimlaneResponse] = await Promise.all([
                 listUserstories(
                     projectId,
-                    buildUserstoriesParams(zoomLevelRef.current, filterQRef.current),
+                    buildUserstoriesParams(
+                        zoomLevelRef.current,
+                        filterQRef.current,
+                        selectedFiltersRef.current,
+                    ),
                 ),
                 httpGet<Swimlane[]>("/swimlanes", { project: projectId }),
             ]);
+            if (!aliveRef.current) {
+                return;
+            }
             const userstories =
                 (usResponse.data as unknown as UserStoryModel[]) ?? [];
             kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
             kanban.setUserstories(userstories);
-        } catch {
-            setLoadError(true);
+
+            // Load the sidebar filter categories (auxiliary; never blocks the board).
+            void loadFilters();
+        } catch (err) {
+            if (!aliveRef.current) {
+                return;
+            }
+            // Respect blocked / archived responses (403 / 451) as permission-denied,
+            // mirroring the Backlog root and `errorHandlingService.permissionDenied()`
+            // (AAP §0.6.3). Any other failure surfaces the generic load error.
+            if (
+                err instanceof HttpError &&
+                (err.status === 403 || err.status === 451)
+            ) {
+                setPermissionDenied(true);
+            } else {
+                setLoadError(true);
+            }
         }
     };
 
@@ -411,7 +806,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     }, [projectId, projectLoaded]);
 
     useEffect(() => {
+        // F-C: mark the root alive for the duration of the mount so async
+        // resolvers (load / reload / filters / delete / bulk-create) can bail out
+        // of `setState` once it unmounts.
+        aliveRef.current = true;
         return () => {
+            aliveRef.current = false;
             if (searchTimer.current !== null) {
                 clearTimeout(searchTimer.current);
             }
@@ -449,9 +849,25 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
 
     const [bulkStatusId, setBulkStatusId] = useState<number | null>(null);
 
-    const addNewUs = (_type: "standard" | "bulk", statusId: number): void => {
-        // Both single and bulk creation funnel through the bulk_create endpoint
-        // (the full generic user-story form is out of the migrated scope).
+    /**
+     * F1: creation now honors the requested `type` (mirrors `addNewUs`,
+     * kanban/main.coffee L266-L276).
+     *  - "standard" → dispatch `genericform:new` so the SURVIVING generic
+     *    user-story form opens (handled by `common/lightboxes.coffee` L622),
+     *    seeded with the target `statusId` (and `project`) so the new story
+     *    lands in the clicked column.
+     *  - "bulk"     → open the React bulk lightbox (many stories from newline
+     *    text via `bulk_create`).
+     */
+    const addNewUs = (type: "standard" | "bulk", statusId: number): void => {
+        if (type === "standard") {
+            broadcastToAngular("genericform:new", {
+                objType: "us",
+                project: projectRef.current,
+                statusId,
+            });
+            return;
+        }
         setBulkStatusId(statusId);
     };
 
@@ -462,8 +878,96 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             return;
         }
         void bulkCreate(projectId, statusId, subjects, null).then(() => {
+            if (!aliveRef.current) {
+                return;
+            }
             void reloadUserstories();
         });
+    };
+
+    /**
+     * F3: open the SURVIVING generic edit form for a single story (mirrors
+     * `editUs`, kanban/main.coffee). The row model is looked up from the board
+     * state and handed to the AngularJS lightbox via `genericform:edit`
+     * (handled by `common/lightboxes.coffee` L638).
+     */
+    const onEditUs = (usId: number): void => {
+        const view = kanban.state.usMap[usId];
+        if (!view) {
+            return;
+        }
+        const project = projectRef.current;
+        broadcastToAngular("genericform:edit", {
+            objType: "us",
+            obj: view.model,
+            statusList: (project?.us_statuses as Status[] | undefined) ?? [],
+            attachments: [],
+        });
+    };
+
+    /**
+     * F3: the card's "Assign to" affordance. The AngularJS quick-assign picker
+     * was bound to the now-deleted controller (`changeUsAssignedUsers` via
+     * `lightboxFactory`) and has no surviving broadcast bridge, so — consistent
+     * with the Backlog root, which routes every story-field edit through the
+     * generic form — assignment opens the same generic edit form, focused on the
+     * assignee field. `focusField` is an inert hint for the AngularJS side
+     * (unknown payload keys are ignored by `genericform` `getSchema`).
+     */
+    const onAssignUs = (usId: number): void => {
+        const view = kanban.state.usMap[usId];
+        if (!view) {
+            return;
+        }
+        const project = projectRef.current;
+        broadcastToAngular("genericform:edit", {
+            objType: "us",
+            obj: view.model,
+            statusList: (project?.us_statuses as Status[] | undefined) ?? [],
+            attachments: [],
+            focusField: "assigned_to",
+        });
+    };
+
+    /**
+     * F2: append the chosen option to the active selection (deduped), reflect it
+     * immediately, then reload the board (filtered) and regenerate the category
+     * counts with the fresh selection. Mirrors `addFilter` (kanban/main.coffee).
+     */
+    const addFilter = (
+        category: KanbanFilterCategory,
+        option: KanbanFilterOption,
+    ): void => {
+        const current = selectedFiltersRef.current;
+        const exists = current.some(
+            (f) => f.dataType === category.dataType && String(f.id) === String(option.id),
+        );
+        if (exists) {
+            return;
+        }
+        const added: KanbanSelectedFilter = {
+            id: option.id,
+            name: option.name,
+            dataType: category.dataType,
+            ...(option.color !== undefined ? { color: option.color } : {}),
+        };
+        const next = [...current, added];
+        selectedFiltersRef.current = next;
+        setSelectedFilters(next);
+        void reloadUserstories();
+        void loadFilters(next);
+    };
+
+    /** F2: drop a selected filter and reload. Mirrors `removeFilter`. */
+    const removeFilter = (filter: KanbanSelectedFilter): void => {
+        const current = selectedFiltersRef.current;
+        const next = current.filter(
+            (f) => !(f.dataType === filter.dataType && String(f.id) === String(filter.id)),
+        );
+        selectedFiltersRef.current = next;
+        setSelectedFilters(next);
+        void reloadUserstories();
+        void loadFilters(next);
     };
 
     const foldStatus = (status: Status): void => {
@@ -492,6 +996,9 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             return;
         }
         void httpDelete(`/userstories/${usId}`).then(() => {
+            if (!aliveRef.current) {
+                return;
+            }
             void reloadUserstories();
         });
     };
@@ -626,7 +1133,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             </div>
 
             <div className={"kanban-manager" + (!openFilter ? " expanded" : "")}>
-                {openFilter ? <div className="kanban-filter" /> : null}
+                {openFilter ? (
+                    <KanbanFilterPanel
+                        filters={filters}
+                        selectedFilters={selectedFilters}
+                        onAddFilter={addFilter}
+                        onRemoveFilter={removeFilter}
+                    />
+                ) : null}
 
                 {loadError ? (
                     <div className="kanban-load-error">Unable to load the board.</div>
@@ -641,7 +1155,6 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         folds={folds}
                         unfold={unfold}
                         foldedSwimlane={foldedSwimlane}
-                        selectedUss={selectedUss}
                         movedUs={movedUs}
                         canAddUs={canAddUs}
                         isArchivedHidden={isArchivedHidden}
@@ -653,6 +1166,8 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         onFoldStatus={foldStatus}
                         onToggleSwimlane={toggleSwimlane}
                         onToggleFold={handleToggleFold}
+                        onClickEdit={onEditUs}
+                        onClickAssignedTo={onAssignUs}
                         onClickDelete={handleDeleteUs}
                     />
                 ) : null}

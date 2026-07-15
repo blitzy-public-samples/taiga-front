@@ -58,7 +58,7 @@ import type {
     ResolvedDrop,
 } from "../../shared/dnd/DndProvider";
 
-import { httpGet, httpPost, httpDelete } from "../../shared/api/httpClient";
+import { httpGet, httpPost, httpDelete, HttpError } from "../../shared/api/httpClient";
 import { listUserstories, bulkCreate } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
 
@@ -241,6 +241,10 @@ function makeState(overrides: Partial<KanbanState> = {}): KanbanState {
 let currentProject: KanbanProject;
 let currentSwimlanes: Swimlane[];
 let currentUserstories: UserStoryModel[];
+// Fixture returned for `GET /userstories/filters_data` (the `filtersData` adapter
+// is kept REAL, so it flows through the mocked `httpGet`). Mirrors the shape of
+// the Django `filters_data` payload consumed by `buildKanbanFilterCategories`.
+let currentFiltersData: Record<string, unknown>;
 
 /** Route `httpGet` by path, mirroring the endpoints KanbanApp calls. */
 function installHappyHttp(): void {
@@ -252,6 +256,9 @@ function installHappyHttp(): void {
         if (path === "/swimlanes") {
             return Promise.resolve(mkRes(currentSwimlanes));
         }
+        if (path === "/userstories/filters_data") {
+            return Promise.resolve(mkRes(currentFiltersData));
+        }
         return Promise.resolve(mkRes({}));
     });
     mockListUserstories.mockImplementation(() =>
@@ -262,6 +269,24 @@ function installHappyHttp(): void {
     mockHttpDelete.mockImplementation(() => Promise.resolve(mkRes({})));
 }
 
+/**
+ * Install a minimal `window.angular` whose injector returns a `$rootScope` with
+ * spied `$broadcast` / `$applyAsync`, so the `broadcastToAngular` bridge (F1/F3)
+ * can be asserted. Mirrors the Backlog root's test harness.
+ */
+function installAngularSpy(): { broadcast: jest.Mock; applyAsync: jest.Mock } {
+    const broadcast = jest.fn();
+    const applyAsync = jest.fn();
+    (window as unknown as { angular?: unknown }).angular = {
+        element: () => ({
+            injector: () => ({
+                get: () => ({ $broadcast: broadcast, $applyAsync: applyAsync }),
+            }),
+        }),
+    };
+    return { broadcast, applyAsync };
+}
+
 beforeEach(() => {
     mockCaptured.boardProps = null;
     currentProject = makeProject();
@@ -270,8 +295,11 @@ beforeEach(() => {
         makeUs({ id: 1, status: 100, kanban_order: 0 }),
         makeUs({ id: 2, status: 100, kanban_order: 1 }),
     ];
+    currentFiltersData = {};
     installHappyHttp();
     mockCreateEventsClient.mockReturnValue(mockEventsClient);
+    // No Angular injector is present unless a test installs one.
+    delete (window as unknown as { angular?: unknown }).angular;
 });
 
 async function renderLoaded(
@@ -703,8 +731,10 @@ describe("KanbanApp — bulk create", () => {
 
     it("does not call bulk_create when the textarea is empty (whitespace only)", async () => {
         await renderLoaded();
+        // NOTE: the empty-guard lives on the BULK path; the "standard" path no
+        // longer opens this lightbox (F1 — it dispatches `genericform:new`).
         await act(async () => {
-            mockCaptured.boardProps?.onAddUs?.("standard", 200);
+            mockCaptured.boardProps?.onAddUs?.("bulk", 200);
         });
         const submit = document.querySelector(".btn-submit") as HTMLButtonElement;
         await act(async () => {
@@ -872,3 +902,287 @@ describe("KanbanApp — board callbacks", () => {
         expect(mockCaptured.boardProps?.showPlaceholder?.(200, null)).toBe(false);
     });
 });
+
+/* ========================================================================== */
+/* F1 — single ("standard") create dispatches genericform:new                 */
+/* ========================================================================== */
+
+describe("KanbanApp — standard create (F1)", () => {
+    it("dispatches genericform:new via the Angular bridge and does NOT open the bulk lightbox", async () => {
+        const { broadcast, applyAsync } = installAngularSpy();
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("standard", 100);
+        });
+        expect(broadcast).toHaveBeenCalledWith(
+            "genericform:new",
+            expect.objectContaining({ objType: "us", statusId: 100 }),
+        );
+        expect(applyAsync).toHaveBeenCalled();
+        // A standard create must NOT open the bulk textarea, and must not create.
+        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+    });
+
+    it("still opens the React bulk lightbox for a bulk create", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        expect(document.querySelector(".bulk-subjects")).not.toBeNull();
+    });
+
+    it("standard create is a safe no-op when Angular is absent (no throw, no create)", async () => {
+        await renderLoaded();
+        expect(() => {
+            act(() => {
+                mockCaptured.boardProps?.onAddUs?.("standard", 100);
+            });
+        }).not.toThrow();
+        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+    });
+});
+
+/* ========================================================================== */
+/* F3 — edit / assignee board callbacks dispatch genericform:edit             */
+/* ========================================================================== */
+
+describe("KanbanApp — edit & assignee callbacks (F3)", () => {
+    it("onClickEdit dispatches genericform:edit for the clicked story", async () => {
+        const { broadcast, applyAsync } = installAngularSpy();
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickEdit?.(1);
+        });
+        expect(broadcast).toHaveBeenCalledWith(
+            "genericform:edit",
+            expect.objectContaining({
+                objType: "us",
+                obj: expect.objectContaining({ id: 1 }),
+            }),
+        );
+        expect(applyAsync).toHaveBeenCalled();
+    });
+
+    it("onClickAssignedTo opens the edit form focused on the assignee field", async () => {
+        const { broadcast } = installAngularSpy();
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickAssignedTo?.(1);
+        });
+        expect(broadcast).toHaveBeenCalledWith(
+            "genericform:edit",
+            expect.objectContaining({
+                objType: "us",
+                obj: expect.objectContaining({ id: 1 }),
+                focusField: "assigned_to",
+            }),
+        );
+    });
+
+    it("does not broadcast for an unknown story id", async () => {
+        const { broadcast } = installAngularSpy();
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickEdit?.(999999);
+            mockCaptured.boardProps?.onClickAssignedTo?.(999999);
+        });
+        expect(broadcast).not.toHaveBeenCalled();
+    });
+
+    it("edit / assign are inert (no throw) when Angular is absent", async () => {
+        await renderLoaded();
+        expect(() => {
+            act(() => {
+                mockCaptured.boardProps?.onClickEdit?.(1);
+                mockCaptured.boardProps?.onClickAssignedTo?.(1);
+            });
+        }).not.toThrow();
+    });
+});
+
+/* ========================================================================== */
+/* F4 — blocked (403) / archived (451) responses map to permission-denied     */
+/* ========================================================================== */
+
+describe("KanbanApp — blocked / archived project (F4)", () => {
+    it("renders permission-denied (not a load error) on a 403 project response", async () => {
+        mockHttpGet.mockRejectedValue(
+            new HttpError(403, "Forbidden", {}, `/projects/${PROJECT_ID}`),
+        );
+        render(<KanbanApp projectId={PROJECT_ID} projectSlug="my-project" />);
+        await waitFor(() =>
+            expect(document.querySelector(".permission-denied")).not.toBeNull(),
+        );
+        expect(document.querySelector(".kanban-load-error")).toBeNull();
+        expect(mockCaptured.boardProps).toBeNull();
+    });
+
+    it("renders permission-denied (not a load error) on a 451 project response", async () => {
+        mockHttpGet.mockRejectedValue(
+            new HttpError(451, "Unavailable For Legal Reasons", {}, `/projects/${PROJECT_ID}`),
+        );
+        render(<KanbanApp projectId={PROJECT_ID} projectSlug="my-project" />);
+        await waitFor(() =>
+            expect(document.querySelector(".permission-denied")).not.toBeNull(),
+        );
+        expect(document.querySelector(".kanban-load-error")).toBeNull();
+    });
+
+    it("still surfaces the generic load error for a non-permission HttpError (500)", async () => {
+        mockHttpGet.mockRejectedValue(
+            new HttpError(500, "Server Error", {}, `/projects/${PROJECT_ID}`),
+        );
+        render(<KanbanApp projectId={PROJECT_ID} projectSlug="my-project" />);
+        await waitFor(() =>
+            expect(document.querySelector(".kanban-load-error")).not.toBeNull(),
+        );
+        expect(document.querySelector(".permission-denied")).toBeNull();
+    });
+});
+
+/* ========================================================================== */
+/* F2 — sidebar filter panel (5 categories, status excluded)                  */
+/* ========================================================================== */
+
+describe("KanbanApp — sidebar filters (F2)", () => {
+    function seedFilters(): void {
+        currentFiltersData = {
+            // `statuses` is intentionally present in the payload to PROVE it is
+            // NOT surfaced as a Kanban sidebar category (columns are statuses).
+            statuses: [{ id: 100, name: "New", color: "#ffffff", count: 3 }],
+            tags: [{ name: "urgent", color: "#ff0000", count: 2 }],
+            assigned_users: [{ id: 9, full_name: "Alice", count: 1 }],
+            roles: [{ id: 3, name: "Developer", count: 4 }],
+            owners: [{ id: 1, full_name: "Bob", count: 5 }],
+            epics: [{ id: 7, ref: 12, subject: "Epic A", count: 1 }],
+        };
+    }
+
+    async function openFilterPanel(): Promise<void> {
+        const filterBtn = document.querySelector(".btn-filter") as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(filterBtn);
+        });
+        await waitFor(() =>
+            expect(document.querySelectorAll(".filter-category").length).toBe(5),
+        );
+    }
+
+    it("renders the five whitelisted categories and OMITS status", async () => {
+        seedFilters();
+        await renderLoaded();
+        await openFilterPanel();
+
+        expect(document.querySelector(".kanban-filter")).not.toBeNull();
+        const dataTypes = Array.from(
+            document.querySelectorAll(".filter-category"),
+        ).map((el) => el.getAttribute("data-type"));
+        expect(dataTypes).toEqual([
+            "tags",
+            "assigned_users",
+            "role",
+            "owner",
+            "epic",
+        ]);
+        // Status must never be offered as a Kanban sidebar filter.
+        expect(document.querySelector('[data-type="status"]')).toBeNull();
+    });
+
+    it("selecting a tag reloads user stories with the grouped query param", async () => {
+        seedFilters();
+        await renderLoaded();
+        await openFilterPanel();
+
+        const before = mockListUserstories.mock.calls.length;
+        const tagOption = document.querySelector(
+            '[data-type="tags"] .filter-name',
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(tagOption);
+        });
+
+        await waitFor(() =>
+            expect(mockListUserstories.mock.calls.length).toBeGreaterThan(before),
+        );
+        expect(mockListUserstories).toHaveBeenCalledWith(
+            PROJECT_ID,
+            expect.objectContaining({ tags: "urgent" }),
+        );
+        // The applied-filter chip is shown.
+        expect(document.querySelector(".filters-applied .filter-applied")).not.toBeNull();
+    });
+
+    it("removing an applied tag reloads WITHOUT the query param", async () => {
+        seedFilters();
+        await renderLoaded();
+        await openFilterPanel();
+
+        const tagOption = document.querySelector(
+            '[data-type="tags"] .filter-name',
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(tagOption);
+        });
+        await waitFor(() =>
+            expect(document.querySelector(".filter-applied")).not.toBeNull(),
+        );
+
+        const chip = document.querySelector(".filter-applied") as HTMLButtonElement;
+        const beforeRemove = mockListUserstories.mock.calls.length;
+        await act(async () => {
+            fireEvent.click(chip);
+        });
+
+        await waitFor(() =>
+            expect(document.querySelector(".filter-applied")).toBeNull(),
+        );
+        // A reload was issued and it carried NO `tags` param.
+        expect(mockListUserstories.mock.calls.length).toBeGreaterThan(beforeRemove);
+        const lastCall =
+            mockListUserstories.mock.calls[mockListUserstories.mock.calls.length - 1];
+        expect(lastCall[1]).not.toHaveProperty("tags");
+    });
+});
+
+/* ========================================================================== */
+/* F-C — unmount guard: a late-resolving load must not continue post-unmount  */
+/* ========================================================================== */
+
+describe("KanbanApp — unmount safety (F-C)", () => {
+    it("aborts the load (no userstories fetch, no board) if unmounted before the project resolves", async () => {
+        let resolveProject: () => void = () => undefined;
+        mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+            const path = String(args[0]);
+            if (path.startsWith("/projects/")) {
+                return new Promise((resolve) => {
+                    resolveProject = () => resolve(mkRes(currentProject));
+                });
+            }
+            if (path === "/swimlanes") {
+                return Promise.resolve(mkRes(currentSwimlanes));
+            }
+            if (path === "/userstories/filters_data") {
+                return Promise.resolve(mkRes(currentFiltersData));
+            }
+            return Promise.resolve(mkRes({}));
+        });
+
+        const { unmount } = render(
+            <KanbanApp projectId={PROJECT_ID} projectSlug="my-project" />,
+        );
+        // Unmount while the project request is still pending.
+        unmount();
+        // Resolve the project AFTER unmount; the aliveRef guard must short-circuit.
+        await act(async () => {
+            resolveProject();
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(mockListUserstories).not.toHaveBeenCalled();
+        expect(mockCaptured.boardProps).toBeNull();
+    });
+});
+
