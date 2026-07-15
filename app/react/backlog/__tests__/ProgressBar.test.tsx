@@ -248,7 +248,13 @@ describe('ProgressBar — variant="backlog-summary"', () => {
     );
     const project = container.querySelector('.project-points-progress') as HTMLElement;
     const closed = container.querySelector('.closed-points-progress') as HTMLElement;
-    // else branch: project = 100 -> 97; closed = ratio(0,0) guarded to 0 -> adjust(-3) = 0
+    // adjusted per ProgressBar.tsx on disk: the naive expectation is "all widths
+    // 0%", but the component follows the AngularJS branch math. With everything
+    // zero: totalPoints = defined_points fallback = 0, so definedPoints(0) is NOT
+    // > totalPoints(0) -> ELSE branch -> project pinned to 100 -> adjust(100-3) = 97;
+    // closed = ratio(0,0) guarded to 0 -> adjust(0-3) = adjust(-3) = 0. The legacy
+    // directive divided UNGUARDED here (0*100/0 = NaN -> "width: NaN%"); the React
+    // port's divide-by-zero guard yields 0 instead, which the NaN assertions below lock in.
     expect(project.style.width).toBe('97%');
     expect(closed.style.width).toBe('0%');
     expect(project.getAttribute('style')).not.toContain('NaN');
