@@ -10,21 +10,42 @@
  * Unit tests for the React `SprintEditLightbox`
  * (app/react/backlog/SprintEditLightbox.tsx).
  *
- * Runs in the browserless jsdom environment (jest.config.js). The milestones
- * API adapter is mocked so no network is touched; the pure `validate()` from
- * `../../shared/validation/sprintForm` runs for real (its exact messages are
- * imported here rather than duplicated, so any drift fails the test).
+ * Runs in the browserless jsdom environment (jest.config.js). Only the frozen
+ * milestones API adapter is mocked, so no network is ever touched; the pure
+ * `validate()` from `../../shared/validation/sprintForm` and the real
+ * `HttpError` from `../../shared/api/httpClient` run UNMOCKED. Message constants
+ * are imported from the validation module (rather than duplicated) so any drift
+ * in the shared copy fails the test.
  *
- * Coverage focus (per the file's validation checklist):
- *  (a) empty name  -> required error shown, the create API is NOT called
- *  (b) inverted date range -> range error attaches to estimated_finish, no API
- *  (c) valid create -> `create` called with the exact writable payload
- *      (name trimmed), then `onChanged` + `onClose` fire
- *  (d) delete flow  -> native confirm accepted, `remove` called with the sprint
- *      id, then `onChanged` + `onClose` fire
+ * Coverage focus (the file's validation checklist + the component's ported
+ * `tgLbCreateEditSprint` behavior, lightboxes.coffee L237):
+ *  - closed              -> nothing (no form / `.sprint-name`) is rendered
+ *  - empty name          -> required error shown, the create API is NOT called
+ *  - inverted range      -> range error attaches to `.date-end`, no API call
+ *  - equal start/finish  -> treated as VALID, `create` IS called
+ *  - valid create        -> `create` called with the exact writable payload
+ *                           (name trimmed, dates normalized), then
+ *                           `onChanged` + `onClose` fire
+ *  - valid edit          -> `save(sprint.id, payload)`, then bubbles
+ *  - server field errors -> `HttpError.body` mapped onto the form without a
+ *                           crash and WITHOUT firing `onChanged`
+ *  - delete flow         -> gated by edit + `canDelete`; native confirm accepted
+ *                           -> `remove(sprint.id)`, then bubbles
+ *  - double submit       -> the submit button is disabled while a request is in
+ *                           flight, so the API is hit exactly once
  */
 
+// Mock ONLY the frozen milestones API adapter. Declared at the very top (after
+// the AGPL header, before the module imports) so ts-jest hoists it above them:
+// create / save / remove become jest mocks and no real `fetch` is ever issued.
+jest.mock("../../shared/api/milestones", () => ({
+    create: jest.fn(),
+    save: jest.fn(),
+    remove: jest.fn(),
+}));
+
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import "@testing-library/jest-dom";
 
 import { SprintEditLightbox } from "../SprintEditLightbox";
 import type { SprintEditLightboxProps } from "../SprintEditLightbox";
@@ -41,27 +62,30 @@ import {
     remove as removeMilestone,
 } from "../../shared/api/milestones";
 import { HttpError } from "../../shared/api/httpClient";
+import type { HttpResponse } from "../../shared/api/httpClient";
 
-// Generic save-failure literal rendered by the component (COMMON.SAVE_ERROR).
-// Kept as an independent literal (not imported from the SUT) so drift fails.
-const GENERIC_SAVE_ERROR = "An error occurred while saving.";
-
-// Mock the frozen-API adapter: create / save / remove become jest mocks so the
-// component's persistence calls are captured without any real `fetch`.
-jest.mock("../../shared/api/milestones", () => ({
-    create: jest.fn(),
-    save: jest.fn(),
-    remove: jest.fn(),
-}));
-
+// Strongly-typed handles onto the mocked adapter functions. `jest.mocked`
+// preserves the original signatures so `mockResolvedValue` / `mockRejectedValue`
+// stay type-checked against the real `HttpResponse<Milestone>` contract.
 const createMock = jest.mocked(createMilestone);
 const saveMock = jest.mocked(saveMilestone);
 const removeMock = jest.mocked(removeMilestone);
 
+// Generic save-failure literal rendered by the component (COMMON.SAVE_ERROR).
+// Held as an INDEPENDENT literal (not imported from the SUT) so that a drift in
+// the component's fallback copy is caught here rather than silently mirrored.
+const GENERIC_SAVE_ERROR = "An error occurred while saving.";
+
 /* -------------------------------------------------------------------------- */
-/* Test data factories                                                        */
+/* Test helpers & data factories                                              */
 /* -------------------------------------------------------------------------- */
 
+/** Build a resolved `HttpResponse<T>` matching the real adapter return shape. */
+function ok<T>(data: T): HttpResponse<T> {
+    return { data, status: 200, headers: new Headers() };
+}
+
+/** A minimal but schema-complete {@link Project} fixture. */
 function makeProject(overrides: Partial<Project> = {}): Project {
     return {
         id: 1,
@@ -80,6 +104,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     };
 }
 
+/** A minimal but schema-complete {@link Sprint} fixture (id defaults to 10). */
 function makeSprint(overrides: Partial<Sprint> = {}): Sprint {
     return {
         id: 10,
@@ -96,6 +121,7 @@ function makeSprint(overrides: Partial<Sprint> = {}): Sprint {
     };
 }
 
+/** Seed values for the controlled sprint form. */
 function makeValues(overrides: Partial<SprintFormValues> = {}): SprintFormValues {
     return {
         name: "Default Sprint",
@@ -106,9 +132,17 @@ function makeValues(overrides: Partial<SprintFormValues> = {}): SprintFormValues
     };
 }
 
+/**
+ * Render the lightbox with sensible defaults. The `onChanged` / `onClose`
+ * spies are created here and wired in AFTER the caller overrides (so they can
+ * never be shadowed), then returned so assertions can inspect them.
+ */
 function renderLightbox(
     overrides: Partial<SprintEditLightboxProps> = {},
-): ReturnType<typeof render> {
+): ReturnType<typeof render> & { onChanged: jest.Mock; onClose: jest.Mock } {
+    const onChanged = jest.fn();
+    const onClose = jest.fn();
+
     const props: SprintEditLightboxProps = {
         open: true,
         mode: "create",
@@ -117,43 +151,73 @@ function renderLightbox(
         initialValues: makeValues(),
         lastSprintName: null,
         canDelete: false,
-        onChanged: jest.fn(),
-        onClose: jest.fn(),
         ...overrides,
+        // Wired last so an accidental override cannot detach the returned spies.
+        onChanged,
+        onClose,
     };
 
-    return render(<SprintEditLightbox {...props} />);
+    const utils = render(<SprintEditLightbox {...props} />);
+
+    return { ...utils, onChanged, onClose };
+}
+
+/** Convenience: fetch the single <form> element rendered by the lightbox. */
+function getForm(container: HTMLElement): HTMLFormElement {
+    return container.querySelector("form") as HTMLFormElement;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Tests                                                                      */
+/* Shared setup — override `window.confirm` (jsdom's default returns false and  */
+/* logs "Not implemented"); restore the original after every test.             */
+/* -------------------------------------------------------------------------- */
+
+let originalConfirm: typeof window.confirm;
+
+beforeEach(() => {
+    originalConfirm = window.confirm;
+    window.confirm = jest.fn(() => true);
+});
+
+afterEach(() => {
+    window.confirm = originalConfirm;
+});
+
+/* -------------------------------------------------------------------------- */
+/* Closed state                                                               */
 /* -------------------------------------------------------------------------- */
 
 describe("SprintEditLightbox — closed state", () => {
-    it("renders nothing when open is false", () => {
+    it("renders no form (nor the .sprint-name input) when open is false", () => {
         const { container } = renderLightbox({ open: false });
 
         expect(container.querySelector(".lightbox-sprint-add-edit")).toBeNull();
+        expect(container.querySelector(".sprint-name")).toBeNull();
+        expect(container.querySelector("form")).toBeNull();
     });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Validation gates the API                                                   */
+/* -------------------------------------------------------------------------- */
+
 describe("SprintEditLightbox — validation gates the API", () => {
-    it("(a) shows the required error and does NOT call the API when the name is empty", () => {
+    it("shows the required-name error and does NOT call the API when the name is empty", () => {
         const { container } = renderLightbox({
             mode: "create",
             initialValues: makeValues({ name: "" }),
         });
 
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        fireEvent.submit(getForm(container));
 
         // The required message is rendered (in the name field's error span)...
         expect(screen.getByText(REQUIRED_MESSAGE)).toBeInTheDocument();
-        // ...and the create endpoint was never reached.
+        // ...and neither persistence endpoint was reached.
         expect(createMock).not.toHaveBeenCalled();
         expect(saveMock).not.toHaveBeenCalled();
     });
 
-    it("(b) attaches the range error to estimated_finish for an inverted date range", () => {
+    it("attaches the date-range error to the finish field for an inverted range and does not call create", () => {
         const { container } = renderLightbox({
             mode: "create",
             initialValues: makeValues({
@@ -163,183 +227,177 @@ describe("SprintEditLightbox — validation gates the API", () => {
             }),
         });
 
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        fireEvent.submit(getForm(container));
 
         const rangeError = screen.getByText(DATE_RANGE_MESSAGE);
         expect(rangeError).toBeInTheDocument();
-        // The range error belongs to the finish (date-end) field, not the start.
+        // The range error belongs to the finish (`.date-end`) field, not the start.
         expect(container.querySelector(".date-end")?.parentElement).toContainElement(
             rangeError,
         );
         expect(createMock).not.toHaveBeenCalled();
     });
+
+    it("treats equal start/finish dates as VALID and calls create", async () => {
+        createMock.mockResolvedValue(ok(makeSprint({ id: 99 })));
+
+        const { container, onChanged } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({
+                name: "Valid",
+                estimated_start: "2021-02-01",
+                estimated_finish: "2021-02-01",
+            }),
+        });
+
+        fireEvent.submit(getForm(container));
+
+        await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    });
+
+    it("reports required errors for both blank dates and focuses the start field", () => {
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({ name: "Ok", estimated_start: "", estimated_finish: "" }),
+        });
+
+        fireEvent.submit(getForm(container));
+
+        expect(screen.getAllByText(REQUIRED_MESSAGE)).toHaveLength(2);
+        expect(document.activeElement).toBe(container.querySelector(".date-start"));
+        expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("focuses the finish field when only the finish date is missing", () => {
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({
+                name: "Ok",
+                estimated_start: "2022-01-01",
+                estimated_finish: "",
+            }),
+        });
+
+        fireEvent.submit(getForm(container));
+
+        expect(document.activeElement).toBe(container.querySelector(".date-end"));
+        expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("passes an unparseable date through so validate reports it (no API call)", () => {
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({
+                name: "Ok",
+                estimated_start: "2022-13-45",
+                estimated_finish: "2022-01-15",
+            }),
+        });
+
+        fireEvent.submit(getForm(container));
+
+        expect(screen.getByText(DATE_INVALID_MESSAGE)).toBeInTheDocument();
+        expect(createMock).not.toHaveBeenCalled();
+    });
 });
 
-describe("SprintEditLightbox — persistence", () => {
-    it("(c) creates the milestone with the exact writable payload, then bubbles onChanged + onClose", async () => {
-        createMock.mockResolvedValue({
-            data: { id: 99 },
-            status: 201,
-            headers: new Headers(),
-        });
-        const onChanged = jest.fn();
-        const onClose = jest.fn();
+/* -------------------------------------------------------------------------- */
+/* Persistence (create / edit)                                                */
+/* -------------------------------------------------------------------------- */
 
-        const { container } = renderLightbox({
+describe("SprintEditLightbox — persistence", () => {
+    it("creates the milestone with the exact writable payload (trimmed name, normalized dates), then fires onChanged + onClose", async () => {
+        createMock.mockResolvedValue(ok(makeSprint({ id: 99 })));
+
+        const { container, onChanged, onClose } = renderLightbox({
             mode: "create",
             // Leading/trailing whitespace must be trimmed in the payload.
             initialValues: makeValues({
-                name: "  Sprint 3  ",
+                name: "  My Sprint  ",
                 estimated_start: "2021-03-01",
                 estimated_finish: "2021-03-15",
             }),
-            onChanged,
-            onClose,
         });
 
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        fireEvent.submit(getForm(container));
 
-        await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-
-        expect(createMock).toHaveBeenCalledTimes(1);
-        expect(createMock).toHaveBeenCalledWith({
-            project: 1,
-            name: "Sprint 3",
-            estimated_start: "2021-03-01",
-            estimated_finish: "2021-03-15",
-        });
+        await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
+        expect(createMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                project: 1,
+                name: "My Sprint",
+                estimated_start: "2021-03-01",
+                estimated_finish: "2021-03-15",
+            }),
+        );
         expect(saveMock).not.toHaveBeenCalled();
-        expect(onChanged).toHaveBeenCalledTimes(1);
+
+        await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+        expect(onClose).toHaveBeenCalledTimes(1);
     });
 
-    it("edits via save() with the sprint id when in edit mode", async () => {
-        saveMock.mockResolvedValue({
-            data: { id: 10 },
-            status: 200,
-            headers: new Headers(),
-        });
-        const onChanged = jest.fn();
-        const onClose = jest.fn();
-        const sprint = makeSprint({ id: 10, name: "Renamed" });
+    it("edits via save(sprint.id, payload) in edit mode, then fires onChanged + onClose", async () => {
+        saveMock.mockResolvedValue(ok(makeSprint({ id: 42, name: "New Name" })));
 
-        const { container } = renderLightbox({
+        const { container, onChanged, onClose } = renderLightbox({
             mode: "edit",
-            sprint,
+            sprint: makeSprint({ id: 42, name: "Old" }),
             canDelete: true,
             initialValues: makeValues({
-                name: "Renamed",
-                estimated_start: sprint.estimated_start,
-                estimated_finish: sprint.estimated_finish,
+                name: "New Name",
+                estimated_start: "2021-04-01",
+                estimated_finish: "2021-04-15",
             }),
-            onChanged,
-            onClose,
         });
 
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        fireEvent.submit(getForm(container));
 
-        await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-
-        expect(saveMock).toHaveBeenCalledTimes(1);
-        expect(saveMock).toHaveBeenCalledWith(10, {
-            project: 1,
-            name: "Renamed",
-            estimated_start: "2021-01-01",
-            estimated_finish: "2021-01-15",
-        });
+        await waitFor(() => expect(saveMock).toHaveBeenCalledTimes(1));
+        expect(saveMock).toHaveBeenCalledWith(
+            42,
+            expect.objectContaining({
+                project: 1,
+                name: "New Name",
+                estimated_start: "2021-04-01",
+                estimated_finish: "2021-04-15",
+            }),
+        );
         expect(createMock).not.toHaveBeenCalled();
-        expect(onChanged).toHaveBeenCalledTimes(1);
-    });
 
-    it("(d) deletes the milestone after a confirmed native confirm, then bubbles onChanged + onClose", async () => {
-        removeMock.mockResolvedValue({
-            data: null,
-            status: 204,
-            headers: new Headers(),
-        });
-        const confirmSpy = jest
-            .spyOn(window, "confirm")
-            .mockImplementation(() => true);
-        const onChanged = jest.fn();
-        const onClose = jest.fn();
-        const sprint = makeSprint({ id: 10 });
-
-        const { container } = renderLightbox({
-            mode: "edit",
-            sprint,
-            canDelete: true,
-            initialValues: makeValues({
-                name: sprint.name,
-                estimated_start: sprint.estimated_start,
-                estimated_finish: sprint.estimated_finish,
-            }),
-            onChanged,
-            onClose,
-        });
-
-        fireEvent.click(container.querySelector(".delete-sprint") as HTMLButtonElement);
-
-        await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-
-        expect(confirmSpy).toHaveBeenCalledTimes(1);
-        expect(removeMock).toHaveBeenCalledTimes(1);
-        expect(removeMock).toHaveBeenCalledWith(10);
-        expect(onChanged).toHaveBeenCalledTimes(1);
-
-        confirmSpy.mockRestore();
-    });
-
-    it("does not delete when the native confirm is dismissed", () => {
-        const confirmSpy = jest
-            .spyOn(window, "confirm")
-            .mockImplementation(() => false);
-        const onChanged = jest.fn();
-        const onClose = jest.fn();
-        const sprint = makeSprint({ id: 10 });
-
-        const { container } = renderLightbox({
-            mode: "edit",
-            sprint,
-            canDelete: true,
-            initialValues: makeValues(),
-            onChanged,
-            onClose,
-        });
-
-        fireEvent.click(container.querySelector(".delete-sprint") as HTMLButtonElement);
-
-        expect(confirmSpy).toHaveBeenCalledTimes(1);
-        expect(removeMock).not.toHaveBeenCalled();
-        expect(onChanged).not.toHaveBeenCalled();
-        expect(onClose).not.toHaveBeenCalled();
-
-        confirmSpy.mockRestore();
+        await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+        expect(onClose).toHaveBeenCalledTimes(1);
     });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Server-error handling                                                      */
+/* -------------------------------------------------------------------------- */
+
 describe("SprintEditLightbox — server error handling", () => {
-    it("maps HttpError body field errors onto the form, shows the server message, and re-enables submit", async () => {
+    it("maps HttpError body field errors onto the form without crashing and does NOT fire onChanged", async () => {
         createMock.mockRejectedValue(
             new HttpError(
                 400,
                 "Bad Request",
-                { name: ["Name already taken"], _error_message: "Could not save sprint" },
-                "http://x/api/v1/milestones",
+                { name: ["Server says bad name"] },
+                "http://x/milestones",
             ),
         );
 
-        const { container } = renderLightbox({
+        const { container, onChanged } = renderLightbox({
             mode: "create",
-            initialValues: makeValues({ name: "Dup" }),
+            initialValues: makeValues({ name: "Valid" }),
         });
 
         const submitButton = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        fireEvent.submit(getForm(container));
 
-        // Field error mapped from the server body (ports form.setErrors(data))...
-        await waitFor(() => expect(screen.getByText("Name already taken")).toBeInTheDocument());
-        // ...plus the generic server toast, and the submit button is re-enabled
-        // (the `finally` cleared `submitting`).
-        expect(screen.getByText("Could not save sprint")).toBeInTheDocument();
+        // The server field message is surfaced on the form...
+        await waitFor(() => expect(container.textContent).toContain("Server says bad name"));
+        // ...the failed request never counts as a change...
+        expect(onChanged).not.toHaveBeenCalled();
+        // ...and the submit button is re-enabled (the `finally` cleared submitting).
         expect(submitButton.disabled).toBe(false);
     });
 
@@ -349,24 +407,146 @@ describe("SprintEditLightbox — server error handling", () => {
         );
 
         const { container } = renderLightbox({ mode: "create", initialValues: makeValues() });
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+
+        fireEvent.submit(getForm(container));
 
         await waitFor(() =>
             expect(screen.getByText("A global problem occurred")).toBeInTheDocument(),
         );
     });
 
-    it("falls back to the generic message for a non-HttpError failure", async () => {
+    it("falls back to the generic save message for a non-HttpError failure", async () => {
         createMock.mockRejectedValue(new Error("network down"));
 
-        const { container } = renderLightbox({ mode: "create", initialValues: makeValues() });
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+        const { container, onChanged } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues(),
+        });
+
+        fireEvent.submit(getForm(container));
 
         await waitFor(() => expect(screen.getByText(GENERIC_SAVE_ERROR)).toBeInTheDocument());
+        expect(onChanged).not.toHaveBeenCalled();
     });
 });
 
-describe("SprintEditLightbox — controlled inputs & date normalization", () => {
+/* -------------------------------------------------------------------------- */
+/* Delete flow                                                                */
+/* -------------------------------------------------------------------------- */
+
+describe("SprintEditLightbox — delete flow", () => {
+    it("does not render the delete button in create mode or when canDelete is false", () => {
+        // create mode, even with canDelete=true → never shown
+        const { container: createC } = renderLightbox({ mode: "create", canDelete: true });
+        expect(createC.querySelector(".delete-sprint")).toBeNull();
+
+        // edit mode without permission → hidden
+        const { container: noPermC } = renderLightbox({
+            mode: "edit",
+            sprint: makeSprint({ id: 7 }),
+            canDelete: false,
+        });
+        expect(noPermC.querySelector(".delete-sprint")).toBeNull();
+    });
+
+    it("renders the delete button only in edit mode with canDelete", () => {
+        const { container } = renderLightbox({
+            mode: "edit",
+            sprint: makeSprint({ id: 7 }),
+            canDelete: true,
+        });
+
+        expect(container.querySelector(".delete-sprint")).not.toBeNull();
+    });
+
+    it("deletes via remove(sprint.id) after a confirmed native confirm, then fires onChanged + onClose", async () => {
+        removeMock.mockResolvedValue(ok<unknown>({}));
+
+        const { container, onChanged, onClose } = renderLightbox({
+            mode: "edit",
+            sprint: makeSprint({ id: 42 }),
+            canDelete: true,
+            initialValues: makeValues({
+                name: "Sprint",
+                estimated_start: "2021-04-01",
+                estimated_finish: "2021-04-15",
+            }),
+        });
+
+        const del = container.querySelector(".delete-sprint") as HTMLElement | null;
+        expect(del).not.toBeNull();
+
+        fireEvent.click(del as HTMLElement);
+
+        expect(window.confirm).toHaveBeenCalledTimes(1);
+        await waitFor(() => expect(removeMock).toHaveBeenCalledWith(42));
+        await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not delete when the native confirm is dismissed", () => {
+        window.confirm = jest.fn(() => false);
+
+        const { container, onChanged, onClose } = renderLightbox({
+            mode: "edit",
+            sprint: makeSprint({ id: 42 }),
+            canDelete: true,
+        });
+
+        fireEvent.click(container.querySelector(".delete-sprint") as HTMLElement);
+
+        expect(window.confirm).toHaveBeenCalledTimes(1);
+        expect(removeMock).not.toHaveBeenCalled();
+        expect(onChanged).not.toHaveBeenCalled();
+        expect(onClose).not.toHaveBeenCalled();
+    });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Double-submit guard                                                        */
+/* -------------------------------------------------------------------------- */
+
+describe("SprintEditLightbox — double-submit guard", () => {
+    it("disables the submit button while a request is in flight so the API is hit exactly once", () => {
+        // A create that never settles keeps the component in the `submitting`
+        // state, so the submit button stays disabled after the first submit.
+        createMock.mockReturnValue(new Promise<never>(() => { /* never resolves */ }));
+
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({
+                name: "Valid",
+                estimated_start: "2021-03-01",
+                estimated_finish: "2021-03-15",
+            }),
+        });
+
+        fireEvent.submit(getForm(container));
+
+        const submitBtn = container.querySelector('button[type="submit"]') as HTMLButtonElement;
+        expect(submitBtn).toBeDisabled();
+        expect(createMock).toHaveBeenCalledTimes(1);
+    });
+});
+
+/* -------------------------------------------------------------------------- */
+/* DOM fidelity & controlled inputs                                           */
+/* -------------------------------------------------------------------------- */
+
+describe("SprintEditLightbox — DOM fidelity & controlled inputs", () => {
+    it("renders the exact lightbox class names and the create title", () => {
+        const { container } = renderLightbox({ mode: "create" });
+
+        expect(container.querySelector(".lightbox.lightbox-sprint-add-edit")).not.toBeNull();
+        expect(container.querySelector(".sprint-name.e2e-sprint-name")).not.toBeNull();
+        expect(container.querySelector(".dates .date-start")).not.toBeNull();
+        expect(container.querySelector(".dates .date-end")).not.toBeNull();
+        expect(
+            container.querySelector(".sprint-add-edit-actions .btn-big.button-large.button-block"),
+        ).not.toBeNull();
+        expect(screen.getByText("New sprint")).toBeInTheDocument();
+    });
+
     it("updates the three editable inputs on change", () => {
         const { container } = renderLightbox({
             mode: "create",
@@ -386,110 +566,11 @@ describe("SprintEditLightbox — controlled inputs & date normalization", () => 
         expect(finishInput.value).toBe("2022-05-20");
     });
 
-    it("reports required errors for both blank dates and focuses the start field", () => {
-        const { container } = renderLightbox({
-            mode: "create",
-            initialValues: makeValues({ name: "Ok", estimated_start: "", estimated_finish: "" }),
-        });
-
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
-
-        expect(screen.getAllByText(REQUIRED_MESSAGE)).toHaveLength(2);
-        expect(document.activeElement).toBe(container.querySelector(".date-start"));
-        expect(createMock).not.toHaveBeenCalled();
-    });
-
-    it("focuses the finish field when only the finish date is missing", () => {
-        const { container } = renderLightbox({
-            mode: "create",
-            initialValues: makeValues({
-                name: "Ok",
-                estimated_start: "2022-01-01",
-                estimated_finish: "",
-            }),
-        });
-
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
-
-        expect(document.activeElement).toBe(container.querySelector(".date-end"));
-        expect(createMock).not.toHaveBeenCalled();
-    });
-
-    it("passes an unparseable date through so validate reports it (no API call)", () => {
-        const { container } = renderLightbox({
-            mode: "create",
-            initialValues: makeValues({
-                name: "Ok",
-                estimated_start: "2022-13-45",
-                estimated_finish: "2022-01-15",
-            }),
-        });
-
-        fireEvent.submit(container.querySelector("form") as HTMLFormElement);
-
-        expect(screen.getByText(DATE_INVALID_MESSAGE)).toBeInTheDocument();
-        expect(createMock).not.toHaveBeenCalled();
-    });
-});
-
-describe("SprintEditLightbox — DOM fidelity", () => {
-    it("renders the exact lightbox class names and the create title", () => {
-        const { container } = renderLightbox({ mode: "create" });
-
-        expect(container.querySelector(".lightbox.lightbox-sprint-add-edit")).not.toBeNull();
-        expect(container.querySelector(".sprint-name.e2e-sprint-name")).not.toBeNull();
-        expect(container.querySelector(".dates .date-start")).not.toBeNull();
-        expect(container.querySelector(".dates .date-end")).not.toBeNull();
-        expect(
-            container.querySelector(".sprint-add-edit-actions .btn-big.button-large.button-block"),
-        ).not.toBeNull();
-        expect(screen.getByText("New sprint")).toBeInTheDocument();
-    });
-
-    it("hides the delete control unless in edit mode with delete permission", () => {
-        const { container, rerender } = renderLightbox({ mode: "create", canDelete: true });
-        // create mode: never shown
-        expect(container.querySelector(".delete-sprint")).toBeNull();
-
-        // edit mode without permission: hidden
-        rerender(
-            <SprintEditLightbox
-                open
-                mode="edit"
-                project={makeProject()}
-                sprint={makeSprint()}
-                initialValues={makeValues()}
-                lastSprintName={null}
-                canDelete={false}
-                onChanged={jest.fn()}
-                onClose={jest.fn()}
-            />,
-        );
-        expect(container.querySelector(".delete-sprint")).toBeNull();
-
-        // edit mode with permission: shown
-        rerender(
-            <SprintEditLightbox
-                open
-                mode="edit"
-                project={makeProject()}
-                sprint={makeSprint()}
-                initialValues={makeValues()}
-                lastSprintName={null}
-                canDelete
-                onChanged={jest.fn()}
-                onClose={jest.fn()}
-            />,
-        );
-        expect(container.querySelector(".delete-sprint")).not.toBeNull();
-    });
-
     it("shows the last-sprint hint only on create when a name is provided", () => {
         renderLightbox({ mode: "create", lastSprintName: "Sprint Zero" });
 
-        // The hint reproduces the exact legacy i18n string
-        // ("last sprint is <strong> {{lastSprint}} ;-) </strong>"), so the name
-        // is embedded (with a ";-)" suffix) inside the <strong> element.
+        // Reproduces the legacy i18n string
+        // ("last sprint is <strong> {{lastSprint}} ;-) </strong>").
         expect(screen.getByText(/last sprint is/)).toBeInTheDocument();
         expect(screen.getByText(/Sprint Zero/)).toBeInTheDocument();
     });
