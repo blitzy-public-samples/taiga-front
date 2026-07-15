@@ -133,9 +133,12 @@ describe("isDragEnabled", () => {
         expect(isDragEnabled(undefined)).toBe(false);
     });
 
-    it("returns false when my_permissions is missing or not an array", () => {
+    it("returns false when my_permissions is undefined, null or an empty array", () => {
         expect(isDragEnabled({})).toBe(false);
+        expect(isDragEnabled({ my_permissions: undefined })).toBe(false);
         expect(isDragEnabled({ my_permissions: null })).toBe(false);
+        // Empty permission set => "modify_us" absent => disabled.
+        expect(isDragEnabled({ my_permissions: [] })).toBe(false);
     });
 
     it("returns false without the modify_us permission", () => {
@@ -212,6 +215,35 @@ describe("computeNeighbors", () => {
         expect(computeNeighbors([10, 30, 20], 2, [20])).toEqual<DropNeighbors>({
             previous: 30,
             next: null,
+        });
+    });
+
+    it("returns {null,null} for a single-element container dropped at the top", () => {
+        // Spec literal: computeNeighbors([10], 0) -> nothing before, nothing after
+        // (draggedIds defaults to [orderedIds[0]] = [10], so the lone id is excluded).
+        expect(computeNeighbors([10], 0)).toEqual<DropNeighbors>({
+            previous: null,
+            next: null,
+        });
+    });
+
+    it("skips a dragged id when scanning BACKWARD for previous (multi-drag)", () => {
+        // Spec literal: [10,20,30,40] dropped at index 2 dragging {30,20}; the
+        // backward scan from index 1 skips 20 (dragged) and lands on 10; because a
+        // previous exists the XOR gate keeps next null.
+        expect(computeNeighbors([10, 20, 30, 40], 2, [30, 20])).toEqual<DropNeighbors>({
+            previous: 10,
+            next: null,
+        });
+    });
+
+    it("finds next at the top while skipping a dragged immediate neighbor (XOR at top)", () => {
+        // Spec literal: [20,30,10] dropped at index 0 dragging {20}; nothing precedes
+        // index 0 (previous null) so the forward scan runs and picks 30 (index 1, not
+        // dragged) — never the dragged 20.
+        expect(computeNeighbors([20, 30, 10], 0, [20])).toEqual<DropNeighbors>({
+            previous: null,
+            next: 30,
         });
     });
 });

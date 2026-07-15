@@ -25,6 +25,7 @@
 
 import { DndContext } from "@dnd-kit/core";
 import { render, screen, fireEvent } from "@testing-library/react";
+import "@testing-library/jest-dom";
 
 import { SprintList } from "../SprintList";
 import type { SprintListProps } from "../SprintList";
@@ -118,6 +119,16 @@ function renderList(overrides: Partial<SprintListProps> = {}): {
 /* -------------------------------------------------------------------------- */
 
 describe("SprintList — header + open sprints", () => {
+    it("renders the root section.sprints container", () => {
+        // Ports the `section.sprints` root of sprints.jade — the wrapper the
+        // compiled backlog SCSS themes; it must always render regardless of counts.
+        const { result } = renderList({
+            totalMilestones: 1,
+            openSprints: [makeSprint({ id: 1 })],
+        });
+        expect(result.container.querySelector("section.sprints")).not.toBeNull();
+    });
+
     it("renders the total count badge and the open sprints in order", () => {
         const openSprints = [
             makeSprint({ id: 1, name: "Sprint Alpha", slug: "alpha" }),
