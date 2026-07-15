@@ -39,6 +39,14 @@ var gulp = require("gulp"),
     classPrefix = require('gulp-class-prefix'),
     coffeelint = require('gulp-coffeelint');
 
+// esbuild is used only by the additive `esbuild` task below, which bundles the
+// React migration entry point (app/react/index.tsx) into
+// dist/<version>/js/react-app.js. It is declared as its own standalone `var`
+// (rather than appended to the comma-chained require list above) so the
+// pre-existing chain — which contains stray semicolons — is left untouched.
+// Gulp itself is retained; this is purely additive (AAP §0.7.2).
+var esbuild = require("esbuild");
+
 var argv = require('minimist')(process.argv.slice(2));
 
 var utils = require("./gulp-utils");
@@ -91,6 +99,16 @@ paths.css_vendor = [
 paths.locales = paths.app + "locales/**/*.json";
 paths.modulesLocales = paths.app + "modules/**/locales/*.json";
 paths.elements = `./elements.js`;
+
+// React/TypeScript migration sources bundled by the `esbuild` task. Used as the
+// glob for the optional dev-loop `gulp.watch` entry (see the "watch" task) so a
+// change under app/react/** rebuilds react-app.js. The `esbuild` task itself
+// only needs the single entry point (app/react/index.tsx); esbuild follows the
+// import graph from there.
+paths.reactSrc = [
+    paths.app + "react/**/*.ts",
+    paths.app + "react/**/*.tsx"
+];
 
 paths.sass = [
     paths.app + "**/*.scss",
@@ -565,6 +583,47 @@ gulp.task("elements", function() {
         .pipe(gulp.dest(paths.distVersion + "js/"));
 });
 
+// Bundle the React 18 / TypeScript migration into a single self-contained
+// browser script, dist/<version>/js/react-app.js. This is the additive step
+// that lets `npx gulp deploy` emit the React bundle alongside the surviving
+// AngularJS `app.js`, `elements.js`, and `libs.js` outputs — Gulp is retained,
+// not replaced (AAP §0.3.1, §0.7.2).
+//
+// - entryPoints: the single React root registration module. Every module under
+//   app/react/** is reachable through its import graph, so esbuild only needs
+//   this one entry. It registers the <tg-react-kanban> / <tg-react-backlog>
+//   custom elements as a load-time side effect.
+// - outfile: MUST be exactly react-app.js under dist/<version>/js/ — a hard
+//   contract shared with app-loader/app-loader.coffee's
+//   loadJS("#{_version}/js/react-app.js") chain and the served docker bundle.
+// - bundle + format:"iife": produce one browser-ready <script> with React and
+//   all app/react code bundled IN (React is a runtime dependency, NOT external),
+//   mirroring how elements.js / app.js are self-contained scripts.
+// - jsx:"automatic": React 18 automatic runtime, matching tsconfig.json's
+//   jsx:"react-jsx". esbuild does its own TS→JS transpile (it does NOT
+//   typecheck — tsconfig.json drives ts-jest and editor tooling instead).
+// - define(process.env.NODE_ENV) + minify: tie production optimization to the
+//   `deploy` invocation via the shared isDeploy flag, exactly like the existing
+//   uglify-on-deploy behavior of the other JS tasks.
+//
+// esbuild.build(...) returns a Promise, which Gulp treats as task completion.
+gulp.task("esbuild", function() {
+    return esbuild.build({
+        entryPoints: [paths.app + "react/index.tsx"],
+        bundle: true,
+        outfile: paths.distVersion + "js/react-app.js",
+        platform: "browser",
+        format: "iife",
+        target: ["es2017"],
+        loader: { ".ts": "ts", ".tsx": "tsx" },
+        jsx: "automatic",
+        define: { "process.env.NODE_ENV": isDeploy ? '"production"' : '"development"' },
+        minify: isDeploy,
+        sourcemap: true,
+        logLevel: "info"
+    });
+});
+
 gulp.task("app-watch", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader"));
 
 gulp.task("app-deploy", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader", function() {
@@ -708,6 +767,7 @@ gulp.task("watch", function(cb) {
     gulp.watch(paths.coffee, gulp.parallel(["app-watch"]));
     gulp.watch(paths.libs, gulp.parallel(["jslibs-watch"]));
     gulp.watch(paths.elements, gulp.parallel(["elements"]));
+    gulp.watch(paths.reactSrc, gulp.parallel(["esbuild"]));
     gulp.watch([paths.locales, paths.modulesLocales], gulp.parallel(["locales"]));
     gulp.watch(paths.images, gulp.parallel(["copy-images"]));
 
@@ -724,6 +784,7 @@ gulp.task("deploy", gulp.series(
         "app-deploy",
         "jslibs-deploy",
         "elements",
+        "esbuild",        // emits dist/<version>/js/react-app.js (React migration bundle)
         "link-images",
         "compile-themes"
     )
@@ -740,6 +801,7 @@ gulp.task("default", gulp.series(
         "jslibs-watch",
         "jade-deploy",
         "elements",
+        "esbuild",
         "express",
         "watch"
     ))
