@@ -55,7 +55,7 @@ import {
     bulkUpdateMilestone,
 } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
-import { createBacklogPersister } from "../../shared/dnd/DndProvider";
+import { createBacklogPersister, isDragEnabled } from "../../shared/dnd/DndProvider";
 
 /* -------------------------------------------------------------------------- */
 /* Module mocks — ALL of ../shared/** plus the presentational children.        */
@@ -241,6 +241,7 @@ const mockBulkUpdateBacklogOrder = bulkUpdateBacklogOrder as unknown as AsyncMoc
 const mockBulkUpdateMilestone = bulkUpdateMilestone as unknown as AsyncMock;
 const mockCreateEventsClient = jest.mocked(createEventsClient);
 const mockCreateBacklogPersister = createBacklogPersister as unknown as jest.Mock;
+const mockIsDragEnabled = isDragEnabled as unknown as jest.Mock;
 
 /* -------------------------------------------------------------------------- */
 /* Test data factories (shapes mirror the sibling specs)                       */
@@ -408,6 +409,10 @@ beforeEach(() => {
     mockCaptured.bulkProps = null;
     mockCaptured.burndownProps = null;
     installHappyHttp();
+    // `clearMocks:true` resets call history but NOT implementations, so a test
+    // that flips the DnD permission gate to `false` would otherwise leak into
+    // later tests. Re-assert the default (DnD permitted) before every test.
+    mockIsDragEnabled.mockReturnValue(true);
     // Ensure no Angular injector is present unless a test adds one.
     delete (window as unknown as { angular?: unknown }).angular;
     try {
@@ -503,6 +508,34 @@ test("renders permission-denied on a 403 project response", async () => {
     expect(countGet((p) => p.includes("/stats"))).toBe(0);
 });
 
+test("does not crash and renders permission-denied on a 451 (unavailable-for-legal-reasons) project response", async () => {
+    // A blocked / archived project answers 451; BacklogApp treats 403 and 451
+    // identically (BacklogApp.tsx: `err.status === 403 || err.status === 451`),
+    // so the screen must gracefully degrade to the permission-denied path with
+    // no downstream backlog load and no thrown error.
+    mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+        if (String(args[0]) === `projects/${PROJECT_ID}`) {
+            return Promise.reject(
+                new HttpError(451, "Unavailable For Legal Reasons", null, "projects/5"),
+            );
+        }
+        return Promise.resolve(mkRes({}));
+    });
+
+    const { container } = render(
+        <BacklogApp projectId={PROJECT_ID} projectSlug="my-project" />,
+    );
+
+    await waitFor(() =>
+        expect(container.querySelector(".permission-denied")).not.toBeNull(),
+    );
+    // No board and no downstream fetches after the gate.
+    expect(container.querySelector(".backlog-table")).toBeNull();
+    expect(countGet((p) => p.includes("/stats"))).toBe(0);
+    expect(countGet((p) => p === "userstories")).toBe(0);
+    expect(mockListMilestones).not.toHaveBeenCalled();
+});
+
 test("renders the load-error shell on a non-permission project failure", async () => {
     mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
         if (String(args[0]) === `projects/${PROJECT_ID}`) {
@@ -594,6 +627,25 @@ test("passes the correct contract props into BacklogTable and SprintList", async
     expect(sl).not.toBeNull();
     expect(sl?.openSprints.length).toBe(1);
     expect(sl?.closedSprintsVisible).toBe(false);
+});
+
+test("passes dragEnabled=false into BacklogTable when the viewer lacks modify_us", async () => {
+    // `dragEnabled` mirrors `isDragEnabled(project)`; a read-only viewer (no
+    // `modify_us`, or an archived project) must NOT be able to drag. The DnD
+    // gate is mocked, so drive the false branch through it while also modelling
+    // a permission-poor project for realism.
+    mockIsDragEnabled.mockReturnValue(false);
+    currentProject = makeProject({ my_permissions: ["view_us"] });
+
+    await renderApp();
+
+    // The gate was consulted with the loaded project.
+    expect(mockIsDragEnabled).toHaveBeenCalledWith(
+        expect.objectContaining({ id: PROJECT_ID }),
+    );
+    // ...and the board received the disabled flag.
+    expect(mockCaptured.backlogTableProps).not.toBeNull();
+    expect(mockCaptured.backlogTableProps?.dragEnabled).toBe(false);
 });
 
 /* ========================================================================== */

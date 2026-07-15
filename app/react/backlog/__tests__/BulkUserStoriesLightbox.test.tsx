@@ -8,236 +8,435 @@
 
 /**
  * Unit tests for the React `BulkUserStoriesLightbox`
- * (app/react/backlog/BulkUserStoriesLightbox.tsx) — the bulk-create
- * user-stories lightbox reproduced INSIDE the React Backlog root (AAP §0.2.1).
+ * (app/react/backlog/BulkUserStoriesLightbox.tsx).
  *
- * Runs browserless in the jsdom environment declared by jest.config.js. The
- * shared user-story API adapter `../../shared/api/userstories` is the ONLY
- * mocked module — its `bulkCreate` is replaced with a `jest.fn()` so no real
- * `fetch` occurs and the exact call arguments can be asserted. The sibling
- * `../../shared/api/httpClient` (which owns `HttpError` / `HttpResponse`) is
- * side-effect-free and is deliberately left un-mocked.
+ * Runs in the browserless jsdom environment (jest.config.js). The shared API
+ * adapter `../../shared/api/userstories` is mocked so no real `fetch` occurs and
+ * the exact `bulkCreate` call arguments can be asserted.
  *
- * Coverage focus (contributes to the AAP §0.6.3 ≥70% line gate):
- *  - closed        -> the lightbox host is hidden (display:none)
- *  - empty / whitespace-only text -> required error AND `bulkCreate` NOT called
- *  - a line longer than 200 chars -> `bulkCreate` NOT called
- *  - valid input   -> `bulkCreate(project.id, statusId, bulkText, null)` (the
- *                     4th swimlane argument is ALWAYS null on the backlog) then
- *                     `onCreated(created, position)` and `onClose()`
- *  - the CROSSED position-radio markup (`#top-backlog` value="bottom",
- *                     `#bottom-backlog` value="top") with default "bottom",
- *                     flipping the emitted position to "top"
- *  - the status selector open/choose updating the id and swatch color
- *  - the swimlane fieldset is NOT rendered on the backlog
- *  - the anti-double-submit guard (submit disabled while a request is in flight)
+ * Coverage focus (per the file's validation checklist):
+ *  - empty textarea -> required error AND `bulkCreate` NOT called
+ *  - a line longer than 200 chars -> line-length error AND `bulkCreate` NOT called
+ *  - valid input -> `bulkCreate(projectId, statusId, bulkText, null)` and
+ *    `onCreated(created, "bottom")` then `onClose()`
+ *  - selecting the "on top" radio forwards position "top"
+ *  - status selector toggles open and selecting an option updates the current
+ *    status and closes the dropdown
+ *  - the close control invokes `onClose`
+ *  - a failed request surfaces a generic error (HttpError path)
  *
- * The expected user-facing copy is pinned here as an INDEPENDENT literal (not
- * imported from the component, whose message constants are module-private) so
- * that unintended drift in the component copy is caught by a failing assertion.
+ * TEST-INDEPENDENCE CONTRACT: the expected user-facing copy is pinned here as
+ * INDEPENDENT literals sourced from the authoritative i18n contract
+ * (app/locales/taiga/locale-en.json) and the file spec, NOT imported from the
+ * module under test (its message constants are module-private). Any unintended
+ * drift in the component's copy is therefore caught by a failing assertion.
  */
 
-jest.mock("../../shared/api/userstories", () => ({
-  bulkCreate: jest.fn(),
-}));
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 
-import { render, fireEvent, waitFor } from "@testing-library/react";
-import "@testing-library/jest-dom";
-import type { ComponentProps } from "react";
 import { BulkUserStoriesLightbox } from "../BulkUserStoriesLightbox";
-import type { Project, UserStory } from "../types";
+import type { BulkUserStoriesLightboxProps } from "../BulkUserStoriesLightbox";
+import type { Project, UsStatus } from "../types";
+
+// Mock the shared user-story API adapter: `bulkCreate` is replaced with a jest
+// mock (hoisted above the imports by ts-jest) so the test drives its behavior.
+jest.mock("../../shared/api/userstories", () => ({
+    bulkCreate: jest.fn(),
+}));
 import { bulkCreate } from "../../shared/api/userstories";
 
 const bulkCreateMock = jest.mocked(bulkCreate);
 
-/** COMMON.FORM_ERRORS.REQUIRED — legacy checksley `data-required="true"` copy. */
-const REQUIRED_MESSAGE = "This value is required.";
-
 /**
- * Build an `HttpResponse<T>` envelope that structurally matches the shared
- * httpClient contract (`{ data, status, headers }`) so `bulkCreate` mock
- * resolutions typecheck without importing the httpClient types (kept out of
- * this file's dependency surface). No `any` is used.
+ * The resolved shape of `bulkCreate` (an `HttpResponse<UserStory[]>`), derived
+ * via `ReturnType`/`Awaited` so the test never imports the httpClient types
+ * (which are outside this file's dependency set) and stays free of `any`.
  */
-function ok<T>(data: T): { data: T; status: number; headers: Headers } {
-  return { data, status: 200, headers: {} as Headers };
+type BulkCreateResult = Awaited<ReturnType<typeof bulkCreate>>;
+
+/* -------------------------------------------------------------------------- */
+/* Independent expected copy (intentionally NOT imported from the component)   */
+/* -------------------------------------------------------------------------- */
+
+/** COMMON.FORM_ERRORS.REQUIRED */
+const EXPECTED_REQUIRED_MESSAGE = "This value is required.";
+/** data-linewidth="200" rule copy pinned by the file spec. */
+const EXPECTED_LINE_TOO_LONG_MESSAGE = "Each line must be 200 characters or fewer.";
+/** Generic request-failure copy pinned by the file spec. */
+const EXPECTED_GENERIC_ERROR_MESSAGE =
+    "The user stories could not be created. Please try again.";
+
+/* -------------------------------------------------------------------------- */
+/* Test data factories                                                        */
+/* -------------------------------------------------------------------------- */
+
+const PROJECT_ID = 7;
+const DEFAULT_STATUS_ID = 1;
+
+function makeUsStatus(overrides: Partial<UsStatus> = {}): UsStatus {
+    return {
+        id: 1,
+        name: "New",
+        color: "#70728f",
+        order: 1,
+        is_closed: false,
+        ...overrides,
+    };
 }
 
-/** A fully-typed `Project` fixture; `us_statuses` supplies the status selector. */
-function makeProject(partial: Partial<Project> = {}): Project {
-  return {
-    id: 1,
-    slug: "proj",
-    name: "Proj",
-    my_permissions: ["modify_us"],
-    roles: [],
-    points: [],
-    us_statuses: [
-      { id: 1, name: "New", color: "rgb(1, 2, 3)", order: 1, is_closed: false },
-      { id: 3, name: "Done", color: "rgb(10, 20, 30)", order: 2, is_closed: true },
-    ],
-    is_backlog_activated: true,
-    is_kanban_activated: false,
-    default_us_status: 1,
-    total_milestones: 0,
-    i_am_admin: true,
-    ...partial,
-  };
+function makeProject(overrides: Partial<Project> = {}): Project {
+    return {
+        id: PROJECT_ID,
+        slug: "my-project",
+        name: "My Project",
+        my_permissions: ["modify_us"],
+        roles: [],
+        points: [],
+        us_statuses: [
+            makeUsStatus({ id: 1, name: "New", color: "#70728f" }),
+            makeUsStatus({ id: 2, name: "Ready", color: "#4c566a" }),
+        ],
+        is_backlog_activated: true,
+        is_kanban_activated: false,
+        default_us_status: DEFAULT_STATUS_ID,
+        total_milestones: null,
+        i_am_admin: true,
+        ...overrides,
+    };
 }
 
-/** A fully-typed `UserStory` fixture (the shape returned by `bulk_create`). */
-function makeUs(partial: Partial<UserStory> & { id: number; ref: number }): UserStory {
-  return {
-    subject: `US ${partial.ref}`,
-    project: 1,
-    status: 1,
-    milestone: null,
-    points: {},
-    total_points: null,
-    backlog_order: partial.ref,
-    sprint_order: partial.ref,
-    assigned_to: null,
-    is_blocked: false,
-    is_closed: false,
-    tags: null,
-    epics: null,
-    due_date: null,
-    version: 1,
-    ...partial,
-  };
+function makeProps(
+    overrides: Partial<BulkUserStoriesLightboxProps> = {},
+): BulkUserStoriesLightboxProps {
+    return {
+        open: true,
+        project: makeProject(),
+        defaultStatusId: DEFAULT_STATUS_ID,
+        onCreated: jest.fn(),
+        onClose: jest.fn(),
+        ...overrides,
+    };
 }
 
-// Type the props from the component itself (NOT a named props-interface export)
-// so the test stays coupled to the real signature.
-type Props = ComponentProps<typeof BulkUserStoriesLightbox>;
-
-function renderBulk(overrides: Partial<Props> = {}) {
-  const onCreated = jest.fn();
-  const onClose = jest.fn();
-  const props: Props = {
-    open: true,
-    project: makeProject(),
-    defaultStatusId: 1,
-    onCreated,
-    onClose,
-    ...overrides,
-  };
-  const utils = render(<BulkUserStoriesLightbox {...props} />);
-  return { ...utils, onCreated, onClose };
-}
-
-/** Submit the lightbox form deterministically (independent of jsdom button quirks). */
+/** Dispatch the form's submit event deterministically (independent of jsdom's submit-button behavior). */
 function submitForm(container: HTMLElement): void {
-  const form = container.querySelector("form");
-  if (form) {
+    const form = container.querySelector("form");
+    if (form === null) {
+        throw new Error("expected a <form> element to be rendered");
+    }
     fireEvent.submit(form);
-    return;
-  }
-  const btn = (container.querySelector(".js-submit-button") ??
-    container.querySelector('button[type="submit"]')) as HTMLElement;
-  fireEvent.click(btn);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Tests                                                                      */
+/* -------------------------------------------------------------------------- */
 
 describe("BulkUserStoriesLightbox", () => {
-  it("keeps the lightbox host hidden (display:none) when closed", () => {
-    // The component never returns null; it toggles visibility via `display`
-    // to mirror the AngularJS `lightboxService.open/close` (element stays in
-    // the DOM). "Closed" is therefore asserted as the hidden host.
-    const { container } = renderBulk({ open: false });
-    const host = container.querySelector(".lightbox-generic-bulk") as HTMLElement | null;
-    expect(host).not.toBeNull();
-    expect(host).toHaveStyle({ display: "none" });
-  });
+    describe("visibility", () => {
+        it("hides the wrapper via display:none when closed", () => {
+            const props = makeProps({ open: false });
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
 
-  it("shows the required error and does not call bulkCreate when the textarea is empty", () => {
-    const { container } = renderBulk();
-    submitForm(container);
-    expect(container.textContent).toContain(REQUIRED_MESSAGE);
-    expect(bulkCreateMock).not.toHaveBeenCalled();
-  });
+            const wrapper = container.querySelector(".lightbox.lightbox-generic-bulk");
+            expect(wrapper).not.toBeNull();
+            expect(wrapper).toHaveStyle({ display: "none" });
+        });
 
-  it("shows the required error for whitespace-only input", () => {
-    const { container } = renderBulk();
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "   " } });
-    submitForm(container);
-    expect(container.textContent).toContain(REQUIRED_MESSAGE);
-    expect(bulkCreateMock).not.toHaveBeenCalled();
-  });
+        it("shows the wrapper (no display override) when open", () => {
+            const props = makeProps({ open: true });
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
 
-  it("rejects a line longer than 200 characters without calling bulkCreate", () => {
-    const { container } = renderBulk();
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "a".repeat(201) } });
-    submitForm(container);
-    expect(bulkCreateMock).not.toHaveBeenCalled();
-  });
+            const wrapper = container.querySelector(".lightbox.lightbox-generic-bulk");
+            expect(wrapper).not.toBeNull();
+            expect(wrapper).not.toHaveStyle({ display: "none" });
+        });
 
-  it("submits a valid bulk create with swimlaneId null and default position bottom", async () => {
-    const created = [makeUs({ id: 1, ref: 1 }), makeUs({ id: 2, ref: 2 })];
-    bulkCreateMock.mockResolvedValue(ok(created));
-    const { container, onCreated, onClose } = renderBulk({ defaultStatusId: 1 });
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "Story A\nStory B" } });
-    submitForm(container);
-    await waitFor(() => expect(bulkCreateMock).toHaveBeenCalledTimes(1));
-    // The 4th argument (swimlaneId) MUST be null for the backlog context.
-    expect(bulkCreateMock).toHaveBeenCalledWith(1, 1, "Story A\nStory B", null);
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith(created, "bottom"));
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
+        it("renders the title, textarea, both position radios and the save button", () => {
+            render(<BulkUserStoriesLightbox {...makeProps()} />);
 
-  it("preserves the crossed radio markup verbatim", () => {
-    const { container } = renderBulk();
-    const top = container.querySelector("#top-backlog") as HTMLInputElement | null;
-    const bottom = container.querySelector("#bottom-backlog") as HTMLInputElement | null;
-    expect(top).not.toBeNull();
-    expect(bottom).not.toBeNull();
-    // The source template intentionally CROSSES id/value: #top-backlog carries
-    // value="bottom" and #bottom-backlog carries value="top". Reproduced verbatim.
-    expect(top!.getAttribute("value")).toBe("bottom");
-    expect(bottom!.getAttribute("value")).toBe("top");
-  });
+            expect(screen.getByText("New bulk insert")).toBeInTheDocument();
+            expect(screen.getByRole("textbox")).toBeInTheDocument();
+            expect(screen.getByRole("radio", { name: "at the bottom" })).toBeInTheDocument();
+            expect(screen.getByRole("radio", { name: "on top" })).toBeInTheDocument();
+            expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+        });
 
-  it("flips the emitted position to top when the other radio is selected", async () => {
-    const created = [makeUs({ id: 1, ref: 1 })];
-    bulkCreateMock.mockResolvedValue(ok(created));
-    const { container, onCreated } = renderBulk();
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "Story A" } });
-    fireEvent.click(container.querySelector("#bottom-backlog") as HTMLInputElement);
-    submitForm(container);
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith(created, "top"));
-  });
+        it("defaults the position to 'at the bottom'", () => {
+            render(<BulkUserStoriesLightbox {...makeProps()} />);
 
-  it("updates the chosen status (id + swatch color) via the status selector", async () => {
-    const created = [makeUs({ id: 5, ref: 5 })];
-    bulkCreateMock.mockResolvedValue(ok(created));
-    const { container } = renderBulk({ defaultStatusId: 1 });
-    fireEvent.click(container.querySelector(".bulk-status-selector") as HTMLElement);
-    expect(container.querySelector(".bulk-status-option-wrapper")).not.toBeNull();
-    const done = Array.from(container.querySelectorAll(".bulk-status-option")).find(
-      (opt) => (opt.textContent ?? "").includes("Done"),
-    ) as HTMLElement;
-    fireEvent.click(done);
-    // After selection the dropdown collapses and the selector swatch adopts the
-    // chosen status color; the closed-selector background carries it verbatim.
-    expect(container.innerHTML).toContain("rgb(10, 20, 30)");
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "Story A" } });
-    submitForm(container);
-    await waitFor(() => expect(bulkCreateMock).toHaveBeenCalledWith(1, 3, "Story A", null));
-  });
+            expect(screen.getByRole("radio", { name: "at the bottom" })).toBeChecked();
+            expect(screen.getByRole("radio", { name: "on top" })).not.toBeChecked();
+        });
 
-  it("does not render the swimlane fieldset on the backlog", () => {
-    const { container } = renderBulk();
-    expect(container.querySelector("select")).toBeNull();
-    expect(container.querySelector('[class*="swimlane"]')).toBeNull();
-  });
+        it("allows switching the position to 'on top' and back to 'at the bottom'", () => {
+            render(<BulkUserStoriesLightbox {...makeProps()} />);
 
-  it("guards against double submit while a request is in flight", () => {
-    bulkCreateMock.mockReturnValue(new Promise<never>(() => { /* never resolves */ }));
-    const { container } = renderBulk();
-    fireEvent.change(container.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "Story A" } });
-    submitForm(container);
-    const btn = (container.querySelector(".js-submit-button") ??
-      container.querySelector('button[type="submit"]')) as HTMLButtonElement;
-    expect(btn).toBeDisabled();
-    expect(bulkCreateMock).toHaveBeenCalledTimes(1);
-  });
+            fireEvent.click(screen.getByRole("radio", { name: "on top" }));
+            expect(screen.getByRole("radio", { name: "on top" })).toBeChecked();
+
+            fireEvent.click(screen.getByRole("radio", { name: "at the bottom" }));
+            expect(screen.getByRole("radio", { name: "at the bottom" })).toBeChecked();
+            expect(screen.getByRole("radio", { name: "on top" })).not.toBeChecked();
+        });
+    });
+
+    describe("validation (replaces checksley)", () => {
+        it("shows the required error and does NOT call bulkCreate for an empty textarea", async () => {
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            submitForm(container);
+
+            expect(await screen.findByText(EXPECTED_REQUIRED_MESSAGE)).toBeInTheDocument();
+            expect(bulkCreateMock).not.toHaveBeenCalled();
+            expect(props.onCreated).not.toHaveBeenCalled();
+            expect(props.onClose).not.toHaveBeenCalled();
+        });
+
+        it("shows the required error for whitespace-only input", async () => {
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "   \n  " } });
+            submitForm(container);
+
+            expect(await screen.findByText(EXPECTED_REQUIRED_MESSAGE)).toBeInTheDocument();
+            expect(bulkCreateMock).not.toHaveBeenCalled();
+        });
+
+        it("shows the line-length error and does NOT call bulkCreate when a line exceeds 200 chars", async () => {
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            const tooLong = `Fine line\n${"a".repeat(201)}`;
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: tooLong } });
+            submitForm(container);
+
+            expect(await screen.findByText(EXPECTED_LINE_TOO_LONG_MESSAGE)).toBeInTheDocument();
+            expect(bulkCreateMock).not.toHaveBeenCalled();
+        });
+
+        it("accepts a line of exactly 200 chars (boundary is inclusive)", async () => {
+            bulkCreateMock.mockResolvedValue({
+                data: [{ id: 10 }],
+                status: 200,
+                headers: new Headers(),
+            });
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            const exactly200 = "a".repeat(200);
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: exactly200 } });
+
+            await act(async () => {
+                submitForm(container);
+            });
+
+            expect(bulkCreateMock).toHaveBeenCalledTimes(1);
+            expect(bulkCreateMock).toHaveBeenCalledWith(
+                PROJECT_ID,
+                DEFAULT_STATUS_ID,
+                exactly200,
+                null,
+            );
+        });
+    });
+
+    describe("submission", () => {
+        it("calls bulkCreate with (projectId, statusId, bulkText, null) and forwards (created, 'bottom')", async () => {
+            const created = [{ id: 101 }, { id: 102 }];
+            bulkCreateMock.mockResolvedValue({
+                data: created,
+                status: 200,
+                headers: new Headers(),
+            });
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            const bulkText = "Story A\nStory B";
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: bulkText } });
+
+            await act(async () => {
+                submitForm(container);
+            });
+
+            // swimlane_id is ALWAYS null for the backlog context.
+            expect(bulkCreateMock).toHaveBeenCalledWith(
+                PROJECT_ID,
+                DEFAULT_STATUS_ID,
+                bulkText,
+                null,
+            );
+            expect(props.onCreated).toHaveBeenCalledWith(created, "bottom");
+            expect(props.onClose).toHaveBeenCalledTimes(1);
+        });
+
+        it("forwards position 'top' when the 'on top' radio is chosen", async () => {
+            bulkCreateMock.mockResolvedValue({
+                data: [{ id: 200 }],
+                status: 200,
+                headers: new Headers(),
+            });
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.click(screen.getByRole("radio", { name: "on top" }));
+            expect(screen.getByRole("radio", { name: "on top" })).toBeChecked();
+
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "Story" } });
+            await act(async () => {
+                submitForm(container);
+            });
+
+            expect(props.onCreated).toHaveBeenCalledWith([{ id: 200 }], "top");
+        });
+
+        it("uses the selected status id in the bulkCreate call", async () => {
+            bulkCreateMock.mockResolvedValue({
+                data: [{ id: 300 }],
+                status: 200,
+                headers: new Headers(),
+            });
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            // Open the selector and pick the "Ready" (id 2) status.
+            fireEvent.click(screen.getByRole("button", { name: "New" }));
+            fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "Story" } });
+            await act(async () => {
+                submitForm(container);
+            });
+
+            expect(bulkCreateMock).toHaveBeenCalledWith(PROJECT_ID, 2, "Story", null);
+        });
+
+        it("guards against double submit while a request is in flight", async () => {
+            let resolveCreate: (() => void) | null = null;
+            bulkCreateMock.mockImplementation(
+                () =>
+                    new Promise<BulkCreateResult>((resolve) => {
+                        resolveCreate = () =>
+                            resolve({ data: [{ id: 1 }], status: 200, headers: new Headers() });
+                    }),
+            );
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "Story" } });
+
+            // First submit starts the (still-pending) request and sets `submitting`.
+            submitForm(container);
+            // The re-render committed by fireEvent's act disables the button, proving
+            // `submitting` is now true so the next submit hits the guard.
+            expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+            // Second submit while in flight must be ignored (no extra bulkCreate call).
+            submitForm(container);
+            expect(bulkCreateMock).toHaveBeenCalledTimes(1);
+
+            await act(async () => {
+                resolveCreate?.();
+            });
+            expect(props.onClose).toHaveBeenCalledTimes(1);
+        });
+
+        it("surfaces a generic error when the request fails and keeps the lightbox open", async () => {
+            bulkCreateMock.mockRejectedValue(new Error("HTTP 400 Bad Request"));
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "Story" } });
+            await act(async () => {
+                submitForm(container);
+            });
+
+            expect(await screen.findByText(EXPECTED_GENERIC_ERROR_MESSAGE)).toBeInTheDocument();
+            expect(props.onClose).not.toHaveBeenCalled();
+            expect(props.onCreated).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("status selector", () => {
+        it("shows the default status name and hides the options initially", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+
+            expect(screen.getByRole("button", { name: "New" })).toBeInTheDocument();
+            expect(container.querySelector(".bulk-status-option-wrapper")).toBeNull();
+        });
+
+        it("toggles the option list open, then selects a status and closes it", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+
+            // Open the dropdown.
+            fireEvent.click(screen.getByRole("button", { name: "New" }));
+            expect(container.querySelector(".bulk-status-option-wrapper")).not.toBeNull();
+            expect(container.querySelectorAll(".bulk-status-option")).toHaveLength(2);
+
+            // Select "Ready": the selector label updates and the dropdown closes.
+            fireEvent.click(screen.getByRole("button", { name: "Ready" }));
+            expect(container.querySelector(".bulk-status-option-wrapper")).toBeNull();
+            expect(screen.getByRole("button", { name: "Ready" })).toBeInTheDocument();
+            expect(screen.queryByRole("button", { name: "New" })).not.toBeInTheDocument();
+        });
+
+        it("renders an empty status label when the default status id is not among us_statuses", () => {
+            const { container } = render(
+                <BulkUserStoriesLightbox {...makeProps({ defaultStatusId: 999 })} />,
+            );
+
+            const selector = container.querySelector(".bulk-status-selector");
+            expect(selector).not.toBeNull();
+            // currentStatus is undefined -> the label span is empty (no name rendered).
+            expect(selector?.querySelector("span")?.textContent).toBe("");
+        });
+
+        it("marks the current status option as selected", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+
+            fireEvent.click(screen.getByRole("button", { name: "New" }));
+
+            const options = container.querySelectorAll(".bulk-status-option");
+            // First option (id 1) is the current status -> carries the `selected` modifier.
+            expect(options[0]).toHaveClass("bulk-status-option", "selected");
+            expect(options[1]).not.toHaveClass("selected");
+        });
+    });
+
+    describe("close control", () => {
+        it("invokes onClose when the close button is clicked", () => {
+            const props = makeProps();
+            render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.click(screen.getByRole("button", { name: "close" }));
+            expect(props.onClose).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    // Backlog-context DOM fidelity: the bulk lightbox reproduces the Jade markup
+    // verbatim so the compiled SCSS themes it unchanged. On the backlog the
+    // swimlane selector (a Kanban-only affordance) is never rendered, and the
+    // position radios intentionally CROSS their id/value pairing.
+    describe("backlog markup fidelity", () => {
+        it("does not render the swimlane fieldset on the backlog", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+
+            expect(container.querySelector("select")).toBeNull();
+            expect(container.querySelector('[class*="swimlane"]')).toBeNull();
+        });
+
+        it("preserves the crossed radio markup verbatim (#top-backlog value=bottom / #bottom-backlog value=top)", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+
+            const top = container.querySelector("#top-backlog") as HTMLInputElement | null;
+            const bottom = container.querySelector("#bottom-backlog") as HTMLInputElement | null;
+            expect(top).not.toBeNull();
+            expect(bottom).not.toBeNull();
+            // The source template intentionally CROSSES id/value: #top-backlog carries
+            // value="bottom" and #bottom-backlog carries value="top". Reproduced verbatim.
+            expect(top!.getAttribute("value")).toBe("bottom");
+            expect(bottom!.getAttribute("value")).toBe("top");
+        });
+    });
 });
