@@ -95,3 +95,5 @@ jobs:
     - name: pass unit test
       run: npm run ci:test
 
+    - name: pass react unit tests (jest, >=70% line coverage)
+      run: npm run test:coverage

@@ -1,0 +1,351 @@
+/*
+ * This source code is licensed under the terms of the
+ * GNU Affero General Public License found in the LICENSE file in
+ * the root directory of this source tree.
+ *
+ * Copyright (c) 2021-present Kaleidos INC
+ */
+
+/**
+ * Sprint — a single sprint card for the React Backlog screen.
+ *
+ * Ports these AngularJS units into one React component (like-for-like, no redesign):
+ *  - `tgSprint`              (app/coffee/modules/backlog/sprints.coffee L169-180,
+ *                             template app/partials/backlog/sprint.jade)
+ *  - `tgBacklogSprintHeader` (sprints.coffee L67-117, template sprint-header.jade)
+ *  - `tgBacklogSprint`       (sprints.coffee L18-60 — the collapse/expand toggle)
+ *  - the per-sprint summary progress bar (`tgProgressBar`,
+ *                             app/coffee/modules/common/components.coffee L433-452,
+ *                             markup progress-bar.jade)
+ *
+ * Renders: a collapsible header (name / date / points / edit), a summary
+ * progress bar, the sprint's user-story rows (each draggable OUT of the sprint,
+ * the whole table droppable so a backlog story can be dropped IN), and a
+ * "go to taskboard" button.
+ *
+ * Drag context is AMBIENT: `BacklogApp` supplies the `<DndContext>` (via
+ * ../shared/dnd/DndProvider) and owns drop resolution + persistence
+ * (resolveDrop / bulkUpdateMilestone). This component only REGISTERS the
+ * draggable rows and the droppable table, and reproduces the exact markup and
+ * class names so the already-compiled SCSS (app/styles/modules/backlog/sprints.scss)
+ * themes it unchanged — the DOM mirrors sprint.jade + sprint-header.jade +
+ * progress-bar.jade.
+ */
+
+import { useState, useMemo, useCallback } from "react";
+import moment from "moment";
+import { useDraggable, useDroppable } from "@dnd-kit/core";
+
+import type { Sprint, Project, UserStory, Epic } from "./types";
+
+/**
+ * Concrete moment format for sprint start/finish dates. Equals the i18n value
+ * of `BACKLOG.SPRINTS.DATE` ("DD MMM YYYY"), which the legacy
+ * `tgBacklogSprintHeader` fed straight into `moment(...).format(...)`.
+ */
+const SPRINT_DATE_FMT = "DD MMM YYYY"; // i18n BACKLOG.SPRINTS.DATE
+
+/**
+ * Format a numeric point value the way the AngularJS `| number` filter did:
+ * grouped thousands using the English locale (e.g. 1234 -> "1,234", 0.5 -> "0.5").
+ */
+function formatNumber(value: number): string {
+    return value.toLocaleString("en");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public props                                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface SprintProps {
+    sprint: Sprint;
+    project: Project;
+    /**
+     * Whether the sprint's rows may be dragged. `BacklogApp` computes this via
+     * shared/dnd `isDragEnabled(project)` (== `modify_us` permission AND project
+     * not archived). When false, rows are inert but still carry `data-id`.
+     */
+    dragEnabled: boolean;
+    /** Opens the SprintEditLightbox in edit mode (ports the `sprintform:edit` broadcast). */
+    onEditSprint: (sprint: Sprint) => void;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Story row (child) — isolates the useDraggable hook call                    */
+/* -------------------------------------------------------------------------- */
+
+interface SprintStoryRowProps {
+    us: UserStory;
+    projectSlug: string;
+    /** `modify_us` permission — gates the `readonly` row modifier. */
+    canModifyUs: boolean;
+    /** Mirror of SprintProps.dragEnabled — gates the drag affordance. */
+    dragEnabled: boolean;
+}
+
+/**
+ * One user-story row inside a sprint. Extracted into its own component because
+ * React hooks (`useDraggable`) cannot be called inside a `.map()` callback —
+ * they must run at the top level of a component.
+ *
+ * Ports the `div.row.milestone-us-item-row` markup from sprint.jade.
+ */
+function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintStoryRowProps): JSX.Element {
+    // Register the row as a draggable node. Called unconditionally (Rules of Hooks);
+    // the drag affordance itself is applied only when `dragEnabled` (below).
+    const { attributes, listeners, setNodeRef } = useDraggable({ id: us.id });
+
+    // Row modifier classes — port ng-class={closedRow, blockedRow} +
+    // tg-class-permission="{'readonly': '!modify_us'}" from sprint.jade.
+    const rowClassName =
+        "row milestone-us-item-row" +
+        (us.is_closed ? " closedRow" : "") +
+        (us.is_blocked ? " blockedRow" : "") +
+        (!canModifyUs ? " readonly" : "");
+
+    // Name-link modifier classes — port ng-class={closed, blocked}.
+    const usNameClassName =
+        "us-name clickable" +
+        (us.is_closed ? " closed" : "") +
+        (us.is_blocked ? " blocked" : "");
+
+    // Points column modifier classes — port ng-class={closed, blocked}.
+    const pointsColumnClassName =
+        "column-points width-1" +
+        (us.is_closed ? " closed" : "") +
+        (us.is_blocked ? " blocked" : "");
+
+    // Apply drag attributes/listeners ONLY when dragging is enabled, so archived
+    // projects (or users lacking `modify_us`) get a non-draggable, inert row.
+    const dragHandleProps = dragEnabled ? { ...attributes, ...listeners } : {};
+
+    return (
+        <div
+            ref={setNodeRef}
+            // `data-id` is ALWAYS present (even when not draggable): DndProvider.resolveDrop
+            // reads it from the DOM to compute the ordered id list on drop.
+            data-id={us.id}
+            className={rowClassName}
+            {...dragHandleProps}
+        >
+            <div className="column-us">
+                <a
+                    className={usNameClassName}
+                    href={`#/project/${projectSlug}/us/${us.ref}`}
+                >
+                    <span className="us-ref-text">#{us.ref}</span>
+                    {/*
+                      Subject is rendered as PLAIN TEXT: React escapes it automatically,
+                      so a subject like "<img src=x onerror=...>" appears verbatim and can
+                      never execute. NEVER use dangerouslySetInnerHTML here. The legacy
+                      `| emojify` transform is intentionally omitted (plain text).
+                    */}
+                    <span className="us-name-text">{us.subject}</span>
+                </a>
+                {us.epics && us.epics.length > 0 ? (
+                    // tg-belong-to-epics format="pill" — one colored pill per epic.
+                    <div className="us-epic-container">
+                        {us.epics.map((epic: Epic) => (
+                            <div
+                                key={epic.ref}
+                                className="belong-to-epic-pill"
+                                style={{ background: epic.color }}
+                                title={`#${epic.ref} ${epic.subject}`}
+                            />
+                        ))}
+                    </div>
+                ) : null}
+                {/* tg-due-date — minimal parity marker (the full popover is out of scope). */}
+                {us.due_date ? <span className="due-date" /> : null}
+            </div>
+            {us.total_points != null ? (
+                <div className={pointsColumnClassName}>
+                    <span className="points-container">{formatNumber(us.total_points)}</span>
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Sprint (main component)                                                    */
+/* -------------------------------------------------------------------------- */
+
+export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintProps): JSX.Element {
+    // Collapse state — ports tgBacklogSprint: closed sprints start collapsed,
+    // open sprints start expanded. When EXPANDED the arrow button gets `active`
+    // and the sprint-table gets `open` (mirrors the legacy toggleSprint()).
+    const [collapsed, setCollapsed] = useState<boolean>(sprint.closed);
+
+    const toggleCollapsed = useCallback(() => {
+        setCollapsed((current) => !current);
+    }, []);
+
+    // Register the sprint table as a droppable target so a backlog story can be
+    // dropped INTO this sprint. The id encodes the sprint so resolveDrop can map
+    // it back to a milestone move.
+    const { setNodeRef: setDroppableRef } = useDroppable({ id: `sprint:${sprint.id}` });
+
+    // Derived header/permission/progress view-model (ports tgBacklogSprintHeader.render).
+    const view = useMemo(() => {
+        // canModifyUs gates draggability + the `readonly` row class.
+        const canModifyUs = project.my_permissions.includes("modify_us");
+        // isEditable gates the `.edit-sprint` control.
+        const isEditable =
+            !project.archived_code && project.my_permissions.includes("modify_milestone");
+        // isVisible gates the taskboard links (header name link + bottom button).
+        const isVisible = project.my_permissions.includes("view_milestones");
+
+        // AngularJS hash route, navUrls key "project-taskboard".
+        const taskboardUrl = `#/project/${project.slug}/taskboard/${sprint.slug}`;
+
+        const start = moment(sprint.estimated_start).format(SPRINT_DATE_FMT);
+        const finish = moment(sprint.estimated_finish).format(SPRINT_DATE_FMT);
+        const estimatedDateRange = `${start} - ${finish}`;
+
+        const closedPoints = sprint.closed_points || 0;
+        const totalPoints = sprint.total_points || 0;
+
+        // Progress — ports tgProgressBar: clamp(0..100) of 100*closed/total, /0 guarded.
+        const pct = totalPoints > 0 ? (100 * closedPoints) / totalPoints : 0;
+        const clampedPct = Math.min(100, Math.max(0, pct));
+        const isFull = pct >= 100;
+
+        return {
+            canModifyUs,
+            isEditable,
+            isVisible,
+            taskboardUrl,
+            estimatedDateRange,
+            closedPoints,
+            totalPoints,
+            clampedPct,
+            isFull,
+        };
+    }, [project, sprint]);
+
+    const hasStories = sprint.user_stories.length > 0;
+
+    // .sprint-table class — mirror ng-class {'sprint-empty-wrapper': !length} plus the
+    // `open` state class the legacy toggleSprint() added when the sprint is expanded.
+    const sprintTableClassName =
+        "sprint-table" +
+        (!hasStories ? " sprint-empty-wrapper" : "") +
+        (!collapsed ? " open" : "");
+
+    return (
+        <>
+            {/* === header (ports tg-backlog-sprint-header / sprint-header.jade) === */}
+            <header>
+                <div className="sprint-summary">
+                    <div className="sprint-name-container">
+                        <div className="sprint-name">
+                            <button
+                                className={`compact-sprint${!collapsed ? " active" : ""}`}
+                                title="Compact Sprint" /* i18n BACKLOG.COMPACT_SPRINT */
+                                onClick={toggleCollapsed}
+                                type="button"
+                            >
+                                {/* tg-svg icon-arrow-right (decorative) */}
+                                <svg className="icon icon-arrow-right" aria-hidden="true" focusable="false">
+                                    <use xlinkHref="#icon-arrow-right" href="#icon-arrow-right" />
+                                </svg>
+                            </button>
+                            {view.isVisible ? (
+                                <a
+                                    href={view.taskboardUrl}
+                                    title={`Go to the taskboard of ${sprint.name}`} /* i18n BACKLOG.GO_TO_TASKBOARD */
+                                >
+                                    <span>{sprint.name}</span>
+                                </a>
+                            ) : (
+                                // Keep the name visible even without the view_milestones permission.
+                                <span>{sprint.name}</span>
+                            )}
+                        </div>
+                        <div className="sprint-date">{view.estimatedDateRange}</div>
+                    </div>
+                    <div className="sprint-points">
+                        {view.isEditable ? (
+                            <a
+                                className="edit-sprint"
+                                href=""
+                                title="Edit Sprint" /* i18n BACKLOG.EDIT_SPRINT */
+                                onClick={(event) => {
+                                    event.preventDefault();
+                                    onEditSprint(sprint);
+                                }}
+                            >
+                                {/* tg-svg icon-edit (decorative) */}
+                                <svg className="icon icon-edit" aria-hidden="true" focusable="false">
+                                    <use xlinkHref="#icon-edit" href="#icon-edit" />
+                                </svg>
+                            </a>
+                        ) : null}
+                        <div className="sprint-info">
+                            <ul>
+                                <li>
+                                    <span className="number">{formatNumber(view.closedPoints)}</span>
+                                    {/* i18n BACKLOG.CLOSED_POINTS */}
+                                    <span className="description">closed</span>
+                                </li>
+                                <li>
+                                    <span className="number">{formatNumber(view.totalPoints)}</span>
+                                    {/* i18n BACKLOG.TOTAL_POINTS */}
+                                    <span className="description">total</span>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </header>
+
+            {/* === summary progress bar (tg-progress-bar="100 * closed_points / total_points") === */}
+            <div className="summary-progress-wrapper">
+                <div className={`sprint-progress-bar${view.isFull ? " full" : ""}`}>
+                    <div
+                        className={`current-progress${view.isFull ? " full" : ""}`}
+                        style={{ width: `${view.clampedPct}%` }}
+                    />
+                </div>
+            </div>
+
+            {/* === sprint table (droppable target; id = `sprint:${sprint.id}`) === */}
+            <div ref={setDroppableRef} className={sprintTableClassName}>
+                {!hasStories ? (
+                    <div className="sprint-empty">
+                        {view.canModifyUs ? (
+                            // i18n BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT
+                            <span>Drop here Stories from your backlog to start a new sprint</span>
+                        ) : (
+                            // i18n BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS
+                            <span>This sprint has no user stories</span>
+                        )}
+                    </div>
+                ) : (
+                    sprint.user_stories.map((us: UserStory) => (
+                        <SprintStoryRow
+                            key={us.id}
+                            us={us}
+                            projectSlug={project.slug}
+                            canModifyUs={view.canModifyUs}
+                            dragEnabled={dragEnabled}
+                        />
+                    ))
+                )}
+            </div>
+
+            {/* === go-to-taskboard button (tg-check-permission="view_milestones") === */}
+            {view.isVisible ? (
+                <a
+                    className="btn-small"
+                    href={view.taskboardUrl}
+                    title={`Go to Taskboard of "${sprint.name}"`} /* i18n BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD */
+                >
+                    {/* i18n BACKLOG.SPRINTS.LINK_TASKBOARD */}
+                    <span>Sprint Taskboard</span>
+                </a>
+            ) : null}
+        </>
+    );
+}
