@@ -1,0 +1,32 @@
+{
+  // ---------------------------------------------------------------------------
+  // Strict TypeScript project for the Playwright E2E / baseline-evidence harness
+  // (finding F06).
+  // ---------------------------------------------------------------------------
+  //
+  // The root `tsconfig.json` deliberately scopes its `include` to the React
+  // application source (`app/react/**`) and *excludes* `e2e-react/**`, because
+  // the two trees have different ambient type surfaces: the React unit tests run
+  // under jsdom/Jest (`jest`, `@testing-library/jest-dom`), whereas the E2E specs
+  // run under Playwright and Node. Without a committed project for the E2E tree,
+  // the Playwright config, fixtures and specs would not be protected by the
+  // mandated strict compiler settings (only an ad-hoc compile covered them).
+  //
+  // This dedicated project inherits every strict `compilerOptions` value from the
+  // root config (strict, noEmit, ES2019, react-jsx, isolatedModules, etc.) and
+  // only re-scopes `include`/`exclude` (which are never inherited through
+  // `extends`) and swaps the ambient `types` to the Playwright/Node surface. A
+  // non-emitting `tsc -p tsconfig.e2e.json --noEmit` is run as part of validation.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Replace the root `types` array (node/jest/jest-dom) with the ambient types
+    // relevant to the E2E harness. Playwright's own types are pulled in through
+    // explicit `import { ... } from '@playwright/test'` statements in the specs
+    // and fixtures, so only the Node global surface needs to be ambient here.
+    "types": ["node"]
+  },
+  // `include`/`exclude` are intentionally NOT inherited from the extended config,
+  // so they are declared explicitly. Only the E2E TypeScript sources are compiled.
+  "include": ["e2e-react/**/*.ts"],
+  "exclude": ["node_modules", "dist", "app"]
+}

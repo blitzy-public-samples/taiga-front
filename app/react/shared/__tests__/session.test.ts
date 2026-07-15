@@ -42,7 +42,7 @@
  * `@types/jest` + ts-jest; they are deliberately NOT imported.
  */
 
-import { getToken, getSessionId, getPreferredLanguage, isAuthenticated } from '../session';
+import { getToken, getUser, getSessionId, getPreferredLanguage, isAuthenticated } from '../session';
 
 /**
  * Installs the shared `window.taiga` global. `session.ts` OWNS this typing
@@ -134,6 +134,53 @@ describe('shared/session auth adapter', () => {
 
       expect(getToken()).toBeNull();
     });
+
+    // --- F17: non-empty-string validation (CWE-20/CWE-287) --------------------
+    // A usable bearer credential must be a non-empty string. Any other parsed
+    // shape, and empty/whitespace-only strings, must resolve to null so that
+    // getToken() stays in lockstep with the Authorization header (set iff a real
+    // token exists) and never reports a bogus "authenticated" token.
+
+    it('returns null for an empty-string token (JSON "")', () => {
+      // Raw stored value is `""` -> JSON.parse -> "" -> rejected (blank).
+      localStorage.setItem('token', JSON.stringify(''));
+      expect(localStorage.getItem('token')).toBe('""');
+      expect(getToken()).toBeNull();
+    });
+
+    it('returns null for a whitespace-only token', () => {
+      // Non-empty but blank once trimmed; not a usable credential.
+      localStorage.setItem('token', JSON.stringify('   '));
+      expect(getToken()).toBeNull();
+    });
+
+    it('returns null for a numeric token', () => {
+      localStorage.setItem('token', JSON.stringify(12345));
+      expect(getToken()).toBeNull();
+    });
+
+    it('returns null for a boolean token', () => {
+      localStorage.setItem('token', JSON.stringify(true));
+      expect(getToken()).toBeNull();
+    });
+
+    it('returns null for an object token', () => {
+      localStorage.setItem('token', JSON.stringify({ token: 'abc' }));
+      expect(getToken()).toBeNull();
+    });
+
+    it('returns null for a JSON null token', () => {
+      // Valid JSON, parses to null -> not a string -> null.
+      localStorage.setItem('token', JSON.stringify(null));
+      expect(getToken()).toBeNull();
+    });
+
+    it('preserves a valid token verbatim (no trimming of a real credential)', () => {
+      // A real token has no surrounding whitespace; ensure the value is returned
+      // exactly as stored (trim is only used to DECIDE emptiness).
+      localStorage.setItem('token', JSON.stringify('abc.def.ghi'));
+      expect(getToken()).toBe('abc.def.ghi');
+    });
   });
 
   describe('getSessionId()', () => {
@@ -208,20 +255,118 @@ describe('shared/session auth adapter', () => {
     });
   });
 
+  describe('getUser()', () => {
+    it('returns the parsed user-session object when userInfo is a valid object', () => {
+      // userInfo is JSON-serialized by StorageService.set, so it is stored with
+      // its object braces and read back with JSON.parse.
+      const user = { id: 42, username: 'ada', lang: 'fr' };
+      localStorage.setItem('userInfo', JSON.stringify(user));
+
+      // The parsed plain object is returned as-is (React does not build a model).
+      expect(getUser()).toEqual(user);
+    });
+
+    it('preserves arbitrary persisted attributes via the index signature', () => {
+      // The legacy user model persists many fields; getUser() must not drop any.
+      const user = { id: 7, is_superuser: true, roles: ['a', 'b'], extra: { nested: 1 } };
+      localStorage.setItem('userInfo', JSON.stringify(user));
+
+      expect(getUser()).toEqual(user);
+    });
+
+    it('returns null when no userInfo key is present', () => {
+      // localStorage.getItem('userInfo') === null -> `if (!raw)` early null.
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for an empty-string userInfo value', () => {
+      // A present-but-empty string is falsy -> `if (!raw)` early null (never
+      // reaches JSON.parse('')).
+      localStorage.setItem('userInfo', '');
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for a corrupt (non-JSON) userInfo value (guarded catch)', () => {
+      // A present-but-invalid userInfo must not throw; the guarded parse yields
+      // null, mirroring StorageService.get's `catch -> return null`.
+      localStorage.setItem('userInfo', 'not-json{');
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for a JSON null userInfo value', () => {
+      // Valid JSON that parses to null -> not a non-null object -> null. This
+      // also mirrors the legacy `if userData` truthiness guard rejecting null.
+      localStorage.setItem('userInfo', JSON.stringify(null));
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for a non-object userInfo value (string)', () => {
+      // A JSON string is valid JSON but not a user session object.
+      localStorage.setItem('userInfo', JSON.stringify('not-a-user'));
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for a non-object userInfo value (number)', () => {
+      localStorage.setItem('userInfo', JSON.stringify(123));
+      expect(getUser()).toBeNull();
+    });
+
+    it('returns null for a non-object userInfo value (boolean)', () => {
+      localStorage.setItem('userInfo', JSON.stringify(true));
+      expect(getUser()).toBeNull();
+    });
+  });
+
   describe('isAuthenticated()', () => {
-    it('returns true when a valid token is present', () => {
-      localStorage.setItem('token', JSON.stringify('abc'));
+    // F17: authentication is defined by the presence of a valid user SESSION
+    // (`getUser() != null`), reproducing `auth.coffee`
+    // `CurrentUserService.isAuthenticated()` (`if @.getUser() != null return true`).
+    // It is INDEPENDENT of the raw bearer token — the token concern is owned
+    // separately by getToken()/the Authorization header.
+
+    it('returns true when a valid userInfo session object is present', () => {
+      localStorage.setItem('userInfo', JSON.stringify({ id: 1, username: 'ada' }));
       expect(isAuthenticated()).toBe(true);
     });
 
-    it('returns false when no token is present', () => {
+    it('returns true from userInfo alone even when NO token is stored (token-independent)', () => {
+      // The key F17 divergence fix: a present user session authenticates the
+      // user regardless of whether a token key exists in storage.
+      localStorage.setItem('userInfo', JSON.stringify({ id: 2 }));
+      expect(getToken()).toBeNull(); // no token stored
+      expect(isAuthenticated()).toBe(true);
+    });
+
+    it('returns true from userInfo even when the token is blank/invalid (decoupled from getToken)', () => {
+      // A blank token yields getToken() === null, but a valid user session still
+      // authenticates — proving isAuthenticated no longer tracks getToken.
+      localStorage.setItem('userInfo', JSON.stringify({ id: 3 }));
+      localStorage.setItem('token', JSON.stringify('   ')); // getToken() -> null
+      expect(getToken()).toBeNull();
+      expect(isAuthenticated()).toBe(true);
+    });
+
+    it('returns false when no userInfo session is present', () => {
       expect(isAuthenticated()).toBe(false);
     });
 
-    it('returns false for a corrupt token (tracks getToken null semantics)', () => {
-      // getToken() returns null for unparseable values, so isAuthenticated,
-      // being derived from getToken, must report false.
-      localStorage.setItem('token', 'not-json{');
+    it('returns false when a token exists but there is no userInfo session', () => {
+      // The previous token-derived implementation returned true here; the legacy
+      // userInfo contract correctly reports NOT authenticated without a session.
+      localStorage.setItem('token', JSON.stringify('abc'));
+      expect(getToken()).toBe('abc'); // a valid token exists...
+      expect(isAuthenticated()).toBe(false); // ...but no user session -> false
+    });
+
+    it('returns false for a corrupt (non-JSON) userInfo value (tracks getUser null)', () => {
+      // getUser() returns null for unparseable values, so isAuthenticated,
+      // being derived from getUser, must report false.
+      localStorage.setItem('userInfo', 'not-json{');
+      expect(isAuthenticated()).toBe(false);
+    });
+
+    it('returns false for a JSON null userInfo value', () => {
+      localStorage.setItem('userInfo', JSON.stringify(null));
       expect(isAuthenticated()).toBe(false);
     });
   });

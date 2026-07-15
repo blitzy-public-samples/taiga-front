@@ -136,7 +136,12 @@ export async function login(
   await page.goto('/login');
   await page.fill('input[name="username"]', username);
   await page.fill('input[name="password"]', password);
-  await page.click('.submit-button');
+  // The current `login-form.jade` renders the sign-in control as
+  // `button.btn-small.full[type="submit"]` inside `form.login-form`; the legacy
+  // `.submit-button` class no longer exists in this markup revision. Scope to the
+  // login form's submit button (robust across the markup change) and keep the
+  // historical `.submit-button` as a comma fallback so either revision resolves.
+  await page.click('.login-form button[type="submit"], .submit-button');
 
   // The legacy harness waited (10000ms) for a redirect to the host root as its
   // success signal (conf.e2e.js:137-145). Waiting for navigation AWAY from

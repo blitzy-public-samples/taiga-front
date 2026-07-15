@@ -147,28 +147,116 @@ const trimStartSlash = (value: string): string => value.replace(/^\/+/, '');
 const joinUrl = (base: string, path: string): string =>
   `${trimEndSlash(base)}/${trimStartSlash(path)}`;
 
+// ---------------------------------------------------------------------------
+// Query serialization — reproduce AngularJS `$httpParamSerializer`
+// (angular.js `ngParamSerializer` / `serializeValue` / `encodeUriQuery`,
+// angular 1.5.10)
+// ---------------------------------------------------------------------------
+
 /**
- * Serializes a params object into a query string (`{ project: 42 }` -> `?project=42`),
- * skipping `null` / `undefined` values. Returns `''` when there are no
- * serializable params so callers can append unconditionally. Uses the standard
- * `URLSearchParams` (correct percent-encoding, no third-party dependency).
+ * Reproduces AngularJS `encodeUriQuery(val)` (angular.js:1494) with the
+ * default `pctEncodeSpaces = false` used by `$httpParamSerializer`.
+ *
+ * `encodeURIComponent` is applied first, then the sub-delimiters AngularJS
+ * leaves LITERAL in a query component are un-escaped (`@ : $ , ;`), and spaces
+ * are encoded as `+` (not `%20`). This byte-for-byte matches the query strings
+ * the AngularJS `$http` produced, which the frozen `/api/v1/` backend already
+ * accepts — `URLSearchParams` diverged here (it percent-encodes `@ : $ , ;` and
+ * also uses `+` for spaces, so the special-character handling differed).
+ *
+ * The `gi` flags mirror the AngularJS source exactly: `%40 %3A %2C %3B` are
+ * replaced case-insensitively, while `%24` (`$`) and `%20` (space) are
+ * case-sensitive (there are no lowercase hex variants of those two).
  */
-function toQueryString(params?: Record<string, unknown>): string {
+function encodeUriQuery(val: string): string {
+  return encodeURIComponent(val)
+    .replace(/%40/gi, '@')
+    .replace(/%3A/gi, ':')
+    .replace(/%24/g, '$')
+    .replace(/%2C/gi, ',')
+    .replace(/%3B/gi, ';')
+    .replace(/%20/g, '+');
+}
+
+/**
+ * Reproduces AngularJS `serializeValue(v)` (angular.js:10746):
+ *   - a `Date` becomes its `toISOString()` string;
+ *   - any other non-null object becomes its JSON serialization (`toJson`, which
+ *     for the plain params objects the React screens send is exactly
+ *     `JSON.stringify`; AngularJS's `toJson` additionally strips `$$`-prefixed
+ *     keys, which never appear in these params);
+ *   - primitives are returned as their string form (numbers, booleans — e.g.
+ *     `false` -> `"false"`), matching `encodeUriQuery(encodeURIComponent(...))`
+ *     coercion of the raw primitive.
+ *
+ * `Date` is detected with `Object.prototype.toString` (AngularJS `isDate`) so it
+ * is robust across realms, not just `instanceof Date`.
+ */
+function serializeValue(v: unknown): string {
+  if (v !== null && typeof v === 'object') {
+    return Object.prototype.toString.call(v) === '[object Date]'
+      ? (v as Date).toISOString()
+      : JSON.stringify(v);
+  }
+
+  return String(v);
+}
+
+/**
+ * Reproduces AngularJS `ngParamSerializer` (angular.js:10773) EXACTLY:
+ *   - keys are sorted alphabetically (`Object.keys(obj).sort()`, `forEachSorted`);
+ *   - `null` and `undefined` values are skipped (and ONLY those — the bundled
+ *     1.5.10 source does not skip functions here, so a function value falls
+ *     through to `serializeValue`, which never occurs for Taiga params but is
+ *     reproduced faithfully rather than diverging);
+ *   - array values emit a REPEATED key (`foo=bar&foo=baz`), each element passed
+ *     through `serializeValue`;
+ *   - scalar/object values emit a single `key=value`, value passed through
+ *     `serializeValue`;
+ *   - both key and value are `encodeUriQuery`-encoded.
+ *
+ * @returns The `&`-joined query string WITHOUT a leading `?` (empty when no
+ *   serializable params remain).
+ */
+function serializeParams(params?: Record<string, unknown>): string {
   if (!params) {
     return '';
   }
 
-  const usp = new URLSearchParams();
+  const parts: string[] = [];
+  // `forEachSorted` iterates keys in ascending sort order.
+  const keys = Object.keys(params).sort();
 
-  for (const [key, value] of Object.entries(params)) {
-    // Skip absent values so they do not serialize as the literal strings
-    // "null"/"undefined"; every other value is coerced to its string form.
-    if (value !== null && value !== undefined) {
-      usp.append(key, String(value));
+  for (const key of keys) {
+    const value = params[key];
+
+    // `if (value === null || isUndefined(value)) return;` — skip only null and
+    // undefined, matching the bundled serializer precisely.
+    if (value === null || value === undefined) {
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      // Repeated key for each element (`foo=bar&foo=baz`).
+      for (const item of value) {
+        parts.push(`${encodeUriQuery(key)}=${encodeUriQuery(serializeValue(item))}`);
+      }
+    } else {
+      parts.push(`${encodeUriQuery(key)}=${encodeUriQuery(serializeValue(value))}`);
     }
   }
 
-  const qs = usp.toString();
+  return parts.join('&');
+}
+
+/**
+ * Serializes a params object into a query string with a leading `?`
+ * (`{ project: 42 }` -> `?project=42`), or `''` when nothing is serializable so
+ * callers can append unconditionally. Delegates to {@link serializeParams},
+ * which reproduces AngularJS `$httpParamSerializer` byte-for-byte.
+ */
+function toQueryString(params?: Record<string, unknown>): string {
+  const qs = serializeParams(params);
 
   return qs ? `?${qs}` : '';
 }
@@ -187,9 +275,104 @@ function safeJsonParse(text: string): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Response body transform — reproduce AngularJS `defaultHttpResponseTransform`
+// (angular.js:10866) + `isJsonLike` (angular.js:10882)
+// ---------------------------------------------------------------------------
+
+/** AngularJS `JSON_PROTECTION_PREFIX` (angular.js:10738): the XSSI guard prefix. */
+const JSON_PROTECTION_PREFIX = /^\)]\}',?\n/;
+/** AngularJS `JSON_START` (angular.js:10733): a body "looks like JSON" if it starts with `[` or `{`. */
+const JSON_START = /^\[|^\{(?!\{)/;
+/** AngularJS `JSON_ENDS` (angular.js:10734): the matching terminator for each start. */
+const JSON_ENDS: Record<string, RegExp> = {
+  '[': /]$/,
+  '{': /}$/,
+};
+
+/**
+ * Reproduces AngularJS `isJsonLike(str)` (angular.js:10882): a trimmed body is
+ * JSON-like when it starts with `[`/`{` (per {@link JSON_START}) AND ends with
+ * the matching `]`/`}` (per {@link JSON_ENDS}).
+ */
+function isJsonLike(str: string): boolean {
+  const jsonStart = str.match(JSON_START);
+  return jsonStart !== null && JSON_ENDS[jsonStart[0]].test(str);
+}
+
+/**
+ * Reproduces AngularJS `defaultHttpResponseTransform` (angular.js:10866) — the
+ * default `$http` response transform that ran on EVERY AngularJS response — so
+ * the React screens parse response bodies the same way `$tgHttp` did (F20):
+ *
+ *   1. Strip the XSSI protection prefix (`)]}',\n`) and trim whitespace.
+ *   2. An empty/whitespace-only body resolves to `null` — this is the ONE
+ *      intentional refinement over AngularJS (which returns the empty string):
+ *      the bulk-ordering endpoints answer `204 No Content` and the adapters
+ *      consume `null`, and this preserves the established, tested contract.
+ *   3. Parse as JSON ONLY when the `Content-Type` starts with `application/json`
+ *      OR the body is JSON-like ({@link isJsonLike}); otherwise return the RAW
+ *      text. This is the core F20 fix: an unconditional `JSON.parse` threw on a
+ *      genuinely non-JSON success body (e.g. a plain-text or HTML `200`),
+ *      whereas AngularJS returned such bodies as strings.
+ *   4. If a body that claims/looks like JSON fails to parse, fall back to the
+ *      raw text rather than throwing (a defensive superset of AngularJS, which
+ *      relied on an outer try/catch; the React client must never surface a
+ *      secondary parse throw on a 2xx response).
+ *
+ * @typeParam T - Expected parsed-body type.
+ * @param text        - The raw response body text.
+ * @param contentType - The response `Content-Type` header value (or `null`).
+ * @returns The parsed JSON (`T`), the raw text (`T`), or `null` for an empty body.
+ */
+function transformResponseBody<T>(text: string, contentType: string | null): T {
+  // Strip the XSSI prefix and surrounding whitespace, matching AngularJS.
+  const tempData = text.replace(JSON_PROTECTION_PREFIX, '').trim();
+
+  // Empty body -> null (204 No Content and the bulk-ordering endpoints).
+  if (tempData === '') {
+    return null as unknown as T;
+  }
+
+  const hasJsonContentType =
+    contentType !== null && contentType.toLowerCase().indexOf('application/json') === 0;
+
+  if (hasJsonContentType || isJsonLike(tempData)) {
+    try {
+      return JSON.parse(tempData) as T;
+    } catch {
+      // A body that declares/looks like JSON but does not parse must not throw
+      // on a 2xx response; return the raw text (defensive superset of $http).
+      return text as unknown as T;
+    }
+  }
+
+  // Non-JSON success body (plain text / HTML): return it verbatim rather than
+  // JSON.parsing it — the "unconditional JSON.parse breaks text" fix (F20).
+  return text as unknown as T;
+}
+
+// ---------------------------------------------------------------------------
 // Header builder — reproduce `$tgHttp.headers()` (http.coffee:17-30) merged
 // with the `app.coffee` default-header split (app.coffee:590-602)
 // ---------------------------------------------------------------------------
+
+/**
+ * The lower-cased names of the client-managed, PROTECTED headers a caller must
+ * never be able to override (F19). `Authorization` and `Accept-Language` are
+ * protected because AngularJS `$tgHttp.request()` assigns `@.headers()` LAST
+ * (`_.assign({}, options.headers, @.headers())`, http.coffee:32), so the caller
+ * can never clobber them. `X-Session-Id` and `Content-Type` come from the
+ * `app.coffee` defaults; no legacy caller overrides them, and letting a caller
+ * forge the session id or content type is exactly the injection risk F19 flags,
+ * so they are protected here too. Names are compared case-insensitively so a
+ * lower-cased `authorization` cannot slip past a same-case overwrite.
+ */
+const PROTECTED_HEADER_NAMES: ReadonlySet<string> = new Set([
+  'authorization',
+  'x-session-id',
+  'content-type',
+  'accept-language',
+]);
 
 /**
  * Builds the effective header set for a request, reproducing the union of the
@@ -201,6 +384,18 @@ function safeJsonParse(text: string): unknown {
  *   - WRITES only:  additionally `Content-Type: application/json`.
  *   - GET:          NO `Content-Type` (the single header difference vs writes).
  *
+ * HEADER PRECEDENCE (F19): the caller's extra headers are applied FIRST and the
+ * client-managed protected headers LAST, so a caller can NEVER override
+ * `Authorization`, `X-Session-Id`, `Content-Type`, or `Accept-Language`. This
+ * reproduces AngularJS `$tgHttp.request()`'s
+ * `_.assign({}, options.headers, @.headers())` (http.coffee:32), which merges
+ * the auth headers OVER the caller's, and additionally protects the
+ * session/content-type headers. The previous implementation merged the caller's
+ * extras LAST, which let a caller clobber the bearer token / session id — the
+ * exact vulnerability F19 identified. Any caller header whose name collides
+ * (case-insensitively) with a protected header is dropped, so a forged
+ * `authorization`/`Authorization` can neither replace nor duplicate the real one.
+ *
  * @param method - The HTTP verb; determines whether `Content-Type` is added.
  * @param extra  - Optional per-call headers (e.g. `x-disable-pagination`).
  * @returns A plain header map ready for `RequestInit.headers`.
@@ -210,6 +405,19 @@ function buildHeaders(
   extra?: Record<string, string>,
 ): Record<string, string> {
   const headers: Record<string, string> = {};
+
+  // 1. Caller-supplied extras FIRST — but drop any key that collides
+  //    (case-insensitively) with a protected header so it cannot forge or
+  //    duplicate a credential/session/content-type header (F19).
+  if (extra) {
+    for (const [name, value] of Object.entries(extra)) {
+      if (!PROTECTED_HEADER_NAMES.has(name.toLowerCase())) {
+        headers[name] = value;
+      }
+    }
+  }
+
+  // 2. Client-managed protected headers LAST (cannot be overridden).
 
   // X-Session-Id — set on EVERY request by the app.coffee defaults
   // (writes app.coffee:593, GET app.coffee:601). `getSessionId()` reads the
@@ -243,12 +451,7 @@ function buildHeaders(
     headers['Content-Type'] = 'application/json';
   }
 
-  // Merge per-call extras last. AngularJS applies the auth headers OVER the
-  // caller's headers (http.coffee:33: `_.assign({}, options.headers, @.headers())`);
-  // because the only per-call extra the adapters send is `x-disable-pagination`
-  // — which never collides with the session/auth/content-type keys above —
-  // merging extras last is equivalent and keeps the result deterministic.
-  return { ...headers, ...(extra ?? {}) };
+  return headers;
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +486,27 @@ async function request<T>(
 ): Promise<HttpResponse<T>> {
   // Read the base lazily at call time (never snapshot at module load) so the
   // live `window.taigaConfig.api` always wins — and so tests can set the global
-  // immediately before invoking a request. Only GET serializes params into the
-  // query string; write verbs carry their payload in the body.
+  // immediately before invoking a request.
+  const base = getApiUrl();
+
+  // Fail fast with a clear error when the API base is absent (F20). `getApiUrl()`
+  // returns '' when `window.taigaConfig.api` is unset; without this guard the
+  // URL would silently collapse to a ROOT-RELATIVE path (e.g.
+  // `/userstories/bulk_create`), sending the request to the front-end origin
+  // instead of the Django API and yielding a confusing 404/HTML response. A
+  // misconfigured runtime must surface immediately, not masquerade as a network
+  // error deep inside a screen.
+  if (!base) {
+    throw new Error(
+      'Taiga API base URL is not configured: `window.taigaConfig.api` is empty. ' +
+        'The React Kanban/Backlog screens cannot issue /api/v1/ requests without it.',
+    );
+  }
+
+  // Only GET serializes params into the query string; write verbs carry their
+  // payload in the body.
   const url =
-    joinUrl(getApiUrl(), path) +
+    joinUrl(base, path) +
     toQueryString(method === 'GET' ? options?.params : undefined);
 
   const init: RequestInit = {
@@ -326,8 +546,13 @@ async function request<T>(
     throw error;
   }
 
-  // Empty body -> `null`; otherwise parse the JSON payload as `T`.
-  const data = text ? (JSON.parse(text) as T) : (null as unknown as T);
+  // Parse the success body the SAME way AngularJS `$http` did (F20): JSON only
+  // when the `Content-Type` is `application/json` or the body is JSON-like, and
+  // the raw text otherwise — an empty body resolves to `null`. This replaces the
+  // previous UNCONDITIONAL `JSON.parse(text)`, which threw on a genuinely
+  // non-JSON success payload (a plain-text or HTML `200`); see
+  // `transformResponseBody`.
+  const data = transformResponseBody<T>(text, response.headers.get('Content-Type'));
 
   return { data, headers: response.headers, status: response.status };
 }

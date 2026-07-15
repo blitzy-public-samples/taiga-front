@@ -35,12 +35,21 @@
  * source declares none.
  */
 
-// The ONLY import. `moment` ships its own type definitions, so `@types/moment`
-// is intentionally NOT added. The default import relies on `esModuleInterop` /
+// `moment` ships its own type definitions, so `@types/moment` is intentionally
+// NOT added. The default import relies on `esModuleInterop` /
 // `allowSyntheticDefaultImports` in the shared tsconfig.json, which is already
 // mandatory across app/react/** (sibling files use `import React from 'react'`,
 // and @types/react uses `export =`), so this default import is safe here.
 import moment from 'moment';
+
+// i18n is the single source of truth for the user-facing validation messages
+// and the picker date format, exactly as the AngularJS source resolved them via
+// `$translate.instant(...)` at runtime (lightboxes.coffee:41,147). Sourcing them
+// here (rather than inlining English) means a localized catalog installed via
+// configureI18n() is honored, and the outgoing date serialization uses the
+// active locale's `COMMON.PICKERDATE.FORMAT` — preserving parity with the
+// AngularJS non-strict `moment(value, prettyDate)` parse under any locale.
+import { t, getDateFormat } from '../i18n';
 
 /**
  * Maximum allowed length of the sprint name. Mirrors `data-maxlength="500"` on
@@ -49,14 +58,17 @@ import moment from 'moment';
 export const SPRINT_NAME_MAX_LENGTH = 500;
 
 /**
- * Default display date format for the sprint date pickers. Mirrors the
- * translated `COMMON.PICKERDATE.FORMAT` value (English = "DD MMM YYYY", e.g.
- * "23 Mar 1984"), which `lightboxes.coffee` reads via
- * `$translate.instant("COMMON.PICKERDATE.FORMAT")` (lightboxes.coffee:41).
+ * English FALLBACK display date format for the sprint date pickers. Mirrors the
+ * `en` value of the translated `COMMON.PICKERDATE.FORMAT` key ("DD MMM YYYY",
+ * e.g. "23 Mar 1984").
  *
- * Callers MAY pass a locale-specific format to `serializeSprintDate` when the
- * app is localized; this constant is the default (English) display format used
- * to parse the picker input strings.
+ * NOTE: this constant is only a fallback. The AUTHORITATIVE picker format is the
+ * one resolved from i18n at runtime via `getDateFormat()` (= the active locale's
+ * `COMMON.PICKERDATE.FORMAT`), exactly as `lightboxes.coffee` did with
+ * `$translate.instant("COMMON.PICKERDATE.FORMAT")` (lightboxes.coffee:41,147).
+ * `serializeSprintDate` therefore defaults to `getDateFormat()`, not to this
+ * constant, so a localized catalog is honored. The constant is retained for
+ * callers that need a static English default (e.g. initial display formatting).
  */
 export const PICKER_DATE_FORMAT = 'DD MMM YYYY';
 
@@ -69,19 +81,21 @@ export const PICKER_DATE_FORMAT = 'DD MMM YYYY';
 export const API_DATE_FORMAT = 'YYYY-MM-DD';
 
 /**
- * User-facing validation messages, reproduced verbatim from the `en` locale
- * (`app/locales/taiga/locale-en.json`). The English strings are inlined here
- * for this POC because the committed visual-evidence screenshots are captured
- * in the `en` locale.
+ * User-facing validation messages, resolved from i18n at call time so a
+ * localized catalog installed via `configureI18n()` is honored (F23). These
+ * reproduce the checksley messages the AngularJS form rendered:
+ *   - required  -> COMMON.FORM_ERRORS.REQUIRED  ("This value is required.")
+ *   - maxLength -> COMMON.FORM_ERRORS.MAX_LENGTH ("... %s characters or less.")
  *
- * i18n keys for a future full-i18n pass (verified against the locale file):
- *   - required  -> COMMON.FORM_ERRORS.REQUIRED
- *   - maxLength -> COMMON.FORM_ERRORS.MAX_LENGTH  ("%s" placeholder -> max)
+ * checksley substituted the numeric limit into the `%s` placeholder of the
+ * MAX_LENGTH string; `maxLength(max)` reproduces that single substitution
+ * exactly (only the FIRST `%s` is replaced, matching checksley's behavior), so
+ * the rendered English message is byte-identical to the pre-migration output.
  */
 export const SPRINT_VALIDATION_MESSAGES = {
-    required: 'This value is required.',
+    required: (): string => t('COMMON.FORM_ERRORS.REQUIRED'),
     maxLength: (max: number): string =>
-        `This value is too long. It should have ${max} characters or less.`,
+        t('COMMON.FORM_ERRORS.MAX_LENGTH').replace('%s', String(max)),
 };
 
 /**
@@ -124,7 +138,7 @@ export function validateName(name?: string | null): string | null {
 
     // data-required="true": invalid only when the value is empty (length 0).
     if (value.length === 0) {
-        return SPRINT_VALIDATION_MESSAGES.required;
+        return SPRINT_VALIDATION_MESSAGES.required();
     }
 
     // data-maxlength="500": invalid when the value exceeds the limit.
@@ -149,7 +163,7 @@ export function validateRequiredDate(value?: string | null): string | null {
     const coerced = value == null ? '' : String(value);
 
     if (coerced.length === 0) {
-        return SPRINT_VALIDATION_MESSAGES.required;
+        return SPRINT_VALIDATION_MESSAGES.required();
     }
 
     return null;
@@ -191,8 +205,14 @@ export function validateSprint(form: SprintFormValues): SprintValidationResult {
 /**
  * Serialize a single picker date string to the frozen `/api/v1/` format.
  * Reproduces `moment(value, prettyDate).format("YYYY-MM-DD")` from
- * `lightboxes.coffee:59-60` / `:66-67`, where `prettyDate` is the translated
- * `COMMON.PICKERDATE.FORMAT` display format (see `PICKER_DATE_FORMAT`).
+ * `lightboxes.coffee:59-60` / `:66-67`, where `prettyDate` was resolved at
+ * runtime from `$translate.instant("COMMON.PICKERDATE.FORMAT")`.
+ *
+ * `displayFormat` DEFAULTS to `getDateFormat()` (the active locale's picker
+ * format from i18n, F23), so a localized catalog parses the picker input with
+ * the same format the picker rendered it in. Callers MAY still pass an explicit
+ * format to override. The default is evaluated per-call, so a locale change
+ * between calls is honored.
  *
  * The parse is the 2-argument, NON-STRICT `moment(value, displayFormat)` call
  * (matching the AngularJS non-strict call), so lenient picker input is accepted
@@ -204,7 +224,7 @@ export function validateSprint(form: SprintFormValues): SprintValidationResult {
  */
 export function serializeSprintDate(
     value: string | null | undefined,
-    displayFormat: string = PICKER_DATE_FORMAT,
+    displayFormat: string = getDateFormat(),
 ): string {
     if (value == null || value === '') {
         return '';

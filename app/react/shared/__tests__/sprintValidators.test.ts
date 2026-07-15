@@ -30,6 +30,7 @@
  * shared tsconfig, so no test-framework import is required.
  */
 
+import { configureI18n, resetI18n } from '../i18n';
 import {
     validateName,
     validateRequiredDate,
@@ -39,11 +40,19 @@ import {
     SPRINT_NAME_MAX_LENGTH,
 } from '../validation/sprintValidators';
 
-// Convenience aliases for the exact, verbatim messages the validators emit.
-// Referencing the exported constant (rather than re-typing the literals in
-// every assertion) guarantees these specs track the module's source of truth.
-const REQUIRED_MESSAGE = SPRINT_VALIDATION_MESSAGES.required;
+// Convenience aliases for the exact, verbatim messages the validators emit in
+// the default English catalog. The message helpers are resolved from i18n at
+// call time (F23), so these aliases are captured while the embedded English
+// defaults are active — which is the state every English spec below runs in
+// (the afterEach reset guarantees no locale set by the F23 block leaks in).
+const REQUIRED_MESSAGE = SPRINT_VALIDATION_MESSAGES.required();
 const MAX_LENGTH_MESSAGE = SPRINT_VALIDATION_MESSAGES.maxLength(SPRINT_NAME_MAX_LENGTH);
+
+// Restore the embedded English defaults after every spec so the F23 non-English
+// cases below cannot leak locale state into the English parity specs.
+afterEach(() => {
+    resetI18n();
+});
 
 describe('sprintValidators', () => {
     // -------------------------------------------------------------------------
@@ -206,11 +215,11 @@ describe('sprintValidators', () => {
     // the AngularJS `en` locale verbatim so visual/behavioral parity holds.
     // -------------------------------------------------------------------------
     describe('SPRINT_VALIDATION_MESSAGES / SPRINT_NAME_MAX_LENGTH', () => {
-        it('exposes the exact required message', () => {
-            expect(SPRINT_VALIDATION_MESSAGES.required).toBe('This value is required.');
+        it('exposes the exact required message (English default)', () => {
+            expect(SPRINT_VALIDATION_MESSAGES.required()).toBe('This value is required.');
         });
 
-        it('builds the exact max-length message for 500 characters', () => {
+        it('builds the exact max-length message for 500 characters (English default)', () => {
             expect(SPRINT_VALIDATION_MESSAGES.maxLength(500)).toBe(
                 'This value is too long. It should have 500 characters or less.',
             );
@@ -218,6 +227,53 @@ describe('sprintValidators', () => {
 
         it('pins the sprint name maximum length to 500', () => {
             expect(SPRINT_NAME_MAX_LENGTH).toBe(500);
+        });
+    });
+
+    // -------------------------------------------------------------------------
+    // F23 — messages AND the picker date format are resolved from i18n at call
+    // time, exactly as the AngularJS source resolved them via
+    // `$translate.instant(...)`. A localized catalog installed via
+    // configureI18n() must therefore be honored by the validators/serializer.
+    // -------------------------------------------------------------------------
+    describe('i18n sourcing (F23)', () => {
+        it('renders the required message from a NON-English catalog', () => {
+            configureI18n(
+                { COMMON: { FORM_ERRORS: { REQUIRED: 'Este valor es obligatorio.' } } },
+                'es',
+            );
+            expect(validateName('')).toBe('Este valor es obligatorio.');
+            expect(validateRequiredDate('')).toBe('Este valor es obligatorio.');
+            expect(
+                validateSprint({ name: '', estimated_start: '', estimated_finish: '' }).errors,
+            ).toEqual({
+                name: 'Este valor es obligatorio.',
+                estimated_start: 'Este valor es obligatorio.',
+                estimated_finish: 'Este valor es obligatorio.',
+            });
+        });
+
+        it('substitutes the limit into a NON-English max-length message (%s)', () => {
+            configureI18n(
+                { COMMON: { FORM_ERRORS: { MAX_LENGTH: 'Máximo %s caracteres.' } } },
+                'es',
+            );
+            expect(validateName('a'.repeat(SPRINT_NAME_MAX_LENGTH + 1))).toBe(
+                'Máximo 500 caracteres.',
+            );
+            expect(SPRINT_VALIDATION_MESSAGES.maxLength(500)).toBe('Máximo 500 caracteres.');
+        });
+
+        it('parses the picker input with the ACTIVE locale date format (getDateFormat default)', () => {
+            configureI18n({ COMMON: { PICKERDATE: { FORMAT: 'DD/MM/YYYY' } } }, 'es');
+            // No explicit format -> serializeSprintDate defaults to getDateFormat().
+            expect(serializeSprintDate('23/03/1984')).toBe('1984-03-23');
+        });
+
+        it('re-resolves the picker format per call (a locale change is honored)', () => {
+            expect(serializeSprintDate('23 Mar 1984')).toBe('1984-03-23'); // English default
+            configureI18n({ COMMON: { PICKERDATE: { FORMAT: 'YYYY.MM.DD' } } }, 'xx');
+            expect(serializeSprintDate('1984.03.23')).toBe('1984-03-23'); // new locale format
         });
     });
 });

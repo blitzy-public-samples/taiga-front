@@ -358,17 +358,38 @@ function applyRefresh(draft: KanbanState, refreshUsMap = true, refreshSwimlanesF
 }
 
 /**
- * Remove, from `archivedStatus`, the ids of the stories whose status is being
- * deleted. Coffee 134-138 was BUGGY: `_.map (it) -> it.id` was invoked without
- * a collection argument and it mutated `@.archived`, a field the service never
- * defines, so the original effectively did nothing. This reproduces the
- * CORRECTED INTENT documented in the migration plan and must never throw.
+ * `deleteStatus` — a documented NO-OP, faithful to the legacy bug chain (F26).
+ *
+ * kanban-usertories.coffee:134-138 read:
+ *     deleteStatus: (statusId) ->
+ *         toDelete = _.filter @.userstoriesRaw, (us) -> return us.status == statusId
+ *         toDelete = _.map (it) -> return it.id                # (A)
+ *         @.archived = _.difference(@.archived, toDelete)      # (B)
+ *
+ * (A) OVERWRITES the just-computed `toDelete`: `_.map` is invoked with a
+ *     FUNCTION as its `collection` and NO iteratee. Iterating a function yields
+ *     nothing, so `toDelete` becomes `[]` — the `_.filter` on the line above is
+ *     dead code.
+ * (B) mutates `@.archived`, a field the service NEVER initializes — the
+ *     constructor/reset only define `@.archivedStatus` and `@.statusHide`
+ *     (kanban-usertories.coffee:28,31) — and which NOTHING in the codebase ever
+ *     reads. `_.difference(undefined, [])` is `[]`, so this only ever assigns
+ *     `[]` to a phantom property.
+ *
+ * NET EFFECT on the real board state (userstoriesRaw, usByStatus, archivedStatus,
+ * statusHide): NONE. This reducer therefore reproduces the legacy behavior
+ * EXACTLY, as a no-op.
+ *
+ * It intentionally does NOT filter `archivedStatus`: that collection holds
+ * STATUS ids (addArchivedStatus pushes a statusId — coffee:113-114), NOT story
+ * ids, so subtracting story ids from it could remove an unrelated status on a
+ * numeric id collision — and would in any case be a behavior CHANGE the
+ * AngularJS screen never performed (violating the AAP's exact-parity rule). No
+ * phantom `archived` field is added to the typed state because nothing consumes
+ * it. Params are prefixed `_` to mark them intentionally unused.
  */
-function applyDeleteStatus(draft: KanbanState, statusId: number): void {
-  const idsToDelete = draft.userstoriesRaw
-    .filter((us) => us.status === statusId)
-    .map((us) => us.id);
-  draft.archivedStatus = draft.archivedStatus.filter((id) => !idsToDelete.includes(id));
+function applyDeleteStatus(_draft: KanbanState, _statusId: number): void {
+  // Intentionally empty — legacy no-op parity (see the doc comment above, F26).
 }
 
 
@@ -507,10 +528,19 @@ export function addArchivedStatus(state: KanbanState, statusId: number): KanbanS
   });
 }
 
-/** Hide a status (applies the deleteStatus effect first). Coffee 123-125. */
+/**
+ * Hide a status. Coffee 123-125:
+ *     hideStatus: (statusId) ->
+ *         @.deleteStatus(statusId)     # no-op (see applyDeleteStatus, F26)
+ *         @.statusHide.push(statusId)
+ *
+ * The `deleteStatus` call is preserved for structural fidelity with the source,
+ * but since it is a no-op the ONLY observable effect is pushing `statusId` onto
+ * `statusHide` — exactly as the AngularJS service behaved.
+ */
 export function hideStatus(state: KanbanState, statusId: number): KanbanState {
   return produce(state, (draft: KanbanState) => {
-    applyDeleteStatus(draft, statusId);
+    applyDeleteStatus(draft, statusId); // no-op, kept for source fidelity (F26)
     draft.statusHide.push(statusId);
   });
 }
@@ -522,7 +552,12 @@ export function showStatus(state: KanbanState, statusId: number): KanbanState {
   });
 }
 
-/** See `applyDeleteStatus`. Coffee 134-138 (bug-corrected). */
+/**
+ * Delete a status. Coffee 134-138. This is a NO-OP by faithful reproduction of
+ * the legacy bug chain (see `applyDeleteStatus`, F26): the returned state is
+ * referentially identical to the input, because immer's `produce` returns the
+ * original object when the draft is never mutated.
+ */
 export function deleteStatus(state: KanbanState, statusId: number): KanbanState {
   return produce(state, (draft: KanbanState) => {
     applyDeleteStatus(draft, statusId);

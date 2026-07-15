@@ -199,8 +199,8 @@ function populatedPrev(): KanbanState {
   // swimlane is configured and the single story has swimlane:null) builds a
   // non-empty swimlanesList including the synthetic unclassified swimlane.
   s = set(s, [makeUs({ id: 1, status: 1, swimlane: null, kanban_order: 0 })]);
-  s = addArchivedStatus(s, 7); // archivedStatus = [7]
-  s = hideStatus(s, 8); // statusHide = [8] (no status-8 stories, so archived is untouched)
+  s = addArchivedStatus(s, 7); // archivedStatus = [7] (status id 7)
+  s = hideStatus(s, 8); // statusHide = [8]; deleteStatus is a no-op, so archivedStatus stays [7]
   return s;
 }
 
@@ -425,9 +425,10 @@ describe('getStatus', () => {
 
 describe('isUsInArchivedHiddenStatus', () => {
   // The status VALUE must be present in BOTH archivedStatus AND statusHide.
-  // The story id (100) is deliberately different from the status value (3) so
-  // that hideStatus's internal deleteStatus effect (which removes story-ids from
-  // archivedStatus) does not strip the archived status value.
+  // addArchivedStatus and hideStatus both operate on the STATUS id (3); the
+  // story id (100) is intentionally different to make clear that story ids play
+  // no part here. hideStatus's internal deleteStatus is a NO-OP (F26), so the
+  // archived status value is never stripped.
   it('is true only when the status is in BOTH archivedStatus and statusHide', () => {
     let s = set(reset(), [makeUs({ id: 100, status: 3 })]);
     s = addArchivedStatus(s, 3);
@@ -535,9 +536,11 @@ describe('addArchivedStatus', () => {
 });
 
 describe('hideStatus', () => {
-  it('pushes the status into statusHide (after applying the deleteStatus effect)', () => {
+  it('pushes the status into statusHide (its internal deleteStatus is a no-op)', () => {
     const s = hideStatus(reset(), 3);
     expect(s.statusHide).toContain(3);
+    // deleteStatus is a no-op (F26), so archivedStatus is never affected here.
+    expect(s.archivedStatus).toEqual([]);
   });
 
   it('is pure', () => {
@@ -571,20 +574,29 @@ describe('showStatus', () => {
 });
 
 describe('deleteStatus', () => {
-  // NOTE: this asserts the DOCUMENTED bug-correction (kanban-usertories.coffee
-  // 134-138 was buggy and effectively a no-op). The reducer computes the ids of
-  // stories whose status === statusId and removes THOSE ids from archivedStatus.
-  it('removes archived ids belonging to the deleted status and keeps unrelated ids; never throws', () => {
+  // Authoritative parity (kanban-usertories.coffee:134-138): deleteStatus is a
+  // NO-OP. The `_.map (it) -> it.id` call (no collection arg) discards the
+  // computed ids, and the result is assigned to a phantom `@.archived` field the
+  // service never initializes and nothing reads. It must NOT touch archivedStatus
+  // (which holds STATUS ids, not story ids) — see applyDeleteStatus (F26).
+  it('is a no-op: leaves archivedStatus (and all state) unchanged; never throws', () => {
     let s = set(reset(), [makeUs({ id: 7, status: 3 }), makeUs({ id: 8, status: 4 })]);
-    s = addArchivedStatus(s, 7); // id 7 belongs to a status-3 story
-    s = addArchivedStatus(s, 99); // unrelated archived id
+    // Archive TWO status ids. Note id 7 numerically COLLIDES with the id of a
+    // status-3 story — a bug-corrected implementation would wrongly strip it.
+    s = addArchivedStatus(s, 7);
+    s = addArchivedStatus(s, 99);
     expect(s.archivedStatus).toEqual([7, 99]);
 
     let result!: KanbanState;
     expect(() => {
       result = deleteStatus(s, 3);
     }).not.toThrow();
-    expect(result.archivedStatus).toEqual([99]);
+
+    // archivedStatus is untouched — proving story ids are NEVER subtracted from
+    // the status-id collection, even on a numeric id collision (F26).
+    expect(result.archivedStatus).toEqual([7, 99]);
+    // A true no-op: immer returns the SAME reference when the draft is unchanged.
+    expect(result).toBe(s);
   });
 
   it('is pure', () => {
@@ -681,16 +693,13 @@ describe('move', () => {
   it('maps afterUserstoryId/beforeUserstoryId from previousCard/nextCard via ?? null', () => {
     const state = threeCardState();
 
-    // Both undefined -> both null (?? null handles undefined).
-    const none = move(
-      state,
-      [20],
-      3,
-      null,
-      0,
-      undefined as unknown as number,
-      undefined as unknown as number,
-    );
+    // Both absent (null) -> both null. `null` is the legal "no adjacent card"
+    // value per the public contract (previousCard/nextCard: number | null, and
+    // KanbanDragResult.after/beforeUserstoryId: UsId | null). No caller ever
+    // passes `undefined`, so we test the legal value rather than casting around
+    // the type (F49). `null` and `undefined` are behaviorally identical here
+    // anyway: `if (previousCard)` and `previousCard ?? null` treat both as absent.
+    const none = move(state, [20], 3, null, 0, null, null);
     expect(none.payload.afterUserstoryId).toBeNull();
     expect(none.payload.beforeUserstoryId).toBeNull();
 

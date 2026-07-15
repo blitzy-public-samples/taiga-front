@@ -32,12 +32,35 @@
  * template (filter.jade), controller (filter.controller.coffee), and directive
  * (filter.directive.coffee), plus the kanban route template (kanban.jade). These live in
  * the legacy client tree and are intentionally NOT imported.
+ *
+ * Accessibility vs. visual fidelity (F41): the AAP mandates "zero visual change"
+ * (Section 0.3.4) and places the frozen visual/design contract ABOVE accessibility
+ * heuristics (Discovery precedence rule D1). The inherited Taiga color tokens that
+ * drive this component (e.g. the `#008AA8` link/brand color and the `#d8dee9`
+ * radio-mark border, defined in the reference SCSS) are therefore NOT altered here,
+ * even where a contrast ratio would fail a WCAG check. All accessibility work in this
+ * file is consequently STRUCTURAL only -- semantic roles, accessible names, keyboard
+ * operability, and a focus ring that REUSES the existing brand color -- and introduces
+ * no new color, spacing, or layout value.
  */
 
 // Automatic JSX runtime (tsconfig `jsx: "react-jsx"`): no default `React` import required.
 import { useMemo, useState } from 'react';
 // Type-only import (erased at build time) used purely to type the inline `style` object.
 import type { CSSProperties } from 'react';
+// Shared, AngularJS-free translation layer (F29). Replaces the former local
+// identity stub so every title, mode label, control, and error message resolves
+// through the active Taiga locale catalog -- exactly as the legacy `translate`
+// filter / service did in filter.jade.
+import { t } from '../../shared/i18n';
+// Emoji-shortcode rendering for applied TAG filters (F30), reproducing the legacy
+// `emojify` filter and its `$tgEmojis` catalog. `getEmojiMap` reads the same
+// `window.emojis` global the app-loader publishes (globals-only boundary).
+import { emojify, getEmojiMap } from '../../shared/emojify';
+// Avatar resolution for user filter options (F30), reproducing the `tg-avatar`
+// directive so `assigned_users` / `owner` options render a REAL image (photo,
+// gravatar, or deterministic local placeholder) instead of a broken `<img src="">`.
+import { getAvatar } from '../../shared/avatar';
 
 /*
  * Custom-element host tags rendered via module-local `as any` constants.
@@ -56,15 +79,6 @@ import type { CSSProperties } from 'react';
  */
 const TgFilter = 'tg-filter' as unknown as any;
 const TgSvg = 'tg-svg' as unknown as any;
-
-/**
- * Lightweight translation passthrough. The AngularJS component resolved copy through the
- * `translate` service / filter; here we return the key unchanged to avoid introducing an
- * i18n runtime dependency (preserving the standalone, globals-only boundary). Upstream
- * owners may pre-resolve copy before passing it in, or this can be swapped for a real
- * lookup without altering the DOM this component renders.
- */
-const t = (key: string): string => key;
 
 /**
  * Inline SVG icon helper reproducing the AngularJS `tg-svg(svg-icon="...")` directive.
@@ -87,6 +101,44 @@ const Svg = ({ icon, className }: { icon: string; className?: string }) => (
     </svg>
   </TgSvg>
 );
+
+/**
+ * Visually-hidden-but-focusable style for the include/exclude radio inputs (F31).
+ *
+ * The reference SCSS hides the radio with `.custom-radio input[type=radio] { display: none }`,
+ * which removes it from the tab order entirely and leaves the focusable-but-inert
+ * `label.filter-mode[tabindex=0]` with no key handling (the F31 defect). We instead
+ * keep the NATIVE radio in the accessibility/tab tree -- overriding `display:none`
+ * with `display:block` and shrinking it to a clipped 1px box -- so screen readers
+ * announce a real radio group and keyboard users get native arrow-key selection and
+ * Space activation for free. The clip/absolute technique removes it from the visual
+ * flow, so the rendered layout is byte-identical to the legacy (ZERO visual change);
+ * this mirrors the identical, visually-verified approach used in ZoomControl.
+ */
+const VISUALLY_HIDDEN_INPUT: CSSProperties = {
+  position: 'absolute',
+  display: 'block',
+  width: '1px',
+  height: '1px',
+  margin: '-1px',
+  padding: 0,
+  border: 0,
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+};
+
+/**
+ * Visible focus indicator drawn on the custom `.radio-mark` when its (visually
+ * hidden) native radio receives keyboard focus (F31, WCAG 2.4.7). Reuses the
+ * existing Taiga link/brand color `#008AA8` (no NEW color is introduced -- F41).
+ * `outline` occupies no layout space and `outlineOffset` lifts the ring clear of
+ * the 16px mark, so the affordance is purely additive with no layout shift.
+ */
+const FOCUS_OUTLINE: CSSProperties = {
+  outline: '2px solid #008AA8',
+  outlineOffset: '2px',
+};
 
 /** A selectable option within a filter category (a tag, user, status, ...). */
 export interface FilterCategoryOption {
@@ -181,6 +233,8 @@ const FilterBar = (props: FilterBarProps) => {
   const [lengthZeroError, setLengthZeroError] = useState(false);
   const [repeatedFilterError, setRepeatedFilterError] = useState(false);
   const [activeCustomFilter, setActiveCustomFilter] = useState<number | string | null>(null);
+  // Which include/exclude radio currently holds keyboard focus (F31 focus ring).
+  const [focusedMode, setFocusedMode] = useState<FilterMode | null>(null);
 
   // Constant option list + resolved labels (FilterController constructor).
   const filterModeOptions = ['include', 'exclude'] as const;
@@ -267,6 +321,43 @@ const FilterBar = (props: FilterBarProps) => {
   const isFilterSelected = (category: FilterCategory, option: FilterCategoryOption): boolean =>
     !!selectedFilters.find((it) => option.id === it.id && category.dataType === it.dataType);
 
+  // Emoji shortcode->image catalog, read once from the `window.emojis` global
+  // (globals-only boundary). Empty when the catalog is absent, which makes
+  // `emojify` a faithful identity for plain tag text (see shared/emojify.ts).
+  const emojiMap = useMemo(() => getEmojiMap(), []);
+
+  /**
+   * Render one applied-filter chip, shared by the included and excluded lists
+   * (both are byte-identical in filter.jade). Reproduces the legacy dual `.name`
+   * binding EXACTLY: TAG filters use `ng-bind-html="it.name | emojify"` (emoji
+   * shortcodes become `<img>`; `dangerouslySetInnerHTML` is React's `ng-bind-html`
+   * equivalent and `emojify` HTML-escapes first, so the sink is safe -- F30),
+   * while every other data type renders the plain `{{it.name}}` text node. The
+   * icon-only remove button gains an accessible name (F31).
+   */
+  const renderAppliedChip = (it: AppliedFilter) => (
+    <div
+      key={it.key ?? `${it.dataType}-${it.id}`}
+      className={`single-applied-filter ng-animate-disabled ${it.mode}`}
+    >
+      {it.dataType === 'tags' ? (
+        <div
+          className="name"
+          dangerouslySetInnerHTML={{ __html: emojify(it.name, emojiMap) }}
+        />
+      ) : (
+        <div className="name">{it.name}</div>
+      )}
+      <button
+        className="remove-filter e2e-remove-filter"
+        aria-label={`${t('COMMON.DELETE')} ${it.name}`}
+        onClick={() => unselectFilter(it)}
+      >
+        <Svg icon="icon-close" />
+      </button>
+    </div>
+  );
+
   return (
     <TgFilter>
       {/* ---- .custom-filters ---- */}
@@ -333,6 +424,7 @@ const FilterBar = (props: FilterBarProps) => {
                 </button>
                 <button
                   className="remove-filter e2e-remove-custom-filter"
+                  aria-label={`${t('COMMON.DELETE')} ${it.name}`}
                   onClick={() => removeCustomFilter(it)}
                 >
                   <Svg icon="icon-trash" />
@@ -353,22 +445,7 @@ const FilterBar = (props: FilterBarProps) => {
                   {t('COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED')}
                 </div>
                 <div className="filters-wrapper">
-                  {includedFilters.map((it) => (
-                    <div
-                      key={it.key ?? `${it.dataType}-${it.id}`}
-                      className={`single-applied-filter ng-animate-disabled ${it.mode}`}
-                    >
-                      {/* NOTE: tags use emojify in the source; we render plain text here
-                          (display-only, no behavioral impact). */}
-                      <div className="name">{it.name}</div>
-                      <button
-                        className="remove-filter e2e-remove-filter"
-                        onClick={() => unselectFilter(it)}
-                      >
-                        <Svg icon="icon-close" />
-                      </button>
-                    </div>
-                  ))}
+                  {includedFilters.map(renderAppliedChip)}
                 </div>
               </div>
             )}
@@ -378,20 +455,7 @@ const FilterBar = (props: FilterBarProps) => {
                   {t('COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED')}
                 </div>
                 <div className="filters-wrapper">
-                  {excludedFilters.map((it) => (
-                    <div
-                      key={it.key ?? `${it.dataType}-${it.id}`}
-                      className={`single-applied-filter ng-animate-disabled ${it.mode}`}
-                    >
-                      <div className="name">{it.name}</div>
-                      <button
-                        className="remove-filter e2e-remove-filter"
-                        onClick={() => unselectFilter(it)}
-                      >
-                        <Svg icon="icon-close" />
-                      </button>
-                    </div>
-                  ))}
+                  {excludedFilters.map(renderAppliedChip)}
                 </div>
               </div>
             )}
@@ -399,7 +463,24 @@ const FilterBar = (props: FilterBarProps) => {
         )}
 
         <div className="filters-advanced">
-          <div className="filters-advanced-form">
+          {/*
+            F31: the include/exclude mode selector is a semantic radio group. The
+            legacy markup hid the native radio (`display:none`) and made the
+            `<label tabindex=0>` focusable but WITHOUT any key handler. We instead
+            keep the NATIVE radio focusable-but-visually-hidden (see
+            VISUALLY_HIDDEN_INPUT) inside an explicit `role="radiogroup"`, so
+            screen readers announce a real group and keyboard users get native
+            arrow-key selection + Space activation. The label's `tabindex` is
+            removed (the input is now the single focusable control). The visible
+            selection is still driven by the `.active` class exactly as before
+            (`.filter-mode.active .radio-mark-inner { opacity: 1 }`), so there is
+            ZERO visual change.
+          */}
+          <div
+            className="filters-advanced-form"
+            role="radiogroup"
+            aria-label={t('COMMON.FILTERS.TITLE_ADVANCED_FILTER')}
+          >
             {filterModeOptions.map((option) => (
               <div key={option} className="custom-radio">
                 <input
@@ -409,13 +490,21 @@ const FilterBar = (props: FilterBarProps) => {
                   value={option}
                   checked={filterMode === option}
                   onChange={() => setFilterMode(option)}
+                  aria-label={filterModeLabels[option]}
+                  style={VISUALLY_HIDDEN_INPUT}
+                  onFocus={() => setFocusedMode(option)}
+                  onBlur={() =>
+                    setFocusedMode((current) => (current === option ? null : current))
+                  }
                 />
                 <label
                   className={`filter-mode ${option}` + (filterMode === option ? ' active' : '')}
                   htmlFor={`filter-mode-${option}`}
-                  tabIndex={0}
                 >
-                  <div className="radio-mark">
+                  <div
+                    className="radio-mark"
+                    style={focusedMode === option ? FOCUS_OUTLINE : undefined}
+                  >
                     <div className={`radio-mark-inner ${option}`} />
                   </div>
                   <span>{filterModeLabels[option]}</span>
@@ -437,6 +526,8 @@ const FilterBar = (props: FilterBarProps) => {
                       (isOpen(filter.dataType) ? ' selected' : '')
                     }
                     onClick={() => toggleFilterCategory(filter.dataType)}
+                    aria-expanded={isOpen(filter.dataType)}
+                    aria-controls={`filter-list-${filter.dataType}`}
                   >
                     <span className="title">{filter.title}</span>
                     {!isOpen(filter.dataType) && (
@@ -446,11 +537,20 @@ const FilterBar = (props: FilterBarProps) => {
                       <Svg className="ng-animate-disabled" icon="icon-arrow-down" />
                     )}
                   </button>
-                  {/* NOTE: `tg-filter-slide-down` is an AngularJS animation directive on the
-                      list; the resting state is identical, so the slide animation is omitted
-                      and the list renders directly. */}
+                  {/*
+                    F30 -- behavioral-equivalent of `tg-filter-slide-down`. That
+                    legacy directive is effectively INERT: its `open()` merely
+                    hides `.filter-list` and then calls `.show()` on
+                    `el.context.nextSibling` (a bare text node, not this element),
+                    with no CSS transition, duration, or easing. It therefore
+                    produces no observable animation and leaves an identical
+                    resting state. Conditionally mounting the list when the
+                    category is open reproduces that exact end state (present when
+                    expanded, absent when collapsed). The list keeps its `id` so
+                    the category toggle's `aria-controls` can reference it (F31).
+                  */}
                   {isOpen(filter.dataType) && (
-                    <div className="filter-list">
+                    <div className="filter-list" id={`filter-list-${filter.dataType}`}>
                       {filter.content
                         .filter(
                           (it) => !isFilterSelected(filter, it) && !(it.count === 0 && filter.hideEmpty),
@@ -473,6 +573,10 @@ const FilterBar = (props: FilterBarProps) => {
                           if (it.color && isTags) {
                             style.background = String(it.color);
                           }
+                          // F30: resolve the option's avatar exactly as the legacy
+                          // `tg-avatar` directive did (photo / gravatar / deterministic
+                          // local placeholder). Computed only for user categories.
+                          const avatar = isUser ? getAvatar(it, 'avatar') : null;
                           return (
                             <button
                               key={it.id}
@@ -480,10 +584,24 @@ const FilterBar = (props: FilterBarProps) => {
                               style={style}
                               onClick={() => selectFilter(filter, it)}
                             >
-                              {/* NOTE: `user-pic` src is the option's photo/avatar url supplied
-                                  upstream (the AngularJS `tg-avatar` directive resolved the same
-                                  url); this keeps FilterBar standalone. */}
-                              {isUser && <img className="user-pic" src={String(it.photo ?? '')} alt="" />}
+                              {/*
+                                F30: reproduce the `tg-avatar` directive's DOM contract
+                                exactly -- it set `src=avatar.url`, `title`/`alt` to the
+                                interpolated `"#{avatar.fullName}"` (String coercion, so an
+                                absent full name yields the literal "undefined"/"null" just
+                                as the legacy did), and the element background to
+                                `avatar.bg || ''`. This renders a REAL image (photo, gravatar,
+                                or deterministic local placeholder) rather than `<img src="">`.
+                              */}
+                              {isUser && avatar && (
+                                <img
+                                  className="user-pic"
+                                  src={avatar.url}
+                                  title={String(avatar.fullName)}
+                                  alt={String(avatar.fullName)}
+                                  style={{ background: avatar.bg || '' }}
+                                />
+                              )}
                               <span className="name">{it.name}</span>
                               {(it.count ?? 0) > 0 && (
                                 <span className="number e2e-filter-count">{it.count}</span>

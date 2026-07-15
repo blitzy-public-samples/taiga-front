@@ -38,6 +38,39 @@ import type {
   CustomFilter,
   FilterBarProps,
 } from '../components/FilterBar';
+// The shared i18n layer FilterBar now resolves copy through (F29). Tests reset it
+// between cases so English defaults are deterministic, and drive `configureI18n`
+// to prove non-English catalogs render (never any raw key).
+import { configureI18n, resetI18n } from '../../shared/i18n';
+
+/*
+ * Expected English strings (the embedded i18n defaults). Declaring them here keeps
+ * the F29 assertions readable and in one place; each must match the catalog in
+ * app/react/shared/i18n.ts exactly.
+ */
+const EN = {
+  TITLE: 'Custom filters',
+  ACTION_ADD: 'Add',
+  ACTION_SAVE: 'save filter',
+  PLACEHOLDER_NAME: 'Write the filter name and press enter',
+  ADVANCED: 'Advanced',
+  LENGTH_ZERO_ERROR: 'Please add a filter name',
+  REPEATED_FILTER_ERROR: 'This filter name is already in use',
+  INCLUDE: 'Include',
+  EXCLUDE: 'Exclude',
+  INCLUDED: 'Filtered by:',
+  EXCLUDED: 'Excluded:',
+  DELETE: 'Delete',
+};
+
+// Reset i18n to pristine English defaults around EVERY case (bookend), so no case
+// leaks a configured locale into the next and the default renders are English.
+beforeEach(() => {
+  resetI18n();
+});
+afterEach(() => {
+  resetI18n();
+});
 
 /* ------------------------------------------------------------------------------------------
  * Small DOM query helpers — typed so strict-mode TS never trips on `Element | null`.
@@ -101,7 +134,20 @@ const filters: FilterCategory[] = [
   {
     dataType: 'assigned_users',
     title: 'Assigned',
-    content: [{ id: 7, name: 'Alice', count: 1, photo: 'alice.png' }],
+    content: [
+      {
+        id: 7,
+        name: 'Alice',
+        count: 1,
+        // User fields consumed by getAvatar (F30). With BOTH a gravatar_id and a
+        // photo, getAvatar returns the photo URL directly (the tg-avatar contract),
+        // so this option's avatar `src` resolves to 'alice.png'.
+        gravatar_id: 'alice-hash',
+        photo: 'alice.png',
+        username: 'alice',
+        full_name_display: 'Alice Anderson',
+      },
+    ],
   },
   {
     dataType: 'epic',
@@ -430,7 +476,7 @@ describe('FilterBar — custom filter save flow (Phase G)', () => {
     expect(input.classList.contains('checksley-error')).toBe(true);
 
     const errorText = qs(container, '.error-text');
-    expect(errorText.textContent).toBe('COMMON.FILTERS.LENGTH_ZERO_ERROR');
+    expect(errorText.textContent).toBe(EN.LENGTH_ZERO_ERROR);
   });
 
   it('rejects a duplicate name with the repeated-filter error and does not save', () => {
@@ -444,7 +490,7 @@ describe('FilterBar — custom filter save flow (Phase G)', () => {
     expect(input.classList.contains('checksley-error')).toBe(true);
 
     const errorText = qs(container, '.error-text');
-    expect(errorText.textContent).toBe('COMMON.FILTERS.REPEATED_FILTER_ERROR');
+    expect(errorText.textContent).toBe(EN.REPEATED_FILTER_ERROR);
   });
 
   it('saves a valid, unique name exactly once and then hides the form', () => {
@@ -594,7 +640,7 @@ describe('FilterBar — prop edge cases (branch completeness)', () => {
     expect(within(qs(container, '.filters-excluded')).getByText('feature')).toBeTruthy();
   });
 
-  it('renders a user option lacking a photo url (empty avatar src) and no count badge', () => {
+  it('renders a user option lacking a gravatar id with the getUnnamed fallback avatar and no count badge', () => {
     const { container } = renderBar({
       filters: [{ dataType: 'assigned_users', title: 'Assigned', content: [{ id: 8, name: 'Bob' }] }],
       selectedFilters: [],
@@ -604,10 +650,278 @@ describe('FilterBar — prop edge cases (branch completeness)', () => {
     fireEvent.click(assignedButton);
 
     const option = qs(getFilterListFor(assignedButton)!, '.single-filter');
-    // The avatar still renders for a user option; its src falls back to '' with no photo.
+    // A user option with no gravatar_id resolves via getAvatar -> getUnnamed(), so the
+    // avatar renders a REAL fallback image (F30) rather than the former `<img src="">`.
     const avatar = qs(option, '.user-pic');
-    expect(avatar.getAttribute('src')).toBe('');
+    expect(avatar.getAttribute('src')).toContain('/images/unnamed.png');
     // No count -> no count badge.
     expect(option.querySelector('.number.e2e-filter-count')).toBeNull();
+  });
+});
+
+/* ==========================================================================================
+ * F29 — Every label, control, error, and mode name resolves through the shared i18n layer
+ *
+ * The component previously used a local identity stub, so these strings rendered as raw
+ * translation KEYS. They must now render as the active catalog's copy (English by default),
+ * and swap wholesale when a non-English catalog is installed.
+ * ======================================================================================== */
+
+describe('FilterBar — i18n resolution (F29)', () => {
+  it('renders the custom-filters title and add button in English, not raw keys', () => {
+    const { container } = renderBar();
+
+    expect(qs(container, '.custom-filters-title .name').textContent).toBe(EN.TITLE);
+    expect(qs(container, '.add-custom-filter').textContent).toBe(EN.ACTION_ADD);
+    // Nothing anywhere in the sidebar leaks a `COMMON.FILTERS.*` key.
+    expect(container.textContent).not.toMatch(/COMMON\.FILTERS\./);
+  });
+
+  it('renders the applied-section titles and include/exclude mode labels in English', () => {
+    const { container } = renderBar();
+
+    expect(qs(container, '.filters-included .filters-title').textContent).toBe(EN.INCLUDED);
+    expect(qs(container, '.filters-excluded .filters-title').textContent).toBe(EN.EXCLUDED);
+
+    const modeLabels = qsa(container, '.filters-advanced-form .filter-mode span').map(
+      (s) => s.textContent,
+    );
+    expect(modeLabels).toEqual([EN.INCLUDE, EN.EXCLUDE]);
+  });
+
+  it('renders the add-filter form placeholder, save label, and length-zero error in English', () => {
+    const { container } = renderBar();
+
+    fireEvent.click(qs(container, '.add-custom-filter'));
+    const input = qs(container, 'input.e2e-filter-name-input') as HTMLInputElement;
+    expect(input.placeholder).toBe(EN.PLACEHOLDER_NAME);
+    expect(input.getAttribute('aria-label')).toBe(EN.PLACEHOLDER_NAME);
+    expect(qs(container, '.e2e-open-custom-filter-form').textContent).toBe(EN.ACTION_SAVE);
+
+    fireEvent.submit(qs(container, '.custom-filters-add-form'));
+    expect(qs(container, '.error-text').textContent).toBe(EN.LENGTH_ZERO_ERROR);
+  });
+
+  it('renders a configured NON-English catalog end-to-end (no raw key leaks through)', () => {
+    configureI18n(
+      {
+        COMMON: {
+          DELETE: 'Eliminar',
+          FILTERS: {
+            TITLE: 'Filtros personalizados',
+            ACTION_ADD: 'Añadir',
+            ADVANCED_FILTERS: {
+              INCLUDE: 'Incluir',
+              EXCLUDE: 'Excluir',
+              INCLUDED: 'Filtrado por:',
+              EXCLUDED: 'Excluido:',
+            },
+          },
+        },
+      },
+      'es',
+    );
+
+    const { container } = renderBar();
+
+    expect(qs(container, '.custom-filters-title .name').textContent).toBe('Filtros personalizados');
+    expect(qs(container, '.add-custom-filter').textContent).toBe('Añadir');
+    expect(qs(container, '.filters-included .filters-title').textContent).toBe('Filtrado por:');
+    expect(qs(container, '.filters-excluded .filters-title').textContent).toBe('Excluido:');
+
+    const modeLabels = qsa(container, '.filter-mode span').map((s) => s.textContent);
+    expect(modeLabels).toEqual(['Incluir', 'Excluir']);
+
+    // The include-mode radio's accessible name switched to Spanish too.
+    const includeRadio = qs(container, 'input[value="include"]');
+    expect(includeRadio.getAttribute('aria-label')).toBe('Incluir');
+
+    // No raw key survives anywhere in the render.
+    expect(container.textContent).not.toMatch(/COMMON\.FILTERS\./);
+  });
+});
+
+/* ==========================================================================================
+ * F30 — Legacy display contracts: emojify for TAG applied filters + real user avatars
+ * ======================================================================================== */
+
+describe('FilterBar — emojify for tag applied filters (F30)', () => {
+  /** Install a one-entry emoji catalog on the globals the port reads, then clean up. */
+  function withEmojiCatalog(run: () => void): void {
+    const w = window as unknown as { emojis?: unknown; _version?: string };
+    const prevEmojis = w.emojis;
+    const prevVersion = w._version;
+    w.emojis = [{ name: 'smile', image: '1f604.png', id: '1f604' }];
+    w._version = 'v-test';
+    try {
+      run();
+    } finally {
+      w.emojis = prevEmojis;
+      w._version = prevVersion;
+    }
+  }
+
+  it('renders a TAG applied filter name through emojify, turning a shortcode into an <img>', () => {
+    withEmojiCatalog(() => {
+      const { container } = renderBar({
+        selectedFilters: [
+          { id: 't1', name: 'happy :smile:', dataType: 'tags', mode: 'include', key: 'tags-t1' },
+        ],
+      });
+
+      const nameEl = qs(container, '.filters-included .single-applied-filter .name');
+      // ng-bind-html | emojify equivalent: the known :smile: shortcode became an <img>.
+      const img = nameEl.querySelector('img');
+      expect(img).toBeTruthy();
+      expect(img!.getAttribute('src')).toBe('/v-test/emojis/1f604.png');
+      // The surrounding literal text is preserved.
+      expect(nameEl.textContent).toContain('happy');
+    });
+  });
+
+  it('leaves an UNKNOWN shortcode untouched and renders a non-tag filter as plain text', () => {
+    withEmojiCatalog(() => {
+      const { container } = renderBar({
+        selectedFilters: [
+          { id: 't2', name: 'has :unknown: code', dataType: 'tags', mode: 'include', key: 'tags-t2' },
+          { id: 9, name: 'New :smile:', dataType: 'status', mode: 'exclude', key: 'status-9' },
+        ],
+      });
+
+      // Unknown shortcode is left verbatim (no <img>) for the tag filter.
+      const tagName = qs(container, '.filters-included .single-applied-filter .name');
+      expect(tagName.querySelector('img')).toBeNull();
+      expect(tagName.textContent).toBe('has :unknown: code');
+
+      // A non-tag (status) filter renders plain text and never runs emojify, so its
+      // ":smile:" stays literal even though the catalog knows it.
+      const nonTagName = qs(container, '.filters-excluded .single-applied-filter .name');
+      expect(nonTagName.querySelector('img')).toBeNull();
+      expect(nonTagName.textContent).toBe('New :smile:');
+    });
+  });
+});
+
+describe('FilterBar — real user avatars via getAvatar (F30)', () => {
+  it('resolves a user option WITH a photo to that photo URL (tg-avatar photo branch)', () => {
+    const { container } = renderBar();
+
+    const assignedButton = getCategoryButton(container, 'Assigned');
+    fireEvent.click(assignedButton);
+
+    const avatar = qs(getFilterListFor(assignedButton)!, '.user-pic');
+    // Alice has gravatar_id + photo -> getAvatar returns the photo URL directly.
+    expect(avatar.getAttribute('src')).toBe('alice.png');
+    // title/alt reproduce the tg-avatar directive's `"#{avatar.fullName}"`.
+    expect(avatar.getAttribute('title')).toBe('Alice Anderson');
+    expect(avatar.getAttribute('alt')).toBe('Alice Anderson');
+  });
+});
+
+/* ==========================================================================================
+ * F31 — Structural accessibility: names, radio group, keyboard operability, expansion state
+ * ======================================================================================== */
+
+describe('FilterBar — accessibility: accessible names on icon-only remove buttons (F31)', () => {
+  it('gives the applied-filter remove buttons an accessible name including the filter name', () => {
+    const { container } = renderBar();
+
+    const includedRemove = qs(container, '.filters-included .remove-filter.e2e-remove-filter');
+    expect(includedRemove.getAttribute('aria-label')).toBe(`${EN.DELETE} New`);
+
+    const excludedRemove = qs(container, '.filters-excluded .remove-filter.e2e-remove-filter');
+    expect(excludedRemove.getAttribute('aria-label')).toBe(`${EN.DELETE} bug`);
+  });
+
+  it('gives the custom-filter trash button an accessible name including the custom filter name', () => {
+    const { container } = renderBar();
+
+    const trash = qs(container, '.single-filter-type-custom .e2e-remove-custom-filter');
+    expect(trash.getAttribute('aria-label')).toBe(`${EN.DELETE} MyFilter`);
+  });
+});
+
+describe('FilterBar — accessibility: include/exclude radio group (F31)', () => {
+  it('wraps the mode radios in a role="radiogroup" with an accessible name', () => {
+    const { container } = renderBar();
+
+    const group = qs(container, '.filters-advanced-form');
+    expect(group.getAttribute('role')).toBe('radiogroup');
+    expect(group.getAttribute('aria-label')).toBe(EN.ADVANCED);
+  });
+
+  it('keeps the native radios focusable (not display:none) and accessibly named', () => {
+    const { container } = renderBar();
+
+    const includeRadio = qs(container, 'input[value="include"]') as HTMLInputElement;
+    const excludeRadio = qs(container, 'input[value="exclude"]') as HTMLInputElement;
+
+    // Visually hidden but NOT display:none -> stays in the tab order.
+    expect(includeRadio.style.display).toBe('block');
+    expect(includeRadio.getAttribute('aria-label')).toBe(EN.INCLUDE);
+    expect(excludeRadio.getAttribute('aria-label')).toBe(EN.EXCLUDE);
+
+    // The former focusable label no longer steals the tab stop.
+    const label = qs(container, '.filter-mode');
+    expect(label.getAttribute('tabindex')).toBeNull();
+  });
+
+  it('shows a focus ring on the custom radio mark while its input is focused, and clears it on blur', () => {
+    const { container } = renderBar();
+
+    const includeRadio = qs(container, 'input[value="include"]');
+    const includeMark = qs(container, '.filter-mode.include .radio-mark');
+
+    // No ring at rest.
+    expect(includeMark.style.outline === '' || includeMark.style.outline === undefined).toBe(true);
+
+    fireEvent.focus(includeRadio);
+    expect(includeMark.style.outline).toContain('2px');
+    expect(includeMark.style.outline).toContain('solid');
+    expect(includeMark.style.outlineOffset).toBe('2px');
+
+    fireEvent.blur(includeRadio);
+    expect(includeMark.style.outline === '' || includeMark.style.outline === undefined).toBe(true);
+  });
+
+  it('does not clear the ring when a stale blur arrives after focus moved to the other radio', () => {
+    const { container } = renderBar();
+
+    const includeRadio = qs(container, 'input[value="include"]');
+    const excludeRadio = qs(container, 'input[value="exclude"]');
+    const includeMark = qs(container, '.filter-mode.include .radio-mark');
+    const excludeMark = qs(container, '.filter-mode.exclude .radio-mark');
+
+    fireEvent.focus(includeRadio); // focusedMode = 'include'
+    fireEvent.focus(excludeRadio); // focusedMode = 'exclude'
+
+    // A late/stale blur for the include radio (focus already moved to exclude) must
+    // leave the exclude ring intact -- exercises the `: current` no-op branch.
+    fireEvent.blur(includeRadio);
+    expect(excludeMark.style.outline).toContain('2px');
+    expect(includeMark.style.outline === '' || includeMark.style.outline === undefined).toBe(true);
+  });
+});
+
+describe('FilterBar — accessibility: category expansion relationship (F31)', () => {
+  it('reflects the open/closed state via aria-expanded and links the toggle to its list', () => {
+    const { container } = renderBar();
+
+    const assignedButton = getCategoryButton(container, 'Assigned');
+    // Collapsed by default.
+    expect(assignedButton.getAttribute('aria-expanded')).toBe('false');
+    const controls = assignedButton.getAttribute('aria-controls');
+    expect(controls).toBe('filter-list-assigned_users');
+
+    // Open it: aria-expanded flips and the referenced list now exists with that id.
+    fireEvent.click(assignedButton);
+    expect(assignedButton.getAttribute('aria-expanded')).toBe('true');
+    const list = getFilterListFor(assignedButton)!;
+    expect(list.getAttribute('id')).toBe(controls);
+
+    // Close it again.
+    fireEvent.click(assignedButton);
+    expect(assignedButton.getAttribute('aria-expanded')).toBe('false');
+    expect(getFilterListFor(assignedButton)).toBeNull();
   });
 });

@@ -93,7 +93,22 @@ declare global {
  * string; this parse is what keeps the header byte-identical to the AngularJS
  * `$tgHttp` output.
  *
- * @returns The bearer token string, or `null` if absent or not valid JSON.
+ * SECURITY / VALIDATION (F17, CWE-20/CWE-287): the parsed value is validated to
+ * be a NON-EMPTY string before it is returned. `JSON.parse` can legitimately
+ * yield an object, number, boolean, `null`, or an empty/whitespace-only string
+ * for malformed or stale session state, and none of those is a usable bearer
+ * credential. Returning such a value would (a) let a blank/whitespace token be
+ * reported as "authenticated" while `httpClient` correctly omits the
+ * `Authorization` header for it (the exact inconsistency F17 flags), and (b) risk
+ * emitting a malformed `Authorization: Bearer [object Object]` header. Rejecting
+ * them to `null` keeps `getToken()` and the `Authorization` header in lockstep:
+ * the header is set iff `getToken()` is non-null, mirroring the legacy
+ * `if token` guard (`http.coffee`), which omits the header for a falsy/empty
+ * token. A genuine token (which never contains surrounding whitespace) is
+ * returned verbatim.
+ *
+ * @returns The bearer token string, or `null` if absent, unparseable, or not a
+ *   non-empty string.
  */
 export function getToken(): string | null {
   const raw = localStorage.getItem('token');
@@ -102,15 +117,27 @@ export function getToken(): string | null {
     return null;
   }
 
+  let parsed: unknown;
+
   try {
     // Token is JSON-serialized (StorageService.set -> JSON.stringify), so it
     // must be JSON.parse'd back to the bare string — NOT returned raw.
-    return JSON.parse(raw) as string;
+    parsed = JSON.parse(raw);
   } catch {
     // Mirror StorageService.get's `catch -> return null` fallback for values
     // that are present but not parseable as JSON.
     return null;
   }
+
+  // A usable bearer token must be a non-empty string. Reject objects, numbers,
+  // booleans, JSON `null`, and empty/whitespace-only strings (F17). `trim()` is
+  // used only to DECIDE emptiness — the original (untrimmed) value is returned
+  // for a valid token so a legitimate credential is never mutated.
+  if (typeof parsed !== 'string' || parsed.trim().length === 0) {
+    return null;
+  }
+
+  return parsed;
 }
 
 /**
@@ -171,14 +198,90 @@ export function getPreferredLanguage(): string {
 }
 
 /**
- * Convenience guard used by React hooks/route guards: reports whether an
- * authentication token is present.
+ * Minimal shape of the persisted user-session object (`localStorage.userInfo`).
  *
- * Derived entirely from {@link getToken} so the "authenticated" definition
- * stays identical to the token the API adapters actually send.
+ * Only fields the React layer may consult are named; every other attribute the
+ * AngularJS user model persists is admitted via the index signature. The object
+ * is a plain JSON snapshot of the AngularJS user attributes, not a model.
+ */
+export interface SessionUser {
+  /** Numeric user id. */
+  id?: number;
+  /** Preferred UI language (also consulted by {@link getPreferredLanguage}). */
+  lang?: string;
+  /** Bearer token some legacy flows mirror onto the user object. */
+  auth_token?: string;
+  /** Tolerate any other persisted user attribute. */
+  [key: string]: unknown;
+}
+
+/**
+ * Returns the persisted user-session object, or `null` when no user is logged in.
  *
- * @returns `true` when a token exists, otherwise `false`.
+ * Reproduces the authoritative legacy session read from
+ * `app/coffee/modules/auth.coffee` `CurrentUserService.getUser()`:
+ *
+ *     getUser: ->
+ *         ...
+ *         userData = @storage.get("userInfo")
+ *         if userData
+ *             user = @model.make_model("users", userData)
+ *         ...
+ *
+ * i.e. it reads `userInfo` from storage (itself JSON-serialized via
+ * `StorageService.set`) and treats a present, truthy, object value as the current
+ * user. React does not build an AngularJS model — it returns the parsed plain
+ * object. A missing key, a parse error, or a non-object value all yield `null`,
+ * matching `StorageService.get`'s `catch -> null` behavior and the legacy
+ * `if userData` truthiness guard.
+ *
+ * @returns The parsed user-session object, or `null` when absent/invalid.
+ */
+export function getUser(): SessionUser | null {
+  const raw = localStorage.getItem('userInfo');
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+
+    // `if userData` in the legacy accepts a truthy value; the user session is
+    // always a JSON object, so require a non-null object here.
+    if (parsed !== null && typeof parsed === 'object') {
+      return parsed as SessionUser;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reports whether an authenticated user session exists.
+ *
+ * Reproduces the authoritative legacy contract from
+ * `app/coffee/modules/auth.coffee` `CurrentUserService.isAuthenticated()`:
+ *
+ *     isAuthenticated: ->
+ *         if @.getUser() != null
+ *             return true
+ *         ...
+ *
+ * Authentication is therefore defined by the presence of a valid user SESSION
+ * (`getUser() != null`), NOT by the raw bearer token. This is deliberate (F17):
+ *   - it matches the legacy user/session truthiness model exactly, and
+ *   - it no longer reports "authenticated" for a blank/empty token value while
+ *     `httpClient` omits the `Authorization` header for that same value — the
+ *     inconsistency the previous token-derived implementation exhibited.
+ * The bearer-token concern is owned separately by {@link getToken} (which now
+ * rejects empty/invalid tokens), so the `Authorization` header and the
+ * authentication check are each faithful to their respective legacy sources.
+ *
+ * @returns `true` when a valid user session exists, otherwise `false`.
  */
 export function isAuthenticated(): boolean {
-  return getToken() !== null;
+  return getUser() !== null;
 }

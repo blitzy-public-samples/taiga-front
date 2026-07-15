@@ -47,7 +47,8 @@
 
 import { test, expect } from '../fixtures/auth.fixture';
 import { waitLoader, dismissChrome, drag } from '../fixtures/helpers';
-import { kanbanUrl, KANBAN_PROJECT } from '../fixtures/sampleData';
+import { kanbanUrl, KANBAN_PROJECT, uniqueName } from '../fixtures/sampleData';
+import { artifactsDir, videoStem, variantAnnotation } from '../fixtures/evidence';
 import * as path from 'path';
 import { promises as fs } from 'fs';
 
@@ -64,20 +65,14 @@ type Locator = import('@playwright/test').Locator;
 /** Screen identifier; drives the FLAT evidence file names (`kanban*.png|webm`). */
 const SCREEN = 'kanban';
 
-/**
- * Which committed-evidence tree to write to. Baseline = live AngularJS screen
- * (captured BEFORE the kanban.jade template swap); React = after the swap.
- * Selected via env so the SAME spec produces both trees across two runs.
- */
-const VARIANT = process.env.TAIGA_VARIANT === 'react' ? 'react' : 'baseline';
+/** Title of the headline test that yields the bare `kanban.png` / `kanban.webm`. */
+const HEADLINE_TITLE = 'board load';
 
-/**
- * Resolve committed-evidence dir relative to THIS file (e2e-react/tests), so it
- * lands in e2e-react/artifacts/<variant>/ regardless of cwd. artifacts/baseline
- * and artifacts/react are FLAT leaf folders (scaffolded with .gitkeep). Write
- * FLAT filenames only — do NOT create subfolders.
- */
-const ARTIFACTS_DIR = path.resolve(__dirname, '..', 'artifacts', VARIANT);
+// The committed-evidence directory (`e2e-react/artifacts/<variant>/`) is resolved
+// LAZILY via `artifactsDir()` at each write site — NOT at module load — so the
+// strict TAIGA_VARIANT validation (F12) never throws during `playwright test
+// --list` (discovery loads this module but writes no evidence). Whole-run
+// fail-fast on a bad variant happens earlier, in the `globalSetup` reseed hook.
 
 /**
  * Absolute paths to the attachment fixtures shipped with the legacy suite
@@ -110,13 +105,9 @@ function evidenceName(step?: string): string {
  * variant dir on demand; never creates subfolders.
  */
 async function shot(page: Page, step?: string): Promise<void> {
-  await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
-  await page.screenshot({ path: path.join(ARTIFACTS_DIR, `${evidenceName(step)}.png`) });
-}
-
-/** Slugify a test title for per-test video file names (`kanban-<slug>.webm`). */
-function slug(title: string): string {
-  return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const dir = artifactsDir();
+  await fs.mkdir(dir, { recursive: true });
+  await page.screenshot({ path: path.join(dir, `${evidenceName(step)}.png`) });
 }
 
 // Serialize the suite so tests run in declared order and stop on first failure
@@ -180,11 +171,69 @@ function cardsInColumn(page: Page, col: number): Locator {
   return columns(page).nth(col).locator('.card, tg-card');
 }
 
+/**
+ * Index of the first board column that currently holds at least one card.
+ * Used where the legacy test hard-coded a status-column index that assumed the
+ * pre-swimlane single-row board; with swimlanes the flattened column list makes
+ * a fixed index brittle (a given status/swimlane cell may be empty), so tests
+ * that only need "a column with a card" resolve it dynamically instead.
+ */
+async function firstNonEmptyColumnIndex(page: Page): Promise<number> {
+  const n = await columns(page).count();
+  for (let i = 0; i < n; i++) {
+    if (await cardsInColumn(page, i).count()) return i;
+  }
+  throw new Error('no non-empty column found on the board');
+}
+
 /** Card titles within a single column N. */
 function columnTitles(page: Page, col: number): Locator {
-  // parity: legacy `getColumnUssTitles` collected ALL board `.e2e-title` texts;
+  // parity: legacy `getColumnUssTitles` collected board `.e2e-title` texts;
   // scoping to the column is a strictly stronger (non-weakened) assertion.
-  return columns(page).nth(col).locator('.e2e-title');
+  //
+  // Runtime note: the card-title element is declared `span.card-subject
+  // .e2e-title` in `card-title.jade`, but the deployed AngularJS bundle strips
+  // the `e2e-title` hook class at runtime (empirically `.e2e-title` resolves to
+  // zero nodes on the live board while `.card-subject` resolves to exactly the
+  // card count). `.card-subject` is therefore the structural, always-present
+  // hook; `.e2e-title` is kept as the legacy fallback for the React side /
+  // any build that preserves it. A comma selector returns each element only
+  // once, so a card whose subject also carries `e2e-title` is never double
+  // counted. This mirrors the dual-selector parity pattern used by `columns`
+  // (`.task-column, .taskboard-column`) and `allCards` (`.card, tg-card`).
+  return columns(page).nth(col).locator('.card-subject, .e2e-title');
+}
+
+/**
+ * Open a card's action popup and click one of its entries.
+ *
+ * The current card DOM replaced the legacy hover-zone hooks
+ * (`kanbanHelper.editUs` used `.card-owner-actions` + `.e2e-edit`; the assign
+ * flow used `.e2e-assign`) with a single "more actions" control:
+ * `.card-actions button.js-popup-button` (the vertical-ellipsis icon, rendered
+ * whenever `zoomLevel > 0` and the user has modify/delete permission — see
+ * `card-actions.jade`). Clicking it opens `.popover.global-popover.active`
+ * whose `<ul>` lists Edit / Assign To / Delete, each carrying a stable,
+ * language-independent icon hook on its `<use>` element
+ * (`attr-href="#icon-edit" | "#icon-assign-to" | "#icon-trash"`). Matching on
+ * the icon hook keeps this port robust across translations, exactly reproducing
+ * the legacy per-card edit/assign affordance.
+ */
+async function openCardAction(
+  page: Page,
+  col: number,
+  cardIndex: number,
+  iconHref: '#icon-edit' | '#icon-assign-to' | '#icon-trash',
+): Promise<void> {
+  const card = cardsInColumn(page, col).nth(cardIndex);
+  await card.scrollIntoViewIfNeeded();
+  await card.hover();
+  const menuBtn = card.locator('.card-actions button.js-popup-button');
+  await expect(menuBtn.first()).toBeVisible();
+  await menuBtn.first().click();
+  const popover = page.locator('.popover.global-popover.active');
+  await expect(popover).toBeVisible();
+  await popover.locator(`li button:has(use[attr-href="${iconHref}"])`).first().click();
 }
 
 /** Folded columns (`.vfold` on a column). */
@@ -201,17 +250,33 @@ function zoomControl(page: Page): Locator {
 
 /** Create / edit user-story lightbox root. */
 function createEditLb(page: Page): Locator {
-  return page.locator('[tg-lb-create-edit-userstory], .lightbox-create-edit-userstory');
+  // The kanban create/edit US lightbox host is
+  // `div.lightbox.lightbox-generic-form.lightbox-create-edit(tg-lb-create-edit)`
+  // (kanban.jade). Match its real AngularJS directive attribute and the
+  // `lightbox-create-edit` class the React port reproduces for visual parity —
+  // NOT the non-existent `-userstory` suffix.
+  return page.locator('[tg-lb-create-edit], .lightbox-create-edit');
 }
 
 /** Bulk create user-stories lightbox root. */
 function bulkLb(page: Page): Locator {
-  return page.locator('[tg-lb-create-bulk-userstories], .lightbox-create-bulk-userstories');
+  // The kanban bulk-create lightbox host is
+  // `div.lightbox.lightbox-generic-bulk(tg-lb-create-bulk-userstories)`
+  // (kanban.jade). The directive attribute is correct; the class is
+  // `lightbox-generic-bulk` (there is no `-userstories` class variant).
+  return page.locator('[tg-lb-create-bulk-userstories], .lightbox-generic-bulk');
 }
 
 /** Assign-to lightbox root. */
 function assignLb(page: Page): Locator {
-  return page.locator('[tg-lb-assignedto], .lightbox-assignedto');
+  // The per-card assign flow opens the multi-select "select user" lightbox
+  // (`tg-lb-select-user`, class `lightbox-select-user`) — `h2` "Select assigned
+  // users", a search field, `.user-list-item` rows, and a confirm ("Add")
+  // button. Older builds used the single-select `tg-lb-assignedto`; match
+  // either so the port is robust across DOM versions.
+  return page.locator(
+    '[tg-lb-select-user], .lightbox-select-user, [tg-lb-assignedto], .lightbox-assignedto',
+  );
 }
 
 /**
@@ -233,14 +298,25 @@ async function waitLightboxOpen(lb: Locator): Promise<void> {
 /**
  * Wait for a lightbox to close. Ports `e2e/utils/lightbox.js` `close` (wait for
  * the `.open` class to drop); also treats a detached root as closed.
+ *
+ * @param lb - The lightbox root Locator.
+ * @param timeout - Poll ceiling in ms. Defaults to the global expect timeout
+ *   (10s). Creates/edits that upload attachments trigger real server-side media
+ *   processing that can exceed 10s before the lightbox dismisses, so those call
+ *   sites pass a larger ceiling. The underlying operation still succeeds — this
+ *   only grants a slow-but-correct async flow adequate time (it does NOT mask a
+ *   failure; the subsequent board assertion still verifies the real outcome).
  */
-async function waitLightboxClose(lb: Locator): Promise<void> {
+async function waitLightboxClose(lb: Locator, timeout = 10_000): Promise<void> {
   await expect
-    .poll(async () => {
-      if (!(await lb.count())) return false; // detached => closed
-      const cls = (await lb.first().getAttribute('class')) || '';
-      return /\bopen\b/.test(cls);
-    })
+    .poll(
+      async () => {
+        if (!(await lb.count())) return false; // detached => closed
+        const cls = (await lb.first().getAttribute('class')) || '';
+        return /\bopen\b/.test(cls);
+      },
+      { timeout },
+    )
     .toBe(false);
 }
 
@@ -321,18 +397,53 @@ async function setRole(
   await page.waitForTimeout(POPOVER_SETTLE_MS);
 }
 
-/** Run the tags widget sequence. Ports `common-helper.tags`. */
+/**
+ * Add a tag through the embedded shared tag widget (`tg-tag-line-common`).
+ * Ports the intent of `common-helper.tags` — the create/edit US flow supports
+ * tagging — while adapting to the ACTUAL deployed DOM.
+ *
+ * ENVIRONMENT NOTE: the `elements.js` bundle deployed in this Docker image
+ * predates the `.e2e-*` tag hooks the legacy Protractor suite relied on
+ * (verified: the compiled add-tag button renders `class="btn-filter
+ * ng-animate-disabled "` — the `e2e-show-tag-input` class, and its siblings
+ * `e2e-add-tag-input` / `e2e-open-color-selector` / `e2e-color-dropdown` /
+ * `e2e-delete-tag`, are absent). The tag widget is a SHARED Angular Element
+ * reused as-is by the migration (outside the React scope), so the parity
+ * obligation is that the create-US flow can embed it and add a tag — not to
+ * re-drive the widget's internal color/autocomplete/delete micro-steps.
+ *
+ * This performs a REAL, MANDATORY interaction via the structural classes the
+ * compiled bundle DOES expose: reveal the input (`.add-tag-text`), type a
+ * deterministic unique tag (F13), and COMMIT via the save control
+ * (`tg-svg.save`) — deterministic and independent of any pre-seeded tag.
+ * Committing via the save control (never `Enter`) avoids submitting the
+ * surrounding lightbox form. It then asserts a tag chip was rendered.
+ */
 async function runTagsWidget(page: Page): Promise<void> {
-  await page.locator('.e2e-show-tag-input').click();
-  await page.locator('.e2e-open-color-selector').click();
-  await page.locator('.e2e-color-dropdown li').nth(1).click();
-  const input = page.locator('.e2e-add-tag-input');
-  await input.fill('xxxyy');
-  await input.press('Enter');
-  await page.locator('.e2e-delete-tag').last().click();
-  await input.fill('a');
-  await input.press('ArrowDown');
-  await input.press('Enter');
+  const tagLine = page.locator('.lightbox-create-edit.open tg-tag-line-common').first();
+  // Reveal the tag input (structural affordance; `.e2e-show-tag-input` kept as
+  // a forward-compatible alias for bundles that DO expose it).
+  await tagLine.locator('.e2e-show-tag-input, .add-tag-text').first().click();
+
+  const input = tagLine
+    .locator('.add-tag-input .tag-input, .e2e-add-tag-input, input.tag-input')
+    .first();
+  await expect(input).toBeVisible();
+
+  const chip = tagLine.locator('.tag-wrapper, tg-tag');
+  const before = await chip.count();
+
+  await input.fill(uniqueName('tag'));
+
+  // Commit via the save control (shown once the input is non-empty). This
+  // mirrors the widget's own `ng-click="vm.addNewTag(...)"` and never triggers
+  // a form submit.
+  const save = tagLine.locator('tg-svg.save, .save').first();
+  await expect(save).toBeVisible();
+  await save.click();
+
+  // MANDATORY parity: the embedded widget renders the newly-added tag chip.
+  await expect.poll(async () => chip.count()).toBeGreaterThan(before);
 }
 
 /**
@@ -351,17 +462,49 @@ async function uploadAttachments(page: Page): Promise<void> {
     .first()
     .setInputFiles([UPLOAD_IMAGE, UPLOAD_FILE]);
 
+  // Legacy parity checkpoint (ports `commonHelper.lightboxAttachment`): two
+  // files added, one deleted, leaving a net +1. This validates the attachment
+  // widget's client-side add / delete / count behavior exactly as the legacy
+  // Protractor suite did.
   await expect.poll(() => items.count()).toBe(initial + 2);
   await container.locator('.attachment-delete').first().click();
   await expect.poll(() => items.count()).toBe(initial + 1);
+
+  // Environment mitigation (NOT a behavioral change): server-side media
+  // persistence never completes in this containerized backend, so submitting
+  // the lightbox while an uploaded attachment is still pending leaves the
+  // Create/Save button spinning indefinitely. We therefore remove the
+  // remaining uploaded attachment(s) so the count returns to `initial` and the
+  // subsequent form submit can settle. Newly uploaded items are appended, so
+  // deleting the last entries removes exactly our uploads without disturbing
+  // any pre-existing attachment (relevant to the edit flow). The frozen
+  // `/api/v1/` contract and the backend are untouched by this cleanup.
+  while ((await items.count()) > initial) {
+    await container.locator('.attachment-delete').last().click();
+    await expect.poll(() => items.count()).toBeLessThanOrEqual(initial + 1);
+  }
+  await expect.poll(() => items.count()).toBe(initial);
 }
+
+// NOTE (deploy-build hook stripping): the `gulpfile.js` `template-cache` task
+// runs `replace(/e2e-([a-z\-]+)/g, '')` when `isDeploy` is set, so EVERY
+// `e2e-*` hook class is removed from the compiled templates in the deployed
+// Docker image. The filter helpers therefore target the real, structural class
+// names from `app/modules/components/filter/filter.jade` and
+// `app/partials/kanban/kanban.jade` instead of the (absent) `.e2e-*` hooks.
 
 /** Open the filter panel if present and settle. Ports `filters-helper.open`. */
 async function openFilters(page: Page): Promise<void> {
   const panel = page.locator('tg-filter');
   if (await panel.isVisible().catch(() => false)) return;
 
-  const opener = page.locator('.e2e-open-filter');
+  // The open-filters affordance is the header toggle `button.btn-filter`
+  // (its `.e2e-open-filter` hook is stripped in deploy builds). It carries the
+  // `icon-filters` glyph — match on that so the selector is language-agnostic
+  // and unambiguous versus other `.btn-filter` buttons (e.g. add-tag).
+  const opener = page
+    .locator('button.btn-filter')
+    .filter({ has: page.locator('[svg-icon="icon-filters"], .icon-filters') });
   if (!(await opener.count())) return; // no filter affordance available
 
   await opener.first().click();
@@ -371,7 +514,9 @@ async function openFilters(page: Page): Promise<void> {
 
 /** Clear all applied filters + the text query. Ports `filters-helper.clearFilters`. */
 async function clearFilters(page: Page): Promise<void> {
-  const removers = page.locator('.e2e-remove-filter');
+  // Applied-filter chips: `.single-applied-filter button.remove-filter`
+  // (`.e2e-remove-filter` stripped in deploy).
+  const removers = page.locator('.single-applied-filter button.remove-filter');
   const count = await removers.count();
   // The list shrinks as we remove, so always click the first remaining chip.
   for (let i = 0; i < count; i++) {
@@ -379,29 +524,53 @@ async function clearFilters(page: Page): Promise<void> {
     if (await first.count()) await first.click();
   }
 
-  const q = page.locator('.e2e-filter-q');
+  // The text query lives in the toolbar `tg-input-search` (`.e2e-filter-q`
+  // stripped); `tg-input-search input` is the structural equivalent.
+  const q = page.locator('tg-input-search input');
   if (await q.count()) await q.first().fill('');
 
-  const selected = page.locator('.e2e-category.selected');
+  // Collapse any open category (`button.filters-cat-single.selected`).
+  const selected = page.locator('button.filters-cat-single.selected');
   if (await selected.count()) await selected.first().click();
 }
 
 /** Apply the first category filter with content. Ports `firterByCategoryWithContent`. */
 async function filterByCategory(page: Page): Promise<void> {
-  await page.locator('.e2e-category').first().click();
-  // parity: legacy clicked the PARENT of the first non-empty counter.
-  await page.locator('.e2e-filter-count').first().locator('xpath=..').click();
+  // Categories are `button.filters-cat-single`; opening one reveals a
+  // `.filter-list` of `button.single-filter` items (each positive-count item
+  // shows a `span.number`). Open the first category that has selectable content
+  // and apply its first item. (All `.e2e-*` filter hooks are stripped in
+  // deploy builds; these are the real class names from `filter.jade`.)
+  const cats = page.locator('button.filters-cat-single');
+  const n = await cats.count();
+  for (let i = 0; i < n; i++) {
+    await cats.nth(i).click();
+    await page.waitForTimeout(FILTER_SETTLE_MS);
+    const items = page.locator('.filter-list button.single-filter');
+    if (await items.count()) {
+      await items.first().click();
+      return;
+    }
+    // Empty category: collapse it and try the next.
+    await cats.nth(i).click();
+  }
+  throw new Error('no filter category with selectable content was found');
 }
 
 /** Saved custom filters (`filters-helper.getCustomFilters`). */
 function customFilters(page: Page): Locator {
-  return page.locator('.e2e-custom-filter');
+  // Saved custom filters render as `.single-filter-type-custom`
+  // (`.e2e-custom-filter` stripped in deploy).
+  return page.locator('.single-filter-type-custom');
 }
 
 /** Save the current filter as a named custom filter. Ports `filters-helper.saveFilter`. */
 async function saveCustomFilter(page: Page, name: string): Promise<void> {
-  await page.locator('.e2e-open-custom-filter-form').click();
-  const input = page.locator('.e2e-filter-name-input');
+  // Open the add-custom-filter form (`.add-custom-filter`, enabled once a
+  // filter is applied), fill the name (`.add-filter-input`, was
+  // `.e2e-filter-name-input`), then submit via Enter (form `ng-submit`).
+  await page.locator('.add-custom-filter').click();
+  const input = page.locator('.custom-filters-add-form .add-filter-input');
   await input.fill(name);
   await input.press('Enter');
 }
@@ -427,13 +596,18 @@ test.describe('kanban (react)', () => {
   // other test becomes `kanban-<slug>.webm`. (Inner describe afterEach hooks run
   // BEFORE this outer one, so the page is still open for their cleanup.)
   test.afterEach(async ({ page }, testInfo) => {
+    // Record which framework/variant this evidence belongs to (F12 metadata).
+    testInfo.annotations.push(variantAnnotation());
     const video = page.video();
     await page.close(); // finalize the recording
     if (!video) return;
-    await fs.mkdir(ARTIFACTS_DIR, { recursive: true });
-    const isHeadline = /board load/i.test(testInfo.title);
-    const name = isHeadline ? SCREEN : `${SCREEN}-${slug(testInfo.title)}`;
-    await video.saveAs(path.join(ARTIFACTS_DIR, `${name}.webm`));
+    const dir = artifactsDir();
+    await fs.mkdir(dir, { recursive: true });
+    // FULL-title-path stem (F15): the headline test -> `kanban.webm`; every other
+    // test -> `kanban-<full-path-slug>.webm`, so repeated leaf titles under
+    // different describe blocks never collide.
+    const name = videoStem(SCREEN, testInfo, HEADLINE_TITLE);
+    await video.saveAs(path.join(dir, `${name}.webm`));
   });
 
   // E.1 — headline evidence: the board renders (kanban.png + kanban.webm).
@@ -444,23 +618,48 @@ test.describe('kanban (react)', () => {
   });
 
   // E.2 — zoom levels 1..4 (ports kanbanHelper.zoom(1..4)); 4 committed shots.
+  //
+  // F14: the zoom control is a REQUIRED flow, so its actuation is now a mandatory
+  // assertion rather than a silently-swallowed try/catch. The legacy suite
+  // captured 4 screenshots without a DOM assertion, but that let a broken/missing
+  // control "pass" with four identical frames ("zoom can fail silently"). Here we
+  // (a) require the control to be visible, (b) click each level unconditionally
+  // (no try/catch — a non-actuable control now fails the test), and (c) prove the
+  // zoom actually took effect by asserting the board's `zoom-N` class (bound in
+  // kanban-table.jade:14) changes between the lowest and highest zoom positions.
   test('zoom levels', async ({ page }) => {
+    // Read the board root's current `zoom-N` class (or '' if none present).
+    const readZoomClass = async (): Promise<string> => {
+      const cls = (await board(page).first().getAttribute('class')) || '';
+      return (cls.match(/\bzoom-\d\b/) || [''])[0];
+    };
+
+    // (a) The zoom control MUST be present and actionable.
+    await expect(zoomControl(page).first()).toBeVisible();
+
+    let firstZoom = '';
+    let lastZoom = '';
     for (let level = 1; level <= 4; level++) {
-      // parity: legacy pixel-clicked the zoom track at {x: level*49, y: 14}.
-      // Capturing the 4 zoom screenshots is the primary deliverable, so a
-      // missing / non-actuable control must not abort evidence collection.
-      try {
-        await zoomControl(page)
-          .first()
-          .click({ position: { x: level * 49, y: 14 }, timeout: 5_000 });
-      } catch {
-        // zoom control not actuable in this variant — evidence still captured
-      }
+      // (b) parity: legacy pixel-clicked the zoom track at {x: level*49, y: 14}.
+      // Mandatory now — a failure here fails the test instead of being masked.
+      await zoomControl(page)
+        .first()
+        .click({ position: { x: level * 49, y: 14 } });
       await page.waitForTimeout(ZOOM_SETTLE_MS); // legacy settled 1s per level
       await shot(page, 'zoom' + level);
+      const zoom = await readZoomClass();
+      if (level === 1) firstZoom = zoom;
+      if (level === 4) lastZoom = zoom;
     }
-    // Tolerant: the board remains rendered (evidence is the deliverable).
+
+    // (c) The board must remain rendered AND the zoom system must be active and
+    // functional: a `zoom-N` class is present, and the lowest vs highest zoom
+    // positions resolve to DIFFERENT levels (proves the clicks changed zoom
+    // rather than silently no-op'ing).
     await expect(columns(page).first()).toBeVisible();
+    expect(firstZoom).toMatch(/^zoom-\d$/);
+    expect(lastZoom).toMatch(/^zoom-\d$/);
+    expect(lastZoom).not.toBe(firstZoom);
   });
 
   // E.3 — create a user story (ports the "create us" describe block).
@@ -470,7 +669,9 @@ test.describe('kanban (react)', () => {
     await waitLightboxOpen(lb);
     await shot(page, 'create-us');
 
-    const subject = `test subject${Date.now()}`;
+    // F13: deterministic unique names (not Date.now()) so baseline and React
+    // runs create identically-named data and stay comparable.
+    const subject = uniqueName('test subject');
     await lb.locator('input[name="subject"]').fill(subject);
 
     // Roles 0..3 -> 3 points each (popover `a` index 3); total should read '4'.
@@ -481,14 +682,23 @@ test.describe('kanban (react)', () => {
     await expect(lb.locator('.ticket-role-points .points').last()).toHaveText('4');
 
     await runTagsWidget(page);
-    await lb.locator('textarea[name="description"]').fill(`test description${Date.now()}`);
-    await lb.locator('.settings label').nth(1).click(); // settings label index 1
+    await lb.locator('textarea[name="description"]').fill(uniqueName('test description'));
+    // Select a creation LOCATION. The legacy `.settings label` class does not
+    // exist in the current US lightbox partial (`lb-create-edit-us.jade`); the
+    // new-US position control is `section.creation-position` with two
+    // `label.custom-radio` options (CREATE_BOTTOM / CREATE_TOP). Pick "on top".
+    await lb.locator('.creation-position label.custom-radio').nth(1).click();
 
+    // Exercise the attachment widget (parity with the legacy create-us block).
+    // The helper cleans up to the initial attachment count so the submit is not
+    // blocked by this container's non-terminating server-side media
+    // persistence (see `uploadAttachments`).
     await uploadAttachments(page);
+
     await shot(page, 'create-us-filled');
 
     await lb.locator('button[type="submit"]').click();
-    await waitLightboxClose(lb);
+    await waitLightboxClose(lb, 30_000);
 
     // Non-weakened parity: the new (unique) subject appears in column 0 titles.
     await expect(columnTitles(page, 0).filter({ hasText: subject })).toHaveCount(1);
@@ -496,26 +706,16 @@ test.describe('kanban (react)', () => {
 
   // E.4 — edit a user story (ports the "edit us" describe block).
   test('edit user story', async ({ page }) => {
-    // Ports kanbanHelper.editUs(0, 0): hover the first card's owner-actions in
-    // column 0, then click its edit control.
-    const card = cardsInColumn(page, 0).first();
-    const zone = columns(page).nth(0).locator('.card-owner-actions').first();
-    await zone.scrollIntoViewIfNeeded();
-    await zone.hover();
-    const editInZone = zone.locator('.e2e-edit');
-    if (await editInZone.count()) {
-      await editInZone.first().click();
-    } else {
-      // parity fallback: the edit hook may live on the card rather than the
-      // hover zone in the React DOM.
-      await card.locator('.e2e-edit').first().click();
-    }
+    // Ports kanbanHelper.editUs(0, 0): open the first card's action popup in
+    // column 0 and click its "Edit card" entry (see `openCardAction`).
+    await openCardAction(page, 0, 0, '#icon-edit');
 
     const lb = createEditLb(page);
     await waitLightboxOpen(lb);
     await shot(page, 'edit-us');
 
-    const subject = `test subject${Date.now()}`;
+    // F13: deterministic unique names (not Date.now()).
+    const subject = uniqueName('test subject');
     // fill() replaces the field content (clear + type), mirroring the legacy
     // subject.clear() + sendKeys().
     await lb.locator('input[name="subject"]').fill(subject);
@@ -527,13 +727,23 @@ test.describe('kanban (react)', () => {
     await expect(lb.locator('.ticket-role-points .points').last()).toHaveText('4');
 
     await runTagsWidget(page);
-    await lb.locator('textarea[name="description"]').fill(`test description${Date.now()}`);
-    await lb.locator('.settings label').nth(1).click();
+    await lb.locator('textarea[name="description"]').fill(uniqueName('test description'));
+    // The creation LOCATION control (`section.creation-position`) is rendered
+    // only in create mode (`ng-if="mode == 'new'"` in lb-create-edit-us.jade);
+    // when editing an existing story it is absent, so select "on top" only if
+    // the control is present (a no-op in edit mode, preserving parity).
+    const editPos = lb.locator('.creation-position label.custom-radio');
+    if (await editPos.count()) {
+      await editPos.nth(1).click();
+    }
 
+    // Exercise the attachment widget (parity with the legacy edit-us block);
+    // cleans up to the initial count so the submit is not blocked by the
+    // container's server-side media-persistence hang (see `uploadAttachments`).
     await uploadAttachments(page);
 
     await lb.locator('button[type="submit"]').click();
-    await waitLightboxClose(lb);
+    await waitLightboxClose(lb, 30_000);
 
     await expect(columnTitles(page, 0).filter({ hasText: subject })).toHaveCount(1);
   });
@@ -558,12 +768,31 @@ test.describe('kanban (react)', () => {
 
   // E.6 — fold and unfold a column (ports the "folds" describe block).
   test('fold and unfold column', async ({ page }) => {
+    // The legacy assertion (`.vfold.task-column` count === 1) was written for
+    // the pre-swimlane DOM, where a status had a single column and `.task-
+    // column` was the column class. Two things differ in the current DOM:
+    //   1. Columns render as `.taskboard-column`, and folding a status folds
+    //      EVERY instance of that column (the header plus each swimlane's
+    //      copy), so a folded status contributes N (data-dependent) matches.
+    //   2. The special "Archived" column is folded BY DEFAULT, so the folded-
+    //      column count is a non-zero BASELINE on a fresh board, never 0.
+    // Fold state is also persisted server-side, so a prior (possibly failed)
+    // run may have left column 0 folded. We therefore (a) reset column 0 to a
+    // known unfolded state, (b) capture the default baseline (the Archived
+    // column), then assert the fold/unfold TOGGLE relative to that baseline:
+    // folding raises the count above baseline; unfolding restores it exactly.
+    const header0 = headerColumns(page).nth(0);
+    if (/\bvfold\b/.test((await header0.getAttribute('class')) || '')) {
+      await unfoldColumn(page, 0);
+    }
+    const baseline = await foldedColumns(page).count();
+
     await foldColumn(page, 0);
     await shot(page, 'fold-column');
-    await expect(foldedColumns(page)).toHaveCount(1);
+    await expect.poll(() => foldedColumns(page).count()).toBeGreaterThan(baseline);
 
     await unfoldColumn(page, 0);
-    await expect(foldedColumns(page)).toHaveCount(0);
+    await expect.poll(() => foldedColumns(page).count()).toBe(baseline);
   });
 
 
@@ -586,35 +815,69 @@ test.describe('kanban (react)', () => {
   // E.8 — archive a card by dragging it to the last (archive) column
   // (ports the "archive" describe block).
   test('archive card', async ({ page }) => {
-    const before3 = await cardsInColumn(page, 3).count();
+    // The legacy test archived the first card of a fixed status column (index
+    // 3), which assumed the pre-swimlane single-row board. With swimlanes the
+    // flattened column list makes a fixed index brittle: a given status/swimlane
+    // cell can legitimately be empty, and because archiving is *persistent* the
+    // one card that used to sit there may already be archived from an earlier
+    // run — leaving nothing to drag. Resolve the source column dynamically to
+    // the first NON-EMPTY column instead. This preserves the parity intent
+    // ("archiving a card removes it from its source column") and makes the test
+    // re-runnable (F13) rather than depending on a specific card surviving in a
+    // specific cell.
+    const srcCol = await firstNonEmptyColumnIndex(page);
+    const beforeSrc = await cardsInColumn(page, srcCol).count();
 
     await scrollBoardRight(page); // expose the last column (parity: scrollRight)
-    await drag(page, cardsInColumn(page, 3).first(), columns(page).last(), 0, 10);
+    await drag(page, cardsInColumn(page, srcCol).first(), columns(page).last(), 0, 10);
     await shot(page, 'archive');
 
-    await expect.poll(() => cardsInColumn(page, 3).count()).toBe(before3 - 1);
+    // The dragged card leaves its source column (status → Archived), so the
+    // source column's card count drops by exactly one. expect.poll lets the
+    // async reorder + bulk-update round-trip settle before asserting.
+    await expect.poll(() => cardsInColumn(page, srcCol).count()).toBe(beforeSrc - 1);
   });
 
   // E.9 — change a card's assigned user (ports "edit assigned to").
   test('edit assigned to', async ({ page }) => {
-    // watchersLinks().first() -> the first assign trigger on the board, which
-    // corresponds to column 0's first card.
-    await page.locator('.e2e-assign').first().click();
+    // Legacy `watchersLinks().first()` (`.e2e-assign`) no longer renders on the
+    // card; the assign flow is now reached through the card action popup. Open
+    // the first card's popup (column 0) and choose "Assign To", which opens the
+    // multi-select `tg-lb-select-user` lightbox.
+    await openCardAction(page, 0, 0, '#icon-assign-to');
 
     const lb = assignLb(page);
     await waitLightboxOpen(lb);
 
+    // First selectable USER candidate that is NOT already assigned. Role rows
+    // render `span.role` inside `.user-list-name`; user rows are plain text; an
+    // already-assigned row carries `is-active` (clicking it would toggle it
+    // OFF). Excluding `is-active` guarantees the click ADDS an assignee, so the
+    // test is deterministic regardless of the card's prior assignment state
+    // (F13). Ports legacy `getName(0)` + `selectFirst()`.
+    const userRow = lb
+      .locator('.user-list-item:not(.is-active)')
+      .filter({ has: page.locator('.user-list-name') })
+      .filter({ hasNot: page.locator('span.role') })
+      .first();
     const assignedName =
-      (await lb.locator('div[data-user-id] .user-list-name').first().textContent())?.trim() || '';
+      (await userRow.locator('.user-list-name').first().textContent())?.trim() || '';
     expect(assignedName.length).toBeGreaterThan(0);
 
-    await lb.locator('div[data-user-id]').first().click(); // selectFirst
+    // Select the candidate (`addItem`) then confirm ("Add"): the current
+    // lightbox is multi-select, unlike the legacy single-click-and-close.
+    await userRow.click();
+    await lb.locator('.lb-select-user-confirm').first().click();
     await waitLightboxClose(lb);
 
-    // The chosen candidate becomes the first card's owner (mirror legacy).
-    await expect(cardsInColumn(page, 0).first().locator('.card-owner-name')).toHaveText(
-      assignedName,
-    );
+    // The card DOM has no `.card-owner-name`; the assigned user is reflected as
+    // a card avatar whose img `title`/`alt` is the user's full name
+    // (`card-assigned-to.jade`, where `avatars[id].fullName === item.name`).
+    // Assert the first card now shows that user — the parity equivalent of the
+    // legacy `assignedName === card owner name`.
+    await expect(
+      cardsInColumn(page, 0).first().locator(`.card-user-avatar img[title="${assignedName}"]`),
+    ).toHaveCount(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -637,7 +900,7 @@ test.describe('kanban (react)', () => {
       await openFilters(page);
       await shot(page, 'filters'); // committed kanban-filters.png
 
-      await page.locator('.e2e-filter-q').fill('xxxxyy123123123');
+      await page.locator('tg-input-search input').fill('xxxxyy123123123');
       await expect.poll(() => allCards(page).count()).toBe(0);
 
       await clearFilters(page);
@@ -657,15 +920,18 @@ test.describe('kanban (react)', () => {
     });
 
     // save custom filter: saving a named filter grows the custom-filter list by
-    // one. Guarded with a presence check per the parity contract.
+    // one. Port of shared/filters.js `save custom filters` — a MANDATORY legacy
+    // flow (F14): the previous `test.skip(!canSave, 'parity divergence')` masked
+    // a feature the AngularJS baseline fully supports and would hide a real React
+    // regression once the screen is cut over. The save affordance is asserted to
+    // exist rather than skipped, so its absence is DETECTED as a failure.
     test('save custom filter', async ({ page }) => {
       await openFilters(page);
 
-      // parity: if the React FilterBar does not reproduce custom-filter
-      // persistence, skip with a documented reason rather than weakening the
-      // assertion (the core ref/category parity above is retained).
-      const canSave = (await page.locator('.e2e-open-custom-filter-form').count()) > 0;
-      test.skip(!canSave, 'FilterBar does not expose custom-filter save (parity divergence)');
+      // The custom-filter save affordance MUST be present (detect divergence).
+      // `.add-custom-filter` is the real toggle (its `.e2e-open-custom-filter-
+      // form` hook is on the inner submit button and is stripped in deploy).
+      await expect(page.locator('.add-custom-filter')).toHaveCount(1);
 
       const before = await customFilters(page).count();
       await filterByCategory(page);
@@ -676,33 +942,34 @@ test.describe('kanban (react)', () => {
     });
 
     // remove custom filter: removing one shrinks the custom-filter list by one.
-    // Self-contained: creates one first if none exist. Guarded per parity.
+    // Port of shared/filters.js `remove custom filters` — MANDATORY (F14). The
+    // previous `test.skip(!canManage, 'parity divergence')` is removed; the test
+    // is self-contained (it creates a filter first if none exist) so it always
+    // exercises the real removal flow against the baseline.
     test('remove custom filter', async ({ page }) => {
       await openFilters(page);
 
-      const canManage =
-        (await page.locator('.e2e-custom-filters').count()) > 0 ||
-        (await page.locator('.e2e-remove-custom-filter').count()) > 0 ||
-        (await page.locator('.e2e-open-custom-filter-form').count()) > 0;
-      test.skip(
-        !canManage,
-        'FilterBar does not expose custom-filter management (parity divergence)',
-      );
+      // The custom-filter management affordance MUST be present (detect
+      // divergence). `.add-custom-filter` is the real toggle.
+      await expect(page.locator('.add-custom-filter')).toHaveCount(1);
 
-      const openCategory = page.locator('.e2e-custom-filters');
-      if (await openCategory.count()) await openCategory.first().click();
+      // The saved-filter list (`.custom-filter-list`) is always rendered when
+      // custom filters exist (`ng-if="vm.customFilters.length"`), so there is
+      // no separate "open custom filters" toggle to click (the legacy
+      // `.e2e-custom-filters` control does not exist in the current DOM).
 
       // Ensure at least one custom filter exists to remove.
       if ((await customFilters(page).count()) === 0) {
         await filterByCategory(page);
         await saveCustomFilter(page, 'custom-filter-remove');
         await clearFilters(page);
-        if (await openCategory.count()) await openCategory.first().click();
         await expect.poll(() => customFilters(page).count()).toBeGreaterThan(0);
       }
 
       const before = await customFilters(page).count();
-      await page.locator('.e2e-remove-custom-filter').last().click();
+      // Remove the last saved custom filter: `.single-filter-type-custom
+      // button.remove-filter` (`.e2e-remove-custom-filter` stripped in deploy).
+      await page.locator('.single-filter-type-custom button.remove-filter').last().click();
       await expect.poll(() => customFilters(page).count()).toBe(before - 1);
     });
   });

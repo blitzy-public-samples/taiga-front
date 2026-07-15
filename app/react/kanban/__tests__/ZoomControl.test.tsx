@@ -40,10 +40,22 @@
  *     is cleared before and after every test for deterministic, isolated runs.
  */
 
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 
 import ZoomControl from '../components/ZoomControl';
+// Shared translation layer: the component reads its labels/title through `t`
+// (F27). Tests drive it directly to prove translated OUTPUT is rendered (never
+// raw keys) and to exercise a non-English locale deterministically (F39).
+import { configureI18n, resetI18n } from '../../shared/i18n';
+
+/**
+ * Expected ENGLISH (fallback) strings for the ZOOM catalog block, declared
+ * locally so the spec pins the exact human-readable output rather than trusting
+ * the component to echo a raw key. Mirrors `app/react/shared/i18n.ts`.
+ */
+const ZOOM_TITLE_EN = 'Zoom:';
+const ZOOM_LABELS_EN = ['Compact', 'Default', 'Detailed', 'Expanded'];
 
 /**
  * Expected CUMULATIVE emission per zoom level, declared locally so the spec
@@ -72,10 +84,14 @@ const STORAGE_KEY = 'kanban_zoom';
 beforeEach(() => {
   window.localStorage.clear();
   jest.clearAllMocks();
+  // Start every case from the pristine English catalog so a locale override
+  // installed by one test can never leak into another (F27/F39 isolation).
+  resetI18n();
 });
 
 afterEach(() => {
   window.localStorage.clear();
+  resetI18n();
 });
 
 // --- Phase C: mount emission + default index 1 ---------------------------
@@ -348,6 +364,237 @@ describe('ZoomControl: DOM structure for visual parity', () => {
     radios.forEach((radio, index) => {
       expect(radio.getAttribute('value')).toBe(String(index));
     });
+  });
+});
+
+// --- F27 / F39: translated OUTPUT, never raw keys, incl. non-English -------
+describe('ZoomControl: renders translated labels, not raw i18n keys (F27/F39)', () => {
+  it('renders the English title and per-level labels from the shared catalog', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    // Title and each pill's visible text are the resolved English strings.
+    expect(screen.getByText(ZOOM_TITLE_EN)).toBeInTheDocument();
+    ZOOM_LABELS_EN.forEach((label) => {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    });
+  });
+
+  it('never leaks a raw catalog key into the rendered DOM', () => {
+    const { container } = render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    // The pre-fix defect was a local `t` stub that echoed the key verbatim.
+    // Assert none of the raw keys appear anywhere in the rendered output —
+    // neither as text nor inside the `title`/`aria-label` attributes.
+    expect(screen.queryByText('ZOOM.TITLE')).toBeNull();
+    for (let level = 1; level <= 4; level += 1) {
+      expect(screen.queryByText(`ZOOM.ZOOM-${level}`)).toBeNull();
+    }
+    expect(container.innerHTML).not.toContain('ZOOM.TITLE');
+    expect(container.innerHTML).not.toContain('ZOOM.ZOOM-');
+  });
+
+  it('uses each level label for the visible text, the title tooltip AND the aria-label', () => {
+    const { container } = render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    const labels = container.querySelectorAll('label.zoom-radio');
+    labels.forEach((label, index) => {
+      const expected = ZOOM_LABELS_EN[index];
+      expect(label.getAttribute('title')).toBe(expected);
+      expect(label.querySelector('.checkmark span')!).toHaveTextContent(expected);
+      expect(label.querySelector('input')!.getAttribute('aria-label')).toBe(
+        expected,
+      );
+    });
+  });
+
+  it('renders a NON-English catalog when one is installed (locale override)', () => {
+    // Deterministically install a Spanish-style catalog (no network) so the
+    // component must resolve through the shared layer, proving it is not
+    // hard-coded to English.
+    configureI18n(
+      {
+        ZOOM: {
+          TITLE: 'Ampliación:',
+          'ZOOM-1': 'Compacto',
+          'ZOOM-2': 'Normal',
+          'ZOOM-3': 'Detallado',
+          'ZOOM-4': 'Ampliado',
+        },
+      },
+      'es',
+    );
+
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    expect(screen.getByText('Ampliación:')).toBeInTheDocument();
+    ['Compacto', 'Normal', 'Detallado', 'Ampliado'].forEach((label) => {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    });
+    // The English strings must NOT appear once the override is active.
+    expect(screen.queryByText(ZOOM_TITLE_EN)).toBeNull();
+    expect(screen.queryByText('Compact')).toBeNull();
+  });
+});
+
+// --- F28: accessible radiogroup semantics + keyboard focus visibility ------
+describe('ZoomControl: accessibility — radiogroup, names, keyboard focus (F28)', () => {
+  it('wraps the radios in a role="radiogroup" named by the visible title', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    // A single radiogroup exists and is accessibly named "Zoom:" via the
+    // title it references through aria-labelledby.
+    const group = screen.getByRole('radiogroup');
+    expect(group).toBeInTheDocument();
+
+    const labelledBy = group.getAttribute('aria-labelledby');
+    expect(labelledBy).toBeTruthy();
+
+    const title = document.getElementById(labelledBy!);
+    expect(title).not.toBeNull();
+    expect(title!).toHaveTextContent(ZOOM_TITLE_EN);
+    expect(title!.classList.contains('board-zoom-title')).toBe(true);
+
+    // The accessible-name computation resolves the radiogroup name too.
+    expect(
+      screen.getByRole('radiogroup', { name: ZOOM_TITLE_EN }),
+    ).toBeInTheDocument();
+  });
+
+  it('groups all four radios under a single shared name for native arrow-key nav', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    const radios = screen.getAllByRole('radio');
+    expect(radios).toHaveLength(4);
+
+    const names = new Set(radios.map((r) => r.getAttribute('name')));
+    // Exactly one shared name => the browser treats them as ONE radio group,
+    // enabling arrow-key movement/selection between levels.
+    expect(names.size).toBe(1);
+    expect([...names][0]).toBeTruthy();
+  });
+
+  it('exposes each radio to assistive tech by its translated accessible name', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    // Each option is reachable by its accessible name (from aria-label).
+    ZOOM_LABELS_EN.forEach((label) => {
+      expect(screen.getByRole('radio', { name: label })).toBeInTheDocument();
+    });
+  });
+
+  it('keeps the radios focusable (not display:none) so keyboard users can reach them', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    radios.forEach((radio) => {
+      // The visually-hidden technique must NOT use display:none/visibility:hidden
+      // (either would drop the control from the tab order — the F28 defect).
+      expect(radio.style.display).not.toBe('none');
+      expect(radio.style.visibility).not.toBe('hidden');
+
+      // And the element genuinely accepts focus. Native `.focus()` (unlike
+      // `fireEvent.focus`) moves document.activeElement, but it also fires the
+      // component's onFocus -> setFocusedValue, so wrap it in act() to flush
+      // that state update and keep the test warning-free.
+      act(() => {
+        radio.focus();
+      });
+      expect(radio).toHaveFocus();
+    });
+  });
+
+  it('mirrors keyboard focus onto the visible pill and clears it on blur (WCAG 2.4.7)', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    const checkmark = radios[2].nextElementSibling as HTMLElement;
+    expect(checkmark.classList.contains('checkmark')).toBe(true);
+
+    // No focus indicator initially.
+    expect(checkmark.style.outline).toBeFalsy();
+
+    // Focusing the (visually hidden) radio draws a visible outline on the pill.
+    // (jsdom stores the `outline` shorthand verbatim without expanding the
+    // longhands, so assert on the shorthand string.)
+    fireEvent.focus(radios[2]);
+    expect(checkmark.style.outline).toBeTruthy();
+    expect(checkmark.style.outline).toContain('2px');
+    expect(checkmark.style.outline).toContain('solid');
+    expect(checkmark.style.outlineOffset).toBe('2px');
+
+    // Blurring removes it again.
+    fireEvent.blur(radios[2]);
+    expect(checkmark.style.outline).toBeFalsy();
+  });
+
+  it('does not clear the ring when a stale blur arrives after focus moved to another pill', () => {
+    render(<ZoomControl onZoomChange={jest.fn()} />);
+
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    const checkmark2 = radios[2].nextElementSibling as HTMLElement;
+    const checkmark3 = radios[3].nextElementSibling as HTMLElement;
+
+    // Focus lands on pill 2, then moves to pill 3 BEFORE the (stale) blur of
+    // pill 2 fires — the ordering that occurs during rapid arrow-key movement.
+    fireEvent.focus(radios[2]);
+    fireEvent.focus(radios[3]);
+    expect(checkmark3.style.outline).toBeTruthy();
+
+    // The late blur of pill 2 must NOT steal the ring from the now-focused
+    // pill 3 (guards the `current === value ? null : current` updater).
+    fireEvent.blur(radios[2]);
+    expect(checkmark3.style.outline).toBeTruthy();
+    expect(checkmark2.style.outline).toBeFalsy();
+  });
+});
+
+// --- F47: fractional/corrupt values normalise to a REAL selected radio -----
+describe('ZoomControl: fractional zoom values normalise to an integer level (F47)', () => {
+  it('truncates a fractional initialZoom (1.5) to level 1, selecting exactly one radio', () => {
+    const onZoomChange = jest.fn();
+
+    render(<ZoomControl onZoomChange={onZoomChange} initialZoom={1.5} />);
+
+    // The emitted level is the integer 1 (never the fraction) with its
+    // cumulative feature list — closing the "partial zoom, no radio selected"
+    // gap the legacy directive left open.
+    expect(onZoomChange).toHaveBeenCalledTimes(1);
+    expect(onZoomChange).toHaveBeenCalledWith(1, L1);
+
+    const radios = screen.getAllByRole('radio');
+    expect(radios[1]).toBeChecked();
+    // Exactly ONE radio is selected — the core F47 guarantee.
+    expect(radios.filter((r) => (r as HTMLInputElement).checked)).toHaveLength(1);
+  });
+
+  it('truncates a fractional initialZoom (2.9) DOWN to level 2 (toward zero)', () => {
+    const onZoomChange = jest.fn();
+
+    render(<ZoomControl onZoomChange={onZoomChange} initialZoom={2.9} />);
+
+    expect(onZoomChange).toHaveBeenCalledWith(2, L2);
+    expect(screen.getAllByRole('radio')[2]).toBeChecked();
+  });
+
+  it('normalises a fractional near-zero initialZoom (0.4) to level 0', () => {
+    const onZoomChange = jest.fn();
+
+    render(<ZoomControl onZoomChange={onZoomChange} initialZoom={0.4} />);
+
+    expect(onZoomChange).toHaveBeenCalledWith(0, L0);
+    expect(screen.getAllByRole('radio')[0]).toBeChecked();
+  });
+
+  it('normalises a fractional PERSISTED value ("2.9") to level 2 and rewrites it to "2"', () => {
+    window.localStorage.setItem(STORAGE_KEY, '2.9');
+
+    const onZoomChange = jest.fn();
+    render(<ZoomControl onZoomChange={onZoomChange} />);
+
+    expect(onZoomChange).toHaveBeenCalledWith(2, L2);
+    expect(screen.getAllByRole('radio')[2]).toBeChecked();
+    // getZoomView persists the normalised integer (Number('2.9') !== 2).
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe('2');
   });
 });
 

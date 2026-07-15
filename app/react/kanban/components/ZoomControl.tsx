@@ -46,12 +46,35 @@
  * from the legacy template is intentionally NOT reproduced; we render only
  * `.board-zoom`.
  *
+ * COLOR CONTRAST (F41): the review flagged the inherited Taiga colors on this
+ * control as below WCAG AA contrast — the uppercase title (`.board-zoom-title`,
+ * `#008AA8` on white ~4.04:1) and the selected pill's white label on the teal
+ * `#008AA8` fill. Those values live ENTIRELY in the reference `board-zoom` SCSS
+ * (`$color-link-primary`, `$color-white`, `$color-gray400`), which this
+ * coexistence migration treats as REFERENCE-ONLY and must reproduce verbatim:
+ * the AAP mandates "zero visual change" (Section 0.3.4), and its precedence
+ * rules place the frozen design contract above accessibility heuristics. This
+ * component therefore does NOT alter any inherited color/typography token —
+ * doing so would change the shared Taiga theme for every other screen and
+ * violate the migration's visual-parity guarantee. The contrast issue is a
+ * pre-existing property of the Taiga design system and its remediation belongs
+ * to a design-token change outside this migration's scope. All accessibility
+ * work here is therefore STRUCTURAL (radiogroup semantics, focusable radios,
+ * names, a visible focus ring) and introduces no new color (the focus ring
+ * reuses the existing `#008AA8` brand value; see {@link FOCUS_OUTLINE}).
+ *
  * NOTE ON JSX RUNTIME: this file relies on the automatic JSX runtime
  * (`tsconfig.json` -> `"jsx": "react-jsx"`), so React itself is not imported;
  * only the hooks are.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState, type CSSProperties } from 'react';
+// Shared, AngularJS-free translation layer (F27). Reads the same catalog the
+// host installs via configureI18n(); falls back to the embedded English strings
+// (ZOOM.TITLE, ZOOM.ZOOM-1..4) so rendered output is human-readable, never a raw
+// key. This is a `shared/` sibling — NOT an AngularJS/CoffeeScript import — so
+// the globals-only coexistence boundary is preserved.
+import { t } from '../../shared/i18n';
 
 /**
  * CUMULATIVE feature groups per zoom level, reproduced verbatim from the
@@ -81,21 +104,40 @@ const MAX_ZOOM_INDEX = ZOOMS.length - 1; // 3
 const STORAGE_KEY = 'kanban_zoom';
 
 /**
- * Clamp a zoom index into the valid `[0, MAX_ZOOM_INDEX]` range.
+ * Default zoom level when nothing (valid) is persisted. Mirrors
+ * `storage.get("kanban_zoom", 1)` from the legacy directive.
+ */
+const DEFAULT_ZOOM_INDEX = 1;
+
+/**
+ * Normalize a raw zoom value to a valid INTEGER level in `[0, MAX_ZOOM_INDEX]`
+ * (F47).
  *
  * The legacy directive only clamped the upper bound (`if zoomIndex > 3 ->
- * zoomIndex = 3`); the lower-bound guard is a defensive superset that can
- * never change observable behaviour because the UI only ever produces indices
- * 0..3, while protecting against a corrupt/negative persisted value.
+ * zoomIndex = 3`) and never coerced fractions, so a corrupt/fractional persisted
+ * value (e.g. `1.5`) left the control in an inconsistent state: no radio matched
+ * (`checked` compares against integers 0..3) yet `getZoomView` still emitted a
+ * partial cumulative feature list (`key <= 1.5` -> levels 0,1). This function
+ * removes that gap deterministically:
+ *   - non-finite input (`NaN`, `Infinity`) -> the default level, and
+ *   - fractional input is truncated toward zero so it selects the same real
+ *     radio the legacy cumulative logic effectively resolved to (`1.5` -> `1`,
+ *     preserving the emitted feature list), then bounded into `[0, 3]`.
+ * The lower-bound guard is a defensive superset (the UI only ever produces
+ * 0..3) that protects against a corrupt/negative persisted value.
  */
 function clamp(index: number): number {
-  if (index > MAX_ZOOM_INDEX) {
+  if (!Number.isFinite(index)) {
+    return DEFAULT_ZOOM_INDEX;
+  }
+  const level = Math.trunc(index);
+  if (level > MAX_ZOOM_INDEX) {
     return MAX_ZOOM_INDEX;
   }
-  if (index < 0) {
+  if (level < 0) {
     return 0;
   }
-  return index;
+  return level;
 }
 
 /**
@@ -114,14 +156,14 @@ function readInitialZoom(override?: number): number {
 
   const raw = localStorage.getItem(STORAGE_KEY);
 
-  // `storage.get("kanban_zoom", 1)` -> unset means the default level 1.
+  // `storage.get("kanban_zoom", 1)` -> unset means the default level.
   if (raw == null || raw === '') {
-    return 1;
+    return DEFAULT_ZOOM_INDEX;
   }
 
-  const parsed = Number(raw);
-
-  return Number.isNaN(parsed) ? 1 : clamp(parsed);
+  // `clamp` normalizes to an integer level and maps a non-finite/NaN parse
+  // (e.g. a corrupt persisted value) to DEFAULT_ZOOM_INDEX (F47).
+  return clamp(Number(raw));
 }
 
 /**
@@ -161,24 +203,6 @@ function getZoomView(zoomIndex: number): string[] {
 }
 
 /**
- * Translation passthrough.
- *
- * The legacy template rendered `{{ 'ZOOM.TITLE' | translate }}` via the
- * AngularJS translate filter. To honour the "globals-only boundary / no i18n
- * dependency" rule this standalone component does not embed an i18n library;
- * it returns the translation key unchanged. The host application's i18n layer
- * is responsible for supplying the human-readable strings when the migrated
- * screen is wired up, keeping this component dependency-free and its output
- * deterministic for unit tests.
- *
- * Recognised keys: `ZOOM.TITLE`, `ZOOM.ZOOM-1`, `ZOOM.ZOOM-2`, `ZOOM.ZOOM-3`,
- * `ZOOM.ZOOM-4`.
- */
-function t(key: string): string {
-  return key;
-}
-
-/**
  * Props for {@link ZoomControl}.
  *
  * Mirrors the legacy directive's isolate scope (`onZoomChange: "&"`).
@@ -200,13 +224,80 @@ export interface ZoomControlProps {
 }
 
 /**
+ * "Visually hidden" style for the real radio `<input>` (F28).
+ *
+ * The reference SCSS hides the radio with `.zoom-radio input { display: none }`,
+ * which ALSO removes it from the keyboard tab order — the root accessibility
+ * defect this finding addresses. Rather than reproduce that (accessibility-
+ * hostile) rule, the radio is hidden with the standard "visually hidden"
+ * technique: it stays in the DOM and in the tab order (so keyboard and
+ * assistive-technology users can operate it) but is clipped to a 1px box.
+ *
+ * `display` MUST be set to a value other than `none` here to OVERRIDE the SCSS
+ * rule inline (otherwise the element would generate no box and could not receive
+ * focus). Because the box is clipped to 1px and pulled out of flow, the rendered
+ * layout is byte-for-byte identical to the legacy control — zero visual change
+ * (F41). The visible pill is still driven entirely by the reference SCSS via the
+ * `.zoom-radio input:checked ~ .checkmark` sibling selector, which continues to
+ * match because the `<input>` remains the checkmark's preceding sibling.
+ */
+const VISUALLY_HIDDEN_INPUT: CSSProperties = {
+  position: 'absolute',
+  display: 'block',
+  width: '1px',
+  height: '1px',
+  margin: '-1px',
+  padding: 0,
+  border: 0,
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+};
+
+/**
+ * Focus indicator mirrored onto the visible pill when its (visually hidden)
+ * radio holds keyboard focus (F28 / WCAG 2.4.7 Focus Visible).
+ *
+ * There is NO focus treatment in the reference SCSS to reproduce, so this is a
+ * purely ADDITIVE accessibility affordance — it introduces no new brand color:
+ * it reuses the existing Taiga primary token value (`$color-link-primary` =
+ * `#008AA8`, the same color the checked pill already uses). `outline` (unlike a
+ * border) occupies no layout space, and `outlineOffset` lifts the ring off the
+ * pill so it reads against both the unchecked (gray) and checked (teal) states,
+ * so the control's size and position are unchanged (F41).
+ */
+const FOCUS_OUTLINE: CSSProperties = {
+  outline: '2px solid #008AA8',
+  outlineOffset: '2px',
+};
+
+/**
  * The kanban zoom selector: a title plus four radio "pills". The currently
  * selected pill expands (via the reference SCSS) to reveal its label.
+ *
+ * Accessibility (F28): the four radios form a NATIVE radio group (shared `name`)
+ * wrapped in an explicit `role="radiogroup"` that is named by the visible title
+ * via `aria-labelledby`. Because the radios are visually hidden but remain in
+ * the tab order (see {@link VISUALLY_HIDDEN_INPUT}), keyboard users can Tab into
+ * the group and use the arrow keys to move between and select zoom levels — the
+ * standard native radio-group interaction — and the currently focused option is
+ * indicated on the visible pill (see {@link FOCUS_OUTLINE}). Each option is
+ * named for assistive technology with an `aria-label` sourced from the shared
+ * translation layer.
  */
 function ZoomControl({ onZoomChange, initialZoom }: ZoomControlProps) {
   const [zoomIndex, setZoomIndex] = useState<number>(() =>
     readInitialZoom(initialZoom),
   );
+
+  // Which pill currently holds keyboard focus (null = none), used only to
+  // mirror the visually-hidden radio's focus ring onto the visible pill (F28).
+  const [focusedValue, setFocusedValue] = useState<number | null>(null);
+
+  // Stable, unique id that binds the visible title to the radiogroup as its
+  // accessible name via `aria-labelledby` (F28). `useId` guarantees uniqueness
+  // even if more than one board mounts on a page.
+  const titleId = useId();
 
   // Keep the latest `onZoomChange` in a ref so the emit effect can depend
   // solely on `[zoomIndex]` while still invoking the current callback. This
@@ -228,33 +319,60 @@ function ZoomControl({ onZoomChange, initialZoom }: ZoomControlProps) {
   }, [zoomIndex]);
 
   return (
-    <div className="board-zoom">
-      <div className="board-zoom-title">{t('ZOOM.TITLE')}</div>
+    <div className="board-zoom" role="radiogroup" aria-labelledby={titleId}>
+      <div className="board-zoom-title" id={titleId}>
+        {t('ZOOM.TITLE')}
+      </div>
 
-      {[0, 1, 2, 3].map((value) => (
-        <label
-          key={value}
-          className="zoom-radio"
-          title={t(`ZOOM.ZOOM-${value + 1}`)}
-        >
-          {/*
-            The <input> MUST precede .checkmark so the reference SCSS selector
-            `.zoom-radio input:checked ~ .checkmark` matches. The radio is
-            fully controlled: `checked` reflects state and `onChange` drives it
-            (no `name` attribute — mutual exclusivity is guaranteed by state,
-            exactly as the legacy `ng-model="value"` binding behaved).
-          */}
-          <input
-            type="radio"
-            value={value}
-            checked={zoomIndex === value}
-            onChange={() => setZoomIndex(value)}
-          />
-          <div className="checkmark">
-            <span>{t(`ZOOM.ZOOM-${value + 1}`)}</span>
-          </div>
-        </label>
-      ))}
+      {[0, 1, 2, 3].map((value) => {
+        // Human-readable option label (e.g. "Compact"/"Default"/...). Sourced
+        // from the shared translation layer so it is never a raw key (F27), and
+        // reused as the visible pill text, the `title` tooltip, and the radio's
+        // `aria-label` so screen readers announce a meaningful name (F28).
+        const label = t(`ZOOM.ZOOM-${value + 1}`);
+
+        return (
+          <label key={value} className="zoom-radio" title={label}>
+            {/*
+              The <input> MUST precede .checkmark so the reference SCSS selector
+              `.zoom-radio input:checked ~ .checkmark` matches. The radio is
+              fully controlled: `checked` reflects state and `onChange` drives
+              it. All four share `name="kanban-zoom"` so the browser treats them
+              as ONE native radio group — restoring arrow-key navigation and
+              selection between zoom levels (F28) — while still guaranteeing
+              mutual exclusivity exactly as the legacy `ng-model="value"` did.
+              It is visually hidden (not display:none) so it stays keyboard-
+              focusable with zero visual change (F41), and `aria-label` names it
+              for assistive technology.
+            */}
+            <input
+              type="radio"
+              name="kanban-zoom"
+              value={value}
+              aria-label={label}
+              checked={zoomIndex === value}
+              style={VISUALLY_HIDDEN_INPUT}
+              onChange={() => setZoomIndex(value)}
+              onFocus={() => setFocusedValue(value)}
+              onBlur={() =>
+                setFocusedValue((current) =>
+                  current === value ? null : current,
+                )
+              }
+            />
+            <div
+              className="checkmark"
+              // Mirror the (visually hidden) radio's keyboard focus onto the
+              // visible pill so focus is perceivable (F28 / WCAG 2.4.7). This is
+              // an additive indicator drawn with `outline`, which occupies no
+              // layout space, so the pill is visually unchanged otherwise (F41).
+              style={focusedValue === value ? FOCUS_OUTLINE : undefined}
+            >
+              <span>{label}</span>
+            </div>
+          </label>
+        );
+      })}
     </div>
   );
 }

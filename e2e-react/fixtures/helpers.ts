@@ -188,23 +188,36 @@ export async function drag(
 
   await page.mouse.move(startX, startY);
   await page.mouse.down();
-  // Small initial move so @dnd-kit's PointerSensor activation constraint fires
-  // BEFORE the large move to the destination. Without this activation nudge the
-  // sensor may never start the drag.
-  await page.mouse.move(startX + 6, startY + 6, { steps: 5 });
 
-  await destLoc.scrollIntoViewIfNeeded();
-  const destBox = await destLoc.boundingBox();
-  if (!destBox) {
-    throw new Error('drag(): destination element has no bounding box (not visible)');
+  // Everything after mouse.down() runs inside try/finally so the pointer is
+  // ALWAYS released, even if destination scrolling / bounds resolution / a move
+  // throws (F16). Leaving the mouse button pressed would contaminate every
+  // subsequent serial test (drags would start from a stuck-down state), so the
+  // release in `finally` is mandatory regardless of how the body exits.
+  try {
+    // Small initial move so @dnd-kit's PointerSensor activation constraint fires
+    // BEFORE the large move to the destination. Without this activation nudge the
+    // sensor may never start the drag.
+    await page.mouse.move(startX + 6, startY + 6, { steps: 5 });
+
+    await destLoc.scrollIntoViewIfNeeded();
+    const destBox = await destLoc.boundingBox();
+    if (!destBox) {
+      throw new Error('drag(): destination element has no bounding box (not visible)');
+    }
+
+    const endX = destBox.x + destBox.width / 2 + extraX;
+    const endY = destBox.y + destBox.height / 2 + extraY;
+
+    // Stepped move so @dnd-kit collision detection registers the intermediate
+    // points along the path to the droppable.
+    await page.mouse.move(endX, endY, { steps: 12 });
+    await page.mouse.move(endX, endY, { steps: 3 }); // settle over the target
+  } finally {
+    // Release the pointer unconditionally. If the try body already reached the
+    // end this performs the normal drop; if it threw, this prevents a stuck
+    // pressed button from leaking into later tests. The original error (if any)
+    // still propagates after the finally completes.
+    await page.mouse.up();
   }
-
-  const endX = destBox.x + destBox.width / 2 + extraX;
-  const endY = destBox.y + destBox.height / 2 + extraY;
-
-  // Stepped move so @dnd-kit collision detection registers the intermediate
-  // points along the path to the droppable.
-  await page.mouse.move(endX, endY, { steps: 12 });
-  await page.mouse.move(endX, endY, { steps: 3 }); // settle over the target
-  await page.mouse.up();
 }

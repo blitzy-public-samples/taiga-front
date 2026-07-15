@@ -99,14 +99,19 @@ module.exports = {
   // including plain `npm test`.
   collectCoverage: true,
 
-  // Measure ONLY the new React source. Test files, ambient type declarations,
-  // and the thin custom-element registration entry point are excluded from the
-  // measured set (they contain no meaningful branch logic to cover).
+  // Measure ALL new React source. Per the AAP coverage-scope rule
+  // (collectCoverageFrom over `app/react/**/*.{ts,tsx}` with only justified
+  // exclusions), the only things removed from the measured set are:
+  //   - test files themselves (`__tests__/**`), which hold the assertions, and
+  //   - ambient type declarations (`*.d.ts`), which carry no executable lines.
+  // The custom-element registration entry point (`app/react/index.tsx`) is
+  // intentionally NOT blanket-excluded (finding F10): registration is
+  // behaviorally important, so once that file is added in a later checkpoint it
+  // is measured and must be covered like any other source file.
   collectCoverageFrom: [
     'app/react/**/*.{ts,tsx}',
     '!app/react/**/__tests__/**',
     '!app/react/**/*.d.ts',
-    '!app/react/index.tsx',
   ],
 
   // The mandated gate: line coverage of the React code must be >= 70%, or the

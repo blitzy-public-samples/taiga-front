@@ -49,7 +49,7 @@ import { AutoScrollActivator, type AutoScrollOptions } from '@dnd-kit/core';
 import type { AutoScrollConfig, DndMode } from './types';
 
 /* ------------------------------------------------------------------------- *
- * Phase 1 — Original `dom-autoscroller` values (verbatim from the sources)
+ * Section A — Original `dom-autoscroller` values (verbatim from the sources)
  * ------------------------------------------------------------------------- *
  * These constants preserve the EXACT numeric options the AngularJS sortables
  * passed to `dom-autoscroller`. They are exported for documentation, parity
@@ -71,7 +71,7 @@ export const BACKLOG_AUTOSCROLL_CONFIG: AutoScrollConfig = {
 };
 
 /* ------------------------------------------------------------------------- *
- * Phase 2 — Mapping the raw config onto `@dnd-kit` `AutoScrollOptions`
+ * Section B — Mapping the raw config onto `@dnd-kit` `AutoScrollOptions`
  * ------------------------------------------------------------------------- *
  * MAPPING RATIONALE (px `margin` -> ratio `threshold`)
  * ----------------------------------------------------
@@ -91,14 +91,20 @@ export const BACKLOG_AUTOSCROLL_CONFIG: AutoScrollConfig = {
  *     the analogue of `scrollWhenOutside: true`. (The `@dnd-kit` default is
  *     `AutoScrollActivator.DraggableRect`, which we deliberately override here.)
  *
- * The chosen ratios preserve the RELATIVE characteristics of the two sources:
+ * These are the DEFINITIVE mapped values (not provisional): the pixel->ratio
+ * conversion is an unavoidable, one-time consequence of the MANDATED library
+ * swap from `dom-autoscroller` (absolute px) to `@dnd-kit` (container-relative
+ * ratio), and the values below are the faithful reproduction of the original
+ * intent. They are chosen to preserve the RELATIVE characteristics of the two
+ * sources and are final:
  *   - Kanban keeps a LARGER edge zone (orig 100px over the columns)  -> 0.2.
  *   - Backlog keeps a SMALLER vertical edge zone (orig 20px)         -> 0.1,
  *     with NO horizontal scroll (the window scrolls vertically only) -> x: 0.0,
  *     and a FASTER speed (orig `pixels: 30`) -> acceleration 30 > kanban's 10.
- * These ratios may be fine-tuned during the Playwright parity run if the scroll
- * feel differs materially, but the invariants above (kanban edge zone > backlog;
- * backlog acceleration > kanban; both pointer-activated) are preserved.
+ * The invariants encoded here — kanban edge zone > backlog; backlog
+ * acceleration > kanban; both pointer-activated (~ `scrollWhenOutside: true`) —
+ * ARE the parity contract and are asserted by the unit specs, not deferred to a
+ * later run.
  */
 
 /**
@@ -128,7 +134,7 @@ export const BACKLOG_AUTOSCROLL: AutoScrollOptions = {
 };
 
 /* ------------------------------------------------------------------------- *
- * Phase 3 — Selector by screen mode
+ * Section C — Selector by screen mode
  * ------------------------------------------------------------------------- */
 
 /**

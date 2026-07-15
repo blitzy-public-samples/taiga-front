@@ -41,27 +41,29 @@
  *
  * COEXISTENCE BOUNDARY (AAP 0.7 — HARD)
  * -------------------------------------
- * This module imports ONLY its own npm dependencies (`@dnd-kit/core`,
- * `@dnd-kit/sortable`). It imports nothing from the repository — not the legacy
- * CoffeeScript sources, the modern Angular-Elements Web Components bundle, the
- * Jade partials, or the SCSS styles — and never references the global AngularJS
- * injector. All interop with the host app flows through globals elsewhere in the
- * `shared` layer, never through this file.
+ * This module imports ONLY its own npm dependency (`@dnd-kit/core`). It imports
+ * nothing from the repository — not the legacy CoffeeScript sources, the modern
+ * Angular-Elements Web Components bundle, the Jade partials, or the SCSS styles —
+ * and never references the global AngularJS injector. All interop with the host
+ * app flows through globals elsewhere in the `shared` layer, never through this
+ * file. (`@dnd-kit/sortable` is intentionally NOT imported — see the F24 parity
+ * note on the import statement below.)
  *
  * CONSUMER: `DndProvider.tsx` calls {@link useDndSensors} and passes the result
  * to `<DndContext sensors={...}>`.
  */
 
-import {
-  PointerSensor,
-  KeyboardSensor,
-  useSensor,
-  useSensors,
-} from '@dnd-kit/core';
-// `sortableKeyboardCoordinates` is the keyboard coordinate getter that moves the
-// active item between sortable positions with the arrow keys — a one-liner that
-// gives us accessible keyboard drag-and-drop parity for free.
-import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
+import { PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+
+// PARITY NOTE (F24 — no keyboard drag-and-drop): the legacy `dragula` drakes on
+// both migrated screens are POINTER-ONLY — neither kanban/sortable.coffee nor
+// backlog/sortable.coffee installs any keydown / arrow-key / tabindex handling,
+// so drag-and-drop was never keyboard-operable before the migration. Adding a
+// `KeyboardSensor` (with `sortableKeyboardCoordinates`) would introduce a NEW
+// interaction the AngularJS screens never had, violating the AAP's exact
+// behavioral-parity rule. It is therefore intentionally NOT configured here, and
+// `@dnd-kit/sortable`'s `sortableKeyboardCoordinates` is intentionally NOT
+// imported. Only the pointer path is reproduced.
 
 /**
  * Minimum pointer movement (in pixels) before a drag is allowed to begin.
@@ -84,19 +86,18 @@ export const POINTER_ACTIVATION_CONSTRAINT = { distance: 5 } as const;
  * Assembles the `@dnd-kit` sensors for the React DnD provider.
  *
  * Replaces the `dragula` drake's implicit mousedown-to-drag start
- * (kanban/sortable.coffee:56; backlog/sortable.coffee:39) with:
- *   1. a {@link PointerSensor} carrying {@link POINTER_ACTIVATION_CONSTRAINT} so
- *      clicks are preserved and a drag begins only after a small movement, and
- *   2. a {@link KeyboardSensor} wired to `sortableKeyboardCoordinates` so the
- *      board/backlog is operable by keyboard (an accessibility improvement that
- *      is behavior-neutral for pointer users).
+ * (kanban/sortable.coffee:56; backlog/sortable.coffee:39) with a single
+ * {@link PointerSensor} carrying {@link POINTER_ACTIVATION_CONSTRAINT}, so clicks
+ * are preserved and a drag begins only after a small movement. No keyboard
+ * sensor is configured — the legacy drakes were pointer-only (see the parity
+ * note on the import above), so pointer is the ONLY drag path reproduced.
  *
  * `useSensors` wraps the descriptor list in `useMemo`, and — crucially —
- * `<DndContext>` keys its sensor-setup effect on the sensor CLASSES themselves
- * (`PointerSensor` / `KeyboardSensor`), which are module-stable references. So
- * the underlying pointer/keyboard listeners are installed once and are NOT torn
- * down and re-created on every re-render, and the result can be passed straight
- * to `<DndContext sensors={...}>`. Must be called from a React render context
+ * `<DndContext>` keys its sensor-setup effect on the sensor CLASS itself
+ * (`PointerSensor`), which is a module-stable reference. So the underlying
+ * pointer listeners are installed once and are NOT torn down and re-created on
+ * every re-render, and the result can be passed straight to
+ * `<DndContext sensors={...}>`. Must be called from a React render context
  * (it is a hook).
  *
  * @returns The `@dnd-kit` `SensorDescriptor[]` for `<DndContext>` (type inferred).
@@ -109,13 +110,7 @@ export function useDndSensors() {
     activationConstraint: POINTER_ACTIVATION_CONSTRAINT,
   });
 
-  // Keyboard: `sortableKeyboardCoordinates` translates arrow-key presses into
-  // sortable coordinate moves, giving keyboard users drag-and-drop parity.
-  const keyboardSensor = useSensor(KeyboardSensor, {
-    coordinateGetter: sortableKeyboardCoordinates,
-  });
-
-  // `useSensors` wraps the descriptors in `useMemo`; `<DndContext>` then keys
-  // its sensor setup on the stable sensor classes, so the listeners install once.
-  return useSensors(pointerSensor, keyboardSensor);
+  // `useSensors` wraps the descriptor in `useMemo`; `<DndContext>` then keys its
+  // sensor setup on the stable sensor class, so the listener installs once.
+  return useSensors(pointerSensor);
 }

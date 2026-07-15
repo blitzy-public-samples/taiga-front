@@ -23,12 +23,33 @@
     "start": "npx gulp",
     "ci:test": "npx gulp deploy && ./node_modules/karma/bin/karma start --single-run --browsers=ChromeHeadlessCI"
   },
+  "//node16CompatibilityNotes": [
+    "The authoritative runtime for this project is Node v16.19.1 (.nvmrc), frozen by AAP",
+    "sections 0.5 and 0.7.2. The following residual dependency advisories cannot be",
+    "remediated by upgrading, because every fixed release requires Node >= 18 and would",
+    "therefore break the frozen Node-16 pin. The exposure is test/build-only (never shipped",
+    "to the browser bundle) and is explicitly risk-accepted for this coexistence POC:",
+    "  - @playwright/test 1.44.1 (GHSA-7mvr-c777-76hp, fixed in 1.55.1 which needs Node>=18):",
+    "    Playwright is a devDependency used only by `npm run e2e`; the harness targets a",
+    "    localhost gateway (allow-listed in playwright.config.ts) and never runs against",
+    "    untrusted remote hosts, so the advisory's attack surface is not reachable.",
+    "  - esbuild 0.19.12 (GHSA-67mh-4wv8-2f99, fixed in 0.25.0 which needs Node>=18):",
+    "    the advisory affects esbuild's development HTTP server (esbuild.serve/context.serve",
+    "    CORS behavior). This project invokes esbuild only for one-shot bundling via the",
+    "    build() API (the Gulp `react` task); the dev-server mode is never used, so the",
+    "    affected code path is unreachable.",
+    "The `overrides` block below pins node-releases to a Node-16-compatible version so",
+    "`npm ci` emits no engine (EBADENGINE) warning for it (finding F44)."
+  ],
+  "overrides": {
+    "node-releases": "2.0.44"
+  },
   "devDependencies": {
     "@playwright/test": "1.44.1",
     "@testing-library/jest-dom": "6.4.6",
     "@testing-library/react": "14.3.1",
-    "@testing-library/user-event": "14.5.2",
     "@types/jest": "29.5.12",
+    "@types/node": "16.18.126",
     "@types/react": "18.2.79",
     "@types/react-dom": "18.2.25",
     "angular-mocks": "1.5.5",
