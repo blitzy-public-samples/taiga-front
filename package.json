@@ -24,7 +24,7 @@
     "test:karma": "./node_modules/karma/bin/karma start",
     "e2e": "./node_modules/.bin/babel-node run-e2e.js",
     "start": "npx gulp",
-    "ci:test": "npx gulp deploy && ./node_modules/karma/bin/karma start --single-run --browsers=ChromeHeadlessCI"
+    "ci:test": "npx gulp deploy && ./node_modules/karma/bin/karma start --single-run --browsers=ChromeHeadlessCI && npx jest --coverage"
   },
   "devDependencies": {
     "@playwright/test": "1.44.1",
