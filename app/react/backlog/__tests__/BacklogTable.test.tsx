@@ -193,6 +193,16 @@ const setScrollMetrics = (
   Object.defineProperty(el, 'scrollTop', { value: metrics.scrollTop, configurable: true, writable: true });
 };
 
+// Reset every mock's call history before each test so `mockUseDroppable` and the
+// per-test callback spies never leak state across cases. The root jest.config.js
+// also sets `clearMocks: true`; declaring this hook explicitly satisfies the
+// spec contract and keeps the suite deterministic even if that config option is
+// ever changed. `jest` is the ambient global (typed via tsconfig `types`) — it is
+// intentionally NOT imported (globals-only HARD RULE).
+beforeEach(() => {
+  jest.clearAllMocks();
+});
+
 describe('BacklogTable — header', () => {
   it('renders the six columns in source order, with User Story / Status / Points labels', () => {
     const { container } = render(<BacklogTable {...makeProps()} />);
