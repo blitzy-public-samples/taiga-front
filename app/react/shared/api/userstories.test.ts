@@ -11,7 +11,6 @@ import {
     bulkUpdateBacklogOrder,
     bulkUpdateKanbanOrder,
     bulkUpdateMilestone,
-    bulkUpdateSprintOrder,
     filtersData,
     listUserstories,
 } from "./userstories";
@@ -155,22 +154,20 @@ describe("shared/api/userstories", () => {
             expect(sent.body).not.toHaveProperty("milestone_id");
             expect(sent.body).not.toHaveProperty("after_userstory_id");
         });
-    });
 
-    describe("bulkUpdateSprintOrder", () => {
-        it("mirrors the backlog-order body exactly at the sprint-order endpoint", async () => {
-            await bulkUpdateSprintOrder(42, 7, 100, null, [10, 11]);
+        it("prefers after_userstory_id over before_userstory_id when BOTH neighbors are given", async () => {
+            // Exercises the `if (after) {} else if (before) {}` XOR precedence
+            // directly (QA F6): with both truthy, 'after' wins and 'before' is omitted.
+            await bulkUpdateBacklogOrder(42, 7, 100, 200, [10, 11]);
 
             const sent = lastRequest();
-            expect(sent.url).toBe(
-                "http://localhost:8000/api/v1/userstories/bulk_update_sprint_order",
-            );
             expect(sent.body).toEqual({
                 project_id: 42,
                 bulk_userstories: [10, 11],
                 milestone_id: 7,
                 after_userstory_id: 100,
             });
+            expect(sent.body).not.toHaveProperty("before_userstory_id");
         });
     });
 
@@ -226,6 +223,18 @@ describe("shared/api/userstories", () => {
             });
             expect(sent.body).not.toHaveProperty("swimlane_id");
             expect(sent.body).not.toHaveProperty("after_userstory_id");
+        });
+
+        it("prefers after_userstory_id over before_userstory_id when BOTH neighbors are given", async () => {
+            // Kanban is the drag hot path; assert the same XOR precedence (QA F6).
+            await bulkUpdateKanbanOrder(42, 3, 5, 100, 200, [10, 11]);
+
+            const sent = lastRequest();
+            expect(sent.body).toMatchObject({
+                after_userstory_id: 100,
+                swimlane_id: 5,
+            });
+            expect(sent.body).not.toHaveProperty("before_userstory_id");
         });
     });
 });

@@ -211,6 +211,19 @@ export function Card(props: CardProps): JSX.Element {
                                         Edit
                                     </button>
                                 )}
+                                {canModify && (
+                                    <button
+                                        type="button"
+                                        className="card-action-assigned-to"
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            setActionsOpen(false);
+                                            onClickAssignedTo?.(item.id);
+                                        }}
+                                    >
+                                        Assign to
+                                    </button>
+                                )}
                                 {canDelete && (
                                     <button
                                         type="button"

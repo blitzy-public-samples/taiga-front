@@ -50,7 +50,7 @@ interface BulkCreateBody {
     swimlane_id: number | null;
 }
 
-/** Request body for backlog/sprint order updates (`bulk_update_backlog_order` / `bulk_update_sprint_order`). */
+/** Request body for `POST /userstories/bulk_update_backlog_order`. */
 interface BulkUpdateOrderBody {
     project_id: number;
     bulk_userstories: number[];
@@ -156,54 +156,26 @@ export function bulkUpdateBacklogOrder(
 }
 
 /**
- * `POST /userstories/bulk_update_sprint_order` — persist sprint drag order.
- *
- * This endpoint (resources.coffee L111, `bulk-update-us-miles-order`) has NO
- * dedicated CoffeeScript service method; its body is reproduced by mirroring
- * the backlog-order contract exactly, as required by the migration plan.
- */
-export function bulkUpdateSprintOrder(
-    projectId: number,
-    milestoneId: OptionalId,
-    afterUserstoryId: OptionalId,
-    beforeUserstoryId: OptionalId,
-    bulkUserstories: number[],
-): Promise<HttpResponse<UserStory[]>> {
-    const body: BulkUpdateOrderBody = {
-        project_id: projectId,
-        bulk_userstories: bulkUserstories,
-    };
-
-    if (milestoneId) {
-        body.milestone_id = milestoneId;
-    }
-
-    if (afterUserstoryId) {
-        body.after_userstory_id = afterUserstoryId;
-    } else if (beforeUserstoryId) {
-        body.before_userstory_id = beforeUserstoryId;
-    }
-
-    return httpPost<UserStory[]>("/userstories/bulk_update_sprint_order", body);
-}
-
-/**
  * `POST /userstories/bulk_update_milestone` — move stories to a milestone.
  * Body `{ project_id, milestone_id, bulk_stories }` where `bulk_stories` is an
  * array of `{ us_id, order }` (userstories.coffee L107-L110; backlog/main.coffee L793-799).
+ *
+ * The frozen backend responds `204 No Content` with an EMPTY body, so
+ * `HttpResponse.data` resolves to `undefined` at runtime; the return type is
+ * therefore `HttpResponse<void>` rather than `HttpResponse<UserStory[]>`.
  */
 export function bulkUpdateMilestone(
     projectId: number,
     milestoneId: number,
     bulkStories: BulkMilestoneStory[],
-): Promise<HttpResponse<UserStory[]>> {
+): Promise<HttpResponse<void>> {
     const body: BulkUpdateMilestoneBody = {
         project_id: projectId,
         milestone_id: milestoneId,
         bulk_stories: bulkStories,
     };
 
-    return httpPost<UserStory[]>("/userstories/bulk_update_milestone", body);
+    return httpPost<void>("/userstories/bulk_update_milestone", body);
 }
 
 /**

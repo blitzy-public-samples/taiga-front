@@ -200,16 +200,17 @@ function makeProps(overrides: Partial<BacklogTableProps> = {}): BacklogTableProp
 interface RenderResult {
     container: HTMLElement;
     props: BacklogTableProps;
+    unmount: () => void;
 }
 
 function renderTable(overrides: Partial<BacklogTableProps> = {}): RenderResult {
     const props = makeProps(overrides);
-    const { container } = render(
+    const { container, unmount } = render(
         <DndContext onDragEnd={() => { /* noop: drop persistence is BacklogApp's job */ }}>
             <BacklogTable {...props} />
         </DndContext>,
     );
-    return { container, props };
+    return { container, props, unmount };
 }
 
 /** Open a row's options popup via its real toggler button. */
@@ -634,5 +635,20 @@ describe("BacklogTable", () => {
             act(() => io.trigger(true));
         }
         expect(props.onLoadMore).not.toHaveBeenCalled();
+    });
+
+    it("disconnects the IntersectionObserver on unmount (no leaked observer)", () => {
+        // Enable pagination so the infinite-scroll observer is actually created.
+        const { unmount } = renderTable({ canLoadMore: true });
+
+        const io = lastIntersectionObserver();
+        expect(io).not.toBeUndefined();
+        // It observed the sentinel and has NOT been torn down yet.
+        expect(io!.observe).toHaveBeenCalled();
+        expect(io!.disconnect).not.toHaveBeenCalled();
+
+        // Effect cleanup (BacklogTable.tsx `observer.disconnect()`) must run on unmount.
+        unmount();
+        expect(io!.disconnect).toHaveBeenCalled();
     });
 });

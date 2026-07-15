@@ -188,8 +188,12 @@ describe("shared/api/milestones", () => {
     });
 
     describe("moveUserStoriesToSprint", () => {
-        it("POSTs to the CURRENT milestone path with the DESTINATION milestone in the body", async () => {
-            await moveUserStoriesToSprint(11, 42, 99, [10, 11, 12]);
+        it("POSTs to the CURRENT milestone path with the DESTINATION milestone and {us_id, order}[] body", async () => {
+            await moveUserStoriesToSprint(11, 42, 99, [
+                { us_id: 10, order: 0 },
+                { us_id: 11, order: 1 },
+                { us_id: 12, order: 2 },
+            ]);
 
             const sent = lastRequest();
             expect(sent.method).toBe("POST");
@@ -199,7 +203,11 @@ describe("shared/api/milestones", () => {
             expect(sent.body).toEqual({
                 project_id: 42,
                 milestone_id: 99,
-                bulk_stories: [10, 11, 12],
+                bulk_stories: [
+                    { us_id: 10, order: 0 },
+                    { us_id: 11, order: 1 },
+                    { us_id: 12, order: 2 },
+                ],
             });
         });
     });

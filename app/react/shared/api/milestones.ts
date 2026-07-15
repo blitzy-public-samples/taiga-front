@@ -48,11 +48,26 @@ export interface MilestoneListResult {
     closed: number;
 }
 
+/**
+ * One entry of the `bulk_stories` payload for `move_userstories_to_sprint`.
+ *
+ * The frozen backend's `UpdateMilestoneBulkValidator.bulk_stories` field is a
+ * `_UserStoryMilestoneBulkValidator(many=True)`, so every element MUST be an
+ * object `{ us_id, order }` — NOT a bare user-story id. This mirrors the
+ * already-correct `bulk_update_milestone` shape (`BulkMilestoneStory` in
+ * `userstories.ts`) and matches the authoritative backend test
+ * `test_api_move_userstories_to_another_sprint`.
+ */
+export interface MoveMilestoneStory {
+    us_id: number;
+    order: number;
+}
+
 /** Request body for `POST /milestones/{id}/move_userstories_to_sprint`. */
 interface MoveUserStoriesBody {
     project_id: number;
     milestone_id: number;
-    bulk_stories: number[];
+    bulk_stories: MoveMilestoneStory[];
 }
 
 /**
@@ -134,12 +149,17 @@ export function remove(milestoneId: number): Promise<HttpResponse<unknown>> {
  * `POST /milestones/{currentMilestoneId}/move_userstories_to_sprint` — move
  * stories into another sprint. Body `{ project_id, milestone_id, bulk_stories }`
  * (sprints.coffee `moveUserStoriesMilestone` L44-L47).
+ *
+ * `currentMilestoneId` (the URL `pk`) is the CURRENT/source milestone; the body
+ * `milestone_id` is the DESTINATION milestone. `bulkStories` is an array of
+ * `{ us_id, order }` objects — the shape required by the frozen backend
+ * validator (see {@link MoveMilestoneStory}).
  */
 export function moveUserStoriesToSprint(
     currentMilestoneId: number,
     projectId: number,
     milestoneId: number,
-    bulkStories: number[],
+    bulkStories: MoveMilestoneStory[],
 ): Promise<HttpResponse<unknown>> {
     const body: MoveUserStoriesBody = {
         project_id: projectId,

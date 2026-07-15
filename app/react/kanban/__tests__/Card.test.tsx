@@ -25,6 +25,23 @@ const usersById: UsersById = {
     10: { id: 10, username: "alice", full_name_display: "Alice A", photo: "a.png" },
 };
 const project: KanbanProject = { id: 7, my_permissions: ["modify_us"] };
+/** A project granting BOTH modify + delete so the Delete action renders (QA F1). */
+const projectRW: KanbanProject = { id: 7, my_permissions: ["modify_us", "delete_us"] };
+
+/**
+ * Open a card's actions popover via its real toggler button.
+ *
+ * The Edit / Assign to / Delete items render ONLY inside `{actionsOpen && ...}`
+ * (Card.tsx). A trustworthy assertion MUST open the menu first: querying those
+ * items without opening the menu always yields `null`, which is exactly the
+ * false-positive `if (element)` pattern QA finding F1 flagged (a neutralized
+ * `onClickEdit`/`onClickDelete` slipped through undetected).
+ */
+function openActionsMenu(container: HTMLElement): void {
+    const toggle = container.querySelector(".card-actions .js-popup-button");
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+}
 
 function view(over: Partial<UserStoryModel> & { id: number }): UsView {
     const model = { status: 1, swimlane: null, kanban_order: 1, ...over } as UserStoryModel;
@@ -99,18 +116,78 @@ describe("Card assignee + actions", () => {
         );
         expect(container.querySelector(".wrapper-assigned-to-data")).not.toBeNull();
     });
-    it("invokes onClickEdit when the edit action is clicked", () => {
+
+    it("does not render the actions menu until the popup button is clicked", () => {
+        const { container } = render(
+            <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} />,
+        );
+        // Closed by default: the action items are absent from the DOM.
+        expect(container.querySelector(".card-actions-menu")).toBeNull();
+        expect(container.querySelector(".card-action-edit")).toBeNull();
+        expect(container.querySelector(".card-action-delete")).toBeNull();
+
+        openActionsMenu(container);
+        expect(container.querySelector(".card-actions-menu")).not.toBeNull();
+    });
+
+    it("fires onClickEdit with the story id when the Edit action is clicked", () => {
         const onClickEdit = jest.fn();
         const { container } = render(
             <Card item={view({ id: 42, subject: "Hi" })} project={project} zoom={ZOOM[2]} zoomLevel={2} onClickEdit={onClickEdit} />,
         );
+        openActionsMenu(container);
         const edit = container.querySelector(".card-action-edit");
-        if (edit) {
-            fireEvent.click(edit);
-            expect(onClickEdit).toHaveBeenCalledWith(42);
-        } else {
-            expect(container.querySelector(".card-actions")).not.toBeNull();
-        }
+        expect(edit).not.toBeNull();
+        fireEvent.click(edit!);
+        expect(onClickEdit).toHaveBeenCalledTimes(1);
+        expect(onClickEdit).toHaveBeenCalledWith(42);
+    });
+
+    it("fires onClickAssignedTo with the story id when the Assign to action is clicked", () => {
+        const onClickAssignedTo = jest.fn();
+        const { container } = render(
+            <Card item={view({ id: 42, subject: "Hi" })} project={project} zoom={ZOOM[2]} zoomLevel={2} onClickAssignedTo={onClickAssignedTo} />,
+        );
+        openActionsMenu(container);
+        const assign = container.querySelector(".card-action-assigned-to");
+        expect(assign).not.toBeNull();
+        fireEvent.click(assign!);
+        expect(onClickAssignedTo).toHaveBeenCalledTimes(1);
+        expect(onClickAssignedTo).toHaveBeenCalledWith(42);
+    });
+
+    it("fires onClickDelete with the story id when the Delete action is clicked (delete permission)", () => {
+        const onClickDelete = jest.fn();
+        const { container } = render(
+            <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} onClickDelete={onClickDelete} />,
+        );
+        openActionsMenu(container);
+        const del = container.querySelector(".card-action-delete");
+        expect(del).not.toBeNull();
+        fireEvent.click(del!);
+        expect(onClickDelete).toHaveBeenCalledTimes(1);
+        expect(onClickDelete).toHaveBeenCalledWith(42);
+    });
+
+    it("hides the Delete action when the project lacks delete permission", () => {
+        const { container } = render(
+            <Card item={view({ id: 42, subject: "Hi" })} project={project} zoom={ZOOM[2]} zoomLevel={2} />,
+        );
+        openActionsMenu(container);
+        // `project` grants modify_us but NOT delete_us: Edit/Assign present, Delete absent.
+        expect(container.querySelector(".card-action-edit")).not.toBeNull();
+        expect(container.querySelector(".card-action-assigned-to")).not.toBeNull();
+        expect(container.querySelector(".card-action-delete")).toBeNull();
+    });
+
+    it("closes the actions menu after an action is chosen", () => {
+        const { container } = render(
+            <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} onClickEdit={jest.fn()} />,
+        );
+        openActionsMenu(container);
+        expect(container.querySelector(".card-actions-menu")).not.toBeNull();
+        fireEvent.click(container.querySelector(".card-action-edit")!);
+        expect(container.querySelector(".card-actions-menu")).toBeNull();
     });
 });
 
@@ -161,24 +238,44 @@ describe("Card rich render at max zoom", () => {
         expect(container.querySelector(".card-estimation")!.textContent).toBe("No pts");
     });
 
-    it("fires onToggleFold, onClickDelete and onClickAssignedTo from their affordances", () => {
+    it("fires onToggleFold with the story id from the unfold affordance", () => {
         const onToggleFold = jest.fn();
-        const onClickDelete = jest.fn();
-        const onClickAssignedTo = jest.fn();
         const { container } = render(
             <Card item={richView()} project={project} zoom={ZOOM[3]} zoomLevel={3}
-                onToggleFold={onToggleFold} onClickDelete={onClickDelete} onClickAssignedTo={onClickAssignedTo} />,
+                onToggleFold={onToggleFold} />,
         );
         const unfold = container.querySelector(".card-unfold");
-        if (unfold) {
-            fireEvent.click(unfold);
-            expect(onToggleFold).toHaveBeenCalledWith(200);
-        }
-        const del = container.querySelector(".card-action-delete");
-        if (del) {
-            fireEvent.click(del);
-            expect(onClickDelete).toHaveBeenCalledWith(200);
-        }
+        expect(unfold).not.toBeNull();
+        fireEvent.click(unfold!);
+        expect(onToggleFold).toHaveBeenCalledTimes(1);
+        expect(onToggleFold).toHaveBeenCalledWith(200);
+    });
+
+    it("fires edit/assign/delete with the story id from the actions menu at max zoom", () => {
+        const onClickEdit = jest.fn();
+        const onClickAssignedTo = jest.fn();
+        const onClickDelete = jest.fn();
+
+        const edit = render(
+            <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickEdit={onClickEdit} />,
+        );
+        fireEvent.click(edit.container.querySelector(".card-actions .js-popup-button")!);
+        fireEvent.click(edit.container.querySelector(".card-action-edit")!);
+        expect(onClickEdit).toHaveBeenCalledWith(200);
+
+        const assign = render(
+            <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickAssignedTo={onClickAssignedTo} />,
+        );
+        fireEvent.click(assign.container.querySelector(".card-actions .js-popup-button")!);
+        fireEvent.click(assign.container.querySelector(".card-action-assigned-to")!);
+        expect(onClickAssignedTo).toHaveBeenCalledWith(200);
+
+        const del = render(
+            <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickDelete={onClickDelete} />,
+        );
+        fireEvent.click(del.container.querySelector(".card-actions .js-popup-button")!);
+        fireEvent.click(del.container.querySelector(".card-action-delete")!);
+        expect(onClickDelete).toHaveBeenCalledWith(200);
     });
 
     it("uses a custom resolveAvatar when provided", () => {

@@ -48,20 +48,22 @@ module.exports = {
         "!app/react/**/*.(test|spec).{ts,tsx}",
         "!app/react/**/__tests__/**",
         "!app/react/**/__mocks__/**",
-        // Future-boundary groundwork stubs: the Kanban/Backlog presentational
-        // layer and its state/types are introduced — and unit-tested — by their
-        // own later checkpoints. They are OUT OF SCOPE for this shared-runtime
-        // foundation boundary (no registered root wires them in yet), so the
-        // ≥70% gate below measures exactly the "new React code" this boundary
-        // delivers (AAP §0.2.1, §0.6.3). Re-include these once the Kanban/Backlog
-        // component boundaries land with their own specs.
-        "!app/react/kanban/useKanbanState.ts",
+        // The Kanban/Backlog component boundaries have now landed with their own
+        // specs (e.g. useKanbanState.ts is exercised by useKanbanState.test.ts),
+        // so those modules are measured by the coverage gate below (QA finding
+        // F7 — the earlier exclusion masked an otherwise well-tested file and
+        // could have hidden a future regression). Only `backlog/types.ts` stays
+        // excluded because it is pure type declarations with no executable lines.
         "!app/react/backlog/types.ts"
     ],
     coverageDirectory: "<rootDir>/coverage",
 
-    // Net-new gate: ≥70% LINE coverage for the new React code (AAP §0.2.1, §0.5.2, §0.6.3)
+    // Net-new gate: ≥70% coverage for the new React code (AAP §0.2.1, §0.5.2, §0.6.3).
+    // The AAP mandates the ≥70% LINE gate; branch/function/statement gates are added
+    // alongside it (QA finding F7 / Areas of Concern #4) so a regression that drops
+    // branch or function coverage — e.g. an untested Card action or Swimlane drag-hover
+    // timer path — is caught rather than being masked by the healthy line aggregate.
     coverageThreshold: {
-        global: { lines: 70 }
+        global: { lines: 70, branches: 70, functions: 70, statements: 70 }
     }
 };
