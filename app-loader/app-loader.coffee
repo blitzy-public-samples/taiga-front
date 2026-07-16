@@ -185,8 +185,18 @@ loadApp = (emojisPromise) ->
     .catch (err) ->
         bootFatal(err)
 
-promise = fetch "conf.json"
-promise
+# F25 (extended to the conf.json step of the boot seam): terminate the PARSE
+# chain itself with `.catch`, not the bare `fetch` promise. The handler used to
+# be attached to `promise` (the fetch), so only a genuine network REJECTION
+# reached the fallback and booted with baked-in defaults; a fetch that RESOLVED
+# 200 with an invalid-JSON body (or the HTML 200 SPA fallback nginx serves when
+# conf.json is missing) rejected inside the UN-CAUGHT `.then(response.json())`
+# chain and surfaced only as an unhandled rejection while `mainLoad()` never
+# ran -- a silent blank-page stall on every route. Chaining `.catch` onto the
+# parse chain funnels BOTH failure modes into the one diagnostic + baked-default
+# `mainLoad()` fallback, matching the documented intent (AAP 0.6.2) that a
+# conf.json problem logs an actionable message and boots anyway.
+fetch("conf.json")
 .then((response) => response.json())
 .then (data) ->
     window.taigaConfig = Object.assign({}, window.taigaConfig, data)
@@ -201,7 +211,6 @@ promise
         document.head.appendChild(base)
 
     mainLoad()
-
-promise.catch () ->
+.catch () ->
     console.error "Your conf.json file is not a valid json file, please review it."
     mainLoad()
