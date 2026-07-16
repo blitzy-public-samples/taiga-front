@@ -221,4 +221,31 @@ describe("Sprint", () => {
     expect(onEditSprint).toHaveBeenCalledTimes(1);
     expect(onEditSprint).toHaveBeenCalledWith(expect.objectContaining({ id: 9 }));
   });
+
+  /* ---------------------------------------------------------------------- */
+  /* [Q] Accessible names / roles for icon-only controls                    */
+  /* ---------------------------------------------------------------------- */
+
+  describe("accessibility (a11y names/roles)", () => {
+    it("[Q] names the compact-sprint chevron and exposes its expanded state", () => {
+      const { container } = renderSprint();
+      const chevron = container.querySelector(".compact-sprint") as HTMLElement;
+      expect(chevron).not.toBeNull();
+      expect(chevron).toHaveAttribute("aria-label", "Compact Sprint");
+      // Sprints start expanded (not collapsed) -> aria-expanded="true".
+      expect(chevron).toHaveAttribute("aria-expanded", "true");
+
+      // Toggling collapses it -> aria-expanded flips to "false".
+      fireEvent.click(chevron);
+      expect(chevron).toHaveAttribute("aria-expanded", "false");
+    });
+
+    it("[Q] exposes the edit-sprint anchor as a named button", () => {
+      const { container } = renderSprint();
+      const edit = container.querySelector(".edit-sprint") as HTMLElement;
+      expect(edit).not.toBeNull();
+      expect(edit).toHaveAttribute("role", "button");
+      expect(edit).toHaveAttribute("aria-label", "Edit Sprint");
+    });
+  });
 });

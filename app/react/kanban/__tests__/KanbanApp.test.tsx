@@ -42,9 +42,20 @@ import {
     parseContainerKey,
     resolveKanbanDrop,
     zoomKeysFor,
+    validateBulkText,
+    firstUsInColumn,
+    hasUnclassifiedStories,
 } from "../KanbanApp";
 import type { KanbanBoardProps } from "../KanbanBoard";
 import { UNCLASSIFIED_SWIMLANE_ID } from "../useKanbanState";
+import {
+    loadColumnFolds,
+    loadKanbanFilters,
+    loadSwimlaneFolds,
+    saveColumnFolds,
+    saveKanbanFilters,
+    saveSwimlaneFolds,
+} from "../persistence";
 import type {
     KanbanProject,
     KanbanState,
@@ -289,6 +300,10 @@ function installAngularSpy(): { broadcast: jest.Mock; applyAsync: jest.Mock } {
 
 beforeEach(() => {
     mockCaptured.boardProps = null;
+    // KanbanApp now restores fold/filter view preferences from localStorage on
+    // load (QA-FUNC-03 / QA-FUNC-09). Clear it before every test so a persisted
+    // preference from one test can never leak into another.
+    window.localStorage.clear();
     currentProject = makeProject();
     currentSwimlanes = [];
     currentUserstories = [
@@ -445,6 +460,129 @@ describe("resolveKanbanDrop", () => {
         expect(result?.target.containerKey).toBe("100::60");
         expect(result?.orderedIds).toEqual([12, 10]);
     });
+
+    /* ---- multi-select group drag (QA-FUNC-01) ------------------------------ */
+
+    it("moves only the single dragged card when the selection has one member", () => {
+        // A one-card selection is NOT a group; behavior is bit-for-bit identical
+        // to the no-selection single-item path.
+        const state = makeState({ usByStatus: { "100": [1, 2, 3] } });
+        const withSel = resolveKanbanDrop(state, dragEnd(1, 3), [1]);
+        const withoutSel = resolveKanbanDrop(state, dragEnd(1, 3));
+        expect(withSel?.draggedIds).toEqual([1]);
+        expect(withSel?.orderedIds).toEqual(withoutSel?.orderedIds);
+        expect(withSel?.target).toEqual(withoutSel?.target);
+    });
+
+    it("moves the WHOLE multi-selection contiguously to the drop point (QA-FUNC-01)", () => {
+        // Selection {1,3}; drag card 1 onto card 4. Both selected cards travel
+        // together to the drop location in board reading order, and BOTH ids are
+        // reported so the bulk-order endpoint receives bulk_userstories > 1.
+        const state = makeState({ usByStatus: { "100": [1, 2, 3, 4] } });
+        const result = resolveKanbanDrop(state, dragEnd(1, 4), [1, 3]);
+        expect(result?.draggedIds).toEqual([1, 3]);
+        expect(result?.draggedIds.length).toBeGreaterThan(1);
+        expect(result?.orderedIds).toEqual([2, 1, 3, 4]);
+    });
+
+    it("moves the group only when the dragged card is part of the selection", () => {
+        // Dragging a NON-selected card (1) while {2,3} are selected must NOT drag
+        // the selection — only the single dragged card moves.
+        const state = makeState({ usByStatus: { "100": [1, 2, 3, 4] } });
+        const result = resolveKanbanDrop(state, dragEnd(1, 4), [2, 3]);
+        expect(result?.draggedIds).toEqual([1]);
+    });
+
+    it("carries every selected card across columns as a group (QA-FUNC-01)", () => {
+        // Selection spans two columns {1 in 100, 3 in 200}; dragging 1 onto the
+        // 200 container moves BOTH into 200, reported as one bulk group.
+        const state = makeState({
+            usByStatus: { "100": [1, 2], "200": [3, 4] },
+        });
+        const result = resolveKanbanDrop(state, dragEnd(1, "200::-1"), [1, 3]);
+        expect(result?.target.containerKey).toBe("200::-1");
+        expect(result?.draggedIds).toEqual([1, 3]);
+        expect(result?.orderedIds).toEqual([4, 1, 3]);
+    });
+});
+
+/* ========================================================================== */
+/* Pure helpers — bulk lightbox (QA-FUNC-04/05/07)                            */
+/* ========================================================================== */
+
+describe("validateBulkText (QA-FUNC-07)", () => {
+    it("rejects an empty / whitespace-only value with the REQUIRED message", () => {
+        expect(validateBulkText("")).toBe("This value is required.");
+        expect(validateBulkText("   \n  ")).toBe("This value is required.");
+    });
+
+    it("accepts a normal multi-line value", () => {
+        expect(validateBulkText("Story A\nStory B")).toBeNull();
+    });
+
+    it("accepts a line of exactly 199 characters (strictly < 200)", () => {
+        expect(validateBulkText("x".repeat(199))).toBeNull();
+    });
+
+    it("rejects a line of 200+ characters with the LINEWIDTH message", () => {
+        const message = validateBulkText("x".repeat(200));
+        expect(message).toBe(
+            "One or more lines is perhaps too long. Try to keep under 200 characters.",
+        );
+        expect(validateBulkText("ok\n" + "y".repeat(250))).toBe(
+            "One or more lines is perhaps too long. Try to keep under 200 characters.",
+        );
+    });
+});
+
+describe("firstUsInColumn (QA-FUNC-04 top placement)", () => {
+    it("returns the first id of a no-swimlane column", () => {
+        const state = makeState({ usByStatus: { "100": [7, 8, 9] } });
+        expect(firstUsInColumn(state, 100, null)).toBe(7);
+    });
+
+    it("returns null for an empty column", () => {
+        const state = makeState({ usByStatus: { "100": [] } });
+        expect(firstUsInColumn(state, 100, null)).toBeNull();
+    });
+
+    it("reads the swimlane bucket in swimlane mode", () => {
+        const state = makeState({
+            swimlanesList: [{ id: 50, name: "S50" }],
+            usByStatusSwimlanes: { 50: { 100: [12, 13] } },
+        });
+        expect(firstUsInColumn(state, 100, 50)).toBe(12);
+    });
+
+    it("maps a null swimlane to the unclassified (-1) bucket in swimlane mode", () => {
+        const state = makeState({
+            swimlanesList: [{ id: 50, name: "S50" }],
+            usByStatusSwimlanes: { [UNCLASSIFIED_SWIMLANE_ID]: { 100: [99] } },
+        });
+        expect(firstUsInColumn(state, 100, null)).toBe(99);
+    });
+});
+
+describe("hasUnclassifiedStories (QA-FUNC-04 swimlane option)", () => {
+    it("is true when the -1 bucket has stories", () => {
+        const state = makeState({
+            usByStatusSwimlanes: { [UNCLASSIFIED_SWIMLANE_ID]: { 100: [1] } },
+        });
+        expect(hasUnclassifiedStories(state)).toBe(true);
+    });
+
+    it("is false when the -1 bucket is absent or empty", () => {
+        expect(hasUnclassifiedStories(makeState())).toBe(false);
+        expect(
+            hasUnclassifiedStories(
+                makeState({
+                    usByStatusSwimlanes: {
+                        [UNCLASSIFIED_SWIMLANE_ID]: { 100: [] },
+                    },
+                }),
+            ),
+        ).toBe(false);
+    });
 });
 
 /* ========================================================================== */
@@ -475,6 +613,26 @@ describe("KanbanApp — module gate", () => {
         expect(mockCaptured.boardProps).toBeNull();
         // Only the project GET happened; no swimlanes / userstories were fetched.
         expect(mockListUserstories).not.toHaveBeenCalled();
+    });
+
+    it("renders a VISIBLE permission-denied message, not a blank section (QA-FUNC-10)", async () => {
+        currentProject = makeProject({ is_kanban_activated: false });
+        render(<KanbanApp projectId={PROJECT_ID} projectSlug="my-project" />);
+        await waitFor(() =>
+            expect(document.querySelector(".permission-denied")).not.toBeNull(),
+        );
+        const section = document.querySelector(".permission-denied") as HTMLElement;
+        // The section must NOT be empty — an explanatory message must render so
+        // the user is not left facing a blank white viewport.
+        const message = section.querySelector(".kanban-permission-denied-message");
+        expect(message).not.toBeNull();
+        expect(message).toHaveAttribute("role", "alert");
+        expect(section.textContent).toContain("Permission denied");
+        expect(section.textContent).toContain(
+            "You don't have permission to access this page.",
+        );
+        // Must NOT collide with the generic 500 load-error state.
+        expect(section.querySelector(".kanban-load-error")).toBeNull();
     });
 
     it("surfaces a load error when the project request rejects", async () => {
@@ -519,6 +677,17 @@ describe("KanbanApp — happy load", () => {
         expect(mockCaptured.boardProps?.canAddUs).toBe(false);
     });
 
+    it("derives canAddUs=false on an archived project even with add_us (QA-FUNC-11)", async () => {
+        // AngularJS `projectService.canEdit(add_us)` returns false on an archived
+        // project regardless of `my_permissions`, disabling the add-us buttons.
+        currentProject = makeProject({
+            my_permissions: ["add_us", "modify_us"],
+            archived_code: "blocked-by-owner-leaving",
+        });
+        await renderLoaded();
+        expect(mockCaptured.boardProps?.canAddUs).toBe(false);
+    });
+
     it("enters swimlane mode (class + swimlaneList) when swimlanes are present", async () => {
         currentSwimlanes = [{ id: 50, name: "Backend", statuses: [makeStatus(100, 1)] }];
         currentUserstories = [makeUs({ id: 1, status: 100, swimlane: 50, kanban_order: 0 })];
@@ -551,7 +720,7 @@ describe("KanbanApp — controls", () => {
     it("reloads with attachments/tasks when zoom crosses above level 2", async () => {
         await renderLoaded();
         const before = mockListUserstories.mock.calls.length;
-        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-level");
+        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-radio input");
         await act(async () => {
             fireEvent.click(zoomBtns[3]);
         });
@@ -571,7 +740,7 @@ describe("KanbanApp — controls", () => {
     it("does not reload when clicking the already-active zoom level", async () => {
         await renderLoaded();
         const before = mockListUserstories.mock.calls.length;
-        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-level");
+        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-radio input");
         await act(async () => {
             // Default zoom level is 1 -> clicking index 1 is a no-op.
             fireEvent.click(zoomBtns[1]);
@@ -582,7 +751,7 @@ describe("KanbanApp — controls", () => {
     it("updates zoom keys without reloading when staying at or below level 2", async () => {
         await renderLoaded();
         const before = mockListUserstories.mock.calls.length;
-        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-level");
+        const zoomBtns = document.querySelectorAll(".board-zoom .zoom-radio input");
         await act(async () => {
             fireEvent.click(zoomBtns[2]);
         });
@@ -766,7 +935,7 @@ describe("KanbanApp — bulk create", () => {
         await act(async () => {
             fireEvent.change(textarea, { target: { value: "Story A\nStory B" } });
         });
-        const submit = document.querySelector(".btn-submit") as HTMLButtonElement;
+        const submit = document.querySelector(".e2e-bulk-submit") as HTMLButtonElement;
         await act(async () => {
             fireEvent.click(submit);
         });
@@ -785,13 +954,14 @@ describe("KanbanApp — bulk create", () => {
         await act(async () => {
             mockCaptured.boardProps?.onAddUs?.("bulk", 200);
         });
-        const submit = document.querySelector(".btn-submit") as HTMLButtonElement;
+        const submit = document.querySelector(".e2e-bulk-submit") as HTMLButtonElement;
         await act(async () => {
             fireEvent.click(submit);
         });
         expect(mockBulkCreate).not.toHaveBeenCalled();
-        // Lightbox closes after submit regardless.
-        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        // An empty submit no longer closes the lightbox silently (QA-FUNC-06/07);
+        // the lightbox stays open so the user can correct the input.
+        expect(document.querySelector(".bulk-subjects")).not.toBeNull();
     });
 
     it("closes the bulk lightbox without creating when Close is clicked", async () => {
@@ -800,12 +970,265 @@ describe("KanbanApp — bulk create", () => {
             mockCaptured.boardProps?.onAddUs?.("bulk", 100);
         });
         expect(document.querySelector(".bulk-subjects")).not.toBeNull();
-        const close = document.querySelector(".btn-close") as HTMLButtonElement;
+        const close = document.querySelector(".e2e-bulk-close") as HTMLButtonElement;
         await act(async () => {
             fireEvent.click(close);
         });
         expect(document.querySelector(".bulk-subjects")).toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
+    });
+
+    // QA-FUNC-06: a failed bulk_create must keep the lightbox OPEN, RETAIN the
+    // typed text, and surface an inline error (no unhandled rejection, no data
+    // loss). Previously `submitBulk` had no `.catch()` and closed synchronously.
+    it("keeps the lightbox open, retains text and shows an error when bulk_create fails", async () => {
+        mockBulkCreate.mockRejectedValueOnce(new Error("boom"));
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        const textarea = document.querySelector(
+            ".bulk-subjects",
+        ) as HTMLTextAreaElement;
+        await act(async () => {
+            fireEvent.change(textarea, { target: { value: "Story A\nStory B" } });
+        });
+        await act(async () => {
+            fireEvent.click(document.querySelector(".e2e-bulk-submit") as HTMLButtonElement);
+        });
+        expect(mockBulkCreate).toHaveBeenCalledTimes(1);
+        // Lightbox STILL open, text preserved, inline error shown.
+        const stillOpen = document.querySelector(
+            ".bulk-subjects",
+        ) as HTMLTextAreaElement;
+        expect(stillOpen).not.toBeNull();
+        expect(stillOpen.value).toBe("Story A\nStory B");
+        expect(document.querySelector(".bulk-error")).not.toBeNull();
+    });
+
+    // The lightbox must close and clear the error on a SUCCESSFUL submit.
+    it("closes the lightbox and clears the error on a successful bulk_create", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        await act(async () => {
+            fireEvent.change(
+                document.querySelector(".bulk-subjects") as HTMLTextAreaElement,
+                { target: { value: "Story A" } },
+            );
+        });
+        await act(async () => {
+            fireEvent.click(document.querySelector(".e2e-bulk-submit") as HTMLButtonElement);
+        });
+        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        expect(document.querySelector(".bulk-error")).toBeNull();
+    });
+
+    // QA-FUNC-04: the enriched lightbox reproduces every region the AngularJS
+    // `lightbox-us-bulk.jade` had (title, status selector, top/bottom position
+    // radios, placeholder, cols=200). On a no-swimlane board the swimlane
+    // selector is absent (its ng-if requires swimlanesList.size).
+    it("renders the enriched lightbox regions (title, status, position, textarea)", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        expect(document.querySelector(".title")?.textContent).toBe(
+            "New bulk insert",
+        );
+        const statusSelector = document.querySelector(".bulk-status-selector");
+        expect(statusSelector).not.toBeNull();
+        expect(statusSelector?.textContent).toContain("Status 100");
+        const radios = document.querySelectorAll(
+            ".creation-position input[type='radio']",
+        ) as NodeListOf<HTMLInputElement>;
+        expect(radios.length).toBe(2);
+        expect(radios[0].value).toBe("bottom");
+        expect(radios[0].checked).toBe(true);
+        expect(radios[1].value).toBe("top");
+        const textarea = document.querySelector(
+            ".bulk-subjects",
+        ) as HTMLTextAreaElement;
+        expect(textarea.placeholder).toBe("One item per line...");
+        expect(textarea.cols).toBe(200);
+        expect(
+            document.querySelector(".js-submit-button")?.textContent,
+        ).toBe("Save");
+        // No swimlanes -> no swimlane selector.
+        expect(document.querySelector(".swimlane-select")).toBeNull();
+    });
+
+    // QA-FUNC-04: in swimlane mode the swimlane selector appears and shows the
+    // project default swimlane (pre-selected).
+    it("shows the swimlane selector (default pre-selected) in swimlane mode", async () => {
+        currentProject = makeProject({ default_swimlane: 50 });
+        currentSwimlanes = [
+            { id: 50, name: "Backend", statuses: [makeStatus(100, 1)] },
+        ];
+        currentUserstories = [makeUs({ id: 1, status: 100, swimlane: 50 })];
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        const swimlaneField = document.querySelector(".swimlane-select");
+        expect(swimlaneField).not.toBeNull();
+        expect(swimlaneField?.textContent).toContain("Backend");
+    });
+
+    // QA-FUNC-05: bulk_create must carry the SELECTED swimlane (defaulting to the
+    // project default_swimlane) rather than the previously hardcoded null.
+    it("passes the default swimlane to bulk_create in swimlane mode (QA-FUNC-05)", async () => {
+        currentProject = makeProject({ default_swimlane: 50 });
+        currentSwimlanes = [
+            { id: 50, name: "Backend", statuses: [makeStatus(100, 1)] },
+        ];
+        currentUserstories = [makeUs({ id: 1, status: 100, swimlane: 50 })];
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        await act(async () => {
+            fireEvent.change(
+                document.querySelector(".bulk-subjects") as HTMLTextAreaElement,
+                { target: { value: "Story A" } },
+            );
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".e2e-bulk-submit") as HTMLButtonElement,
+            );
+        });
+        expect(mockBulkCreate).toHaveBeenCalledWith(
+            PROJECT_ID,
+            100,
+            "Story A",
+            50,
+        );
+    });
+
+    // QA-FUNC-07: an empty submit is blocked with a visible REQUIRED message and
+    // performs no bulk_create (it previously closed the lightbox silently).
+    it("blocks an empty submit with the required message (QA-FUNC-07)", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".e2e-bulk-submit") as HTMLButtonElement,
+            );
+        });
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(document.querySelector(".bulk-error")?.textContent).toBe(
+            "This value is required.",
+        );
+        expect(document.querySelector(".bulk-subjects")).not.toBeNull();
+    });
+
+    // QA-FUNC-07: a line >= 200 chars is blocked with the LINEWIDTH message and
+    // performs no bulk_create.
+    it("blocks a >200-char line with the linewidth message (QA-FUNC-07)", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        await act(async () => {
+            fireEvent.change(
+                document.querySelector(".bulk-subjects") as HTMLTextAreaElement,
+                { target: { value: "x".repeat(200) } },
+            );
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".e2e-bulk-submit") as HTMLButtonElement,
+            );
+        });
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(document.querySelector(".bulk-error")?.textContent).toBe(
+            "One or more lines is perhaps too long. Try to keep under 200 characters.",
+        );
+    });
+
+    // QA-FUNC-04: changing the status via the selector submits the NEW status.
+    it("submits the status chosen in the status selector", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".bulk-status-selector") as HTMLButtonElement,
+            );
+        });
+        const options = document.querySelectorAll(
+            ".bulk-status-option",
+        ) as NodeListOf<HTMLButtonElement>;
+        // Pick the option for status 200 (the other project status).
+        const option200 = Array.from(options).find((o) =>
+            o.textContent?.includes("Status 200"),
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(option200);
+        });
+        await act(async () => {
+            fireEvent.change(
+                document.querySelector(".bulk-subjects") as HTMLTextAreaElement,
+                { target: { value: "Story A" } },
+            );
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".e2e-bulk-submit") as HTMLButtonElement,
+            );
+        });
+        expect(mockBulkCreate).toHaveBeenCalledWith(
+            PROJECT_ID,
+            200,
+            "Story A",
+            null,
+        );
+    });
+
+    // QA-FUNC-04 "on top": choosing the top radio reorders the created stories
+    // ahead of the column's current first story (mirrors moveUsToTop) via
+    // bulk_update_kanban_order.
+    it("reorders created stories to the top when the top position is chosen", async () => {
+        mockBulkCreate.mockImplementationOnce(() =>
+            Promise.resolve(mkRes([{ id: 900 }])),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        const radios = document.querySelectorAll(
+            ".creation-position input[type='radio']",
+        ) as NodeListOf<HTMLInputElement>;
+        await act(async () => {
+            fireEvent.click(radios[1]); // "on top"
+        });
+        await act(async () => {
+            fireEvent.change(
+                document.querySelector(".bulk-subjects") as HTMLTextAreaElement,
+                { target: { value: "Story A" } },
+            );
+        });
+        await act(async () => {
+            fireEvent.click(
+                document.querySelector(".e2e-bulk-submit") as HTMLButtonElement,
+            );
+        });
+        // bulk_update_kanban_order placed id 900 BEFORE the current first story (id 1).
+        const orderCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/bulk_update_kanban_order",
+        );
+        expect(orderCall).toBeTruthy();
+        expect(orderCall?.[1]).toMatchObject({
+            project_id: PROJECT_ID,
+            status_id: 100,
+            before_userstory_id: 1,
+            bulk_userstories: [900],
+        });
     });
 });
 
@@ -899,6 +1322,22 @@ describe("KanbanApp — board callbacks", () => {
         expect(mockCaptured.boardProps?.unfold).toBe(100);
     });
 
+    // QA-FUNC-02: archived status columns must load PRE-FOLDED (squished),
+    // mirroring the AngularJS `ctrl.initialLoad` watcher (kanban/main.coffee
+    // L797-803). Non-archived columns stay unfolded.
+    it("pre-folds every archived status column on initial load", async () => {
+        const archived = makeStatus(300, 3);
+        archived.is_archived = true;
+        currentProject = makeProject({
+            us_statuses: [makeStatus(100, 1), makeStatus(200, 2), archived],
+        });
+        await renderLoaded();
+        expect(mockCaptured.boardProps?.folds[300]).toBe(true);
+        // Non-archived columns are NOT pre-folded.
+        expect(mockCaptured.boardProps?.folds[100]).toBeFalsy();
+        expect(mockCaptured.boardProps?.folds[200]).toBeFalsy();
+    });
+
     it("toggles a swimlane's folded state", async () => {
         await renderLoaded();
         await act(async () => {
@@ -936,6 +1375,26 @@ describe("KanbanApp — board callbacks", () => {
             mockCaptured.boardProps?.onClickDelete?.(1);
         });
         expect(mockHttpDelete).not.toHaveBeenCalled();
+        confirmSpy.mockRestore();
+    });
+
+    // QA-FUNC-14: a failed DELETE must surface an error notification and SKIP the
+    // reload (so the still-present card remains), mirroring the AngularJS
+    // `confirm.notify("error")` branch. Previously there was no `.catch()`.
+    it("shows an error notification and does NOT reload when delete fails", async () => {
+        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
+        mockHttpDelete.mockRejectedValueOnce(new Error("boom"));
+        await renderLoaded();
+        // Baseline: listUserstories calls so far (initial load).
+        const callsBefore = mockListUserstories.mock.calls.length;
+        await act(async () => {
+            mockCaptured.boardProps?.onClickDelete?.(1);
+        });
+        expect(mockHttpDelete).toHaveBeenCalledWith("/userstories/1");
+        // Error banner shown...
+        expect(document.querySelector(".kanban-notification-error")).not.toBeNull();
+        // ...and NO extra reload was triggered by the failed delete.
+        expect(mockListUserstories.mock.calls.length).toBe(callsBefore);
         confirmSpy.mockRestore();
     });
 
@@ -1065,6 +1524,10 @@ describe("KanbanApp — blocked / archived project (F4)", () => {
             expect(document.querySelector(".permission-denied")).not.toBeNull(),
         );
         expect(document.querySelector(".kanban-load-error")).toBeNull();
+        // QA-FUNC-10: a visible message must accompany the 403 permission-denied.
+        expect(
+            document.querySelector(".permission-denied .kanban-permission-denied-message"),
+        ).not.toBeNull();
         expect(mockCaptured.boardProps).toBeNull();
     });
 
@@ -1077,6 +1540,10 @@ describe("KanbanApp — blocked / archived project (F4)", () => {
             expect(document.querySelector(".permission-denied")).not.toBeNull(),
         );
         expect(document.querySelector(".kanban-load-error")).toBeNull();
+        // QA-FUNC-10: a visible message must accompany the 451 permission-denied.
+        expect(
+            document.querySelector(".permission-denied .kanban-permission-denied-message"),
+        ).not.toBeNull();
     });
 
     it("still surfaces the generic load error for a non-permission HttpError (500)", async () => {
@@ -1192,6 +1659,158 @@ describe("KanbanApp — sidebar filters (F2)", () => {
         const lastCall =
             mockListUserstories.mock.calls[mockListUserstories.mock.calls.length - 1];
         expect(lastCall[1]).not.toHaveProperty("tags");
+    });
+});
+
+/* ========================================================================== */
+/* QA-FUNC-03 / QA-FUNC-09 — fold + filter persistence across reloads         */
+/* ========================================================================== */
+
+describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () => {
+    // --- QA-FUNC-03: column + swimlane fold modes ---
+
+    it("restores persisted column fold modes on load", async () => {
+        saveColumnFolds(PROJECT_ID, { 100: true, 200: false });
+
+        await renderLoaded();
+
+        expect(mockCaptured.boardProps?.folds).toMatchObject({
+            100: true,
+            200: false,
+        });
+    });
+
+    it("restores persisted swimlane fold modes on load", async () => {
+        saveSwimlaneFolds(PROJECT_ID, { 10: true, 20: false });
+
+        await renderLoaded();
+
+        expect(mockCaptured.boardProps?.foldedSwimlane).toMatchObject({
+            10: true,
+            20: false,
+        });
+    });
+
+    it("forces archived columns folded even when persisted unfolded (QA-FUNC-02 precedence)", async () => {
+        // An archived status persisted as UNFOLDED must still render folded on a
+        // fresh load: the archived override is applied ON TOP of restored modes.
+        currentProject = makeProject({
+            us_statuses: [
+                makeStatus(100, 1),
+                { ...makeStatus(300, 3), is_archived: true },
+            ],
+        });
+        saveColumnFolds(PROJECT_ID, { 100: false, 300: false });
+
+        await renderLoaded();
+
+        expect(mockCaptured.boardProps?.folds[300]).toBe(true); // archived forced
+        expect(mockCaptured.boardProps?.folds[100]).toBe(false); // restored as-is
+    });
+
+    it("persists a column fold toggle so it survives a reload", async () => {
+        await renderLoaded();
+        const status = makeStatus(100, 1);
+
+        await act(async () => {
+            mockCaptured.boardProps?.onFoldStatus?.(status);
+        });
+
+        expect(loadColumnFolds(PROJECT_ID)).toMatchObject({ 100: true });
+    });
+
+    it("persists a swimlane fold toggle so it survives a reload", async () => {
+        await renderLoaded();
+
+        await act(async () => {
+            mockCaptured.boardProps?.onToggleSwimlane?.(10);
+        });
+
+        expect(loadSwimlaneFolds(PROJECT_ID)).toMatchObject({ 10: true });
+    });
+
+    // --- QA-FUNC-09: sidebar filters + search query ---
+
+    it("persists the search query on change", async () => {
+        await renderLoaded();
+        const search = document.querySelector(
+            'input[type="search"]',
+        ) as HTMLInputElement;
+
+        await act(async () => {
+            fireEvent.change(search, { target: { value: "login" } });
+        });
+
+        expect(loadKanbanFilters(PROJECT_ID)?.q).toBe("login");
+    });
+
+    it("restores a persisted search query, fills the box, and feeds the first fetch", async () => {
+        saveKanbanFilters(PROJECT_ID, { q: "login", selected: [] });
+
+        await renderLoaded();
+
+        const search = document.querySelector(
+            'input[type="search"]',
+        ) as HTMLInputElement;
+        expect(search.value).toBe("login");
+        // The very first userstories request must already carry the query.
+        expect(mockListUserstories).toHaveBeenCalledWith(
+            PROJECT_ID,
+            expect.objectContaining({ q: "login" }),
+        );
+    });
+
+    it("restores persisted selected filters and applies them to the first fetch", async () => {
+        // The QA finding's canonical case: an "assigned to" filter (Carol) must
+        // survive a reload and re-filter the board on the first fetch.
+        saveKanbanFilters(PROJECT_ID, {
+            q: "",
+            selected: [
+                { id: "9", name: "Carol", dataType: "assigned_users" },
+            ],
+        });
+
+        await renderLoaded();
+
+        expect(mockListUserstories).toHaveBeenCalledWith(
+            PROJECT_ID,
+            expect.objectContaining({ assigned_users: "9" }),
+        );
+    });
+
+    it("persists an added sidebar filter selection", async () => {
+        currentFiltersData = {
+            tags: [{ name: "urgent", color: "#ff0000", count: 2 }],
+        };
+        await renderLoaded();
+
+        const filterBtn = document.querySelector(
+            ".btn-filter",
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(filterBtn);
+        });
+        await waitFor(() =>
+            expect(
+                document.querySelectorAll(".filter-category").length,
+            ).toBeGreaterThan(0),
+        );
+
+        const tagOption = document.querySelector(
+            '[data-type="tags"] .filter-name',
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(tagOption);
+        });
+
+        const persisted = loadKanbanFilters<{
+            id: string;
+            name: string;
+            dataType: string;
+        }>(PROJECT_ID);
+        expect(persisted?.selected).toEqual([
+            expect.objectContaining({ dataType: "tags", name: "urgent" }),
+        ]);
     });
 });
 

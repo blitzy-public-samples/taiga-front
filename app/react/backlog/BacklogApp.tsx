@@ -23,20 +23,27 @@
  *     `moveUsToTopOfBacklog`) through `../shared/dnd/DndProvider`.
  *   - Every mutation handler (create/edit/delete story, status/points change,
  *     add/edit sprint, bulk create) and the filters/search/velocity controls.
- *   - The two React lightboxes (bulk user stories + sprint add/edit). The
- *     shared generic-form lightbox stays in AngularJS and is reached through
- *     the `broadcastToAngular` bridge.
+ *   - The three React lightboxes: bulk user stories, sprint add/edit, and the
+ *     single-user-story create/edit form (`UserStoryEditLightbox`). All are
+ *     React-owned — the migrated `backlog.jade` no longer hosts any AngularJS
+ *     generic-form bridge (QA finding #2).
  *
  * This is the NAMED export consumed by `../index.tsx`
  * (`import { BacklogApp } from "./backlog/BacklogApp"`), which registers the
  * `<tg-react-backlog>` custom element.
  *
- * TRANSIENT-NaN CONTRACT: the host element reads `Number(this.dataset.projectId)`
- * and AngularJS may resolve `data-project-id="{{project.id}}"` AFTER the first
- * `connectedCallback`, so `projectId` can be `NaN` on the first render. EVERY
- * network call and the WebSocket connect are therefore DEFERRED until
- * `Number.isFinite(projectId)` and re-run when a finite id arrives (see the
- * effect in Phase H).
+ * PROJECT-ID RESOLUTION CONTRACT (QA finding #1): the host element derives the
+ * id from `data-project-id="{{project.id}}"`, but the migrated Jade shell has
+ * NO controller putting `project` on the template scope, so that attribute
+ * interpolates to `""` (→ `0`) or arrives as the raw `"{{project.id}}"` literal
+ * (→ `NaN`) — NEVER a real id. Only a POSITIVE INTEGER is treated as valid
+ * (`isValidProjectId`); `0`/`NaN` are rejected so the screen never issues the
+ * spurious `GET /projects/0` that returned 404. When the prop id is unusable
+ * the project is resolved from the slug embedded in the route URL
+ * (`/project/:pslug/...`) via `GET projects/by_slug`, and the resolved id is
+ * published to `resolvedId` (+ `resolvedIdRef`). EVERY network call and the
+ * WebSocket connect are DEFERRED until a valid id is resolved; when neither a
+ * valid prop id nor a URL slug is present, NO network runs (transient-NaN).
  *
  * SHARED-SESSION CONTRACT: this component NEVER mints its own JWT/sessionId and
  * NEVER opens a parallel WebSocket. It uses the `../shared/**` adapters
@@ -48,9 +55,11 @@
  */
 
 import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, FormEvent, ReactNode } from "react";
 import moment from "moment";
 
 import type {
+    CustomFilter,
     Filters,
     FilterCategory,
     FilterOption,
@@ -68,10 +77,19 @@ import { BacklogTable } from "./BacklogTable";
 import { SprintList } from "./SprintList";
 import { SprintEditLightbox } from "./SprintEditLightbox";
 import { BulkUserStoriesLightbox } from "./BulkUserStoriesLightbox";
+import { UserStoryEditLightbox } from "./UserStoryEditLightbox";
+import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
+import type {
+    AssignableUser,
+    UserStoryCreateFields,
+    UserStoryEditChanges,
+} from "./UserStoryEditLightbox";
 import { httpGet, httpPatch, httpDelete, HttpError } from "../shared/api/httpClient";
-import type { QueryParams } from "../shared/api/httpClient";
+import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import * as userstoriesApi from "../shared/api/userstories";
 import * as milestonesApi from "../shared/api/milestones";
+import * as userStorageApi from "../shared/api/userStorage";
+import type { StoredCustomFilters } from "../shared/api/userStorage";
 import { createEventsClient } from "../shared/events/websocket";
 import {
     DndProvider,
@@ -79,6 +97,14 @@ import {
     createBacklogPersister,
 } from "../shared/dnd/DndProvider";
 import type { NormalizedDragEnd, ResolvedDrop, DropNeighbors } from "../shared/dnd/DndProvider";
+import {
+    rowPreferringCollisionDetection,
+    singleStepKeyboardCoordinates,
+} from "../shared/dnd/keyboardCoordinates";
+import { notifyError } from "../shared/notifications/notificationCenter";
+import { NotificationHost } from "../shared/notifications/NotificationHost";
+import { resetInterceptorHooks, setInterceptorHooks } from "../shared/api/httpInterceptor";
+import { t } from "../shared/i18n/translate";
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -129,6 +155,29 @@ interface SprintLightboxState {
 /** Controlled state for the bulk-user-story lightbox. */
 interface BulkLightboxState {
     open: boolean;
+}
+
+/**
+ * Controlled state for the single-user-story create/edit lightbox
+ * ({@link UserStoryEditLightbox}). `us` is the row being edited in `"edit"`
+ * mode and `null` in `"create"` mode. Ports the AngularJS generic-form
+ * `$scope.mode` + `$scope.obj` (common/lightboxes.coffee L622-L673).
+ */
+interface UsLightboxState {
+    open: boolean;
+    mode: "create" | "edit";
+    us: UserStory | null;
+}
+
+/**
+ * Controlled state for the themed delete-confirmation dialog ([H]). Replaces the
+ * native `window.confirm()`. `us` is the story pending deletion; `busy` disables
+ * the dialog buttons while the DELETE request is in flight.
+ */
+interface DeleteConfirmState {
+    open: boolean;
+    us: UserStory | null;
+    busy: boolean;
 }
 
 /** A raw filter item as returned inside `GET /userstories/filters_data`. */
@@ -187,6 +236,13 @@ const SEARCH_DEBOUNCE_MS = 250;
  */
 const BURNDOWN_COLLAPSED_KEY = "is-burndown-grpahs-collapsed";
 
+/**
+ * `storeCustomFiltersName` for the backlog (backlog/main.coffee L50). Used to
+ * namespace the saved-filters row in `/api/v1/user-storage` so the React screen
+ * reads/writes the SAME row the AngularJS backlog used.
+ */
+const BACKLOG_CUSTOM_FILTERS_SUFFIX = "backlog-custom-filters";
+
 /** DnD container key for the backlog (milestone === null). */
 const BACKLOG_KEY = "backlog";
 /** DnD container key prefix for a sprint (`sprint:{id}`). */
@@ -209,6 +265,38 @@ function getBaseHref(): string {
 /** Per-project localStorage key for the show-tags preference. */
 function showTagsKey(projectId: number): string {
     return `showTags-${projectId}`;
+}
+
+/**
+ * A project id is valid only when it is a POSITIVE INTEGER. The host element
+ * derives the id from `data-project-id`, which the AngularJS Jade shell emits
+ * as `{{project.id}}`; with no controller putting `project` on the template
+ * scope it interpolates to `""` (→ `Number("") === 0`) or arrives as the raw
+ * `"{{project.id}}"` literal (→ `NaN`). BOTH must be rejected — treating `0`
+ * as an id previously produced `GET /projects/0` → 404 (QA finding #1). Only a
+ * finite positive integer unlocks any network / WebSocket work.
+ */
+function isValidProjectId(id: number): boolean {
+    return Number.isInteger(id) && id > 0;
+}
+
+/**
+ * Resolve the project slug from the current URL. The Backlog route is
+ * `/project/:pslug/backlog` (app.coffee), so the slug is ALWAYS present in the
+ * path even though `data-project-slug` (like `data-project-id`) fails to
+ * interpolate in the migrated shell. This is the RELIABLE fallback source used
+ * to look the project up via `GET projects/by_slug` when the host attribute did
+ * not yield a usable id (QA finding #1). Returns `null` when no slug segment is
+ * present (e.g. jsdom's default `/` path), which keeps the transient-NaN
+ * "no network until resolvable" contract intact.
+ */
+function slugFromLocation(): string | null {
+    try {
+        const match = /\/project\/([^/]+)/.exec(window.location.pathname);
+        return match ? decodeURIComponent(match[1]) : null;
+    } catch {
+        return null;
+    }
 }
 
 /** Map a DnD container key to its milestone id (`null` for the backlog). */
@@ -415,7 +503,11 @@ function buildFilterCategories(data: Record<string, unknown>): Filters {
         color: readColor(it),
         count: readCount(it),
     }));
-    categories.push({ title: "Status", dataType: "status", content: status });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.STATUS", "Status"),
+        dataType: "status",
+        content: status,
+    });
 
     // Tags — `it.id = it.name`.
     const tags: FilterOption[] = asRawItems(data.tags).map((it) => ({
@@ -424,23 +516,35 @@ function buildFilterCategories(data: Record<string, unknown>): Filters {
         color: readColor(it),
         count: readCount(it),
     }));
-    categories.push({ title: "Tags", dataType: "tags", content: tags });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.TAGS", "Tags"),
+        dataType: "tags",
+        content: tags,
+    });
 
     // Assigned to — `it.id ? id.toString() : "null"`, `name = full_name || "Unassigned"`.
     const assigned: FilterOption[] = asRawItems(data.assigned_users).map((it) => ({
         id: it.id != null ? String(it.id) : "null",
-        name: readString(it.full_name) || "Unassigned",
+        name: readString(it.full_name) || t("COMMON.FILTERS.UNASSIGNED", "Unassigned"),
         count: readCount(it),
     }));
-    categories.push({ title: "Assigned to", dataType: "assigned_users", content: assigned });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.ASSIGNED_TO", "Assigned to"),
+        dataType: "assigned_users",
+        content: assigned,
+    });
 
     // Role — `it.id ? id.toString() : "null"`, `name = name || "Unassigned"`.
     const role: FilterOption[] = asRawItems(data.roles).map((it) => ({
         id: it.id != null ? String(it.id) : "null",
-        name: readString(it.name) || "Unassigned",
+        name: readString(it.name) || t("COMMON.FILTERS.UNASSIGNED", "Unassigned"),
         count: readCount(it),
     }));
-    categories.push({ title: "Role", dataType: "role", content: role });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.ROLE", "Role"),
+        dataType: "role",
+        content: role,
+    });
 
     // Created by (owner) — `it.id = id.toString()`, `name = full_name`.
     const owner: FilterOption[] = asRawItems(data.owners).map((it) => ({
@@ -448,7 +552,11 @@ function buildFilterCategories(data: Record<string, unknown>): Filters {
         name: readString(it.full_name),
         count: readCount(it),
     }));
-    categories.push({ title: "Created by", dataType: "owner", content: owner });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.CREATED_BY", "Created by"),
+        dataType: "owner",
+        content: owner,
+    });
 
     // Epic — with-id: `name = "#{ref} {subject}"`; no-id: id "null", "Not in an epic".
     const epic: FilterOption[] = asRawItems(data.epics).map((it) => {
@@ -459,9 +567,17 @@ function buildFilterCategories(data: Record<string, unknown>): Filters {
                 count: readCount(it),
             };
         }
-        return { id: "null", name: "Not in an epic", count: readCount(it) };
+        return {
+            id: "null",
+            name: t("COMMON.FILTERS.NOT_IN_EPIC", "Not in an epic"),
+            count: readCount(it),
+        };
     });
-    categories.push({ title: "Epic", dataType: "epic", content: epic });
+    categories.push({
+        title: t("COMMON.FILTERS.CATEGORIES.EPIC", "Epic"),
+        dataType: "epic",
+        content: epic,
+    });
 
     return categories;
 }
@@ -491,43 +607,98 @@ function pickSelectedFilterParams(selected: SelectedFilter[]): QueryParams {
 }
 
 /**
- * The one unavoidable coupling to AngularJS: dispatch a `$rootScope` broadcast
- * so the surviving generic-form lightbox (single user-story edit / new-standard
- * create) still opens. It is a SAFE NO-OP when Angular / its injector is absent
- * (e.g. under jsdom in unit tests), because the whole body is guarded.
+ * Reduce the current selection to the plain string→string map a custom filter
+ * persists (filter key incl. `exclude_` prefix → comma-joined ids), mirroring
+ * the slice of `location.search()` that `saveCustomFilter` stored
+ * (controllerMixins.coffee L201-L214).
  */
-function broadcastToAngular(name: string, payload: unknown): void {
-    try {
-        const ng = (
-            window as unknown as {
-                angular?: {
-                    element: (d: Document) => {
-                        injector: () => {
-                            get: (s: string) => {
-                                $broadcast: (n: string, p: unknown) => void;
-                                $applyAsync: () => void;
-                            };
-                        };
-                    };
-                };
-            }
-        ).angular;
-        if (!ng) {
-            return; // no-op in jsdom / tests
+function selectedToStoredMap(selected: SelectedFilter[]): Record<string, string> {
+    const groups: Record<string, string[]> = {};
+    for (const filter of selected) {
+        const key = filter.mode === "exclude" ? `exclude_${filter.dataType}` : filter.dataType;
+        if (!VALID_QUERY_PARAMS.has(key)) {
+            continue;
         }
-        const rootScope = ng.element(document).injector().get("$rootScope");
-        rootScope.$broadcast(name, payload);
-        rootScope.$applyAsync();
-    } catch {
-        /* no-op when Angular / injector is absent */
+        (groups[key] ??= []).push(String(filter.id));
     }
+    const map: Record<string, string> = {};
+    for (const key of Object.keys(groups)) {
+        map[key] = groups[key].join(",");
+    }
+    return map;
 }
 
-/** Diagnostic logger for recoverable failures (never throws). */
-function reportError(context: string, error: unknown): void {
+/**
+ * Rebuild a {@link SelectedFilter} list from a saved custom-filter param map,
+ * matching each id against the freshly-loaded categories to recover its display
+ * name/color (falling back to the raw id when the value no longer exists) —
+ * mirroring `formatSelectedFilters` (controllerMixins.coffee L133-L177). Keys
+ * carrying the `exclude_` prefix are restored with `mode: "exclude"`.
+ */
+function reconstructSelectedFromParamMap(
+    paramMap: Record<string, string>,
+    categories: Filters,
+): SelectedFilter[] {
+    const byDataType = new Map<string, FilterCategory>();
+    for (const category of categories) {
+        byDataType.set(category.dataType, category);
+    }
+
+    const selected: SelectedFilter[] = [];
+    for (const rawKey of Object.keys(paramMap)) {
+        const value = paramMap[rawKey];
+        if (value == null || value === "") {
+            continue;
+        }
+        const isExclude = rawKey.startsWith("exclude_");
+        const dataType = isExclude ? rawKey.slice("exclude_".length) : rawKey;
+        const mode = isExclude ? "exclude" : "include";
+        const category = byDataType.get(dataType);
+
+        for (const id of String(value).split(",")) {
+            const trimmed = id.trim();
+            if (trimmed === "") {
+                continue;
+            }
+            const option = category?.content.find((o) => String(o.id) === trimmed);
+            selected.push({
+                id: trimmed,
+                name: option ? option.name : trimmed,
+                dataType,
+                mode,
+                ...(option?.color !== undefined ? { color: option.color } : {}),
+            });
+        }
+    }
+    return selected;
+}
+
+/**
+ * Convert the raw `/user-storage` value (name → param map) into the
+ * {@link CustomFilter} list the panel renders, mirroring the `_.forOwn` mapping
+ * in `generateFilters` (controllerMixins.coffee L362-L364).
+ */
+function storedToCustomFilters(raw: StoredCustomFilters): CustomFilter[] {
+    return Object.keys(raw).map((key) => ({ id: key, name: key, filter: raw[key] }));
+}
+
+/**
+ * Report a recoverable failure (never throws).
+ *
+ * Always logs a diagnostic to the console (developer signal, carries the raw
+ * error). When a `userMessage` is supplied it ALSO emits a non-blocking
+ * notification onto the shared bus so the user is never left without feedback —
+ * QA finding [ERR-1] (every mutation failure previously routed to
+ * `console.error` only). The console detail and the user-facing copy are kept
+ * separate: the toast never leaks internal error detail.
+ */
+function reportError(context: string, error: unknown, userMessage?: string): void {
     if (typeof console !== "undefined") {
         // eslint-disable-next-line no-console
         console.error(`[taiga-react] ${context}`, error);
+    }
+    if (userMessage !== undefined) {
+        notifyError(userMessage);
     }
 }
 
@@ -556,8 +727,18 @@ function writeStoredBoolean(key: string, value: boolean): void {
 interface BacklogFilterPanelProps {
     filters: Filters;
     selectedFilters: SelectedFilter[];
+    /** Saved ("custom") filters for this project (QA finding [J]). */
+    customFilters: CustomFilter[];
+    /** Currently-applied saved filter id, for the `.active` highlight. */
+    activeCustomFilter: Id | string | null;
+    /** Include/exclude mode of the NEXT option selection (QA finding [K]). */
+    filterMode: string;
+    onSetFilterMode: (mode: string) => void;
     onAddFilter: (category: FilterCategory, option: FilterOption) => void;
     onRemoveFilter: (filter: SelectedFilter) => void;
+    onSaveCustomFilter: (name: string) => void;
+    onSelectCustomFilter: (filter: CustomFilter) => void;
+    onRemoveCustomFilter: (filter: CustomFilter) => void;
 }
 
 /**
@@ -585,8 +766,128 @@ function Svg({ icon }: { icon: string }): JSX.Element {
     );
 }
 
+/**
+ * Render the delete-confirmation message from the shared catalog ([i18n], key
+ * `US.TITLE_DELETE_MESSAGE`). The catalog value embeds a `<strong>` around the
+ * interpolated (and quote-wrapped) story subject; rather than losing that
+ * emphasis (a flat string cannot carry React elements) OR risking
+ * `dangerouslySetInnerHTML`, we split the localized string on the single known
+ * `<strong>…</strong>` boundary — mirroring `renderLastSprintHint` in
+ * `SprintEditLightbox` — and render each segment as escaped React text. This
+ * preserves both the bold emphasis (visual parity) AND localization, with the
+ * interpolated subject always escaped by React (XSS-safe). The fallback matches
+ * the frozen catalog verbatim, including its literal `\u201C` quotes on BOTH
+ * sides of the subject (a catalog quirk preserved for exact parity).
+ */
+function renderDeleteMessage(subject: string): ReactNode {
+    const rendered = t(
+        "US.TITLE_DELETE_MESSAGE",
+        "Are you sure you want to delete <strong>\u201C{{subject}}\u201C</strong>?",
+        { subject },
+    );
+    const match = rendered.match(/^([\s\S]*?)<strong>([\s\S]*?)<\/strong>([\s\S]*)$/);
+    if (!match) {
+        // No <strong> in this locale's value — render plain (tag-stripped) text.
+        return rendered.replace(/<\/?strong>/g, "");
+    }
+    return (
+        <>
+            {match[1]}
+            <strong>{match[2]}</strong>
+            {match[3]}
+        </>
+    );
+}
+
+/** Angular `filterModeOptions` (filter.controller.coffee L20). */
+const FILTER_MODE_OPTIONS = ["include", "exclude"] as const;
+
+/** Per-category `single-filter-type-*` class (filter.jade `ng-class`). */
+function optionTypeClass(dataType: string): string {
+    if (dataType === "tags") {
+        return "single-filter-type-tag";
+    }
+    if (dataType === "assigned_users" || dataType === "owner") {
+        return "single-filter-type-user";
+    }
+    return "single-filter-type-general";
+}
+
+/**
+ * Per-option inline color, reproducing filter.jade's `ng-style`: tags color the
+ * background, every other category colors the left border; absent colors fall
+ * back to a transparent border so the SCSS `border-left` slot stays reserved.
+ */
+function optionStyle(dataType: string, option: FilterOption): CSSProperties {
+    if (dataType === "tags") {
+        return option.color ? { background: option.color } : {};
+    }
+    return { borderColor: option.color ? option.color : "transparent" };
+}
+
+/**
+ * In-board reimplementation of the shared AngularJS `tg-filter` widget
+ * (filter.jade + filter.controller.coffee), rendering the SAME class-driven
+ * DOM so the compiled `filter.scss` themes it unchanged. It restores three
+ * capabilities the first React port dropped:
+ *   - [J] the saved ("custom") filters section (list + add-form + delete),
+ *   - [K] the include/exclude mode toggle and the included/excluded split of
+ *     applied filters, and
+ *   - [L] collapsible filter categories (only one open at a time; all closed
+ *     initially, matching `FilterController.opened = null`).
+ */
 function BacklogFilterPanel(props: BacklogFilterPanelProps): JSX.Element {
-    const { filters, selectedFilters, onAddFilter, onRemoveFilter } = props;
+    const {
+        filters,
+        selectedFilters,
+        customFilters,
+        activeCustomFilter,
+        filterMode,
+        onSetFilterMode,
+        onAddFilter,
+        onRemoveFilter,
+        onSaveCustomFilter,
+        onSelectCustomFilter,
+        onRemoveCustomFilter,
+    } = props;
+
+    // -- [L] Collapse: a single open category dataType (null = all closed). ----
+    const [opened, setOpened] = useState<string | null>(null);
+    const isOpen = useCallback((dataType: string): boolean => opened === dataType, [opened]);
+    const toggleCategory = useCallback((dataType: string): void => {
+        setOpened((prev) => (prev === dataType ? null : dataType));
+    }, []);
+
+    // -- [J] Custom-filter add-form state + validation (filter.controller). ----
+    const [customFilterForm, setCustomFilterForm] = useState<boolean>(false);
+    const [customFilterName, setCustomFilterName] = useState<string>("");
+    const [lengthZeroError, setLengthZeroError] = useState<boolean>(false);
+    const [repeatedFilterError, setRepeatedFilterError] = useState<boolean>(false);
+
+    const openCustomFilter = useCallback((): void => {
+        setCustomFilterForm(true);
+        setLengthZeroError(false);
+        setRepeatedFilterError(false);
+    }, []);
+
+    const submitCustomFilter = useCallback(
+        (event: FormEvent): void => {
+            event.preventDefault();
+            const name = customFilterName;
+            const isDuplicate = customFilters.some((f) => f.name === name);
+            if (name.length > 0 && !isDuplicate) {
+                setLengthZeroError(false);
+                setRepeatedFilterError(false);
+                onSaveCustomFilter(name);
+                setCustomFilterForm(false);
+                setCustomFilterName("");
+                return;
+            }
+            setLengthZeroError(name.length === 0);
+            setRepeatedFilterError(name.length > 0 && isDuplicate);
+        },
+        [customFilterName, customFilters, onSaveCustomFilter],
+    );
 
     const isSelected = useCallback(
         (dataType: string, id: Id | string): boolean =>
@@ -596,71 +897,235 @@ function BacklogFilterPanel(props: BacklogFilterPanelProps): JSX.Element {
         [selectedFilters],
     );
 
+    // -- [K] Applied filters split by mode. ------------------------------------
+    const includedFilters = selectedFilters.filter((f) => f.mode !== "exclude");
+    const excludedFilters = selectedFilters.filter((f) => f.mode === "exclude");
+    const hasCustomForm = customFilterForm && selectedFilters.length > 0;
+
+    /** One applied-filter chip (shared by the included/excluded groups). */
+    const appliedChip = (filter: SelectedFilter): JSX.Element => (
+        <div
+            key={`${filter.dataType}:${filter.id}`}
+            className={`single-applied-filter ${filter.mode ?? "include"}`}
+        >
+            <span className="name">{filter.name}</span>
+            <button
+                type="button"
+                className="remove-filter e2e-remove-filter"
+                aria-label={t("COMMON.FILTERS.REMOVE", "Remove filter {{name}}", { name: filter.name })}
+                onClick={() => onRemoveFilter(filter)}
+            >
+                <Svg icon="icon-close" />
+            </button>
+        </div>
+    );
+
     return (
         <div className="backlog-filter" id="backlog-filter">
-            {selectedFilters.length > 0 && (
-                <div className="filters-applied">
-                    {selectedFilters.map((filter) => (
+            {/* [J] Custom (saved) filters ------------------------------------ */}
+            <div className="custom-filters">
+                <div className="custom-filters-header">
+                    <div className="custom-filters-title">
+                        <span className="name">{t("COMMON.FILTERS.TITLE", "Custom filters")}</span>
+                        <span className="number">({customFilters.length})</span>
+                    </div>
+                    {!customFilterForm && (
                         <button
                             type="button"
-                            key={`${filter.dataType}:${filter.id}`}
-                            className={`filter-applied${filter.mode === "exclude" ? " exclude" : ""}`}
-                            onClick={() => onRemoveFilter(filter)}
-                            title="Remove filter" /* i18n: COMMON.FILTERS.REMOVE */
+                            className="add-custom-filter"
+                            disabled={selectedFilters.length === 0}
+                            onClick={openCustomFilter}
                         >
-                            <span className="name">{filter.name}</span>
+                            {t("COMMON.FILTERS.ACTION_ADD", "Add")}
                         </button>
-                    ))}
+                    )}
                 </div>
-            )}
 
-            <div className="filters-cats">
-                {filters.map((category) => (
-                    <div
-                        className="filter-category"
-                        key={category.dataType}
-                        data-type={category.dataType}
-                    >
-                        <h4 className="filters-title">{category.title}</h4>
-                        <ul className="filter-list">
-                            {category.content.map((option) => {
-                                const selected = isSelected(category.dataType, option.id);
-                                return (
-                                    <li
-                                        key={String(option.id)}
-                                        className={`single-filter${selected ? " active" : ""}`}
-                                    >
-                                        <button
-                                            type="button"
-                                            className="filter-name"
-                                            onClick={() =>
-                                                selected
-                                                    ? onRemoveFilter({
-                                                          id: option.id,
-                                                          name: option.name,
-                                                          dataType: category.dataType,
-                                                          color: option.color,
-                                                      })
-                                                    : onAddFilter(category, option)
-                                            }
-                                        >
-                                            {option.color && (
-                                                <span
-                                                    className="color-bullet"
-                                                    style={{ background: option.color }}
-                                                />
-                                            )}
-                                            <span className="name">{option.name}</span>
-                                            {typeof option.count === "number" && (
-                                                <span className="number">{option.count}</span>
-                                            )}
-                                        </button>
-                                    </li>
-                                );
-                            })}
-                        </ul>
+                {hasCustomForm && (
+                    <form className="custom-filters-add-form" onSubmit={submitCustomFilter}>
+                        <input
+                            className={`add-filter-input e2e-filter-name-input${
+                                lengthZeroError || repeatedFilterError ? " checksley-error" : ""
+                            }`}
+                            type="text"
+                            placeholder={t(
+                                "COMMON.FILTERS.PLACEHOLDER_FILTER_NAME",
+                                "Write the filter name and press enter",
+                            )}
+                            aria-label={t(
+                                "COMMON.FILTERS.PLACEHOLDER_FILTER_NAME",
+                                "Write the filter name and press enter",
+                            )}
+                            value={customFilterName}
+                            onChange={(e) => setCustomFilterName(e.target.value)}
+                        />
+                        {lengthZeroError && (
+                            <span className="error-text">
+                                {t("COMMON.FILTERS.LENGTH_ZERO_ERROR", "Please add a filter name")}
+                            </span>
+                        )}
+                        {repeatedFilterError && !lengthZeroError && (
+                            <span className="error-text">
+                                {t("COMMON.FILTERS.REPEATED_FILTER_ERROR", "This filter name is already in use")}
+                            </span>
+                        )}
+                        <button className="btn-small e2e-open-custom-filter-form" type="submit">
+                            {t("COMMON.FILTERS.ACTION_SAVE_CUSTOM_FILTER", "save filter")}
+                        </button>
+                    </form>
+                )}
+
+                {customFilters.length > 0 && (
+                    <div className="custom-filter-list">
+                        {customFilters.map((filter) => (
+                            <div
+                                key={String(filter.id)}
+                                className={`single-filter single-filter-type-custom${
+                                    filter.id === activeCustomFilter ? " active" : ""
+                                }`}
+                            >
+                                <button
+                                    type="button"
+                                    className="name"
+                                    onClick={() => onSelectCustomFilter(filter)}
+                                >
+                                    {filter.name}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="remove-filter e2e-remove-custom-filter"
+                                    aria-label={t("COMMON.FILTERS.REMOVE_CUSTOM_FILTER", "Remove saved filter {{name}}", {
+                                        name: filter.name,
+                                    })}
+                                    onClick={() => onRemoveCustomFilter(filter)}
+                                >
+                                    <Svg icon="icon-trash" />
+                                </button>
+                            </div>
+                        ))}
                     </div>
-                ))}
+                )}
+            </div>
+
+            <div className="filters-step-cat">
+                {/* [K] Applied filters, split into included / excluded --------- */}
+                {(includedFilters.length > 0 || excludedFilters.length > 0) && (
+                    <div className="filters-applied">
+                        {includedFilters.length > 0 && (
+                            <div className="filters-included">
+                                <div className="filters-title">
+                                    {t("COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED", "Filtered by:")}
+                                </div>
+                                <div className="filters-wrapper">
+                                    {includedFilters.map(appliedChip)}
+                                </div>
+                            </div>
+                        )}
+                        {excludedFilters.length > 0 && (
+                            <div className="filters-excluded">
+                                <div className="filters-title">
+                                    {t("COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED", "Excluded:")}
+                                </div>
+                                <div className="filters-wrapper">
+                                    {excludedFilters.map(appliedChip)}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {/* [K] Include / exclude mode toggle --------------------------- */}
+                <div className="filters-advanced">
+                    <div className="filters-advanced-form">
+                        {FILTER_MODE_OPTIONS.map((option) => (
+                            <div className="custom-radio" key={option}>
+                                <input
+                                    type="radio"
+                                    name="filter-mode"
+                                    id={`filter-mode-${option}`}
+                                    value={option}
+                                    checked={filterMode === option}
+                                    onChange={() => onSetFilterMode(option)}
+                                />
+                                <label
+                                    className={`filter-mode ${option}${
+                                        filterMode === option ? " active" : ""
+                                    }`}
+                                    htmlFor={`filter-mode-${option}`}
+                                >
+                                    <span className="radio-mark">
+                                        <span className={`radio-mark-inner ${option}`} />
+                                    </span>
+                                    <span>
+                                        {option === "include"
+                                            ? t("COMMON.FILTERS.ADVANCED_FILTERS.INCLUDE", "Include")
+                                            : t("COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDE", "Exclude")}
+                                    </span>
+                                </label>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                {/* [L] Collapsible filter categories --------------------------- */}
+                <div className="filters-cats">
+                    <ul>
+                        {filters.map((category) => {
+                            const open = isOpen(category.dataType);
+                            return (
+                                <li
+                                    key={category.dataType}
+                                    className={open ? "selected" : ""}
+                                    data-type={category.dataType}
+                                >
+                                    <button
+                                        type="button"
+                                        className={`filters-cat-single e2e-category${
+                                            open ? " selected" : ""
+                                        }`}
+                                        aria-expanded={open}
+                                        onClick={() => toggleCategory(category.dataType)}
+                                    >
+                                        <span className="title">{category.title}</span>
+                                        <Svg icon={open ? "icon-arrow-down" : "icon-arrow-right"} />
+                                    </button>
+
+                                    {open && (
+                                        <div className="filter-list">
+                                            {category.content
+                                                .filter(
+                                                    (option) =>
+                                                        !isSelected(category.dataType, option.id),
+                                                )
+                                                .map((option) => (
+                                                    <button
+                                                        type="button"
+                                                        key={String(option.id)}
+                                                        className={`single-filter ${optionTypeClass(
+                                                            category.dataType,
+                                                        )}`}
+                                                        style={optionStyle(
+                                                            category.dataType,
+                                                            option,
+                                                        )}
+                                                        onClick={() => onAddFilter(category, option)}
+                                                    >
+                                                        <span className="name">{option.name}</span>
+                                                        {typeof option.count === "number" &&
+                                                            option.count > 0 && (
+                                                                <span className="number e2e-filter-count">
+                                                                    {option.count}
+                                                                </span>
+                                                            )}
+                                                    </button>
+                                                ))}
+                                        </div>
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>
+                </div>
             </div>
         </div>
     );
@@ -697,6 +1162,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         setLoadingUserstories,
         setFirstLoadComplete,
         setFilters,
+        setCustomFilters,
         setFilterQ,
         setForecasting,
         applyMovedUserstories,
@@ -714,6 +1180,20 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const [project, setProject] = useState<Project | null>(null);
     const [permissionDenied, setPermissionDenied] = useState<boolean>(false);
     const [loadError, setLoadError] = useState<string | null>(null);
+    // [ERR-2] offline surface: set when a React `fetch` fails with no HTTP
+    // response (network down). Mirrors the AngularJS offline interceptor branch
+    // (`errorHandlingService.error()`, app.coffee L620-623) which renders a
+    // full-page error rather than a transient toast.
+    const [connectionError, setConnectionError] = useState<boolean>(false);
+    // The EFFECTIVE project id the whole screen keys off. It is the prop id when
+    // that is already a valid positive integer; otherwise it stays `NaN` until
+    // `loadProject` resolves it from the URL slug via `GET projects/by_slug`
+    // (QA finding #1). `resolvedIdRef` mirrors it so the memoised async loaders
+    // can read the freshest id the instant `loadProject` publishes it — WITHIN
+    // the same `loadInitialData` run — without being re-created on every change.
+    const [resolvedId, setResolvedId] = useState<number>(() =>
+        isValidProjectId(projectId) ? projectId : NaN,
+    );
     const [burndownCollapsed, setBurndownCollapsed] = useState<boolean>(() =>
         readStoredBoolean(BURNDOWN_COLLAPSED_KEY),
     );
@@ -727,6 +1207,20 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         canDelete: false,
     });
     const [bulkLightbox, setBulkLightbox] = useState<BulkLightboxState>({ open: false });
+    const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>({
+        open: false,
+        us: null,
+        busy: false,
+    });
+    const [usLightbox, setUsLightbox] = useState<UsLightboxState>({
+        open: false,
+        mode: "create",
+        us: null,
+    });
+    // Include/exclude mode of the NEXT filter option selected (QA finding [K]),
+    // and the id of the applied saved filter for its `.active` highlight ([J]).
+    const [filterMode, setFilterMode] = useState<string>("include");
+    const [activeCustomFilter, setActiveCustomFilter] = useState<Id | string | null>(null);
 
     // Refs that mirror the latest render values so the memoised async callbacks
     // never read a stale closure (the controller relied on a live `@scope`).
@@ -735,8 +1229,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     stateRef.current = state;
     const projectRef = useRef<Project | null>(project);
     projectRef.current = project;
+    const resolvedIdRef = useRef<number>(resolvedId);
+    resolvedIdRef.current = resolvedId;
     const closedVisibleRef = useRef<boolean>(closedSprintsVisible);
     closedVisibleRef.current = closedSprintsVisible;
+    // Mirror the include/exclude mode so `addFilterBacklog` (memoised, no
+    // `filterMode` dependency) always reads the live value.
+    const filterModeRef = useRef<string>(filterMode);
+    filterModeRef.current = filterMode;
 
     // Pagination cursor authority: the hook's `appendUserstories` increments its
     // own `page` on `hasNextPage` but does NOT reset it on a reset-load, so the
@@ -753,25 +1253,91 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const canLoadMore = !state.disablePagination && state.firstLoadComplete;
     const baseHref = useMemo(() => getBaseHref(), []);
 
+    // [ERR-2] — replicate the AngularJS global HTTP interceptors that the React
+    // `fetch` path bypasses, mapping their side effects onto this root's
+    // full-page surfaces (mirroring `errorHandlingService.error()`/`.block()`
+    // which render an overlay rather than navigating):
+    //   - offline (network failure) → a full-page connection-error overlay;
+    //   - 451 blocked-project        → the existing permission-denied overlay.
+    // The 401 refresh/redirect is handled by the DEFAULT interceptor policy
+    // (`shared/api/httpInterceptor`), which persists the rotated token to the
+    // shared session and redirects to login only in a real browser. Hooks are
+    // reset on unmount so a later screen restores the default (toast) policy.
+    useEffect(() => {
+        setInterceptorHooks({
+            onOffline: () => {
+                setConnectionError(true);
+            },
+            onBlocked: () => {
+                setPermissionDenied(true);
+            },
+        });
+        return () => {
+            resetInterceptorHooks();
+        };
+    }, []);
+
     /* ---------------------------------------------------------------------- */
-    /* Phase B — data loaders (ALL guarded by Number.isFinite(projectId))      */
+    /* Phase B — data loaders (ALL guarded by isValidProjectId(resolvedId))    */
     /* ---------------------------------------------------------------------- */
 
     /**
-     * Port of `loadProject` (main.coffee L469). Resolves the project payload and
-     * gates the whole screen: a project without `is_backlog_activated`, or a
-     * 403/451 (blocked / archived) response, sets `permissionDenied`. Returns
-     * `true` only when the backlog may proceed to load.
+     * Port of `loadProject` (main.coffee L469), extended with URL-slug
+     * resolution to fix QA finding #1. Resolves the project payload and gates
+     * the whole screen: a project without `is_backlog_activated`, or a 403/451
+     * (blocked / archived) response, sets `permissionDenied`. Returns `true`
+     * only when the backlog may proceed to load.
+     *
+     * Resolution strategy (ONE network round-trip, never `GET /projects/0`):
+     *   - When the host attribute yielded a valid positive integer id, fetch
+     *     `GET projects/{id}` directly (the fast path; also what unit tests that
+     *     pass a real `projectId` exercise).
+     *   - Otherwise the migrated Jade shell never interpolated a usable id (its
+     *     `data-project-id="{{project.id}}"` has no controller-scope `project`),
+     *     so fall back to the slug embedded in the URL — `/project/:pslug/...` —
+     *     and resolve the project with `GET projects/by_slug?slug={pslug}`. When
+     *     no slug is present (e.g. a transient render with a bare path) there is
+     *     nothing to resolve yet, so return without touching the network.
+     *
+     * On success the resolved id is published to BOTH `resolvedIdRef` (read
+     * synchronously by the parallel loaders in the same `loadInitialData` run)
+     * and `resolvedId` state (drives the render gate + memo recreation).
+     *
+     * [ERR-3]: the transient gate state (`permissionDenied` / `loadError`) is
+     * reset at the START of every load so a stale denial/error from a previous
+     * project or a recovered failure never sticks across reloads.
      */
     const loadProject = useCallback(async (): Promise<boolean> => {
-        if (!Number.isFinite(projectId)) {
-            return false;
-        }
+        // [ERR-3] — clear any prior denial/error before (re)loading.
+        setPermissionDenied(false);
+        setLoadError(null);
+        // [ERR-2] — clear a prior offline overlay so a recovered connection
+        // never keeps the board wedged on a stale connection-error screen.
+        setConnectionError(false);
+
         try {
-            const res = await httpGet<Project>(`projects/${projectId}`);
+            // Choose the resolution endpoint. Only a valid positive-integer id
+            // uses the by-id path (called with a single arg, exactly as before);
+            // everything else falls back to the URL slug via `projects/by_slug`.
+            let res: HttpResponse<Project>;
+            if (isValidProjectId(projectId)) {
+                res = await httpGet<Project>(`projects/${projectId}`);
+            } else {
+                const slug = slugFromLocation();
+                if (!slug) {
+                    // No id and no slug → nothing resolvable yet; no network.
+                    return false;
+                }
+                res = await httpGet<Project>("projects/by_slug", { slug });
+            }
             if (!aliveRef.current) {
                 return false;
             }
+            // Publish the resolved id to the ref FIRST so the loaders invoked
+            // later in this same `loadInitialData` run read the real id, then to
+            // state so the render gate opens and the memo chain recomputes.
+            resolvedIdRef.current = res.data.id;
+            setResolvedId(res.data.id);
             setProject(res.data);
             if (!res.data.is_backlog_activated) {
                 // Port `errorHandlingService.permissionDenied()`.
@@ -787,8 +1353,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             if (err instanceof HttpError && (err.status === 403 || err.status === 451)) {
                 setPermissionDenied(true);
             } else {
-                // i18n: BACKLOG.ERROR_LOADING_BACKLOG (generic load failure).
-                setLoadError("The backlog could not be loaded.");
+                setLoadError(t("BACKLOG.ERROR_LOADING_BACKLOG", "The backlog could not be loaded."));
                 reportError("loadProject failed", err);
             }
             return false;
@@ -800,11 +1365,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * `completedPercentage` and `showGraphPlaceholder` inside `setStats`.
      */
     const loadProjectStats = useCallback(async (): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
             return;
         }
         try {
-            const res = await httpGet<ProjectStats>(`projects/${projectId}/stats`);
+            const res = await httpGet<ProjectStats>(`projects/${id}/stats`);
             if (!aliveRef.current) {
                 return;
             }
@@ -812,7 +1378,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         } catch (err) {
             reportError("loadProjectStats failed", err);
         }
-    }, [projectId, setStats]);
+    }, [setStats]);
 
     /**
      * Port of `loadSprints` (main.coffee L304): open sprints (`{closed:false}`),
@@ -820,11 +1386,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * `sprint_order` and derives `currentSprint`.
      */
     const loadSprints = useCallback(async (): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
             return;
         }
         try {
-            const result = await milestonesApi.list(projectId, { closed: false });
+            const result = await milestonesApi.list(id, { closed: false });
             if (!aliveRef.current) {
                 return;
             }
@@ -834,15 +1401,16 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         } catch (err) {
             reportError("loadSprints failed", err);
         }
-    }, [projectId, setSprints]);
+    }, [setSprints]);
 
     /** Port of `loadClosedSprints` (main.coffee L281): closed sprints (`{closed:true}`). */
     const loadClosedSprints = useCallback(async (): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
             return;
         }
         try {
-            const result = await milestonesApi.list(projectId, { closed: true });
+            const result = await milestonesApi.list(id, { closed: true });
             if (!aliveRef.current) {
                 return;
             }
@@ -851,7 +1419,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         } catch (err) {
             reportError("loadClosedSprints failed", err);
         }
-    }, [projectId, setClosedSprints]);
+    }, [setClosedSprints]);
 
     /**
      * Port of `loadUserstories` (main.coffee L341): the backlog (milestone
@@ -863,7 +1431,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      */
     const loadUserstories = useCallback(
         async (opts: { reset: boolean; q?: string; selected?: SelectedFilter[] }): Promise<void> => {
-            if (!Number.isFinite(projectId)) {
+            const id = resolvedIdRef.current;
+            if (!isValidProjectId(id)) {
                 return;
             }
             const s = stateRef.current;
@@ -874,7 +1443,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             setLoadingUserstories(true);
 
             const params: QueryParams = {
-                project: projectId,
+                project: id,
                 milestone: "null",
                 page: requestPage,
                 page_size: PAGE_SIZE,
@@ -916,7 +1485,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 reportError("loadUserstories failed", err);
             }
         },
-        [projectId, setLoadingUserstories, appendUserstories],
+        [setLoadingUserstories, appendUserstories],
     );
 
     /**
@@ -926,7 +1495,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      */
     const loadFilters = useCallback(
         async (overrideSelected?: SelectedFilter[]): Promise<void> => {
-            if (!Number.isFinite(projectId)) {
+            const id = resolvedIdRef.current;
+            if (!isValidProjectId(id)) {
                 return;
             }
             const s = stateRef.current;
@@ -936,7 +1506,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 overrideSelected !== undefined ? overrideSelected : s.selectedFilters;
             try {
                 const res = await userstoriesApi.filtersData({
-                    project: projectId,
+                    project: id,
                     milestone: "null",
                     ...pickSelectedFilterParams(selected),
                 });
@@ -949,8 +1519,33 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 reportError("loadFilters failed", err);
             }
         },
-        [projectId, setFilters],
+        [setFilters],
     );
+
+    /**
+     * Load the project's saved ("custom") filters from `/user-storage` and
+     * publish them to the hook (QA finding [J]; mirrors the second half of
+     * `generateFilters`, controllerMixins.coffee L246-L364). Declared here — with
+     * the other loaders — because `loadInitialData` lists it as a dependency.
+     */
+    const loadCustomFilters = useCallback(async (): Promise<void> => {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
+            return;
+        }
+        try {
+            const raw = await userStorageApi.getFilters(id, BACKLOG_CUSTOM_FILTERS_SUFFIX);
+            if (!aliveRef.current) {
+                return;
+            }
+            // Update ONLY the customFilters slice. Reading stateRef.current.filters
+            // here and writing it back via setFilters would clobber the categories
+            // loadFilters set moments earlier (no render has flushed the ref yet).
+            setCustomFilters(storedToCustomFilters(raw));
+        } catch (err) {
+            reportError("loadCustomFilters failed", err);
+        }
+    }, [setCustomFilters]);
 
     /** Port of `loadBacklog` (main.coffee L410): stats + sprints + first US page in parallel. */
     const loadBacklog = useCallback(async (): Promise<void> => {
@@ -968,20 +1563,21 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * refreshes even for changes this client originated.
      */
     const initializeSubscription = useCallback((): void => {
-        if (!Number.isFinite(projectId)) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
             return;
         }
         const client = createEventsClient();
         eventsRef.current = client;
         client.connect();
 
-        client.subscribe(`changes.project.${projectId}.userstories`, () => {
+        client.subscribe(`changes.project.${id}.userstories`, () => {
             void loadUserstories({ reset: true });
             void loadSprints();
         });
 
         client.subscribe(
-            `changes.project.${projectId}.milestones`,
+            `changes.project.${id}.milestones`,
             () => {
                 void loadSprints();
                 void loadClosedSprints();
@@ -989,7 +1585,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             },
             { selfNotification: true },
         );
-    }, [projectId, loadUserstories, loadSprints, loadClosedSprints, loadProjectStats]);
+    }, [loadUserstories, loadSprints, loadClosedSprints, loadProjectStats]);
 
     /**
      * Port of `loadInitialData` (main.coffee L488): project → subscription →
@@ -997,9 +1593,10 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * show-tags preference before loading (port of the `getShowTags` check).
      */
     const loadInitialData = useCallback(async (): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
-            return;
-        }
+        // NO leading id guard: in production the host attribute never yields a
+        // usable id, so the id is resolved from the URL slug INSIDE loadProject.
+        // loadProject returns false (without touching the network) when nothing
+        // is resolvable, which correctly short-circuits the rest of the load.
         const ok = await loadProject();
         if (!aliveRef.current || !ok) {
             return;
@@ -1008,8 +1605,9 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         initializeSubscription();
 
         // Restore the persisted show-tags preference (port of `getShowTags`).
+        // Uses the RESOLVED id (published synchronously by loadProject above).
         try {
-            const stored = window.localStorage.getItem(showTagsKey(projectId));
+            const stored = window.localStorage.getItem(showTagsKey(resolvedIdRef.current));
             if (stored != null) {
                 const desired = stored === "true";
                 if (stateRef.current.showTags !== desired) {
@@ -1028,8 +1626,22 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (!aliveRef.current) {
             return;
         }
+        // Saved ("custom") filters — QA finding [J]. Loaded after the categories
+        // so the panel can resolve saved ids to display names on first paint.
+        await loadCustomFilters();
+        if (!aliveRef.current) {
+            return;
+        }
         setFirstLoadComplete(true);
-    }, [projectId, loadProject, initializeSubscription, loadBacklog, loadFilters, setFirstLoadComplete, bsToggleShowTags]);
+    }, [
+        loadProject,
+        initializeSubscription,
+        loadBacklog,
+        loadFilters,
+        loadCustomFilters,
+        setFirstLoadComplete,
+        bsToggleShowTags,
+    ]);
 
     /* ---------------------------------------------------------------------- */
     /* Phase E — drag & drop                                                   */
@@ -1068,7 +1680,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             );
             dropIndex = base.length;
         } else {
-            // Dropped over another row → land at that row's position.
+            // Dropped over another row.
             const overLoc = locateUs(overId, userstories, sprints, closedSprints);
             if (!overLoc) {
                 return null;
@@ -1076,7 +1688,29 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             targetKey = overLoc.containerKey;
             const base = overLoc.ids.filter((id) => id !== draggedId);
             const k = base.indexOf(overId);
-            dropIndex = k === -1 ? base.length : k;
+            if (k === -1) {
+                dropIndex = base.length;
+            } else if (
+                overLoc.containerKey === origin.containerKey &&
+                origin.index < overLoc.index
+            ) {
+                // SAME-container DOWNWARD move ([N]): land AFTER the over-row.
+                // Filtering the dragged id out of `base` shifts every row below the
+                // drag up by one, so the plain "insert BEFORE the over-row" index
+                // (`k`) resolves to the drag's ORIGINAL slot — a silent no-op that
+                // affected BOTH a single-ArrowDown keyboard step AND an adjacent
+                // pointer drag (the story never moved and nothing persisted).
+                // Landing at `k + 1` reproduces canonical dnd-kit `arrayMove`
+                // semantics (moving down = step PAST each crossed row), so the item
+                // advances exactly one slot per crossed row for pointer and keyboard
+                // alike. Upward moves and cross-container drops need no adjustment
+                // because removing the dragged id does not shift the over-row.
+                dropIndex = k + 1;
+            } else {
+                // Same-container UPWARD move, or a cross-container insertion: land
+                // at the over-row's position (insert before it).
+                dropIndex = k;
+            }
         }
 
         const targetIds = containerIds(targetKey, userstories, sprints, closedSprints).filter(
@@ -1134,7 +1768,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             applyMovedUserstories(moved);
 
             const targetMilestoneId = milestoneIdFromKey(resolved.target.containerKey);
-            const persister = createBacklogPersister(projectId);
+            const persister = createBacklogPersister(resolvedId);
 
             try {
                 // Neighbor → API mapping: previous → afterUserstoryId, next → beforeUserstoryId.
@@ -1181,10 +1815,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     // Roll back the optimistic move.
                     applyMovedUserstories(prev);
                 }
-                reportError("drag order persistence failed", err);
+                reportError(
+                    "drag order persistence failed",
+                    err,
+                    t("BACKLOG.ERROR_MOVE_US", "Could not save the new order. Please try again."),
+                );
             }
         },
-        [projectId, applyMovedUserstories, patchUserStory, loadSprints, loadProjectStats, loadClosedSprints],
+        [resolvedId, applyMovedUserstories, patchUserStory, loadSprints, loadProjectStats, loadClosedSprints],
     );
 
     /**
@@ -1220,7 +1858,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
             try {
                 const res = await userstoriesApi.bulkUpdateBacklogOrder(
-                    projectId,
+                    resolvedId,
                     null,
                     null,
                     nextUs,
@@ -1245,10 +1883,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (aliveRef.current) {
                     applyMovedUserstories(prev);
                 }
-                reportError("move-to-top failed", err);
+                reportError(
+                    "move-to-top failed",
+                    err,
+                    t("BACKLOG.ERROR_MOVE_US", "Could not move the story. Please try again."),
+                );
             }
         },
-        [projectId, applyMovedUserstories, patchUserStory, loadSprints, loadProjectStats],
+        [resolvedId, applyMovedUserstories, patchUserStory, loadSprints, loadProjectStats],
     );
 
     /* ---------------------------------------------------------------------- */
@@ -1256,28 +1898,27 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     /* ---------------------------------------------------------------------- */
 
     /**
-     * Port of `editUserStory` (main.coffee L653) via the generic-form bridge. In
-     * AngularJS the controller re-fetched the story by ref + its attachments;
-     * here the row `us` is passed through and the shared AngularJS lightbox
-     * re-fetches as needed. Safe no-op under jsdom (no Angular).
+     * Port of `editUserStory` (main.coffee L653). In AngularJS the controller
+     * re-fetched the story + attachments and broadcast to the generic-form
+     * lightbox; here the row `us` seeds the React-owned {@link
+     * UserStoryEditLightbox} directly (the Angular host was removed by the
+     * migration — QA finding #2).
      */
     const onEditUserStory = useCallback((us: UserStory): void => {
-        // i18n bridge event: "genericform:edit".
-        broadcastToAngular("genericform:edit", { objType: "us", obj: us, attachments: [] });
+        // [#2] Open the React-owned create/edit lightbox in EDIT mode, seeded
+        // from the row. Previously this broadcast "genericform:edit" to the
+        // Angular `tg-lb-create-edit` host that the migrated backlog.jade
+        // removed, so it was a silent no-op.
+        setUsLightbox({ open: true, mode: "edit", us });
     }, []);
 
     /**
-     * Port of `deleteUserStory` (main.coffee L662): confirm, optimistically
-     * remove, DELETE, reload stats + sprints; restore on failure.
+     * The ACTUAL user-story deletion (main.coffee L662, minus the confirm):
+     * optimistically remove, DELETE, reload stats + sprints; restore on failure.
+     * The confirmation step is handled by the themed {@link ConfirmDialog} ([H]).
      */
-    const onDeleteUserStory = useCallback(
+    const performDeleteUserStory = useCallback(
         async (us: UserStory): Promise<void> => {
-            // i18n: US.TITLE_DELETE_MESSAGE {subject}.
-            const message = `Delete the user story "${us.subject}"?`;
-            if (!window.confirm(message)) {
-                return;
-            }
-
             const previous = stateRef.current.userstories;
             removeUserStory(us);
 
@@ -1291,11 +1932,42 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (aliveRef.current) {
                     restoreUserstories(previous);
                 }
-                reportError("deleteUserStory failed", err);
+                reportError(
+                    "deleteUserStory failed",
+                    err,
+                    t("BACKLOG.ERROR_DELETE_US", "Could not delete the story. Please try again."),
+                );
             }
         },
         [removeUserStory, restoreUserstories, loadProjectStats, loadSprints],
     );
+
+    /**
+     * Row "delete" action: open the themed confirmation dialog ([H], replacing
+     * the native `window.confirm`). The dialog's confirm handler runs the
+     * deletion. Ports `deleteUserStory`'s `$confirm.askOnDelete(...)` prompt.
+     */
+    const onDeleteUserStory = useCallback((us: UserStory): void => {
+        setDeleteConfirm({ open: true, us, busy: false });
+    }, []);
+
+    /** Confirm handler for the delete dialog: run the delete, then close. */
+    const handleConfirmDelete = useCallback(async (): Promise<void> => {
+        const us = deleteConfirm.us;
+        if (!us) {
+            return;
+        }
+        setDeleteConfirm((s) => ({ ...s, busy: true }));
+        await performDeleteUserStory(us);
+        if (aliveRef.current) {
+            setDeleteConfirm({ open: false, us: null, busy: false });
+        }
+    }, [deleteConfirm.us, performDeleteUserStory]);
+
+    /** Cancel handler for the delete dialog. */
+    const handleCancelDelete = useCallback((): void => {
+        setDeleteConfirm({ open: false, us: null, busy: false });
+    }, []);
 
     /** Port of the row "move to top" action → {@link moveUsToTopOfBacklog}. */
     const onMoveToTop = useCallback(
@@ -1327,7 +1999,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (err instanceof HttpError && err.status === 409) {
                     await loadUserstories({ reset: true });
                 } else {
-                    reportError("changeStatus failed", err);
+                    reportError(
+                        "changeStatus failed",
+                        err,
+                        t("BACKLOG.ERROR_CHANGE_STATUS", "Could not update the status. Please try again."),
+                    );
                 }
             }
         },
@@ -1356,7 +2032,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (err instanceof HttpError && err.status === 409) {
                     await loadUserstories({ reset: true });
                 } else {
-                    reportError("changePoints failed", err);
+                    reportError(
+                        "changePoints failed",
+                        err,
+                        t("BACKLOG.ERROR_CHANGE_POINTS", "Could not update the points. Please try again."),
+                    );
                 }
             }
         },
@@ -1370,7 +2050,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      */
     const addNewUs = useCallback((type: "standard" | "bulk"): void => {
         if (type === "standard") {
-            broadcastToAngular("genericform:new", { objType: "us", project: projectRef.current });
+            // [#2] Open the React-owned create/edit lightbox in CREATE mode.
+            // Previously this broadcast "genericform:new" to the Angular
+            // `tg-lb-create-edit` host removed by the migration, so it was a
+            // silent no-op.
+            setUsLightbox({ open: true, mode: "create", us: null });
         } else {
             setBulkLightbox({ open: true });
         }
@@ -1404,12 +2088,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 name: "",
                 estimated_start: estimatedStart.format("YYYY-MM-DD"),
                 estimated_finish: estimatedFinish.format("YYYY-MM-DD"),
-                project: projectId,
+                project: resolvedId,
             },
             lastSprintName: lastSprint ? lastSprint.name : null,
             canDelete: false,
         });
-    }, [projectId]);
+    }, [resolvedId]);
 
     /** Open the sprint lightbox in edit mode for an existing sprint. */
     const onEditSprint = useCallback(
@@ -1426,13 +2110,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     estimated_finish: moment(sprint.estimated_finish, "YYYY-MM-DD").format(
                         "YYYY-MM-DD",
                     ),
-                    project: projectId,
+                    project: resolvedId,
                 },
                 lastSprintName: null,
                 canDelete,
             });
         },
-        [projectId],
+        [resolvedId],
     );
 
     /** After a create/edit/delete sprint: close the lightbox and reload. */
@@ -1466,7 +2150,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (nextUs !== undefined) {
                     try {
                         await userstoriesApi.bulkUpdateBacklogOrder(
-                            projectId,
+                            resolvedId,
                             null,
                             null,
                             nextUs,
@@ -1478,12 +2162,92 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                         await loadUserstories({ reset: true });
                         await loadProjectStats();
                     } catch (err) {
-                        reportError("bulk move-to-top failed", err);
+                        reportError(
+                            "bulk move-to-top failed",
+                            err,
+                            t("BACKLOG.ERROR_MOVE_US", "Could not move the selected stories. Please try again."),
+                        );
                     }
                 }
             }
         },
-        [setNewUs, projectId, loadUserstories, loadProjectStats],
+        [setNewUs, resolvedId, loadUserstories, loadProjectStats],
+    );
+
+    /**
+     * [#2] Persist a NEW single story from {@link UserStoryEditLightbox}. Ports
+     * the generic-form `mode == 'new'` branch (common/lightboxes.coffee L786-792)
+     * onto the AAP-enumerated endpoints: `bulk_create` carries subject + status,
+     * and — because that endpoint does NOT accept points/assignee — a follow-up
+     * `PATCH userstories/{id}` persists those when set. Then `onBulkCreated`
+     * re-reads the backlog (and reorders to the top when the user chose "top"),
+     * mirroring `usform:new:success`. Rejects on failure so the lightbox keeps
+     * itself open and surfaces the error.
+     */
+    const onCreateUserStory = useCallback(
+        async (fields: UserStoryCreateFields): Promise<void> => {
+            const res = await userstoriesApi.bulkCreate(
+                resolvedId,
+                fields.statusId,
+                fields.subject,
+                null,
+            );
+            // The bulk_create endpoint returns full story objects; the API
+            // adapter types them with the minimal `{ id }` shape, so narrow to the
+            // richer domain `UserStory` (mirrors BulkUserStoriesLightbox). No
+            // `any` is used.
+            let created = res.data as unknown as UserStory[];
+            const first = created[0];
+            const hasPoints = Object.keys(fields.points).length > 0;
+            if (first && (hasPoints || fields.assignedTo !== null)) {
+                const patchRes = await httpPatch<UserStory>(`userstories/${first.id}`, {
+                    points: fields.points,
+                    assigned_to: fields.assignedTo,
+                    version: first.version,
+                });
+                if (!aliveRef.current) {
+                    return;
+                }
+                created = [patchRes.data, ...created.slice(1)];
+            }
+            await onBulkCreated(created, fields.position);
+        },
+        [resolvedId, onBulkCreated],
+    );
+
+    /**
+     * [#2] Persist EDITS to an existing story from {@link UserStoryEditLightbox}.
+     * Ports the generic-form `mode == 'edit'` branch (common/lightboxes.coffee
+     * L794): `PATCH userstories/{id}` with the changed fields + `version` for
+     * optimistic concurrency, then patch state + reload stats + re-read the
+     * backlog. A 409 version conflict reloads to pick up fresh versions (ports
+     * the 409 branch of `onChangeStatus`); the error is rethrown so the lightbox
+     * keeps itself open and surfaces the failure.
+     */
+    const onSaveUserStoryEdit = useCallback(
+        async (target: UserStory, changes: UserStoryEditChanges): Promise<void> => {
+            try {
+                const res = await httpPatch<UserStory>(`userstories/${target.id}`, {
+                    subject: changes.subject,
+                    status: changes.status,
+                    points: changes.points,
+                    assigned_to: changes.assigned_to,
+                    version: target.version,
+                });
+                if (!aliveRef.current) {
+                    return;
+                }
+                patchUserStory(target.id, res.data);
+                await loadProjectStats();
+                await loadUserstories({ reset: true });
+            } catch (err) {
+                if (err instanceof HttpError && err.status === 409) {
+                    await loadUserstories({ reset: true });
+                }
+                throw err;
+            }
+        },
+        [patchUserStory, loadProjectStats, loadUserstories],
     );
 
     /** The prop-drilled user-story action contract (memoised). */
@@ -1503,6 +2267,24 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         }),
         [onEditUserStory, onDeleteUserStory, onMoveToTop, onChangeStatus, onChangePoints],
     );
+
+    // [#2] Assignable users for the create/edit lightbox's assignee control,
+    // derived from the already-loaded `userstories-filters` "assigned_users"
+    // category (id = user id, name = full name). This reuses the AAP-enumerated
+    // filters endpoint rather than introducing a new members request. The
+    // synthetic "Unassigned" entry (id === null / "null") is dropped — the
+    // lightbox offers its own "Not assigned" option. Declared here (with the
+    // other hooks, BEFORE any early return) to honor the Rules of Hooks.
+    const assignableUsers = useMemo<AssignableUser[]>(() => {
+        const category = state.filters.find((c) => c.dataType === "assigned_users");
+        if (!category) {
+            return [];
+        }
+        return category.content
+            .filter((option) => option.id !== null && String(option.id) !== "null")
+            .map((option) => ({ id: Number(option.id), name: option.name }))
+            .filter((user) => Number.isInteger(user.id));
+    }, [state.filters]);
 
     /* ---------------------------------------------------------------------- */
     /* Phase G — filters / search / toggles                                    */
@@ -1541,8 +2323,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const toggleShowTags = useCallback((): void => {
         const next = !stateRef.current.showTags;
         bsToggleShowTags();
-        writeStoredBoolean(showTagsKey(projectId), next);
-    }, [projectId, bsToggleShowTags]);
+        writeStoredBoolean(showTagsKey(resolvedId), next);
+    }, [resolvedId, bsToggleShowTags]);
 
     /**
      * Port of the velocity/forecasting toggle: recompute the forecast from the
@@ -1600,13 +2382,20 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             if (exists) {
                 return;
             }
+            // Attach the current include/exclude mode (QA finding [K]) so the
+            // selection round-trips to the correct `status` / `exclude_status`
+            // query param (see `pickSelectedFilterParams`).
             const added: SelectedFilter = {
                 id: option.id,
                 name: option.name,
                 dataType: category.dataType,
+                mode: filterModeRef.current,
                 ...(option.color !== undefined ? { color: option.color } : {}),
             };
             const nextSelected = [...s.selectedFilters, added];
+            // A manual selection clears the applied saved-filter highlight
+            // (filter.controller.coffee `selectFilter` sets activeCustomFilter = null).
+            setActiveCustomFilter(null);
             setFilters(s.filters, s.customFilters, nextSelected);
             void loadUserstories({ reset: true, selected: nextSelected });
             void loadFilters(nextSelected);
@@ -1621,11 +2410,101 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             const nextSelected = s.selectedFilters.filter(
                 (f) => !(f.dataType === filter.dataType && String(f.id) === String(filter.id)),
             );
+            setActiveCustomFilter(null);
             setFilters(s.filters, s.customFilters, nextSelected);
             void loadUserstories({ reset: true, selected: nextSelected });
             void loadFilters(nextSelected);
         },
         [setFilters, loadUserstories, loadFilters],
+    );
+
+    /* -- Custom (saved) filters — QA finding [J] --------------------------- */
+
+    /**
+     * Port of `saveCustomFilter` (controllerMixins.coffee L201-L214): snapshot
+     * the current selection into a param map, merge it under `name`, and persist
+     * the whole map back to `/user-storage`.
+     */
+    const saveCustomFilter = useCallback(
+        async (name: string): Promise<void> => {
+            const id = resolvedIdRef.current;
+            if (!isValidProjectId(id)) {
+                return;
+            }
+            const paramMap = selectedToStoredMap(stateRef.current.selectedFilters);
+            try {
+                const existing = await userStorageApi.getFilters(
+                    id,
+                    BACKLOG_CUSTOM_FILTERS_SUFFIX,
+                );
+                const next: StoredCustomFilters = { ...existing, [name]: paramMap };
+                await userStorageApi.storeFilters(id, next, BACKLOG_CUSTOM_FILTERS_SUFFIX);
+                if (!aliveRef.current) {
+                    return;
+                }
+                // Only the customFilters slice changes; leave categories/selection intact.
+                setCustomFilters(storedToCustomFilters(next));
+            } catch (err) {
+                reportError(
+                    "saveCustomFilter failed",
+                    err,
+                    t("BACKLOG.ERROR_SAVE_CUSTOM_FILTER", "Could not save the custom filter. Please try again."),
+                );
+            }
+        },
+        [setCustomFilters],
+    );
+
+    /**
+     * Port of `selectCustomFilter` (controllerMixins.coffee L197-L200): replace
+     * the whole selection with the saved filter's stored params, then reload.
+     */
+    const selectCustomFilter = useCallback(
+        (filter: CustomFilter): void => {
+            const s = stateRef.current;
+            const nextSelected = reconstructSelectedFromParamMap(filter.filter ?? {}, s.filters);
+            setActiveCustomFilter(filter.id);
+            setFilters(s.filters, s.customFilters, nextSelected);
+            void loadUserstories({ reset: true, selected: nextSelected });
+            void loadFilters(nextSelected);
+        },
+        [setFilters, loadUserstories, loadFilters],
+    );
+
+    /**
+     * Port of `removeCustomFilter` (controllerMixins.coffee L216-L221): drop the
+     * saved filter from the stored map and persist (DELETE when it becomes
+     * empty). The current selection is left untouched.
+     */
+    const removeCustomFilter = useCallback(
+        async (filter: CustomFilter): Promise<void> => {
+            const id = resolvedIdRef.current;
+            if (!isValidProjectId(id)) {
+                return;
+            }
+            try {
+                const existing = await userStorageApi.getFilters(
+                    id,
+                    BACKLOG_CUSTOM_FILTERS_SUFFIX,
+                );
+                const next: StoredCustomFilters = { ...existing };
+                delete next[String(filter.id)];
+                await userStorageApi.storeFilters(id, next, BACKLOG_CUSTOM_FILTERS_SUFFIX);
+                if (!aliveRef.current) {
+                    return;
+                }
+                setActiveCustomFilter((prev) => (prev === filter.id ? null : prev));
+                // Only the customFilters slice changes; leave categories/selection intact.
+                setCustomFilters(storedToCustomFilters(next));
+            } catch (err) {
+                reportError(
+                    "removeCustomFilter failed",
+                    err,
+                    t("BACKLOG.ERROR_REMOVE_CUSTOM_FILTER", "Could not remove the custom filter. Please try again."),
+                );
+            }
+        },
+        [setCustomFilters],
     );
 
     /**
@@ -1638,7 +2517,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      */
     const moveSelectedToSprint = useCallback(
         async (target: "current" | "latest"): Promise<void> => {
-            if (!Number.isFinite(projectId)) {
+            if (!isValidProjectId(resolvedId)) {
                 return;
             }
             const s = stateRef.current;
@@ -1668,7 +2547,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             }
             const bulkStories = ids.map((usId, index) => ({ us_id: usId, order: index }));
             try {
-                await userstoriesApi.bulkUpdateMilestone(projectId, targetSprint.id, bulkStories);
+                await userstoriesApi.bulkUpdateMilestone(resolvedId, targetSprint.id, bulkStories);
                 if (!aliveRef.current) {
                     return;
                 }
@@ -1680,10 +2559,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     await loadClosedSprints();
                 }
             } catch (err) {
-                reportError("moveSelectedToSprint failed", err);
+                reportError(
+                    "moveSelectedToSprint failed",
+                    err,
+                    t("BACKLOG.ERROR_MOVE_US", "Could not move the stories to the sprint. Please try again."),
+                );
             }
         },
-        [projectId, loadBacklog, loadClosedSprints],
+        [resolvedId, loadBacklog, loadClosedSprints],
     );
 
     /* ---------------------------------------------------------------------- */
@@ -1715,18 +2598,21 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     /* ---------------------------------------------------------------------- */
 
     /**
-     * Mount / project-change effect. Guards the TRANSIENT-NaN case: on the first
-     * render `projectId` may be `NaN` (AngularJS resolves `data-project-id` via
-     * `$digest` AFTER the first `connectedCallback`), so NO network / WebSocket
-     * work happens until a finite id arrives. `loadInitialData` is stable per
-     * `projectId` (it depends only on `projectId` + module-stable setters), so
-     * this effect fires exactly once per distinct id — never on every state
-     * update. Cleanup disconnects the shared events client and cancels the
-     * pending search debounce.
+     * Mount / project-change effect. It fires `loadInitialData` only when there
+     * is SOMETHING to resolve — either a valid positive-integer prop id, OR a
+     * slug in the URL (`/project/:pslug/...`) that `loadProject` can look up via
+     * `GET projects/by_slug` (QA finding #1). When neither is present (a bare
+     * transient render), NO network / WebSocket work runs, preserving the
+     * transient-NaN contract. `loadInitialData` is stable per `projectId` (its
+     * dependency chain bottoms out at `projectId` + module-stable setters +
+     * refs), so this effect fires once per distinct prop id — never on every
+     * state update, and NOT again merely because `loadProject` published the
+     * resolved id into state. Cleanup disconnects the shared events client and
+     * cancels the pending search debounce.
      */
     useEffect(() => {
         aliveRef.current = true;
-        if (Number.isFinite(projectId)) {
+        if (isValidProjectId(projectId) || slugFromLocation() !== null) {
             void loadInitialData();
         }
         return () => {
@@ -1746,11 +2632,32 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
     // --- Render guards. ALL hooks are declared above, so branching is safe. ---
 
-    // Transient-NaN: the project id has not resolved yet (AngularJS fills
-    // data-project-id via a later $digest), so no network has run — render a
-    // neutral shell, never crash.
-    if (!Number.isFinite(projectId)) {
+    // Transient-NaN: the project id has not resolved yet. Either the prop id is
+    // still unusable AND the URL slug lookup (loadProject → GET projects/by_slug)
+    // has not returned, so no board data exists — render a neutral shell, never
+    // crash. Once `resolvedId` becomes a valid positive integer the full board
+    // renders below.
+    if (!isValidProjectId(resolvedId)) {
         return <main className="main scrum" />;
+    }
+
+    // [ERR-2] offline overlay — a React `fetch` failed with no HTTP response
+    // (network down). Mirrors the AngularJS offline interceptor which renders a
+    // full-page error rather than leaving the user with a silently-stale board.
+    if (connectionError) {
+        return (
+            <main className="main scrum">
+                <div className="error-load-data">
+                    <h1>{t("COMMON.CONNECTION_ERROR", "Connection lost")}</h1>
+                    <p>
+                        {t(
+                            "COMMON.CONNECTION_ERROR_HELP",
+                            "Unable to reach the server. Check your connection and reload the page.",
+                        )}
+                    </p>
+                </div>
+            </main>
+        );
     }
 
     // Port of `permissionDenied` (backlog module disabled, or a 403 / 451
@@ -1758,10 +2665,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     if (permissionDenied) {
         return (
             <main className="main scrum">
-                {/* i18n: PERMISSIONS.ERROR / COMMON.PERMISSION_DENIED */}
                 <div className="permission-denied">
-                    <h1>Permission denied</h1>
-                    <p>You don&apos;t have permission to see the backlog.</p>
+                    <h1>{t("ERROR.PERMISSION_DENIED", "Permission denied")}</h1>
+                    <p>
+                        {t(
+                            "BACKLOG.PERMISSION_DENIED_HELP",
+                            "You don't have permission to see the backlog.",
+                        )}
+                    </p>
                 </div>
             </main>
         );
@@ -1772,7 +2683,6 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (loadError) {
             return (
                 <main className="main scrum">
-                    {/* i18n: BACKLOG.ERROR_LOADING_BACKLOG */}
                     <div className="error-load-data">{loadError}</div>
                 </main>
             );
@@ -1786,6 +2696,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const canAddMilestone = project.my_permissions.includes("add_milestone");
     const hasSelectedFilters = state.selectedFilters.length > 0;
     const hasStories = state.userstories.length > 0;
+    // [M] move-to-sprint reveal. The `.btn-filter.move-to-sprint` SCSS rule has a
+    // hard `display:none` base with no class-based reveal in the compiled CSS. The
+    // AngularJS backlog revealed it imperatively in `checkSelected`
+    // (`moveToSprintDom.css('display','flex')`) when at least one user story was
+    // checked AND there was at least one open sprint to move it into; otherwise it
+    // called `.hide()`. We reproduce that exact condition and drive an inline
+    // `display` style so the button becomes visible on selection.
+    const selectedCount = Object.values(state.selection.checked).filter(Boolean).length;
+    const moveToSprintVisible = selectedCount > 0 && state.sprints.length > 0;
     // Empty-state visibility ports the jade `ng-class`. In React `userstories`
     // is ALWAYS an array (never `undefined`), so the `=== undefined` disjunct
     // collapses out.
@@ -1800,10 +2719,32 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 the backlog into a sprint. DndProvider renders a fragment (no DOM
                 wrapper), so `main`'s children remain `section.backlog` +
                 `sidebar.sidebar`, exactly as the Jade emitted. */}
-            <DndProvider project={project} resolveDrop={resolveDrop} persist={persist}>
+            {/* [N] Backlog OPTS IN to row-level drop targeting:
+                - `collisionDetection` prefers an individual story ROW (numeric
+                  droppable id) over the enclosing container, so both pointer and
+                  keyboard drops land at a precise row rather than the end.
+                - `keyboardCoordinateGetter` gives single-step (down-one / up-one)
+                  keyboard movement instead of jumping to the container end.
+                Kanban (out of scope) shares DndProvider but leaves both undefined,
+                keeping @dnd-kit's default behavior there. */}
+            <DndProvider
+                project={project}
+                resolveDrop={resolveDrop}
+                persist={persist}
+                collisionDetection={rowPreferringCollisionDetection}
+                keyboardCoordinateGetter={singleStepKeyboardCoordinates}
+            >
                 <section className="backlog">
-                    {/* `mainTitle` is an AngularJS component (outer page chrome) and is
-                        intentionally NOT rendered by the React root. */}
+                    {/* [F] Section title. Ported from mainTitle.jade + main-title.jade
+                        (`header > h1 > span`), which the original backlog.jade rendered
+                        as the FIRST child of `section.backlog` (React-owned region), not
+                        outer chrome. Rendering it here restores the correct heading
+                        order (h1 "Scrum" → h2 "Backlog" → h1 "SPRINTS"). */}
+                    <header>
+                        <h1>
+                            <span>{t("BACKLOG.SECTION_NAME", "Scrum")}</span>
+                        </h1>
+                    </header>
 
                     <Burndown
                         stats={state.stats}
@@ -1818,22 +2759,29 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                             <div className="backlog-menu">
                                 <div className="backlog-header">
                                     <div className="backlog-header-title">
-                                        {/* i18n: BACKLOG.TITLE */}
-                                        <h2>Backlog</h2>
+                                        <h2>{t("BACKLOG.TITLE", "Backlog")}</h2>
                                         {hasSelectedFilters ? (
                                             <>
                                                 <span className="backlog-stories-number squared">
                                                     {state.userstories.length}
                                                 </span>
-                                                {/* i18n: BACKLOG.TOTAL_STORIES_FILTERED */}
+                                                {/* [C] filtered story count. */}
                                                 <span className="backlog-stories-number">
-                                                    {state.totalUserStories} total
+                                                    {t(
+                                                        "BACKLOG.TOTAL_STORIES_FILTERED",
+                                                        "of {{ totalUserStories }} user stories",
+                                                        { totalUserStories: state.totalUserStories },
+                                                    )}
                                                 </span>
                                             </>
                                         ) : (
-                                            /* i18n: BACKLOG.TOTAL_STORIES */
+                                            /* [B] unfiltered story count. */
                                             <span className="backlog-stories-number">
-                                                {state.totalUserStories} total
+                                                {t(
+                                                    "BACKLOG.TOTAL_STORIES",
+                                                    "{{ totalUserStories }} user stories",
+                                                    { totalUserStories: state.totalUserStories },
+                                                )}
                                             </span>
                                         )}
                                     </div>
@@ -1848,15 +2796,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                                         onClick={() => addNewUs("standard")}
                                                     >
                                                         <Svg icon="icon-add" />
-                                                        {/* i18n: US.ADD */}
-                                                        <span className="text">Add</span>
+                                                        {/* [E] add-user-story label. */}
+                                                        <span className="text">{t("US.ADD", "user story")}</span>
                                                     </button>
                                                     <button
                                                         className="btn-icon"
                                                         type="button"
-                                                        /* i18n: US.ADD_BULK */
-                                                        aria-label="Add user stories in bulk"
-                                                        title="Add user stories in bulk"
+                                                        aria-label={t("US.ADD_BULK", "Add some new user stories in bulk")}
+                                                        title={t("US.ADD_BULK", "Add some new user stories in bulk")}
                                                         onClick={() => addNewUs("bulk")}
                                                     >
                                                         <Svg icon="icon-bulk" />
@@ -1879,8 +2826,9 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                         >
                                             <Svg icon="icon-filters" />
                                             <span className="text">
-                                                {/* i18n: BACKLOG.FILTERS.HIDE_TITLE / .TITLE */}
-                                                {state.activeFilters ? "Hide filters" : "Filters"}
+                                                {state.activeFilters
+                                                    ? t("BACKLOG.FILTERS.HIDE_TITLE", "Hide filters")
+                                                    : t("BACKLOG.FILTERS.TITLE", "Filters")}
                                             </span>
                                             {hasSelectedFilters && (
                                                 <span className="selected-filters">
@@ -1889,13 +2837,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                             )}
                                         </button>
 
-                                        {/* Reproduces tg-input-search. i18n: COMMON.SEARCH */}
+                                        {/* Reproduces tg-input-search. */}
                                         <input
                                             className="tg-input-search"
                                             type="search"
                                             value={state.filterQ}
-                                            placeholder="Search"
-                                            aria-label="Search"
+                                            placeholder={t("COMMON.SEARCH", "Search")}
+                                            aria-label={t("COMMON.SEARCH", "Search")}
                                             onChange={(e) => changeQ(e.target.value)}
                                         />
 
@@ -1914,8 +2862,9 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                                     />
                                                     <div />
                                                 </div>
-                                                {/* i18n: BACKLOG.TAGS.SHOW */}
-                                                <label htmlFor="show-tags-input">Show tags</label>
+                                                <label htmlFor="show-tags-input">
+                                                    {t("BACKLOG.TAGS.SHOW", "tags")}
+                                                </label>
                                             </div>
                                         )}
                                     </div>
@@ -1926,13 +2875,16 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                                 id="move-to-current-sprint"
                                                 type="button"
                                                 className="btn-filter move-to-current-sprint move-to-sprint e2e-move-to-sprint"
-                                                /* i18n: BACKLOG.MOVE_US_TO_CURRENT_SPRINT */
-                                                title="Move to current sprint"
+                                                title={t("BACKLOG.MOVE_US_TO_CURRENT_SPRINT", "Move to Current Sprint")}
+                                                // [M] inline reveal — see moveToSprintVisible above.
+                                                style={{ display: moveToSprintVisible ? "flex" : "none" }}
                                                 onClick={() => {
                                                     void moveSelectedToSprint("current");
                                                 }}
                                             >
-                                                <span className="text">Move to current sprint</span>
+                                                <span className="text">
+                                                    {t("BACKLOG.MOVE_US_TO_CURRENT_SPRINT", "Move to Current Sprint")}
+                                                </span>
                                                 <Svg icon="icon-add-to-sprint" />
                                             </button>
                                         ) : (
@@ -1940,13 +2892,16 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                                 id="move-to-latest-sprint"
                                                 type="button"
                                                 className="btn-filter move-to-latest-sprint move-to-sprint e2e-move-to-sprint"
-                                                /* i18n: BACKLOG.MOVE_US_TO_LATEST_SPRINT */
-                                                title="Move to latest sprint"
+                                                title={t("BACKLOG.MOVE_US_TO_LATEST_SPRINT", "Move to latest Sprint")}
+                                                // [M] inline reveal — see moveToSprintVisible above.
+                                                style={{ display: moveToSprintVisible ? "flex" : "none" }}
                                                 onClick={() => {
                                                     void moveSelectedToSprint("latest");
                                                 }}
                                             >
-                                                <span className="text">Move to latest sprint</span>
+                                                <span className="text">
+                                                    {t("BACKLOG.MOVE_US_TO_LATEST_SPRINT", "Move to latest Sprint")}
+                                                </span>
                                                 <Svg icon="icon-add-to-sprint" />
                                             </button>
                                         )}
@@ -1957,13 +2912,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                             <button
                                                 type="button"
                                                 className="btn-filter active velocity-forecasting-btn e2e-velocity-forecasting"
-                                                /* i18n: BACKLOG.FORECASTING.TITLE */
-                                                title="Forecasting"
+                                                title={t("BACKLOG.FORECASTING.TITLE", "Velocity forecasting")}
                                                 onClick={toggleVelocityForecasting}
                                             >
                                                 <Svg icon="icon-fold-column" />
-                                                {/* i18n: BACKLOG.FORECASTING.BACKLOG */}
-                                                <span className="text">Forecasting</span>
+                                                <span className="text">
+                                                    {t("BACKLOG.FORECASTING.BACKLOG", "return to backlog")}
+                                                </span>
                                             </button>
                                         )}
                                         {hasStories &&
@@ -1973,12 +2928,10 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                                 <button
                                                     type="button"
                                                     className="btn-filter velocity-forecasting-btn e2e-velocity-forecasting"
-                                                    /* i18n: BACKLOG.FORECASTING.BACKLOG */
-                                                    title="Forecasting"
+                                                    title={t("BACKLOG.FORECASTING.BACKLOG", "return to backlog")}
                                                     onClick={toggleVelocityForecasting}
                                                 >
-                                                    {/* i18n: BACKLOG.FORECASTING.TITLE */}
-                                                    Forecasting
+                                                    {t("BACKLOG.FORECASTING.TITLE", "Velocity forecasting")}
                                                 </button>
                                             )}
                                     </div>
@@ -1994,8 +2947,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                     <BacklogFilterPanel
                                         filters={state.filters}
                                         selectedFilters={state.selectedFilters}
+                                        customFilters={state.customFilters}
+                                        activeCustomFilter={activeCustomFilter}
+                                        filterMode={filterMode}
+                                        onSetFilterMode={setFilterMode}
                                         onAddFilter={addFilterBacklog}
                                         onRemoveFilter={removeFilterBacklog}
+                                        onSaveCustomFilter={saveCustomFilter}
+                                        onSelectCustomFilter={selectCustomFilter}
+                                        onRemoveCustomFilter={removeCustomFilter}
                                     />
                                 )}
 
@@ -2009,6 +2969,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                         showTags={state.showTags}
                                         activeFilters={state.activeFilters}
                                         displayVelocity={state.displayVelocity}
+                                        stats={state.stats}
                                         firstUsInBacklog={state.first_us_in_backlog}
                                         loadingUserstories={state.loadingUserstories}
                                         dragEnabled={dragEnabled}
@@ -2023,21 +2984,25 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
                                     {state.displayVelocity && (
                                         <div className="forecasting-add-sprint e2e-velocity-forecasting-add">
-                                            {/* i18n: BACKLOG.FORECASTING.NEW_SPRINT / .CURRENT_SPRINT */}
                                             <span className="forecasting-text">
                                                 {state.forecastNewSprint
-                                                    ? "New sprint"
-                                                    : "Current sprint"}
+                                                    ? t(
+                                                          "BACKLOG.FORECASTING.NEW_SPRINT",
+                                                          "Candidate user stories for your next sprint based on your velocity.",
+                                                      )
+                                                    : t(
+                                                          "BACKLOG.FORECASTING.CURRENT_SPRINT",
+                                                          "Candidate user stories for your sprint based on your velocity. Click to add to current sprint.",
+                                                      )}
                                             </span>
                                             <div className="button btn-link">
                                                 <Svg icon="icon-add" />
-                                                {/* i18n: BACKLOG.FORECASTING.ADD_NEW_SPRINT */}
                                                 <button
                                                     className="text"
                                                     type="button"
                                                     onClick={() => addNewSprint()}
                                                 >
-                                                    Add new sprint
+                                                    {t("BACKLOG.FORECASTING.ADD_NEW_SPRINT", "create sprint and add US")}
                                                 </button>
                                             </div>
                                         </div>
@@ -2049,10 +3014,19 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                         emptyBacklogHidden ? " hidden" : ""
                                     }`}
                                 >
-                                    {/* i18n: BACKLOG.NO_MATCH */}
-                                    <p className="no-match">No matches</p>
-                                    {/* i18n: BACKLOG.NO_MATCH_HELP */}
-                                    <p className="no-match-help">Try another search</p>
+                                    <p className="no-match">
+                                        {t(
+                                            "BACKLOG.NO_MATCH",
+                                            "No matching search result found with \u201C{{ q }}\u201D",
+                                            { q: state.filterQ },
+                                        )}
+                                    </p>
+                                    <p className="no-match-help">
+                                        {t(
+                                            "BACKLOG.NO_MATCH_HELP",
+                                            "Try again using more general search terms",
+                                        )}
+                                    </p>
                                 </div>
 
                                 <div
@@ -2060,8 +3034,9 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                         emptyLargeHidden ? " hidden" : ""
                                     }`}
                                 >
-                                    {/* i18n: BACKLOG.EMPTY */}
-                                    <p className="title">Your backlog is empty</p>
+                                    <p className="title">
+                                        {t("BACKLOG.EMPTY", "The backlog is empty!")}
+                                    </p>
                                     {canAddUs && (
                                         <button
                                             className="btn-small"
@@ -2069,13 +3044,17 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                             onClick={() => addNewUs("standard")}
                                         >
                                             <Svg icon="icon-add" />
-                                            {/* i18n: BACKLOG.CREATE_NEW_US_EMPTY_HELP */}
-                                            <span className="text">Create user story</span>
+                                            <span className="text">
+                                                {t(
+                                                    "BACKLOG.CREATE_NEW_US_EMPTY_HELP",
+                                                    "Add a user story",
+                                                )}
+                                            </span>
                                         </button>
                                     )}
                                     <img
                                         src={`${baseHref}images/empty/empty_mex.png`}
-                                        alt="Your backlog is empty"
+                                        alt={t("BACKLOG.EMPTY", "The backlog is empty!")}
                                     />
                                 </div>
                             </div>
@@ -2106,14 +3085,29 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 )}
             </DndProvider>
 
-            {/* React lightboxes. The shared generic-form (single-US create/edit)
-                lightbox stays in the AngularJS Jade shell. */}
+            {/* [ERR-1] non-blocking user notifications (failed inline change /
+                move / delete / drop / filter mutations). Renders nothing until a
+                notification is emitted onto the shared bus. */}
+            <NotificationHost />
+
+            {/* React lightboxes — all three are React-owned (QA finding #2):
+                bulk create, single-US create/edit, and sprint add/edit. */}
             <BulkUserStoriesLightbox
                 open={bulkLightbox.open}
                 project={project}
                 defaultStatusId={project.default_us_status}
                 onCreated={onBulkCreated}
                 onClose={() => setBulkLightbox({ open: false })}
+            />
+            <UserStoryEditLightbox
+                open={usLightbox.open}
+                mode={usLightbox.mode}
+                project={project}
+                us={usLightbox.us}
+                assignableUsers={assignableUsers}
+                onCreate={onCreateUserStory}
+                onEdit={onSaveUserStoryEdit}
+                onClose={() => setUsLightbox((s) => ({ ...s, open: false }))}
             />
             <SprintEditLightbox
                 open={sprintLightbox.open}
@@ -2125,6 +3119,26 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 canDelete={sprintLightbox.canDelete}
                 onChanged={onSprintChanged}
                 onClose={() => setSprintLightbox((s) => ({ ...s, open: false }))}
+            />
+            {/* [H] Themed delete-confirmation dialog, replacing the native
+                window.confirm. Ports `$confirm.askOnDelete(...)`:
+                title US.TITLE_DELETE_ACTION, message US.TITLE_DELETE_MESSAGE. */}
+            <ConfirmDialog
+                open={deleteConfirm.open}
+                variant="delete"
+                busy={deleteConfirm.busy}
+                title={t("US.TITLE_DELETE_ACTION", "Delete user story")}
+                message={
+                    deleteConfirm.us
+                        ? renderDeleteMessage(deleteConfirm.us.subject)
+                        : null
+                }
+                confirmLabel={t("COMMON.DELETE", "Delete")}
+                cancelLabel={t("COMMON.CANCEL", "Cancel")}
+                onConfirm={() => {
+                    void handleConfirmDelete();
+                }}
+                onCancel={handleCancelDelete}
             />
         </main>
     );

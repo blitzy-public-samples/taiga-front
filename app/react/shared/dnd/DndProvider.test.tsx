@@ -119,6 +119,18 @@ jest.mock("@dnd-kit/core", () => {
     };
 });
 
+// Stub @dnd-kit/sortable's `sortableKeyboardCoordinates`. The real module reads
+// `KeyboardCode` from @dnd-kit/core at import time, which the core mock above
+// deliberately omits; providing an identifiable stub keeps the import resolvable
+// AND lets the sensor test assert the KeyboardSensor was wired with THIS
+// coordinate getter (QA-A11Y-03).
+const mockSortableKeyboardCoordinates = jest.fn();
+jest.mock("@dnd-kit/sortable", () => ({
+    __esModule: true,
+    sortableKeyboardCoordinates: (...args: unknown[]) =>
+        mockSortableKeyboardCoordinates(...args),
+}));
+
 // Mock the sibling API so the persister factories can be asserted on argument
 // order without hitting the real fetch stack.
 jest.mock("../api/userstories", () => ({
@@ -487,13 +499,24 @@ describe("DndProvider — configuration", () => {
 
         const sensors = mockCaptured.sensors as Array<{
             sensor: { sensorName: string };
-            options?: { activationConstraint?: { distance?: number } };
+            options?: {
+                activationConstraint?: { distance?: number };
+                coordinateGetter?: (...args: unknown[]) => unknown;
+            };
         }>;
         // Two sensors: pointer (mouse/touch/pen) + keyboard (WCAG-accessible DnD).
         expect(sensors).toHaveLength(2);
         expect(sensors[0].sensor.sensorName).toBe("PointerSensor");
         expect(sensors[0].options?.activationConstraint?.distance).toBe(5);
         expect(sensors[1].sensor.sensorName).toBe("KeyboardSensor");
+        // QA-A11Y-03: the KeyboardSensor MUST be given a coordinateGetter, else
+        // arrow keys produce no movement. Assert it is wired to
+        // `sortableKeyboardCoordinates` (invoking it delegates to that export).
+        const coordinateGetter = sensors[1].options?.coordinateGetter;
+        expect(typeof coordinateGetter).toBe("function");
+        mockSortableKeyboardCoordinates.mockClear();
+        coordinateGetter?.("evt", "ctx");
+        expect(mockSortableKeyboardCoordinates).toHaveBeenCalledTimes(1);
     });
 
     it("honors a custom activationDistance", () => {

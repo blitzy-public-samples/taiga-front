@@ -257,11 +257,52 @@ describe("KanbanApp — bulk user-story creation", () => {
 });
 
 describe("KanbanApp — chrome controls", () => {
-    it("renders the filter button, search input and 4 zoom-level buttons", async () => {
+    it("renders the filter button, search input and 4 board-zoom radios", async () => {
         await renderLoaded();
         expect(document.querySelector(".btn-filter.e2e-open-filter")).not.toBeNull();
         expect(document.querySelector(".kanban-search.e2e-search")).not.toBeNull();
-        expect(document.querySelectorAll(".board-zoom .zoom-level").length).toBe(4);
+        expect(document.querySelectorAll(".board-zoom .zoom-radio input").length).toBe(4);
+    });
+    it("renders the section title as <header><h1><span>Kanban</span> (QA-VIS-01)", async () => {
+        await renderLoaded();
+        const h1 = document.querySelector(".kanban-header header h1");
+        expect(h1).not.toBeNull();
+        expect(h1!.querySelector("span")!.textContent).toBe("Kanban");
+        // The old project-name div.main-title must be gone.
+        expect(document.querySelector(".kanban-header .main-title")).toBeNull();
+    });
+    it("renders the board-zoom radio-pill control with a title and 4 labeled radios (QA-VIS-02)", async () => {
+        await renderLoaded();
+        expect(document.querySelector(".board-zoom .board-zoom-title")!.textContent).toBe("Zoom:");
+        const labels = Array.from(
+            document.querySelectorAll<HTMLElement>(".board-zoom .zoom-radio"),
+        );
+        expect(labels.map((l) => l.querySelector(".checkmark span")!.textContent)).toEqual([
+            "Compact",
+            "Default",
+            "Detailed",
+            "Expanded",
+        ]);
+        // Radios carry sequential 0-3 values and the current level is checked.
+        const inputs = Array.from(
+            document.querySelectorAll<HTMLInputElement>(".board-zoom .zoom-radio input[type='radio']"),
+        );
+        expect(inputs.map((i) => i.value)).toEqual(["0", "1", "2", "3"]);
+        expect(inputs.filter((i) => i.checked).length).toBe(1);
+    });
+    it("renders the search inside <tg-input-search> with a magnifier, placeholder and aria-label (QA-VIS-04/A11Y-01)", async () => {
+        await renderLoaded();
+        const host = document.querySelector("tg-input-search");
+        expect(host).not.toBeNull();
+        const input = host!.querySelector("input.kanban-search") as HTMLInputElement;
+        expect(input).not.toBeNull();
+        expect(input.getAttribute("type")).toBe("search");
+        expect(input.getAttribute("placeholder")).toBe("subject or reference");
+        expect(input.getAttribute("aria-label")).toBe("Search by subject or reference");
+        expect(input.id).toBeTruthy();
+        expect(input.getAttribute("name")).toBeTruthy();
+        // The magnifier renders as the shared sprite icon inside the host.
+        expect(host!.querySelector("svg.icon.icon-search")).not.toBeNull();
     });
     it("toggles the filter panel when the filter button is clicked", async () => {
         await renderLoaded();
@@ -392,7 +433,7 @@ describe("KanbanApp — zoom + search reloads", () => {
     it("re-fetches user stories with attachments/tasks when crossing into zoom level 3", async () => {
         await renderLoaded();
         fetchMock.mockClear();
-        fireEvent.click(document.querySelectorAll(".board-zoom .zoom-level")[3]);
+        fireEvent.click(document.querySelectorAll(".board-zoom .zoom-radio input")[3]);
         await waitFor(() => expect(findCall("/userstories")).toBeTruthy());
         const call = findCall("/userstories")!;
         expect(String(call[0])).toContain("include_attachments");

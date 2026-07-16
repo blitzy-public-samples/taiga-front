@@ -43,7 +43,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import moment from "moment";
 
 import type { Project, Sprint, Id } from "./types";
@@ -58,7 +58,9 @@ import {
     remove as removeMilestone,
 } from "../shared/api/milestones";
 import type { MilestoneWritable } from "../shared/api/milestones";
+import { t } from "../shared/i18n/translate";
 import { HttpError } from "../shared/api/httpClient";
+import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -80,12 +82,43 @@ const NAME_MAX_LENGTH = 500;
 const SAVE_ERROR_MESSAGE = "An error occurred while saving.";
 
 /**
- * Delete confirmation prompt. Ports `$confirm.askOnDelete(...)`
- * (lightboxes.coffee L107) with a dependency-free native `window.confirm`.
- * i18n: LIGHTBOX.ADD_EDIT_SPRINT.ACTION_DELETE_SPRINT
- * ("Do you want to delete this sprint?").
+ * Delete-confirmation dialog title. Ports `$confirm.askOnDelete(title, message)`
+ * (lightboxes.coffee L104-107) where `title = LIGHTBOX.DELETE_SPRINT.TITLE`.
+ * [H] The native `window.confirm` is replaced by the themed {@link ConfirmDialog}
+ * (`.lightbox-generic-delete`), matching the AngularJS styled confirm-lightbox.
+ * i18n: LIGHTBOX.DELETE_SPRINT.TITLE ("Delete sprint").
  */
-const DELETE_CONFIRM_MESSAGE = "Do you want to delete this sprint?";
+const DELETE_CONFIRM_TITLE = "Delete sprint";
+
+/**
+ * Render the create-mode "last sprint is <strong>{name}</strong>" hint from the
+ * shared catalog ([i18n], key LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME). The
+ * catalog value embeds a `<strong>` around the interpolated sprint name; rather
+ * than losing that emphasis (a flat string cannot carry React elements) OR
+ * risking `dangerouslySetInnerHTML`, we split the localized string on the single
+ * known `<strong>…</strong>` boundary and render each segment as escaped React
+ * text — preserving both the bold emphasis (visual parity) AND localization,
+ * with the interpolated name always escaped by React (XSS-safe).
+ */
+function renderLastSprintHint(name: string): ReactNode {
+    const rendered = t(
+        "LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME",
+        "last sprint is <strong> {{lastSprint}} ;-) </strong>",
+        { lastSprint: name },
+    );
+    const match = rendered.match(/^([\s\S]*?)<strong>([\s\S]*?)<\/strong>([\s\S]*)$/);
+    if (!match) {
+        // No <strong> in this locale's value — render the plain (tag-stripped) text.
+        return rendered.replace(/<\/?strong>/g, "");
+    }
+    return (
+        <>
+            {match[1]}
+            <strong>{match[2]}</strong>
+            {match[3]}
+        </>
+    );
+}
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -175,6 +208,8 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
     const [errors, setErrors] = useState<SprintFormErrors>({});
     const [submitting, setSubmitting] = useState<boolean>(false);
     const [serverError, setServerError] = useState<string | null>(null);
+    // [H] Visibility of the themed delete-confirm dialog (replaces window.confirm).
+    const [deleteConfirmOpen, setDeleteConfirmOpen] = useState<boolean>(false);
 
     // Refs to move focus to the first invalid field on a failed validate()
     // (ports the AngularJS focus behavior; keeps the form keyboard-friendly).
@@ -218,13 +253,13 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
             const generic =
                 firstString(body["_error_message"]) ??
                 firstString(body["__all__"]) ??
-                SAVE_ERROR_MESSAGE;
+                t("COMMON.SAVE_ERROR", SAVE_ERROR_MESSAGE);
             setServerError(generic);
 
             return;
         }
 
-        setServerError(SAVE_ERROR_MESSAGE);
+        setServerError(t("COMMON.SAVE_ERROR", SAVE_ERROR_MESSAGE));
     }, []);
 
     // Submit handler. Guards double-submit (replaces `debounce 2000`), normalizes
@@ -291,15 +326,31 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         [submitting, values, mode, sprint, project, onChanged, onClose, handleApiError],
     );
 
-    // Delete handler (edit + `delete_milestone` only). Ports `remove()` +
-    // `$confirm.askOnDelete(...)` (lightboxes.coffee L103-118) using a
-    // dependency-free native confirm.
-    const handleRemove = useCallback(async (): Promise<void> => {
+    // Delete handler (edit + `delete_milestone` only). Ports `remove()`
+    // (lightboxes.coffee L103-118). [H] Opens the themed {@link ConfirmDialog}
+    // instead of the native `window.confirm`; the actual removal runs in
+    // `handleConfirmDelete` once the user confirms.
+    const handleRemove = useCallback((): void => {
         if (submitting || !sprint) {
             return;
         }
+        setDeleteConfirmOpen(true);
+    }, [submitting, sprint]);
 
-        if (!window.confirm(DELETE_CONFIRM_MESSAGE)) {
+    // [H] Cancel path — dismiss the confirm dialog without deleting.
+    const handleCancelDelete = useCallback((): void => {
+        if (submitting) {
+            return;
+        }
+        setDeleteConfirmOpen(false);
+    }, [submitting]);
+
+    // [H] Confirm path — perform the milestone removal. Ports the
+    // `$confirm.askOnDelete(...).then(onSuccess, onError)` body: on success the
+    // parent is notified and both dialogs close; on error the confirm dialog is
+    // dismissed and the server error surfaces in the edit lightbox.
+    const handleConfirmDelete = useCallback(async (): Promise<void> => {
+        if (submitting || !sprint) {
             return;
         }
 
@@ -309,9 +360,11 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         try {
             const sprintId: Id = sprint.id;
             await removeMilestone(sprintId);
+            setDeleteConfirmOpen(false);
             onChanged();
             onClose();
         } catch (error) {
+            setDeleteConfirmOpen(false);
             handleApiError(error);
         } finally {
             setSubmitting(false);
@@ -344,14 +397,20 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
     const showLastSprintHint = mode === "create" && Boolean(lastSprintName);
 
     return (
-        <div className="lightbox lightbox-sprint-add-edit">
+        <>
+        {/* [#3] reveal: the `.lightbox` SCSS mixin's base is `display:none;opacity:0`
+            and it is revealed ONLY by the `.open` class (`.lightbox.open{display:flex}`).
+            This component returns `null` when `!open` (see the guard above), so it is
+            rendered exclusively in the open state — hence the `open` class is applied
+            unconditionally here. */}
+        <div className="lightbox lightbox-sprint-add-edit open">
             {/* Ports tg-lightbox-close (tg-svg svg-icon="icon-close"). i18n COMMON.CLOSE */}
             <button
                 className="close"
                 type="button"
                 onClick={onClose}
-                title="close"
-                aria-label="close"
+                title={t("COMMON.CLOSE", "close")}
+                aria-label={t("COMMON.CLOSE", "close")}
             >
                 <svg className="icon icon-close" aria-hidden="true" focusable="false">
                     <use xlinkHref="#icon-close" href="#icon-close" />
@@ -360,8 +419,9 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
 
             <form onSubmit={handleSubmit} noValidate>
                 <h2 className="title">
-                    {/* create: LIGHTBOX.ADD_EDIT_SPRINT.TITLE ; edit: BACKLOG.EDIT_SPRINT */}
-                    {mode === "create" ? "New sprint" : "Edit Sprint"}
+                    {mode === "create"
+                        ? t("LIGHTBOX.ADD_EDIT_SPRINT.TITLE", "New sprint")
+                        : t("BACKLOG.EDIT_SPRINT", "Edit Sprint")}
                 </h2>
 
                 <fieldset className={errors.name ? "checksley-error" : undefined}>
@@ -373,19 +433,11 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                         maxLength={NAME_MAX_LENGTH}
                         value={values.name}
                         onChange={handleNameChange}
-                        /* i18n LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_NAME */
-                        placeholder="sprint name"
+                        placeholder={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_NAME", "sprint name")}
                         autoFocus
                     />
                     <label className="last-sprint-name">
-                        {/* i18n LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME */}
-                        {showLastSprintHint ? (
-                            <>
-                                last sprint is <strong> {lastSprintName} ;-) </strong>
-                            </>
-                        ) : (
-                            ""
-                        )}
+                        {showLastSprintHint ? renderLastSprintHint(lastSprintName as string) : ""}
                     </label>
                     {errors.name && <span className="checksley-required">{errors.name}</span>}
                 </fieldset>
@@ -399,8 +451,7 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                             name="estimated_start"
                             value={values.estimated_start}
                             onChange={handleStartChange}
-                            /* i18n LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START */
-                            aria-label="Estimated Start"
+                            aria-label={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START", "Estimated Start")}
                         />
                         {errors.estimated_start && (
                             <span className="checksley-required">{errors.estimated_start}</span>
@@ -414,8 +465,7 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                             name="estimated_finish"
                             value={values.estimated_finish}
                             onChange={handleFinishChange}
-                            /* i18n LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END */
-                            aria-label="Estimated End"
+                            aria-label={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END", "Estimated End")}
                         />
                         {errors.estimated_finish && (
                             <span className="checksley-required">{errors.estimated_finish}</span>
@@ -427,11 +477,10 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                     <button
                         className="btn-big button-large button-block"
                         type="submit"
-                        title="Save"
+                        title={t("COMMON.SAVE", "Save")}
                         disabled={submitting}
                     >
-                        {/* i18n COMMON.SAVE */}
-                        Save
+                        {t("COMMON.SAVE", "Save")}
                     </button>
 
                     {mode === "edit" && canDelete && (
@@ -439,16 +488,17 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                             className="btn-link delete-sprint"
                             type="button"
                             onClick={handleRemove}
-                            /* i18n LIGHTBOX.ADD_EDIT_SPRINT.TITLE_ACTION_DELETE_SPRINT */
-                            title="delete sprint"
+                            title={t("LIGHTBOX.ADD_EDIT_SPRINT.TITLE_ACTION_DELETE_SPRINT", "delete sprint")}
                             disabled={submitting}
                         >
                             <svg className="icon icon-trash" aria-hidden="true" focusable="false">
                                 <use xlinkHref="#icon-trash" href="#icon-trash" />
                             </svg>
                             <span className="delete-sprint-text">
-                                {/* i18n LIGHTBOX.ADD_EDIT_SPRINT.ACTION_DELETE_SPRINT */}
-                                Do you want to delete this sprint?
+                                {t(
+                                    "LIGHTBOX.ADD_EDIT_SPRINT.ACTION_DELETE_SPRINT",
+                                    "Do you want to delete this sprint?",
+                                )}
                             </span>
                         </button>
                     )}
@@ -461,5 +511,21 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                 )}
             </form>
         </div>
+
+        {/* [H] Themed delete-confirm dialog (replaces the native window.confirm).
+            Ports `$confirm.askOnDelete(LIGHTBOX.DELETE_SPRINT.TITLE, sprint.name)`
+            — title + sprint name in the `.lightbox-generic-delete` shell. */}
+        <ConfirmDialog
+            open={deleteConfirmOpen}
+            variant="delete"
+            title={t("LIGHTBOX.DELETE_SPRINT.TITLE", DELETE_CONFIRM_TITLE)}
+            message={sprint ? <strong>{sprint.name}</strong> : null}
+            confirmLabel={t("COMMON.DELETE", "Delete")}
+            cancelLabel={t("COMMON.CANCEL", "Cancel")}
+            busy={submitting}
+            onConfirm={handleConfirmDelete}
+            onCancel={handleCancelDelete}
+        />
+        </>
     );
 }

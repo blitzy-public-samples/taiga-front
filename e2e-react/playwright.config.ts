@@ -62,6 +62,14 @@ export default defineConfig({
     testDir: __dirname,                 // e2e-react/ — discovers *.spec.ts here
     // fixtures/session.ts is not a *.spec.ts, so it is not run as a test.
 
+    // Deterministic sample-data reset/reseed BEFORE the whole run, so the suite
+    // can be executed twice-from-clean without duplicate-name/data/order drift.
+    // The hook is env-configurable (E2E_RESEED_CMD / E2E_RESEED_URL) because the
+    // taiga-back backend is out of scope for this submodule; it is a safe,
+    // non-failing no-op with an actionable warning when no reseed is configured.
+    // See fixtures/globalSetup.ts for the full contract and examples.
+    globalSetup: require.resolve('./fixtures/globalSetup'),
+
     fullyParallel: false,               // single shared session -> no parallelism
     workers: 1,                         // serialized (AAP: workers:1)
     retries: 0,                         // deterministic single-session run

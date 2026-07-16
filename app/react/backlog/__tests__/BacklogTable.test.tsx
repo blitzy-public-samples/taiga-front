@@ -185,6 +185,7 @@ function makeProps(overrides: Partial<BacklogTableProps> = {}): BacklogTableProp
         showTags: false,
         activeFilters: false,
         displayVelocity: false,
+        stats: null,
         firstUsInBacklog: null,
         loadingUserstories: false,
         dragEnabled: true,
@@ -650,5 +651,152 @@ describe("BacklogTable", () => {
         // Effect cleanup (BacklogTable.tsx `observer.disconnect()`) must run on unmount.
         unmount();
         expect(io!.disconnect).toHaveBeenCalled();
+    });
+
+    /* ---------------------------------------------------------------------- */
+    /* [S] Popover reveal contract                                            */
+    /* ---------------------------------------------------------------------- */
+    // The `.popover` SCSS mixin sets base `display:none` and the compiled theme
+    // provides NO `.active`/`.open` rule that flips it back — the AngularJS
+    // popovers were revealed by jQuery `fadeIn()` writing an inline `display:block`.
+    // Each React popover therefore MUST render an inline `display:block` when open,
+    // otherwise it stays invisible (0×0, offsetParent null) as reported in [S].
+    describe("[S] reveals each open popover with an inline display:block", () => {
+        it("status popover carries inline display:block", () => {
+            const us = makeUs({ id: 50, ref: 5, status: 100 });
+            const { container } = renderTable({ userstories: [us], visibleRefs: [5] });
+
+            fireEvent.click(
+                (container.querySelector(".us-item-row") as HTMLElement).querySelector(
+                    ".us-status",
+                ) as Element,
+            );
+            expect(container.querySelector("ul.popover.pop-status")).toHaveStyle({
+                display: "block",
+            });
+        });
+
+        it("points popover carries inline display:block", () => {
+            const us = makeUs({ id: 50, ref: 5 });
+            const { container } = renderTable({ userstories: [us], visibleRefs: [5] });
+
+            fireEvent.click(container.querySelector(".us-points") as Element);
+            expect(container.querySelector("ul.popover.pop-points")).toHaveStyle({
+                display: "block",
+            });
+        });
+
+        it("header role popover carries inline display:block", () => {
+            const { container } = renderTable({ userstories: [makeUs({ id: 50, ref: 5 })] });
+
+            fireEvent.click(container.querySelector(".backlog-table-header .inner") as Element);
+            expect(container.querySelector("ul.popover.pop-role")).toHaveStyle({
+                display: "block",
+            });
+        });
+
+        it("row options popover carries inline display:block", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 50, ref: 5 })],
+                visibleRefs: [5],
+            });
+
+            openRowOptions(container.querySelector(".us-item-row") as HTMLElement);
+            expect(container.querySelector("ul.popover.us-option-popup")).toHaveStyle({
+                display: "block",
+            });
+        });
+    });
+
+    /* ---------------------------------------------------------------------- */
+    /* [P][Q][R] Accessible names / roles                                     */
+    /* ---------------------------------------------------------------------- */
+
+    describe("accessibility (a11y names/roles)", () => {
+        it("[P] gives the draggable handle an accessible name including ref + subject", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 42, subject: "Ship it" })],
+            });
+            const handle = container.querySelector(".draggable-us-row");
+            expect(handle).not.toBeNull();
+            expect(handle).toHaveAttribute("aria-label", "Reorder user story #42 Ship it");
+        });
+
+        it("[R] exposes the status control as a button with popup + expanded state", () => {
+            const { container } = renderTable();
+            const status = container.querySelector(".us-item-row .us-status") as HTMLElement;
+            expect(status).not.toBeNull();
+            expect(status).toHaveAttribute("role", "button");
+            expect(status).toHaveAttribute("aria-haspopup", "menu");
+            expect(status).toHaveAttribute("aria-expanded", "false");
+        });
+
+        it("[R] exposes the points control as a button with an accessible name", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 1, total_points: 1, points: { "1": 11 } })],
+            });
+            const points = container.querySelector(".us-item-row .us-points") as HTMLElement;
+            expect(points).not.toBeNull();
+            expect(points).toHaveAttribute("role", "button");
+            expect(points.getAttribute("aria-label") ?? "").toMatch(/^Points: /);
+        });
+
+        it("[Q] names the row-options (kebab) button and exposes its menu state", () => {
+            const { container } = renderTable();
+            const kebab = container.querySelector(
+                ".us-item-row .us-option-popup-button",
+            ) as HTMLElement;
+            expect(kebab).not.toBeNull();
+            expect(kebab).toHaveAttribute("aria-label", "User story options");
+            expect(kebab).toHaveAttribute("aria-haspopup", "menu");
+            expect(kebab).toHaveAttribute("aria-expanded", "false");
+        });
+
+        it("[R] toggles aria-expanded when the status popover opens", () => {
+            const { container } = renderTable();
+            const status = container.querySelector(".us-item-row .us-status") as HTMLElement;
+            expect(status).toHaveAttribute("aria-expanded", "false");
+            fireEvent.click(status);
+            expect(status).toHaveAttribute("aria-expanded", "true");
+        });
+    });
+
+    /* ---------------------------------------------------------------------- */
+    /* [A] Doomline banner                                                    */
+    /* ---------------------------------------------------------------------- */
+
+    describe("doomline banner [A]", () => {
+        it("renders the 'Project Scope [Doomline]' banner before the over-committed row", () => {
+            const { container } = renderTable({
+                userstories: [
+                    makeUs({ id: 1000, ref: 1, total_points: 40 }),
+                    makeUs({ id: 1001, ref: 2, total_points: 80 }),
+                ],
+                // cumulative 40, 120 -> breaks at index 1 (row #2).
+                stats: { total_points: 100, assigned_points: 0 } as never,
+                displayVelocity: false,
+            });
+            const doom = container.querySelector(".doom-line");
+            expect(doom).not.toBeNull();
+            expect(doom).toHaveTextContent("Project Scope [Doomline]");
+        });
+
+        it("does NOT render the doomline when velocity is displayed", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 1, total_points: 40 })],
+                stats: { total_points: 100, assigned_points: 0 } as never,
+                displayVelocity: true,
+            });
+            expect(container.querySelector(".doom-line")).toBeNull();
+        });
+
+        it("does NOT render the doomline when stats are absent", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 1, total_points: 40 })],
+                stats: null,
+                displayVelocity: false,
+            });
+            expect(container.querySelector(".doom-line")).toBeNull();
+        });
     });
 });

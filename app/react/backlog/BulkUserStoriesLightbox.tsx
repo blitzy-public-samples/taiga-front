@@ -46,10 +46,14 @@ import type { FormEvent } from "react";
 
 import type { Project, UsStatus, Id, UserStory } from "./types";
 import { bulkCreate } from "../shared/api/userstories";
+import { t } from "../shared/i18n/translate";
 
 /* -------------------------------------------------------------------------- */
-/* i18n literals — English values pinned from app/locales/taiga/locale-en.json */
-/* (translation key retained in the trailing comment for future extraction).   */
+/* i18n literals — English values pinned from app/locales/taiga/locale-en.json. */
+/* Each constant is the ENGLISH FALLBACK, routed through the shared catalog      */
+/* ([i18n]) at its render-time use site via `t(KEY, CONST)` (key in each JSDoc). */
+/* `t()` MUST be evaluated per-render, never at module load, so these stay plain */
+/* string constants used only as the fallback argument.                         */
 /* -------------------------------------------------------------------------- */
 
 /** COMMON.NEW_BULK */
@@ -186,7 +190,7 @@ export function BulkUserStoriesLightbox(
             // Validation — REPLACES checksley `data-required` + `data-linewidth=200`.
             const trimmed = bulk.trim();
             if (trimmed === "") {
-                setError(REQUIRED_MESSAGE);
+                setError(t("COMMON.FORM_ERRORS.REQUIRED", REQUIRED_MESSAGE));
                 textareaRef.current?.focus();
                 return;
             }
@@ -195,7 +199,7 @@ export function BulkUserStoriesLightbox(
                 .split(/\r?\n/)
                 .some((line) => line.length > MAX_LINE_LENGTH);
             if (hasTooLongLine) {
-                setError(LINE_TOO_LONG_MESSAGE);
+                setError(t("LIGHTBOX.BULK.LINE_TOO_LONG", LINE_TOO_LONG_MESSAGE));
                 textareaRef.current?.focus();
                 return;
             }
@@ -216,7 +220,7 @@ export function BulkUserStoriesLightbox(
             } catch {
                 // HttpError (or any request failure): surface the single inline error
                 // slot (ports form.setErrors + $confirm.notify, L378-388).
-                setError(GENERIC_ERROR_MESSAGE);
+                setError(t("LIGHTBOX.BULK.CREATE_ERROR", GENERIC_ERROR_MESSAGE));
             } finally {
                 setSubmitting(false);
             }
@@ -226,29 +230,35 @@ export function BulkUserStoriesLightbox(
 
     return (
         // Wrapper reproduces the backlog shell's host element
-        // `div.lightbox.lightbox-generic-bulk`; visibility is toggled via `display`
-        // to mirror `lightboxService.open/close` (element stays in the DOM).
+        // `div.lightbox.lightbox-generic-bulk`. [#3] reveal: the `.lightbox` SCSS
+        // mixin sets base `display:none;opacity:0` and reveals ONLY via
+        // `.lightbox.open{display:flex;opacity:1}`. The previous `style={{display:
+        // open ? undefined : "none"}}` left `display` unset when open, so the base
+        // `display:none` still applied and the lightbox never appeared. We toggle
+        // the `open` class instead (element stays in the DOM either way, mirroring
+        // `lightboxService.open/close`).
         <div
-            className="lightbox lightbox-generic-bulk"
-            style={{ display: open ? undefined : "none" }}
+            className={"lightbox lightbox-generic-bulk" + (open ? " open" : "")}
         >
             {/* tg-lightbox-close */}
             <button
                 className="close"
                 type="button"
                 onClick={onClose}
-                aria-label={CLOSE_ARIA_LABEL}
+                aria-label={t("COMMON.CLOSE", CLOSE_ARIA_LABEL)}
             >
                 ✕
             </button>
 
             <form onSubmit={handleSubmit} noValidate>
-                <h2 className="title">{TITLE_NEW_BULK}</h2>
+                <h2 className="title">{t("COMMON.NEW_BULK", TITLE_NEW_BULK)}</h2>
 
                 {/* Status selector — jade `fieldset(ng-if="project.us_statuses")` */}
                 {project.us_statuses ? (
                     <fieldset>
-                        <span className="label">{LABEL_SELECT_STATUS}</span>
+                        <span className="label">
+                            {t("LIGHTBOX.CREATE_EDIT.SELECT_STATUS", LABEL_SELECT_STATUS)}
+                        </span>
                         <div className="bulk-status-selector-wrapper">
                             <button
                                 type="button"
@@ -289,7 +299,7 @@ export function BulkUserStoriesLightbox(
 
                 {/* Creation position — jade `fieldset.creation-position` */}
                 <fieldset className="creation-position">
-                    <span className="label">{LABEL_LOCATION}</span>
+                    <span className="label">{t("LIGHTBOX.CREATE_EDIT.LOCATION", LABEL_LOCATION)}</span>
                     <div className="creation-position-fields">
                         {/*
                           The source template intentionally CROSSES the id/value pairs:
@@ -306,7 +316,9 @@ export function BulkUserStoriesLightbox(
                                 onChange={() => setUsPosition("bottom")}
                             />
                             <span className="radio-control" />
-                            <span className="radio-label">{LABEL_CREATE_BOTTOM}</span>
+                            <span className="radio-label">
+                                {t("LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM", LABEL_CREATE_BOTTOM)}
+                            </span>
                         </label>
 
                         <label className="custom-radio">
@@ -319,7 +331,9 @@ export function BulkUserStoriesLightbox(
                                 onChange={() => setUsPosition("top")}
                             />
                             <span className="radio-control" />
-                            <span className="radio-label">{LABEL_CREATE_TOP}</span>
+                            <span className="radio-label">
+                                {t("LIGHTBOX.CREATE_EDIT.CREATE_TOP", LABEL_CREATE_TOP)}
+                            </span>
                         </label>
                     </div>
                 </fieldset>
@@ -337,7 +351,7 @@ export function BulkUserStoriesLightbox(
                         wrap="off"
                         value={bulk}
                         onChange={(changeEvent) => setBulk(changeEvent.target.value)}
-                        placeholder={PLACEHOLDER_ONE_ITEM_LINE}
+                        placeholder={t("COMMON.ONE_ITEM_LINE", PLACEHOLDER_ONE_ITEM_LINE)}
                     />
                     {error ? (
                         <span className="checksley-required" role="alert">
@@ -352,7 +366,7 @@ export function BulkUserStoriesLightbox(
                         type="submit"
                         disabled={submitting}
                     >
-                        {LABEL_SAVE}
+                        {t("COMMON.SAVE", LABEL_SAVE)}
                     </button>
                 </div>
             </form>

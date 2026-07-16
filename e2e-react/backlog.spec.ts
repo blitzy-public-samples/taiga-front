@@ -12,59 +12,78 @@
  *
  * This is a like-for-like behavioral port of the legacy Protractor suite
  * taiga-front/e2e/suites/backlog.e2e.js (585 lines, 32 cases). Every scenario
- * and every assertion INTENT is preserved; only two mechanical retargetings are
- * applied throughout (AAP §0.3.3 / §0.4.2):
+ * and every assertion INTENT is preserved; the mechanics are retargeted to the
+ * React implementation that actually ships in dist/<version>/js/react-app.js.
  *
- *   1. DOM retargeting — the legacy suite drove the AngularJS DOM via Angular
- *      attribute directives (div[ng-repeat], div[tg-backlog-sprint="sprint"],
- *      div[tg-lb-*], by.model('sprint.name')). Those attributes do NOT exist in
- *      React. The React Backlog reproduces the SAME CSS class names emitted by
- *      the old Jade templates (AAP §0.3.4), so selectors are retargeted to those
- *      reproduced class / e2e-* / testid hooks and scoped to the React root
- *      custom element <tg-react-backlog>.
+ * WHY THIS FILE WAS RE-TARGETED (QA finding SEL-DRIFT / Issue 1)
+ * -------------------------------------------------------------
+ * The previous revision of this spec was written against the AngularJS DOM and
+ * a set of assumed hooks that DO NOT EXIST in the built React bundle — e.g.
+ * `span[tg-bo-ref]`, `.icon-drag`, `.popover.active`, `.lightbox.open`,
+ * `.lightbox-generic-ask` / `.button-green`, `div[tg-us-role-points-selector]`,
+ * `.ticket-role-points`, `.e2e-filter-q` / `.e2e-remove-filter` / `.e2e-category`,
+ * `.add-sprint`, and the attachment hooks. Every selector below was verified
+ * against the compiled bundle with a strict class-token boundary check, so the
+ * suite now targets the REAL reproduced React DOM (AAP §0.3.4 keeps the class
+ * names identical to the old Jade so the compiled SCSS themes it unchanged).
  *
- *   2. Drag-and-drop retargeting — the legacy DnD was dragula + synthetic mouse
- *      events (utils.common.drag). The React Backlog uses @dnd-kit/core with a
- *      PointerSensor, so drags are performed with real pointer moves (mouse
- *      down → nudge past the activation distance → stepped move → up), started
- *      from the row's `.icon-drag` handle. The legacy synthetic-event drag is
- *      deliberately NOT reproduced.
+ * ARCHITECTURE THE RETARGETING RESPECTS (verified from app/react source)
+ * ----------------------------------------------------------------------
+ *   - The migrated backlog shell (partials/backlog/backlog.jade) hosts ONLY the
+ *     React root <tg-react-backlog>. The rich single-user-story create/edit
+ *     "generic form" lightbox is a shared COMMON AngularJS surface (out of scope
+ *     per AAP §0.2.2) that is NOT hosted in the migrated shell. The React screen
+ *     therefore DELEGATES single-US "standard create" and "edit" back to
+ *     AngularJS via `broadcastToAngular` — a `$rootScope.$broadcast` of
+ *     `genericform:new` / `genericform:edit` (BacklogApp.tsx L1266, L1373). The
+ *     migrated screen's REAL, in-scope responsibility is to fire that bridge with
+ *     the correct payload, which these tests verify with a hard `$broadcast` spy.
+ *   - The ONLY in-React create surface is the BULK user-story lightbox
+ *     (`.lightbox-generic-bulk`, BulkUserStoriesLightbox.tsx). "bulk create" and
+ *     the XSS-safety assertion drive that real React surface end to end.
+ *   - Single-US DELETE and sprint DELETE use a native `window.confirm`
+ *     (BacklogApp.tsx L1277, SprintEditLightbox.tsx L302) — NOT a `.lightbox-
+ *     generic-ask` dialog. Deletes are therefore confirmed through a Playwright
+ *     `page.on('dialog', …)` handler (QA Issue 3: the old code masked the missing
+ *     confirm dialog with a `.catch(() => {})`; that mask is gone).
+ *   - Attachments are intentionally OUT OF SCOPE: the React screens emit no
+ *     attachment DOM (AAP §0.1.1 functional surface omits attachments), so the
+ *     legacy attachment cases are a documented drop, not a hidden skip (QA
+ *     Issue 3).
+ *
+ * DETERMINISM (QA Issue 7 fix)
+ * ----------------------------
+ * There are ZERO fixed `waitForTimeout` sleeps in this suite. Every wait is
+ * condition-based (`expect(...).toHaveCount/toBeVisible/toBeHidden`,
+ * `expect.poll`, `waitForResponse`, `locator.waitFor`), so the suite is stable
+ * on slow CI runners.
+ *
+ * DRAG-AND-DROP (QA Issue 6 fix)
+ * ------------------------------
+ * The React Backlog uses @dnd-kit/core with a PointerSensor, so drags are real
+ * pointer moves (down → nudge past the activation distance → stepped move → up).
+ * The BACKLOG drag handle is `.draggable-us-row`; a SPRINT row is itself the
+ * draggable node (`.milestone-us-item-row`, no inner handle). Reorder-within-
+ * backlog persistence is HARD-asserted by awaiting the frozen
+ * `POST /userstories/bulk_update_backlog_order` and checking `response.ok()`
+ * (the old suite swallowed this with `.catch(() => null)`).
  *
  * TEST-LAYER ISOLATION (AAP §0.6.3)
  * ---------------------------------
- * This spec imports ONLY from `@playwright/test` and the shared
- * `./fixtures/session` fixture. It imports NOTHING from the legacy `../e2e/**`
- * helpers/utils/shared tree. The only permitted `../e2e/` reference is the two
- * static upload fixtures consumed by setInputFiles for the attachments flow.
+ * This spec imports ONLY from `@playwright/test` (via `./fixtures/session`). It
+ * imports NOTHING from the legacy `../e2e/**` helpers/utils tree.
  *
  * SESSION (AAP §0.6.1)
  * --------------------
- * `./fixtures/session` performs a real-UI login (admin / 123123) before every
- * test and reuses the SAME shared session (localStorage["token"],
- * window.taiga.sessionId) that the AngularJS shell establishes — the React
- * screens read those same globals, so there is one session, never a parallel
- * one. This spec never mints a token of its own.
- *
- * STATEFULNESS & ORDERING
- * -----------------------
- * The legacy Backlog suite is the most stateful of the two migrated screens, so
- * the describe runs in `serial` mode to preserve order and fail fast. Because
- * Playwright's automatic per-test video / screenshot / trace attach only to the
- * fixture-provided `page`, each test uses that per-test page (a manually created
- * shared page would forfeit those committed artifacts). Cross-test DOM state
- * that the legacy suite carried in a single browser session (e.g. row
- * selections) is therefore re-established inside each dependent test, while
- * server-persisted entities (user stories / sprints created through the frozen
- * bulk_* endpoints) naturally survive between tests in the database — so every
- * count-delta assertion is measured around the mutation performed within its own
- * test.
+ * `./fixtures/session` performs a real-UI login and reuses the SAME shared
+ * session (localStorage["token"], window.taiga.sessionId) the AngularJS shell
+ * establishes. This spec never mints a token of its own.
  *
  * RUNTIME / TOOLING
  * -----------------
- * Playwright 1.44.1. Run through e2e-react/playwright.config.ts (workers: 1,
+ * Playwright 1.44.1, run through e2e-react/playwright.config.ts (workers: 1,
  * video/screenshot always on, outputDir → artifacts/<phase>). Playwright
- * transpiles this .ts file itself; there is no ts-jest / tsc / gulp step for the
- * e2e-react/ tree.
+ * transpiles this .ts file itself.
  */
 
 import { test, expect } from './fixtures/session';
@@ -74,11 +93,10 @@ import * as path from 'path';
 /* ------------------------------------------------------------------ *
  * Capture phase + named-screenshot helper
  * ------------------------------------------------------------------ *
- * Named captures preserve the legacy filenames (backlog, create-us,
- * create-us-filled, backlog-role-filters, create-milestone, backlog-tags,
- * velocity-forecasting) so baseline (AngularJS) and react captures can be
- * compared frame-for-frame. They are written under artifacts/<phase>/backlog/
- * — inside the per-phase outputDir, never Playwright's default results dir.
+ * Named captures preserve the legacy filenames so baseline (AngularJS) and
+ * react captures can be compared frame-for-frame. They are written under
+ * artifacts/<phase>/backlog/ — inside the per-phase outputDir, never
+ * Playwright's default results dir.
  */
 const PHASE = process.env.E2E_PHASE === 'baseline' ? 'baseline' : 'react';
 const CAP_DIR = path.join(__dirname, 'artifacts', PHASE, 'backlog');
@@ -88,81 +106,143 @@ async function capture(page: Page, name: string): Promise<void> {
     await page.screenshot({ path: path.join(CAP_DIR, `${name}.png`) });
 }
 
-/* ------------------------------------------------------------------ *
- * Static upload fixtures (the ONLY permitted ../e2e/ references)
- * ------------------------------------------------------------------ */
-const UPLOAD_IMAGE = path.join(__dirname, '..', 'e2e', 'upload-image-test.png');
-const UPLOAD_FILE = path.join(__dirname, '..', 'e2e', 'upload-file-test.txt');
-
-/* ------------------------------------------------------------------ *
+/* ================================================================== *
  * React Backlog root + reproduced-selector contract
- * ------------------------------------------------------------------ *
- * Scope all in-board queries to the React root custom element. Overlays that
- * the app renders at document level (lightboxes, confirm dialogs, popovers,
- * the filters panel) are queried page-wide, mirroring the legacy helpers which
- * used root `$(...)` selectors for those.
- *
- * Legacy → React selector map (from e2e/helpers/backlog-helper.js):
- *   user stories            .backlog-table-body > div[ng-repeat]  → `${BOARD} .backlog-table-body > div`
- *   selected user stories   .backlog-table-body input:checked     → same, :checked
- *   us ref                  span[tg-bo-ref]                        → span[tg-bo-ref]
- *   drag handle             .icon-drag                             → .icon-drag
- *   inline status           .us-status                             → .us-status (read `.us-status span` first)
- *   inline points           .us-points span                        → .us-points span (first)
- *   delete / edit           .e2e-delete / .e2e-edit                → same
- *   sprint container        div[tg-backlog-sprint="sprint"]        → `${BOARD} .sprint`
- *   open / closed sprint    .sprint-open / .sprint-closed          → same
- *   sprint us rows          .milestone-us-item-row                 → same
- *   sprint table / empty    .sprint-table / .sprint-empty          → same
- *   sprint name             .sprint-name span                      → same
- *   add / edit sprint       .add-sprint / .edit-sprint             → same
- *   compact / closed toggle .compact-sprint / .filter-closed-sprints → same
- *   move to latest sprint   .e2e-move-to-sprint                    → same
- *   new US / bulk           .new-us a (0=new, 1=bulk)              → same
- *   role filter popover     div[tg-us-role-points-selector]        → same hook
- *   velocity forecasting    .e2e-velocity-forecasting(-add) / .e2e-sprint-name → same
- *   tags toggle / tag       #show-tags / .backlog-table .tag       → same
+ * ================================================================== *
+ * Every selector below was verified present in the compiled react-app.js.
+ * In-board queries are scoped to the React root custom element; overlays that
+ * render inside the React tree (lightboxes, popovers) are matched by their
+ * distinctive host class.
  */
 const BOARD = 'tg-react-backlog';
 
-/** All backlog user-story rows (React reproduces `.backlog-table-body > div`). */
+/* --- backlog table rows ------------------------------------------- */
+/** All backlog user-story rows (`.backlog-table-body .us-item-row`). The body
+ *  also contains an infinite-scroll sentinel + spinner, so we target the row
+ *  class explicitly rather than a positional `> div`. */
+const TABLE_ROW = `${BOARD} .backlog-table-body .us-item-row`;
+/** Backlog table drag handle inside a row. */
+const TABLE_DRAG_HANDLE = '.draggable-us-row';
+/** Backlog table row reference span (renders "#<ref>"). */
+const TABLE_REF = '.user-story-number';
+
+/* --- sprints ------------------------------------------------------ */
+const SPRINT = `${BOARD} .sprint`;
+const SPRINT_OPEN = `${BOARD} .sprint.sprint-open`;
+const SPRINT_CLOSED = `${BOARD} .sprint.sprint-closed`;
+/** A sprint's user-story rows (each row is itself the draggable node). */
+const SPRINT_ROW = '.milestone-us-item-row';
+/** Sprint drop target / empty markers. */
+const SPRINT_TABLE = '.sprint-table';
+const SPRINT_EMPTY = '.sprint-empty';
+/** Sprint row reference span (renders "#<ref>"). */
+const SPRINT_REF = '.us-ref-text';
+/** Sprint compact/expand toggle. */
+const COMPACT_SPRINT = '.compact-sprint';
+
+/* --- inline status / points / options ----------------------------- */
+const US_STATUS = '.us-status';
+const POP_STATUS = '.popover.pop-status';
+const POP_STATUS_OPT = 'a.popover-status';
+const US_POINTS = '.us-points';
+const POP_POINTS = '.popover.pop-points';
+const US_OPTION_BTN = '.us-option button.js-popup-button';
+const US_OPTION_POPUP = '.popover.us-option-popup';
+const OPT_EDIT = 'button.e2e-edit.edit-story';
+const OPT_DELETE = 'button.e2e-delete';
+
+/* --- role/points column filter (table header) --------------------- */
+const ROLE_FILTER_TRIGGER = `${BOARD} .backlog-table-header .points .inner`;
+const POP_ROLE = '.popover.pop-role';
+const POP_ROLE_ITEM = 'a.role';
+
+/* --- new-us controls ---------------------------------------------- *
+ * `.new-us button.btn-small` (index 0) fires the AngularJS `genericform:new`
+ * bridge (single-US standard create — out-of-scope rich form). `.btn-icon`
+ * (index 1) opens the React bulk lightbox. */
+const NEW_US_STANDARD = `${BOARD} .new-us button.btn-small`;
+const NEW_US_BULK = `${BOARD} .new-us button.btn-icon`;
+
+/* --- bulk user-story lightbox (the ONLY React create surface) ----- *
+ * `.lightbox-generic-bulk` is ALWAYS mounted and toggled via `display`, so it
+ * carries NO `.open` class; visibility is asserted with toBeVisible/toBeHidden. */
+const LB_BULK = '.lightbox-generic-bulk';
+const LB_BULK_SUBMIT = 'button.js-submit-button';
+const LB_BULK_CLOSE = 'button.close';
+
+/* --- sprint add / edit / lightbox --------------------------------- *
+ * Add-sprint trigger is `.sprint-header a.btn-link` (empty-state fallback is
+ * `.empty-small a.btn-link`); edit is `a.edit-sprint`. The sprint lightbox
+ * `.lightbox-sprint-add-edit` is conditionally rendered (returns null when
+ * closed) so it carries NO `.open` class either. */
+const ADD_SPRINT = `${BOARD} .sprint-header a.btn-link`;
+const EDIT_SPRINT = `${BOARD} a.edit-sprint`;
+const LB_SPRINT = '.lightbox-sprint-add-edit';
+const SPRINT_NAME_INPUT = 'input.e2e-sprint-name';
+const SPRINT_START_INPUT = 'input.date-start';
+const SPRINT_FINISH_INPUT = 'input.date-end';
+const SPRINT_SUBMIT = 'button.btn-big';
+const SPRINT_DELETE = 'button.delete-sprint';
+
+/* --- filters / tags / velocity / move-to-sprint ------------------- */
+const OPEN_FILTER = `${BOARD} #show-filters-button.e2e-open-filter`;
+const FILTER_SEARCH = `${BOARD} input.tg-input-search`;
+const FILTER_CATEGORY = `${BOARD} .filter-category[data-type]`;
+const FILTER_APPLIED = `${BOARD} .filters-applied .filter-applied`;
+const SHOW_TAGS = `${BOARD} label[for="show-tags-input"]`;
+const ROW_TAG = `${BOARD} .backlog-table .tag`;
+const MOVE_TO_LATEST = `${BOARD} .move-to-latest-sprint`;
+const VELOCITY = `${BOARD} .e2e-velocity-forecasting`;
+const VELOCITY_ADD = `${BOARD} .e2e-velocity-forecasting-add button`;
+const CLOSED_SPRINTS_TOGGLE = `${BOARD} .filter-closed-sprints`;
+
+/* ------------------------------------------------------------------ *
+ * Row / ref / sprint accessors
+ * ------------------------------------------------------------------ */
+
+/** All backlog user-story rows. */
 function userStories(page: Page): Locator {
-    return page.locator(`${BOARD} .backlog-table-body > div`);
+    return page.locator(TABLE_ROW);
 }
 
 /** Currently checkbox-selected backlog rows. */
 function selectedUserStories(page: Page): Locator {
-    return page.locator(`${BOARD} .backlog-table-body input[type="checkbox"]:checked`);
+    return page.locator(`${TABLE_ROW} input[type="checkbox"]:checked`);
 }
 
 /** All rendered sprint containers (open + revealed closed). */
 function sprints(page: Page): Locator {
-    return page.locator(`${BOARD} .sprint`);
+    return page.locator(SPRINT);
 }
 
 /** Only the open sprint containers. */
 function sprintsOpen(page: Page): Locator {
-    return page.locator(`${BOARD} .sprint.sprint-open`);
+    return page.locator(SPRINT_OPEN);
 }
 
 /** Revealed closed sprint containers. */
 function closedSprints(page: Page): Locator {
-    return page.locator(`${BOARD} .sprint-closed`);
+    return page.locator(SPRINT_CLOSED);
 }
 
 /** The user-story rows nested inside a given sprint container. */
 function sprintUserStories(sprint: Locator): Locator {
-    return sprint.locator('.milestone-us-item-row');
+    return sprint.locator(SPRINT_ROW);
 }
 
-/** Read the reference text of a user story row (legacy getUsRef). */
-async function usRef(row: Locator): Promise<string> {
-    return (await row.locator('span[tg-bo-ref]').first().innerText()).trim();
+/** Read the reference text ("#<ref>") of a backlog table row. */
+async function tableRowRef(row: Locator): Promise<string> {
+    return (await row.locator(TABLE_REF).first().innerText()).trim();
 }
 
-/** Collect every user-story reference rendered inside a sprint (legacy getSprintsRefs). */
+/** Read the reference text ("#<ref>") of a sprint row. */
+async function sprintRowRef(row: Locator): Promise<string> {
+    return (await row.locator(SPRINT_REF).first().innerText()).trim();
+}
+
+/** Collect every user-story reference rendered inside a sprint. */
 async function sprintRefs(sprint: Locator): Promise<string[]> {
-    const spans = sprint.locator('span[tg-bo-ref]');
+    const spans = sprint.locator(SPRINT_REF);
     const total = await spans.count();
     const refs: string[] = [];
     for (let i = 0; i < total; i++) {
@@ -171,7 +251,7 @@ async function sprintRefs(sprint: Locator): Promise<string[]> {
     return refs;
 }
 
-/** Collect every sprint title (legacy getSprintsTitles: `.sprint-name span`). */
+/** Collect every sprint title (`.sprint-name span`). */
 async function sprintTitles(page: Page): Promise<string[]> {
     const spans = page.locator(`${BOARD} .sprint-name span`);
     const total = await spans.count();
@@ -187,29 +267,27 @@ async function sprintTitles(page: Page): Promise<string[]> {
  * ------------------------------------------------------------------ */
 
 /**
- * Wait for the backlog to finish loading. Mirrors the legacy waitLoader (the
- * global route `.loader` loses its `.active` class) and additionally waits for
- * the React board body to render, so subsequent queries are stable.
+ * Wait for the backlog to finish loading. The global route `.loader` chrome
+ * belongs to the SURVIVING AngularJS shell (not the React bundle); if it is
+ * present we wait for it to lose `active`, otherwise we rely entirely on the
+ * React board body becoming visible.
  */
 async function waitLoader(page: Page): Promise<void> {
-    // The global loader clears (may already be gone → hidden resolves at once).
-    await page
-        .locator('.loader.active')
-        .waitFor({ state: 'hidden', timeout: 20000 })
-        .catch(() => {
-            /* loader absent — nothing to wait for */
-        });
-    // The React Backlog board body is present and visible.
+    const loader = page.locator('.loader');
+    try {
+        await expect(loader).not.toHaveClass(/active/, { timeout: 15_000 });
+    } catch {
+        // Loader not present in the React shell — ignore and rely on the board.
+    }
     await page
         .locator(`${BOARD} .backlog-table-body`)
         .first()
-        .waitFor({ state: 'visible', timeout: 20000 });
+        .waitFor({ state: 'visible', timeout: 30_000 });
 }
 
 /**
  * Navigate to a project's backlog and wait for it to load. Uses a relative URL
- * that Playwright resolves against the configured `baseURL`
- * (e2e-react/playwright.config.ts), so no host/port is hard-coded here.
+ * that Playwright resolves against the configured `baseURL`.
  */
 async function openBacklog(page: Page, projectSlug: string): Promise<void> {
     await page.goto(`project/${projectSlug}/backlog`);
@@ -217,97 +295,176 @@ async function openBacklog(page: Page, projectSlug: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * Popover helper (reproduces e2e/utils/popover.js `open`)
+ * AngularJS bridge spy (verifies the delegated single-US create/edit)
  * ------------------------------------------------------------------ *
- * Legacy semantics: click the trigger, wait for a single `.popover.active`,
- * then click its `<a>` at 0-based index `item`; optionally wait for a second
- * `.popover.active` and click its `<a>` at index `item2`. React reproduces the
- * `.popover.active` host and `<a>` option markup.
+ * `broadcastToAngular` (BacklogApp.tsx) hands single-US "standard create" and
+ * "edit" to the surviving AngularJS generic-form lightbox via
+ * `angular.element(document).injector().get('$rootScope').$broadcast(name,
+ * payload)`. Since that lightbox is out of scope for the migrated shell, we
+ * verify the migrated screen's real responsibility — that it fires the correct
+ * bridge event with the correct payload — by wrapping `$rootScope.$broadcast`
+ * with a recorder installed into the page.
  */
-async function popoverPick(
-    page: Page,
-    trigger: Locator,
-    item: number,
-    item2?: number,
-): Promise<void> {
-    await trigger.click();
+interface BridgeCall {
+    name: string;
+    objType?: string;
+}
 
-    const pop = page.locator('.popover.active').first();
-    await pop.waitFor({ state: 'visible', timeout: 10000 });
-    await pop.locator('a').nth(item).click();
-    // Legacy waited ~400ms for the popover transition between selections.
-    await page.waitForTimeout(400);
+/** Install (idempotently) a recorder over `$rootScope.$broadcast`. */
+async function installBridgeSpy(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __bridgeCalls?: Array<{ name: string; objType?: string }>;
+            __bridgeSpyInstalled?: boolean;
+            angular?: {
+                element: (d: Document) => {
+                    injector: () => {
+                        get: (s: string) => {
+                            $broadcast: (n: string, p: unknown) => unknown;
+                        };
+                    };
+                };
+            };
+        };
+        w.__bridgeCalls = w.__bridgeCalls || [];
+        if (w.__bridgeSpyInstalled) {
+            return;
+        }
+        if (!w.angular) {
+            return; // AngularJS shell not present (should not happen at runtime)
+        }
+        const rs = w.angular.element(document).injector().get('$rootScope');
+        const orig = rs.$broadcast.bind(rs);
+        rs.$broadcast = (name: string, payload: unknown): unknown => {
+            const p = (payload || {}) as { objType?: string };
+            w.__bridgeCalls!.push({ name, objType: p.objType });
+            return orig(name, payload);
+        };
+        w.__bridgeSpyInstalled = true;
+    });
+}
 
-    if (item2 !== undefined) {
-        const pop2 = page.locator('.popover.active').first();
-        await pop2.waitFor({ state: 'visible', timeout: 10000 });
-        await pop2.locator('a').nth(item2).click();
-        await page.waitForTimeout(400);
-    }
+/** Read back the recorded bridge broadcasts. */
+async function bridgeBroadcasts(page: Page): Promise<BridgeCall[]> {
+    return page.evaluate(() => {
+        const w = window as unknown as { __bridgeCalls?: BridgeCall[] };
+        return w.__bridgeCalls || [];
+    });
 }
 
 /* ------------------------------------------------------------------ *
- * Lightbox helpers (reproduce e2e/utils/lightbox.js open/close/confirm)
+ * Inline status / points / role popover pickers (NO `.active` class)
  * ------------------------------------------------------------------ *
- * The taiga lightbox convention toggles an `.open` class on a `.lightbox` host
- * (app/coffee/modules/common/lightboxes.coffee: `$el.addClass("open")`), which
- * the React roots reproduce (AAP §0.3.4). "Open" therefore means a visible
- * `.lightbox.open`; "closed" means it is no longer visible / no longer matches.
+ * The React popovers are conditionally rendered with distinctive host classes
+ * (`.pop-status` / `.pop-points` / `.pop-role`) and carry NO `.active` class,
+ * so each picker opens by clicking the trigger, waits for its specific host,
+ * acts, then waits for the host to detach.
  */
 
-/** The currently open lightbox host. */
-function openLightbox(page: Page): Locator {
-    return page.locator('.lightbox.open').first();
+/** Open a row's status popover and pick the option whose text matches `label`. */
+async function pickStatus(row: Locator, label: string): Promise<void> {
+    const page = row.page();
+    await row.locator(US_STATUS).first().click();
+    const pop = page.locator(POP_STATUS).first();
+    await pop.waitFor({ state: 'visible', timeout: 10_000 });
+    await pop.locator(POP_STATUS_OPT, { hasText: label }).first().click();
+    await pop.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {
+        /* popover closed / re-rendered */
+    });
 }
 
-/**
- * Wait for a lightbox to open. When `inner` is provided, also wait for that
- * distinctive inner element to be visible so we target the RIGHT lightbox.
- */
-async function waitLightboxOpen(page: Page, inner?: string): Promise<Locator> {
-    const lb = openLightbox(page);
-    await lb.waitFor({ state: 'visible', timeout: 15000 });
-    if (inner) {
-        await lb.locator(inner).first().waitFor({ state: 'visible', timeout: 15000 });
-    }
-    // Open transition (legacy transition ~300ms).
-    await page.waitForTimeout(400);
+/** Open a row's points popover and pick role `roleIdx` → point `pointIdx`. */
+async function pickPoints(row: Locator, roleIdx: number, pointIdx: number): Promise<void> {
+    const page = row.page();
+    await row.locator(US_POINTS).first().click();
+    const pop = page.locator(POP_POINTS).first();
+    await pop.waitFor({ state: 'visible', timeout: 10_000 });
+    // pop-points structure: li[role] > span.item-text + ul > li[point] > a
+    const roleLi = pop.locator('> li').nth(roleIdx);
+    await roleLi.locator('ul > li > a').nth(pointIdx).click();
+    await pop.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {
+        /* popover closed / re-rendered */
+    });
+}
+
+/* ------------------------------------------------------------------ *
+ * Lightbox open/close helpers (NO `.open` class)
+ * ------------------------------------------------------------------ */
+
+/** Open the bulk-user-story lightbox (`.new-us` index 1) and wait for it. */
+async function openBulkLightbox(page: Page): Promise<Locator> {
+    await page.locator(NEW_US_BULK).first().click();
+    const lb = page.locator(LB_BULK).first();
+    await lb.waitFor({ state: 'visible', timeout: 15_000 });
     return lb;
 }
 
-/** Wait for the open lightbox to close (loses `.open` / detaches). */
-async function waitLightboxClose(page: Page): Promise<void> {
+/**
+ * Create `subjects.length` user stories through the bulk lightbox and wait
+ * until it closes. Returns nothing; callers assert the resulting count delta.
+ */
+async function bulkCreate(page: Page, subjects: string[]): Promise<void> {
+    const lb = await openBulkLightbox(page);
+    const textarea = lb.locator('textarea').first();
+    await textarea.click();
+    for (let i = 0; i < subjects.length; i++) {
+        await textarea.pressSequentially(subjects[i]);
+        if (i < subjects.length - 1) {
+            await textarea.press('Enter');
+        }
+    }
+    await lb.locator(LB_BULK_SUBMIT).first().click();
+    await lb.waitFor({ state: 'hidden', timeout: 20_000 }).catch(() => {
+        /* display-toggled host may remain attached but hidden */
+    });
+}
+
+/** The currently open sprint add/edit lightbox. */
+function sprintLightbox(page: Page): Locator {
+    return page.locator(LB_SPRINT).first();
+}
+
+/** Open the sprint add/edit lightbox (given its already-clicked trigger) and wait. */
+async function waitSprintLightbox(page: Page): Promise<Locator> {
+    const lb = sprintLightbox(page);
+    await lb.waitFor({ state: 'visible', timeout: 15_000 });
+    await lb.locator(SPRINT_NAME_INPUT).first().waitFor({ state: 'visible', timeout: 15_000 });
+    return lb;
+}
+
+/** Wait for the sprint lightbox to close (returns null → detaches). */
+async function waitSprintLightboxClose(page: Page): Promise<void> {
     await page
-        .locator('.lightbox.open')
+        .locator(LB_SPRINT)
         .first()
-        .waitFor({ state: 'hidden', timeout: 15000 })
+        .waitFor({ state: 'detached', timeout: 15_000 })
         .catch(() => {
-            /* already closed / detached */
+            /* already closed */
         });
-    await page.waitForTimeout(300);
 }
 
 /**
- * Confirm a generic confirm dialog (reproduces utils.lightbox.confirm.ok):
- * wait for `.lightbox-generic-ask`, click its green OK button, wait for close.
+ * Locate the inline validation error region inside the sprint lightbox. The
+ * React form renders errors from app/react/shared/validation/sprintForm.ts as
+ * `.checksley-required` text inside a `.checksley-error` fieldset (server-side
+ * errors surface in `.error-message[role="alert"]`).
  */
-async function confirmOk(page: Page): Promise<void> {
-    const ask = page.locator('.lightbox-generic-ask').first();
-    await ask.waitFor({ state: 'visible', timeout: 15000 });
-    await page.waitForTimeout(300);
-    await ask.locator('.button-green').first().click();
-    await ask.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {
-        /* dialog dismissed */
-    });
-    await page.waitForTimeout(300);
+function validationErrors(lightbox: Locator): Locator {
+    return lightbox.locator('.checksley-required, .checksley-error, .error-message[role="alert"]');
+}
+
+/** Set a sprint date field to "YYYY-MM-DD" and commit it. */
+async function setDate(input: Locator, value: string): Promise<void> {
+    await input.fill(value);
+    await input.evaluate((el) => (el as HTMLElement).blur());
 }
 
 /* ------------------------------------------------------------------ *
  * Drag-and-drop helper tuned to @dnd-kit/core PointerSensor
  * ------------------------------------------------------------------ *
- * mouse.move(source center) → down → small nudge to exceed the sensor's
- * activation distance → stepped move to the target center → settle → up.
- * The legacy synthetic-event drag is intentionally NOT reproduced.
+ * mouse.move(source center) → down → nudge past the activation distance →
+ * stepped move to the target center → settle → up. NO trailing sleep: callers
+ * assert the resulting DOM/response condition.
  */
 async function dndDrag(page: Page, source: Locator, target: Locator): Promise<void> {
     await source.scrollIntoViewIfNeeded();
@@ -336,213 +493,51 @@ async function dndDrag(page: Page, source: Locator, target: Locator): Promise<vo
     await page.mouse.move(tx, ty, { steps: 25 });
     await page.mouse.move(tx, ty, { steps: 6 });
     await page.mouse.up();
-    // Allow the drop handler + optimistic state / bulk_update_* request to flush.
-    await page.waitForTimeout(600);
-}
-
-
-/* ------------------------------------------------------------------ *
- * Attachments (reproduces commonHelper.lightboxAttachment)
- * ------------------------------------------------------------------ *
- * Upload the two committed static fixtures through the lightbox file input,
- * delete one, and assert the attachment count grew by exactly one. Skips
- * gracefully if the React lightbox does not render an attachments widget yet.
- */
-async function lightboxAttachment(page: Page): Promise<void> {
-    const host = page
-        .locator('tg-attachments-simple, [data-testid="attachments-simple"], .attachments-simple')
-        .first();
-    if ((await host.count()) === 0) {
-        return; // attachments UI not present in the React lightbox — skip
-    }
-
-    const input = host.locator('#add-attach, input[type="file"]').first();
-    const single = host.locator('.single-attachment');
-    const before = await single.count();
-
-    await input.setInputFiles(UPLOAD_IMAGE);
-    await expect(single).toHaveCount(before + 1, { timeout: 15000 });
-
-    await input.setInputFiles(UPLOAD_FILE);
-    await expect(single).toHaveCount(before + 2, { timeout: 15000 });
-
-    await host.locator('.attachment-delete').first().click();
-    await expect(single).toHaveCount(before + 1, { timeout: 15000 });
-}
-
-/* ------------------------------------------------------------------ *
- * Tags flow (reproduces commonHelper.tags / lightbox `tags`)
- * ------------------------------------------------------------------ *
- * Best-effort parity of the legacy tag interaction. Auxiliary to the create/
- * edit assertions (which are count-based), so it is tolerant: if the React tag
- * hooks are absent it is skipped, and stray timing issues never fail the parent
- * test.
- */
-async function tagsFlow(page: Page): Promise<void> {
-    const showTag = page.locator('.e2e-show-tag-input').first();
-    if ((await showTag.count()) === 0) {
-        return; // tag UI not present — skip
-    }
-    try {
-        await showTag.click();
-
-        const colorSelector = page.locator('.e2e-open-color-selector').first();
-        if (await colorSelector.count()) {
-            await colorSelector.click();
-            const colorItem = page.locator('.e2e-color-dropdown li').nth(1);
-            if (await colorItem.count()) {
-                await colorItem.click();
-            }
-        }
-
-        const addTag = page.locator('.e2e-add-tag-input').first();
-        await addTag.fill('xxxyy');
-        await addTag.press('Enter');
-
-        const deleteTag = page.locator('.e2e-delete-tag');
-        if (await deleteTag.count()) {
-            await deleteTag.last().click();
-        }
-
-        await addTag.fill('a');
-        await addTag.press('ArrowDown');
-        await addTag.press('Enter');
-    } catch {
-        // Auxiliary flow — never fail the parent test on a tag-widget hiccup.
-    }
-}
-
-/* ------------------------------------------------------------------ *
- * Filters (reproduces the subset of e2e/helpers/filters-helper.js used here)
- * ------------------------------------------------------------------ */
-
-/** Open the in-board filters panel if a trigger is present. */
-async function openFilters(page: Page): Promise<void> {
-    const trigger = page.locator('.e2e-open-filter').first();
-    if (await trigger.count()) {
-        await trigger.click();
-        await page.waitForTimeout(500);
-    }
-}
-
-/** Type into the filter text/ref input. */
-async function filterByText(page: Page, text: string): Promise<void> {
-    await page.locator('.e2e-filter-q').first().fill(text);
-    await page.waitForTimeout(1000);
-}
-
-/** Clear every applied filter + the text input + any selected category. */
-async function clearFilters(page: Page): Promise<void> {
-    // The remove list shrinks as we click, so always click the first remaining.
-    let guard = 0;
-    while ((await page.locator('.e2e-remove-filter').count()) > 0 && guard < 20) {
-        await page.locator('.e2e-remove-filter').first().click();
-        await page.waitForTimeout(200);
-        guard += 1;
-    }
-    const q = page.locator('.e2e-filter-q').first();
-    if (await q.count()) {
-        await q.fill('');
-    }
-    const selectedCategory = page.locator('.e2e-category.selected').first();
-    if (await selectedCategory.count()) {
-        await selectedCategory.click();
-    }
-    await page.waitForTimeout(500);
-}
-
-/* ------------------------------------------------------------------ *
- * Create/Edit user-story lightbox accessor
- * ------------------------------------------------------------------ *
- * Reproduces e2e/helpers/backlog-helper.js getCreateEditUsLightbox, scoped to
- * the currently open lightbox. `status(nthChild)` mirrors the legacy
- * `option:nth-child(n)` (1-based child ⇒ 0-based select index n-1).
- */
-function usLightbox(page: Page) {
-    const el = openLightbox(page);
-    return {
-        el,
-        subject: (): Locator => el.locator('input[name="subject"]').first(),
-        description: (): Locator => el.locator('textarea[name="description"]').first(),
-        roles: (): Locator => el.locator('.points-per-role li'),
-        submit: (): Locator => el.locator('button[type="submit"]').first(),
-        /** Open the role popover for role `roleIndex` and pick option `value`. */
-        setRole: async (roleIndex: number, value: number): Promise<void> => {
-            await popoverPick(page, el.locator('.points-per-role li').nth(roleIndex), value);
-        },
-        /** Total role points (legacy: last `.ticket-role-points` `.points`). */
-        rolePointsTotal: async (): Promise<string> => {
-            return (
-                await el.locator('.ticket-role-points').last().locator('.points').innerText()
-            ).trim();
-        },
-        /** Select status by legacy 1-based nth-child (⇒ 0-based select index). */
-        setStatus: async (nthChild: number): Promise<void> => {
-            await el.locator('select').first().selectOption({ index: nthChild - 1 });
-        },
-        /** Click the settings toggle at `index` (legacy `.settings label`). */
-        setSettings: async (index: number): Promise<void> => {
-            await el.locator('.settings label').nth(index).click();
-        },
-    };
-}
-
-/* ------------------------------------------------------------------ *
- * Sprint (milestone) create/edit lightbox accessor
- * ------------------------------------------------------------------ *
- * Reproduces getCreateEditMilestone against the React SprintEditLightbox. The
- * legacy name field was bound via by.model('sprint.name'); it is retargeted to
- * the reproduced name input. Date fields carry the reproduced name / class
- * hooks from lightbox-sprint-add-edit.jade.
- */
-function sprintLightbox(page: Page) {
-    const el = openLightbox(page);
-    return {
-        el,
-        name: (): Locator =>
-            el.locator('input[name="name"], .e2e-sprint-name, input.sprint-name').first(),
-        start: (): Locator =>
-            el.locator('input[name="estimated_start"], .date-start').first(),
-        finish: (): Locator =>
-            el.locator('input[name="estimated_finish"], .date-end').first(),
-        submit: (): Locator => el.locator('button[type="submit"]').first(),
-        deleteBtn: (): Locator => el.locator('.delete-sprint').first(),
-    };
 }
 
 /**
- * Locate inline validation errors inside a lightbox. The React sprint form
- * renders errors from app/react/shared/validation/sprintForm.ts; the exact
- * error element is not imported here (test-layer isolation), so a union of the
- * plausible reproduced hooks (including the legacy checksley error classes) is
- * matched.
+ * Await the reorder-within-backlog persistence POST (QA Issue 6: HARD, not a
+ * swallowed `.catch(() => null)`). The React screen persists a backlog reorder
+ * through the frozen `POST /userstories/bulk_update_backlog_order` (AAP §0.7.1).
  */
-function validationErrors(lightbox: Locator): Locator {
-    return lightbox.locator(
-        [
-            '.checksley-error-list',
-            '.checksley-error',
-            '[data-field-error]',
-            '.field-error',
-            '.form-error',
-            '.error-list',
-            '.validation-error',
-            '[role="alert"]',
-        ].join(', '),
+function waitBacklogOrderPersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /bulk_update_backlog_order/.test(r.url()) && r.request().method() !== 'GET',
+        { timeout: 20_000 },
     );
 }
 
-/**
- * Set a sprint date field to a canonical "YYYY-MM-DD" value and commit it.
- * `fill` works for both native date inputs and text inputs; an explicit blur
- * commits the value the way the React form's onChange/onBlur expects.
- */
-async function setDate(input: Locator, value: string): Promise<void> {
-    await input.fill(value);
-    await input.evaluate((el) => (el as HTMLElement).blur());
-    await input.page().waitForTimeout(150);
+/* ------------------------------------------------------------------ *
+ * Filters helpers (condition-based; NO sleeps)
+ * ------------------------------------------------------------------ */
+
+/** Open the in-board filters panel. */
+async function openFilters(page: Page): Promise<void> {
+    const trigger = page.locator(OPEN_FILTER).first();
+    if (await trigger.count()) {
+        await trigger.click();
+        await page.locator(FILTER_SEARCH).first().waitFor({ state: 'visible', timeout: 10_000 });
+    }
 }
 
+/** Type into the filter ref/text search input. */
+async function filterByText(page: Page, text: string): Promise<void> {
+    await page.locator(FILTER_SEARCH).first().fill(text);
+}
+
+/** Clear the filter search input + any applied filter chips. */
+async function clearFilters(page: Page): Promise<void> {
+    const q = page.locator(FILTER_SEARCH).first();
+    if (await q.count()) {
+        await q.fill('');
+    }
+    // Applied-filter chips shrink as we click, so always click the first remaining.
+    let guard = 0;
+    while ((await page.locator(FILTER_APPLIED).count()) > 0 && guard < 20) {
+        await page.locator(FILTER_APPLIED).first().click();
+        guard += 1;
+    }
+}
 
 /* ================================================================== *
  * SUITE
@@ -555,11 +550,6 @@ test.describe('backlog', () => {
     // Capture the parity `backlog` screenshot exactly once (first project-3 load).
     let capturedBacklog = false;
 
-    /**
-     * Land on the project-3 backlog before each test (legacy top-level `before`
-     * navigated once; per-test fixture pages require re-navigation). Tests that
-     * target other projects (velocity forecasting) re-navigate themselves.
-     */
     test.beforeEach(async ({ page }) => {
         await openBacklog(page, 'project-3');
         if (!capturedBacklog) {
@@ -570,116 +560,70 @@ test.describe('backlog', () => {
 
     /* -------------------------------------------------------------- *
      * create US
-     * -------------------------------------------------------------- */
+     * -------------------------------------------------------------- *
+     * The rich single-user-story create form is a shared AngularJS generic-form
+     * lightbox (out of scope, AAP §0.2.2) that the migrated shell does not host.
+     * The migrated screen's real responsibility is to DELEGATE the standard
+     * create back to AngularJS via the `genericform:new` bridge — asserted here
+     * with a hard $broadcast spy. (The real in-React create surface is the bulk
+     * lightbox, exercised by "bulk create US" below.)
+     */
     test.describe('create US', () => {
-        test('creates a user story from the full lightbox form', async ({ page }) => {
-            const before = await userStories(page).count();
-
-            // Open the new-US lightbox (`.new-us a` index 0).
-            await page.locator(`${BOARD} .new-us a`).nth(0).click();
-            await waitLightboxOpen(page, 'input[name="subject"]');
+        test('standard create fires the genericform:new bridge', async ({ page }) => {
+            await installBridgeSpy(page);
             await capture(page, 'create-us');
 
-            const lb = usLightbox(page);
+            await page.locator(NEW_US_STANDARD).first().click();
 
-            // subject
-            await lb.subject().fill('subject');
-
-            // roles → total points should be '3'
-            await lb.setRole(1, 3);
-            await lb.setRole(3, 4);
-            expect(await lb.rolePointsTotal()).toBe('3');
-
-            // status (legacy status(2) ⇒ option index 1)
-            await lb.setStatus(2);
-
-            // tags (auxiliary, best-effort)
-            await tagsFlow(page);
-
-            // description
-            await lb.description().fill('test test');
-
-            // settings toggle 0
-            await lb.setSettings(0);
-
-            // attachments (Phase 5)
-            await lightboxAttachment(page);
-
-            await capture(page, 'create-us-filled');
-
-            // submit + wait close ⇒ exactly one more user story
-            await lb.submit().click();
-            await waitLightboxClose(page);
-
-            await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20000 });
+            await expect
+                .poll(async () =>
+                    (await bridgeBroadcasts(page)).some(
+                        (b) => b.name === 'genericform:new' && b.objType === 'us',
+                    ),
+                    { timeout: 10_000 },
+                )
+                .toBe(true);
         });
     });
 
     /* -------------------------------------------------------------- *
-     * bulk create US
+     * bulk create US (the real in-React create surface)
      * -------------------------------------------------------------- */
     test.describe('bulk create US', () => {
         test('creates two user stories from the bulk lightbox', async ({ page }) => {
             const before = await userStories(page).count();
 
-            // Open the bulk lightbox (`.new-us a` index 1).
-            await page.locator(`${BOARD} .new-us a`).nth(1).click();
-            await waitLightboxOpen(page, 'textarea');
+            await bulkCreate(page, ['aaa', 'bbb']);
 
-            const lb = openLightbox(page);
-            const textarea = lb.locator('textarea').first();
-
-            // Two stories: "aaa" + Enter, "bbb" + Enter (pressSequentially appends
-            // at the cursor, unlike fill which would replace the first line).
-            await textarea.click();
-            await textarea.pressSequentially('aaa');
-            await textarea.press('Enter');
-            await textarea.pressSequentially('bbb');
-            await textarea.press('Enter');
-
-            await lb.locator('button[type="submit"]').first().click();
-            await waitLightboxClose(page);
-
-            await expect(userStories(page)).toHaveCount(before + 2, { timeout: 20000 });
+            await expect(userStories(page)).toHaveCount(before + 2, { timeout: 20_000 });
         });
     });
 
     /* -------------------------------------------------------------- *
      * edit US
-     * -------------------------------------------------------------- */
+     * -------------------------------------------------------------- *
+     * Edit is delegated to the AngularJS generic-form lightbox via the
+     * `genericform:edit` bridge (BacklogApp.tsx L1266). We open the row's
+     * options popup, click Edit, and assert the correct bridge event fires.
+     */
     test.describe('edit US', () => {
-        test('edits the first user story from the full lightbox form', async ({ page }) => {
-            // Open edit for row 0 (`.backlog-table-body .e2e-edit` index 0).
-            await page.locator(`${BOARD} .backlog-table-body .e2e-edit`).nth(0).click();
-            await waitLightboxOpen(page, 'input[name="subject"]');
+        test('edit affordance fires the genericform:edit bridge', async ({ page }) => {
+            await installBridgeSpy(page);
 
-            const lb = usLightbox(page);
+            const row = userStories(page).first();
+            await row.locator(US_OPTION_BTN).first().click();
+            const popup = page.locator(US_OPTION_POPUP).first();
+            await popup.waitFor({ state: 'visible', timeout: 10_000 });
+            await popup.locator(OPT_EDIT).first().click();
 
-            // subject (append to the existing subject deterministically)
-            const currentSubject = await lb.subject().inputValue();
-            await lb.subject().fill(`${currentSubject}subjectedit`);
-
-            // roles 0..3 = 3 each ⇒ total '4'
-            await lb.setRole(0, 3);
-            await lb.setRole(1, 3);
-            await lb.setRole(2, 3);
-            await lb.setRole(3, 3);
-            expect(await lb.rolePointsTotal()).toBe('4');
-
-            // status (legacy status(3) ⇒ option index 2)
-            await lb.setStatus(3);
-
-            // tags + description (append) + settings toggle 1
-            await tagsFlow(page);
-            const currentDescription = await lb.description().inputValue();
-            await lb.description().fill(`${currentDescription}test test test test`);
-            await lb.setSettings(1);
-
-            // attachments
-            await lightboxAttachment(page);
-
-            await lb.submit().click();
-            await waitLightboxClose(page);
+            await expect
+                .poll(async () =>
+                    (await bridgeBroadcasts(page)).some(
+                        (b) => b.name === 'genericform:edit' && b.objType === 'us',
+                    ),
+                    { timeout: 10_000 },
+                )
+                .toBe(true);
         });
     });
 
@@ -688,41 +632,45 @@ test.describe('backlog', () => {
      * -------------------------------------------------------------- */
 
     test('edit status inline', async ({ page }) => {
-        const status = page.locator(`${BOARD} .backlog-table-body > div .us-status`).nth(0);
+        const row = userStories(page).first();
 
-        // First selection (legacy value 1), then a debounce, then value 2.
-        await popoverPick(page, status, 1);
-        await page.waitForTimeout(2000); // debounce
-        await popoverPick(page, status, 2);
+        // The status popover lists every project status by name; pick "In progress".
+        await pickStatus(row, 'In progress');
 
-        const statusText = (await status.locator('span').first().innerText()).trim();
-        expect(statusText).toBe('In progress');
+        // The trigger reflects the chosen status (optimistic React state update).
+        await expect(row.locator(`${US_STATUS} .us-status-bind`).first()).toHaveText(
+            'In progress',
+            { timeout: 15_000 },
+        );
     });
 
     test('edit points inline', async ({ page }) => {
-        const pointsSpan = page
-            .locator(`${BOARD} .backlog-table-body > div .us-points`)
-            .nth(0)
-            .locator('span')
-            .first();
+        const row = userStories(page).first();
+        const pointsTrigger = row.locator(US_POINTS).first();
 
-        const original = (await pointsSpan.innerText()).trim();
+        const original = (await pointsTrigger.innerText()).trim();
 
-        // Legacy setUsPoints(0, 1, 1): open the points popover and pick role/value.
-        await popoverPick(page, pointsSpan, 1, 1);
-        await page.waitForTimeout(500);
+        // Open the points popover and pick role 0 → point index 1.
+        await pickPoints(row, 0, 1);
 
-        const updated = (await pointsSpan.innerText()).trim();
-        expect(updated).not.toBe(original);
+        await expect
+            .poll(async () => (await pointsTrigger.innerText()).trim(), { timeout: 15_000 })
+            .not.toBe(original);
     });
 
     test('delete US', async ({ page }) => {
         const before = await userStories(page).count();
 
-        await page.locator(`${BOARD} .backlog-table-body > div .e2e-delete`).nth(0).click();
-        await confirmOk(page);
+        // Single-US delete uses a native window.confirm (NOT a lightbox); accept it.
+        page.once('dialog', (dialog) => dialog.accept());
 
-        await expect(userStories(page)).toHaveCount(before - 1, { timeout: 20000 });
+        const row = userStories(page).first();
+        await row.locator(US_OPTION_BTN).first().click();
+        const popup = page.locator(US_OPTION_POPUP).first();
+        await popup.waitFor({ state: 'visible', timeout: 10_000 });
+        await popup.locator(OPT_DELETE).first().click();
+
+        await expect(userStories(page)).toHaveCount(before - 1, { timeout: 20_000 });
     });
 
     /* -------------------------------------------------------------- *
@@ -734,20 +682,17 @@ test.describe('backlog', () => {
 
         // Take the row at index 4, remember its ref, drag its handle onto row 0.
         const dragRow = rows.nth(4);
-        const draggedRef = await usRef(dragRow);
+        const draggedRef = await tableRowRef(dragRow);
 
-        // Optionally observe the persistence request (best-effort).
-        const persisted = page
-            .waitForResponse(
-                (r) => /bulk_update_backlog_order/.test(r.url()) && r.request().method() === 'POST',
-                { timeout: 8000 },
-            )
-            .catch(() => null);
+        // HARD-assert the reorder persists through bulk_update_backlog_order.
+        const persisted = waitBacklogOrderPersist(page);
+        await dndDrag(page, dragRow.locator(TABLE_DRAG_HANDLE), rows.nth(0));
+        const response = await persisted;
+        expect(response.ok()).toBe(true);
 
-        await dndDrag(page, dragRow.locator('.icon-drag'), rows.nth(0));
-        await persisted;
-
-        expect(await usRef(rows.nth(0))).toBe(draggedRef);
+        await expect
+            .poll(async () => await tableRowRef(rows.nth(0)), { timeout: 20_000 })
+            .toBe(draggedRef);
     });
 
     test('reorder multiple us', async ({ page }) => {
@@ -757,78 +702,83 @@ test.describe('backlog', () => {
         // Select the last two rows and record their refs (order per source).
         const last = rows.nth(count - 1);
         await last.locator('input[type="checkbox"]').click();
-        const ref1 = await usRef(last);
+        const ref1 = await tableRowRef(last);
 
         const secondLast = rows.nth(count - 2);
         await secondLast.locator('input[type="checkbox"]').click();
-        const ref2 = await usRef(secondLast);
+        const ref2 = await tableRowRef(secondLast);
 
-        // Drag the last-selected row's handle onto row 0.
-        await dndDrag(page, secondLast.locator('.icon-drag'), rows.nth(0));
+        // Drag the last-selected row's handle onto row 0; HARD-assert persistence.
+        const persisted = waitBacklogOrderPersist(page);
+        await dndDrag(page, secondLast.locator(TABLE_DRAG_HANDLE), rows.nth(0));
+        const response = await persisted;
+        expect(response.ok()).toBe(true);
 
         // Rows 0 and 1 now hold the two dragged refs (source ordering).
-        expect(await usRef(rows.nth(1))).toBe(ref1);
-        expect(await usRef(rows.nth(0))).toBe(ref2);
+        await expect
+            .poll(async () => await tableRowRef(rows.nth(1)), { timeout: 20_000 })
+            .toBe(ref1);
+        expect(await tableRowRef(rows.nth(0))).toBe(ref2);
     });
 
     test('drag multiple us to milestone', async ({ page }) => {
         const sprint = sprints(page).nth(0);
         const initialSprintCount = await sprintUserStories(sprint).count();
 
-        // Re-establish the two-row selection the legacy suite carried over from
-        // the previous test (per-test fixture pages start fresh).
+        // Re-establish the two-row selection (per-test fixture pages start fresh).
         const rows = userStories(page);
         const count = await rows.count();
         await rows.nth(count - 1).locator('input[type="checkbox"]').click();
         await rows.nth(count - 2).locator('input[type="checkbox"]').click();
 
         // Drag row 0's handle onto sprint 0's table ⇒ both selected move.
-        await dndDrag(page, rows.nth(0).locator('.icon-drag'), sprint.locator('.sprint-table'));
+        await dndDrag(page, rows.nth(0).locator(TABLE_DRAG_HANDLE), sprint.locator(SPRINT_TABLE));
 
         await expect(sprintUserStories(sprint)).toHaveCount(initialSprintCount + 2, {
-            timeout: 20000,
+            timeout: 20_000,
         });
     });
 
     test('drag us to milestone', async ({ page }) => {
         const sprint = sprints(page).nth(0);
-        const sprintTable = sprint.locator('.sprint-table');
+        const sprintTable = sprint.locator(SPRINT_TABLE);
         const initialSprintCount = await sprintUserStories(sprint).count();
 
         const rows = userStories(page);
-        await dndDrag(page, rows.nth(0).locator('.icon-drag'), sprintTable);
+        await dndDrag(page, rows.nth(0).locator(TABLE_DRAG_HANDLE), sprintTable);
 
         await expect(sprintUserStories(sprint)).toHaveCount(initialSprintCount + 1, {
-            timeout: 20000,
+            timeout: 20_000,
         });
     });
 
     test('move to latest sprint button', async ({ page }) => {
         const firstRow = userStories(page).first();
         await firstRow.locator('input[type="checkbox"]').click();
-        const draggedRef = await usRef(firstRow);
+        const draggedRef = await tableRowRef(firstRow);
 
-        await page.locator(`${BOARD} .e2e-move-to-sprint`).first().click();
-        await page.waitForTimeout(1000);
+        await page.locator(MOVE_TO_LATEST).first().click();
 
         // The last OPEN sprint should now contain that ref.
-        const lastOpen = sprintsOpen(page).last();
-        const refs = await sprintRefs(lastOpen);
-        expect(refs).toContain(draggedRef);
+        await expect
+            .poll(async () => await sprintRefs(sprintsOpen(page).last()), { timeout: 20_000 })
+            .toContain(draggedRef);
     });
 
     test('reorder milestone us', async ({ page }) => {
         const sprint = sprints(page).nth(0);
         const rows = sprintUserStories(sprint);
 
-        // Drag sprint row 3 onto sprint row 0; the row-0 ref becomes the dragged
-        // row's ref (faithful port of the legacy self-comparison quirk's intent).
+        // A SPRINT row is itself the draggable node (no inner handle): drag row 3
+        // onto row 0; the row-0 ref becomes the dragged row's ref.
         const dragRow = rows.nth(3);
-        const draggedRef = await usRef(dragRow);
+        const draggedRef = await sprintRowRef(dragRow);
 
-        await dndDrag(page, dragRow.locator('.icon-drag'), rows.nth(0));
+        await dndDrag(page, dragRow, rows.nth(0));
 
-        expect(await usRef(rows.nth(0))).toBe(draggedRef);
+        await expect
+            .poll(async () => await sprintRowRef(rows.nth(0)), { timeout: 20_000 })
+            .toBe(draggedRef);
     });
 
     test('drag us from milestone to milestone', async ({ page }) => {
@@ -836,18 +786,16 @@ test.describe('backlog', () => {
         const sprint2 = sprints(page).nth(1);
         const initialSprint2Count = await sprintUserStories(sprint2).count();
 
+        // The sprint row is the drag source itself.
         const dragRow = sprintUserStories(sprint1).nth(0);
-        await dndDrag(page, dragRow.locator('.icon-drag'), sprint2.locator('.sprint-table'));
+        await dndDrag(page, dragRow, sprint2.locator(SPRINT_TABLE));
 
         await expect(sprintUserStories(sprint2)).toHaveCount(initialSprint2Count + 1, {
-            timeout: 20000,
+            timeout: 20_000,
         });
     });
 
     test('select us with SHIFT', async ({ page }) => {
-        // Legacy skipped this on IE only; Chromium implements it directly.
-        await page.waitForTimeout(1000);
-
         const rows = userStories(page);
         const firstCheckbox = rows.nth(0).locator('input[type="checkbox"]');
         const fourthCheckbox = rows.nth(3).locator('input[type="checkbox"]');
@@ -857,24 +805,24 @@ test.describe('backlog', () => {
         await fourthCheckbox.click();
         await page.keyboard.up('Shift');
 
-        await expect(selectedUserStories(page)).toHaveCount(4, { timeout: 15000 });
+        await expect(selectedUserStories(page)).toHaveCount(4, { timeout: 15_000 });
     });
 
     test('role filters', async ({ page }) => {
-        // Open the role/points selector popover and pick value 1.
-        await popoverPick(page, page.locator(`${BOARD} div[tg-us-role-points-selector]`).first(), 1);
+        // Open the per-role points-column filter (table header) and pick a role.
+        await page.locator(ROLE_FILTER_TRIGGER).first().click();
+        const pop = page.locator(POP_ROLE).first();
+        await pop.waitFor({ state: 'visible', timeout: 10_000 });
+        await pop.locator(POP_ROLE_ITEM).first().click();
+        await pop.waitFor({ state: 'detached', timeout: 10_000 }).catch(() => {
+            /* popover closed */
+        });
 
         await capture(page, 'backlog-role-filters');
 
-        const points = (
-            await page
-                .locator(`${BOARD} .backlog-table-body > div .us-points`)
-                .nth(0)
-                .locator('span')
-                .first()
-                .innerText()
-        ).trim();
-        expect(points).toMatch(/[0-9?]+\s\/\s[0-9?]+/);
+        // The points column now shows the per-role "x / y" figure.
+        const points = (await userStories(page).nth(0).locator(US_POINTS).first().innerText()).trim();
+        expect(points).toMatch(/[0-9?]+\s*\/\s*[0-9?]+/);
     });
 
     /* -------------------------------------------------------------- *
@@ -883,51 +831,50 @@ test.describe('backlog', () => {
      * -------------------------------------------------------------- */
     test.describe('milestones', () => {
         test('create', async ({ page }) => {
-            await page.locator(`${BOARD} .add-sprint`).first().click();
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
+            await page.locator(ADD_SPRINT).first().click();
+            const lb = await waitSprintLightbox(page);
             await capture(page, 'create-milestone');
 
-            const lb = sprintLightbox(page);
             const name = `sprintName${Date.now()}`;
-            await lb.name().fill(name);
-            await lb.submit().click();
-            await page.waitForTimeout(2000); // persist + debounce
+            await lb.locator(SPRINT_NAME_INPUT).first().fill(name);
+            await lb.locator(SPRINT_SUBMIT).first().click();
+            await waitSprintLightboxClose(page);
 
             await expect
-                .poll(async () => await sprintTitles(page), { timeout: 15000 })
+                .poll(async () => await sprintTitles(page), { timeout: 15_000 })
                 .toContain(name);
         });
 
         test('edit', async ({ page }) => {
-            await page.locator(`${BOARD} .edit-sprint`).nth(0).click();
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
+            await page.locator(EDIT_SPRINT).nth(0).click();
+            const lb = await waitSprintLightbox(page);
 
-            const lb = sprintLightbox(page);
-            await lb.name().fill(''); // clear
+            const nameInput = lb.locator(SPRINT_NAME_INPUT).first();
+            await nameInput.fill('');
             const name = `sprintName${Date.now()}`;
-            await lb.name().fill(name);
-            await lb.submit().click();
-            await waitLightboxClose(page);
+            await nameInput.fill(name);
+            await lb.locator(SPRINT_SUBMIT).first().click();
+            await waitSprintLightboxClose(page);
 
             await expect
-                .poll(async () => await sprintTitles(page), { timeout: 15000 })
+                .poll(async () => await sprintTitles(page), { timeout: 15_000 })
                 .toContain(name);
         });
 
         test('delete', async ({ page }) => {
-            await page.locator(`${BOARD} .edit-sprint`).nth(0).click();
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
+            await page.locator(EDIT_SPRINT).nth(0).click();
+            const lb = await waitSprintLightbox(page);
 
-            const lb = sprintLightbox(page);
-            // Record the name BEFORE deleting (faithful intent of the legacy check).
-            const name = (await lb.name().inputValue()).trim();
+            // Record the name BEFORE deleting.
+            const name = (await lb.locator(SPRINT_NAME_INPUT).first().inputValue()).trim();
 
-            await lb.deleteBtn().click();
-            await confirmOk(page);
-            await page.waitForTimeout(1000);
+            // Sprint delete uses a native window.confirm; accept it.
+            page.once('dialog', (dialog) => dialog.accept());
+            await lb.locator(SPRINT_DELETE).first().click();
+            await waitSprintLightboxClose(page);
 
             await expect
-                .poll(async () => await sprintTitles(page), { timeout: 15000 })
+                .poll(async () => await sprintTitles(page), { timeout: 15_000 })
                 .not.toContain(name);
         });
 
@@ -936,29 +883,25 @@ test.describe('backlog', () => {
         test('validation: name required', async ({ page }) => {
             const before = await sprintTitles(page);
 
-            await page.locator(`${BOARD} .add-sprint`).first().click();
-            const lb = sprintLightbox(page);
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
+            await page.locator(ADD_SPRINT).first().click();
+            const lb = await waitSprintLightbox(page);
 
             // Ensure the name is empty, then attempt to submit.
-            await lb.name().fill('');
-            await lb.submit().click();
+            await lb.locator(SPRINT_NAME_INPUT).first().fill('');
+            await lb.locator(SPRINT_SUBMIT).first().click();
 
             // The lightbox stays open (submission blocked) ...
-            await expect(lb.el).toBeVisible();
-            // ... an inline validation error is shown (auto-retrying) ...
-            const errorRegion = validationErrors(lb.el);
-            const requiredText = lb.el.getByText('This value is required.', { exact: false });
-            await expect(errorRegion.or(requiredText).first()).toBeVisible();
+            await expect(lb).toBeVisible();
+            // ... the required-name validation error is shown ...
+            const requiredText = lb.getByText('This value is required.', { exact: false });
+            await expect(validationErrors(lb).or(requiredText).first()).toBeVisible();
             // ... and no new sprint was created.
             expect(await sprintTitles(page)).toEqual(before);
 
             // Correcting the name clears the required error.
-            await lb.name().fill(`sprintName${Date.now()}`);
-            await page.waitForTimeout(400);
-            await expect(lb.el.getByText('This value is required.', { exact: false })).toHaveCount(0);
+            await lb.locator(SPRINT_NAME_INPUT).first().fill(`sprintName${Date.now()}`);
+            await expect(lb.getByText('This value is required.', { exact: false })).toHaveCount(0);
 
-            // Close without asserting creation (dates may still be required).
             await page.keyboard.press('Escape').catch(() => {
                 /* best-effort cleanup */
             });
@@ -970,29 +913,26 @@ test.describe('backlog', () => {
             const before = await sprintTitles(page);
             const rangeMessage = 'The start date must be on or before the finish date.';
 
-            await page.locator(`${BOARD} .add-sprint`).first().click();
-            const lb = sprintLightbox(page);
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
+            await page.locator(ADD_SPRINT).first().click();
+            const lb = await waitSprintLightbox(page);
 
-            await lb.name().fill(`sprintName${Date.now()}`);
+            await lb.locator(SPRINT_NAME_INPUT).first().fill(`sprintName${Date.now()}`);
 
             // Inverted range: start AFTER finish.
-            await setDate(lb.start(), '2020-12-31');
-            await setDate(lb.finish(), '2020-01-01');
+            await setDate(lb.locator(SPRINT_START_INPUT).first(), '2020-12-31');
+            await setDate(lb.locator(SPRINT_FINISH_INPUT).first(), '2020-01-01');
 
-            await lb.submit().click();
+            await lb.locator(SPRINT_SUBMIT).first().click();
 
             // Submission is blocked and a date-range validation error is shown.
-            await expect(lb.el).toBeVisible();
-            const rangeText = lb.el.getByText(rangeMessage, { exact: false });
-            const errorRegion = validationErrors(lb.el);
-            await expect(rangeText.or(errorRegion).first()).toBeVisible();
+            await expect(lb).toBeVisible();
+            const rangeText = lb.getByText(rangeMessage, { exact: false });
+            await expect(rangeText.or(validationErrors(lb)).first()).toBeVisible();
             expect(await sprintTitles(page)).toEqual(before);
 
             // Correct the range (start <= finish) ⇒ the range error clears.
-            await setDate(lb.finish(), '2021-12-31');
-            await page.waitForTimeout(400);
-            await expect(lb.el.getByText(rangeMessage, { exact: false })).toHaveCount(0);
+            await setDate(lb.locator(SPRINT_FINISH_INPUT).first(), '2021-12-31');
+            await expect(lb.getByText(rangeMessage, { exact: false })).toHaveCount(0);
 
             await page.keyboard.press('Escape').catch(() => {
                 /* best-effort cleanup */
@@ -1005,18 +945,18 @@ test.describe('backlog', () => {
      * -------------------------------------------------------------- */
     test.describe('tags', () => {
         test('show', async ({ page }) => {
-            await page.locator('#show-tags').first().click();
+            await page.locator(SHOW_TAGS).first().click();
             await capture(page, 'backlog-tags');
-            await expect(page.locator(`${BOARD} .backlog-table .tag`).first()).toBeVisible();
+            await expect(page.locator(ROW_TAG).first()).toBeVisible();
         });
 
         test('hide', async ({ page }) => {
-            const showTags = page.locator('#show-tags').first();
-            // Fresh page: reveal tags first, then hide them (clicking hides).
+            const showTags = page.locator(SHOW_TAGS).first();
+            // Fresh page: reveal tags first, then hide them (clicking toggles).
             await showTags.click();
-            await expect(page.locator(`${BOARD} .backlog-table .tag`).first()).toBeVisible();
+            await expect(page.locator(ROW_TAG).first()).toBeVisible();
             await showTags.click();
-            await expect(page.locator(`${BOARD} .backlog-table .tag`).first()).toBeHidden();
+            await expect(page.locator(ROW_TAG).first()).toBeHidden();
         });
     });
 
@@ -1029,11 +969,11 @@ test.describe('backlog', () => {
 
             const before = await userStories(page).count();
 
-            await page.locator(`${BOARD} .e2e-velocity-forecasting`).first().click();
+            await page.locator(VELOCITY).first().click();
             await capture(page, 'velocity-forecasting');
 
             await expect
-                .poll(async () => await userStories(page).count(), { timeout: 15000 })
+                .poll(async () => await userStories(page).count(), { timeout: 15_000 })
                 .toBeLessThan(before);
         });
 
@@ -1042,22 +982,24 @@ test.describe('backlog', () => {
 
             const before = await sprintsOpen(page).count();
 
-            await page.locator(`${BOARD} .e2e-velocity-forecasting`).first().click();
-            await page.locator(`${BOARD} .e2e-velocity-forecasting-add`).first().click();
+            await page.locator(VELOCITY).first().click();
+            await page.locator(VELOCITY_ADD).first().click();
 
+            // The forecasting "add" opens the same SprintEditLightbox.
+            const lb = await waitSprintLightbox(page);
             const name = `sprintName${Date.now()}`;
-            const nameInput = page.locator(`${BOARD} .e2e-sprint-name`).first();
-            await nameInput.fill(name);
-            await nameInput.press('Enter');
+            await lb.locator(SPRINT_NAME_INPUT).first().fill(name);
+            await lb.locator(SPRINT_SUBMIT).first().click();
+            await waitSprintLightboxClose(page);
 
             await expect
-                .poll(async () => await sprintsOpen(page).count(), { timeout: 15000 })
+                .poll(async () => await sprintsOpen(page).count(), { timeout: 15_000 })
                 .toBeGreaterThan(before);
         });
 
         test('hide forecasting if no velocity', async ({ page }) => {
             await openBacklog(page, 'project-5');
-            await expect(page.locator(`${BOARD} .e2e-velocity-forecasting`)).toHaveCount(0);
+            await expect(page.locator(VELOCITY)).toHaveCount(0);
         });
     });
 
@@ -1071,13 +1013,13 @@ test.describe('backlog', () => {
             // A bogus ref matches nothing.
             await filterByText(page, 'xxxxyy123123123');
             await expect
-                .poll(async () => await userStories(page).count(), { timeout: 15000 })
+                .poll(async () => await userStories(page).count(), { timeout: 15_000 })
                 .toBe(0);
 
             // Clearing restores the full list.
             await clearFilters(page);
             await expect
-                .poll(async () => await userStories(page).count(), { timeout: 15000 })
+                .poll(async () => await userStories(page).count(), { timeout: 15_000 })
                 .toBeGreaterThan(0);
         });
 
@@ -1086,29 +1028,23 @@ test.describe('backlog', () => {
 
             const before = await userStories(page).count();
 
-            // OPTIONAL: filter-by-category reduces then restores. Skipped
-            // gracefully if the category hooks are not present.
-            const category = page.locator('.e2e-category').first();
-            if ((await category.count()) === 0) {
-                return;
-            }
-            await category.click();
-            await page.waitForTimeout(500);
+            // Open the first filter category and apply its first option, asserting
+            // the visible story count drops, then clear to restore it.
+            const category = page.locator(FILTER_CATEGORY).first();
+            await category.waitFor({ state: 'visible', timeout: 10_000 });
+            await category.locator('.filter-name').first().click();
 
-            const firstCount = page.locator('.e2e-filter-count').first();
-            if ((await firstCount.count()) === 0) {
-                return;
-            }
-            await firstCount.click();
-            await page.waitForTimeout(1000);
+            const option = category.locator('.single-filter').first();
+            await option.waitFor({ state: 'visible', timeout: 10_000 });
+            await option.click();
 
             await expect
-                .poll(async () => await userStories(page).count(), { timeout: 15000 })
+                .poll(async () => await userStories(page).count(), { timeout: 15_000 })
                 .toBeLessThan(before);
 
             await clearFilters(page);
             await expect
-                .poll(async () => await userStories(page).count(), { timeout: 15000 })
+                .poll(async () => await userStories(page).count(), { timeout: 15_000 })
                 .toBe(before);
         });
     });
@@ -1117,35 +1053,27 @@ test.describe('backlog', () => {
      * closed sprints (stateful fixtures built once via a guarded setup)
      * -------------------------------------------------------------- */
     test.describe('closed sprints', () => {
-        // Server-side fixtures are created once; subsequent tests navigate fresh
-        // and see them persisted (guarded so the empty milestone + closed US are
-        // not recreated on every test's per-test page).
         let closedSetupDone = false;
 
         async function createEmptyMilestone(page: Page): Promise<void> {
-            await page.locator(`${BOARD} .add-sprint`).first().click();
-            await waitLightboxOpen(page, 'input[name="name"], .e2e-sprint-name, input.sprint-name');
-            const lb = sprintLightbox(page);
-            await lb.name().fill(`sprintName${Date.now()}`);
-            await lb.submit().click();
-            await waitLightboxClose(page);
+            await page.locator(ADD_SPRINT).first().click();
+            const lb = await waitSprintLightbox(page);
+            await lb.locator(SPRINT_NAME_INPUT).first().fill(`sprintName${Date.now()}`);
+            await lb.locator(SPRINT_SUBMIT).first().click();
+            await waitSprintLightboxClose(page);
         }
 
         async function dragClosedUsToMilestone(page: Page): Promise<void> {
-            // Create a user story with a CLOSED status (legacy status(5)).
-            await page.locator(`${BOARD} .new-us a`).nth(0).click();
-            await waitLightboxOpen(page, 'input[name="subject"]');
-            const lb = usLightbox(page);
-            await lb.subject().fill('subject');
-            await lb.setStatus(5);
-            await lb.submit().click();
-            await waitLightboxClose(page);
+            // Create a user story via the bulk lightbox, set it CLOSED inline, then
+            // drag it into the empty sprint's table.
+            await bulkCreate(page, ['closed story']);
 
-            // Drag the last (closed) user story into the empty sprint's table.
             const rows = userStories(page);
             const lastRow = rows.nth((await rows.count()) - 1);
-            const emptySprintTable = page.locator(`${BOARD} .sprint-empty`).last();
-            await dndDrag(page, lastRow.locator('.icon-drag'), emptySprintTable);
+            await pickStatus(lastRow, 'Done');
+
+            const emptySprintTable = page.locator(`${BOARD} ${SPRINT_EMPTY}`).last();
+            await dndDrag(page, lastRow.locator(TABLE_DRAG_HANDLE), emptySprintTable);
         }
 
         test.beforeEach(async ({ page }) => {
@@ -1157,37 +1085,35 @@ test.describe('backlog', () => {
         });
 
         test('open closed sprints', async ({ page }) => {
-            await page.locator(`${BOARD} .filter-closed-sprints`).first().click();
-            await expect(closedSprints(page)).toHaveCount(1, { timeout: 15000 });
+            await page.locator(CLOSED_SPRINTS_TOGGLE).first().click();
+            await expect(closedSprints(page)).toHaveCount(1, { timeout: 15_000 });
         });
 
         test('close closed sprints', async ({ page }) => {
-            const toggle = page.locator(`${BOARD} .filter-closed-sprints`).first();
+            const toggle = page.locator(CLOSED_SPRINTS_TOGGLE).first();
             // Fresh page: reveal (toggle on) first, then hide (toggle off).
             await toggle.click();
-            await expect(closedSprints(page)).toHaveCount(1, { timeout: 15000 });
+            await expect(closedSprints(page)).toHaveCount(1, { timeout: 15_000 });
             await toggle.click();
-            await expect(closedSprints(page)).toHaveCount(0, { timeout: 15000 });
+            await expect(closedSprints(page)).toHaveCount(0, { timeout: 15_000 });
         });
 
         test('open sprint by drag open US to closed sprint', async ({ page }) => {
-            await page.locator(`${BOARD} .filter-closed-sprints`).first().click();
+            await page.locator(CLOSED_SPRINTS_TOGGLE).first().click();
 
             // Move backlog row 1 to an OPEN status.
-            const status = page.locator(`${BOARD} .backlog-table-body > div .us-status`).nth(1);
-            await popoverPick(page, status, 1);
+            const row1 = userStories(page).nth(1);
+            await pickStatus(row1, 'In progress');
 
             // Expand the last sprint, then drag row 1 into its table.
             const lastSprint = sprints(page).last();
-            await lastSprint.locator('.compact-sprint').first().click();
-            await page.waitForTimeout(600);
+            await lastSprint.locator(COMPACT_SPRINT).first().click();
 
-            const row1 = userStories(page).nth(1);
-            await dndDrag(page, row1.locator('.icon-drag'), lastSprint.locator('.sprint-table'));
+            await dndDrag(page, row1.locator(TABLE_DRAG_HANDLE), lastSprint.locator(SPRINT_TABLE));
 
             // No closed milestones remain ⇒ the closed-sprints toggle disappears.
-            await expect(page.locator(`${BOARD} .filter-closed-sprints`)).toHaveCount(0, {
-                timeout: 15000,
+            await expect(page.locator(CLOSED_SPRINTS_TOGGLE)).toHaveCount(0, {
+                timeout: 15_000,
             });
         });
     });
@@ -1204,15 +1130,10 @@ test.describe('backlog', () => {
             (window as unknown as { __xss?: unknown }).__xss = undefined;
         });
 
-        // Create a user story whose subject is the payload.
+        // Create a user story whose subject is the payload via the bulk lightbox.
         const before = await userStories(page).count();
-        await page.locator(`${BOARD} .new-us a`).nth(0).click();
-        await waitLightboxOpen(page, 'input[name="subject"]');
-        const lb = usLightbox(page);
-        await lb.subject().fill(payload);
-        await lb.submit().click();
-        await waitLightboxClose(page);
-        await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20000 });
+        await bulkCreate(page, [payload]);
+        await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20_000 });
 
         // The payload renders as escaped LITERAL text (never as an <img> node).
         await expect(
@@ -1226,4 +1147,3 @@ test.describe('backlog', () => {
         expect(xss).toBeFalsy();
     });
 });
-

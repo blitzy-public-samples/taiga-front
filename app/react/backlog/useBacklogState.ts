@@ -188,6 +188,7 @@ export interface UseBacklogStateResult {
         custom: CustomFilter[],
         selected: SelectedFilter[],
     ) => void;
+    setCustomFilters: (custom: CustomFilter[]) => void;
     setFilterQ: (q: string) => void;
     toggleShowTags: () => void;
     toggleActiveFilters: () => void;
@@ -539,6 +540,20 @@ export function useBacklogState(): UseBacklogStateResult {
         [],
     );
 
+    // Update ONLY the customFilters slice. This is intentionally decoupled from
+    // setFilters so callers in the initial-load chain (loadCustomFilters, which
+    // runs immediately after loadFilters with no intervening render) do not have
+    // to read-modify-write draft.filters / draft.selectedFilters from a stale
+    // stateRef snapshot -- doing so would clobber the categories that loadFilters
+    // just set. Save/remove custom-filter handlers use this for the same reason.
+    const setCustomFilters = useCallback((custom: CustomFilter[]): void => {
+        setState((prev) =>
+            produce(prev, (draft) => {
+                draft.customFilters = castDraft(custom);
+            }),
+        );
+    }, []);
+
     const setFilterQ = useCallback((q: string): void => {
         setState((prev) => produce(prev, (draft) => {
             draft.filterQ = q;
@@ -724,6 +739,7 @@ export function useBacklogState(): UseBacklogStateResult {
             setPage,
             setFirstLoadComplete,
             setFilters,
+            setCustomFilters,
             setFilterQ,
             toggleShowTags,
             toggleActiveFilters,
@@ -747,6 +763,7 @@ export function useBacklogState(): UseBacklogStateResult {
             setPage,
             setFirstLoadComplete,
             setFilters,
+            setCustomFilters,
             setFilterQ,
             toggleShowTags,
             toggleActiveFilters,

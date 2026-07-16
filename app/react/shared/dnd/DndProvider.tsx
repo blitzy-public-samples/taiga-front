@@ -66,7 +66,13 @@ import {
     useSensor,
     useSensors,
 } from "@dnd-kit/core";
-import type { DragEndEvent, DragStartEvent } from "@dnd-kit/core";
+import type {
+    CollisionDetection,
+    DragEndEvent,
+    DragStartEvent,
+    KeyboardCoordinateGetter,
+} from "@dnd-kit/core";
+import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 
 import { bulkUpdateBacklogOrder, bulkUpdateKanbanOrder } from "../api/userstories";
 import type { UserStory } from "../api/userstories";
@@ -184,6 +190,20 @@ export interface DndProviderProps {
     activationDistance?: number;
     /** Optional pass-through for dnd-kit autoScroll (default `true` — built-in autoscroll enabled). */
     autoScroll?: boolean;
+    /**
+     * Optional collision-detection strategy for the `DndContext`. When omitted,
+     * dnd-kit's default (`rectIntersection`) is used. The Backlog passes
+     * {@link rowPreferringCollisionDetection} so drops resolve to a specific row
+     * (precise reorder + single-step keyboard); Kanban leaves it undefined.
+     */
+    collisionDetection?: CollisionDetection;
+    /**
+     * Optional `KeyboardSensor` coordinate getter for accessible keyboard DnD.
+     * When omitted, the dnd-kit default (fixed pixel step) is used. The Backlog
+     * passes {@link singleStepKeyboardCoordinates} for one-row-per-arrow movement
+     * ([N]); Kanban leaves it undefined.
+     */
+    keyboardCoordinateGetter?: KeyboardCoordinateGetter;
     /**
      * Optional RECOVERABLE-FAILURE-SIGNALING hook. Invoked when the drop's
      * {@link persist} REJECTS (async) OR throws synchronously.
@@ -413,6 +433,8 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         renderDragOverlay,
         activationDistance,
         autoScroll,
+        collisionDetection,
+        keyboardCoordinateGetter,
         onPersistError,
     } = props;
 
@@ -431,13 +453,29 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
     //     pick up, arrow keys to move, Space/Enter to drop, Esc to cancel). The
     //     legacy imperative `dragula` drake had no keyboard affordance; adding the
     //     KeyboardSensor is required for WCAG-compatible keyboard DnD.
+    //
+    //     The KeyboardSensor MUST be given a `coordinateGetter`; without one it
+    //     picks a card up but the arrow keys produce no movement, so a keyboard
+    //     user cannot reorder cards (QA-A11Y-03). `sortableKeyboardCoordinates`
+    //     from @dnd-kit/sortable translates arrow keys into the next sortable
+    //     droppable position, matching the `SortableContext` +
+    //     `verticalListSortingStrategy` the columns already use.
     const sensors = useSensors(
         useSensor(PointerSensor, {
             activationConstraint: {
                 distance: activationDistance ?? DEFAULT_ACTIVATION_DISTANCE,
             },
         }),
-        useSensor(KeyboardSensor),
+        // Keyboard DnD coordinate getter, resolved per screen so BOTH boards stay
+        // operable by keyboard (the KeyboardSensor ALWAYS receives a coordinateGetter,
+        // never a no-op pick-up):
+        //   • Backlog injects `singleStepKeyboardCoordinates` (one-row-per-arrow, [N]).
+        //   • Kanban passes nothing and falls back to `sortableKeyboardCoordinates`
+        //     (QA-A11Y-03), which matches the `SortableContext` +
+        //     `verticalListSortingStrategy` the columns use.
+        useSensor(KeyboardSensor, {
+            coordinateGetter: keyboardCoordinateGetter ?? sortableKeyboardCoordinates,
+        }),
     );
 
     const handleDragStart = useCallback((event: DragStartEvent): void => {
@@ -513,6 +551,7 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         <DndContext
             sensors={sensors}
             autoScroll={autoScroll ?? true}
+            collisionDetection={collisionDetection}
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
             onDragCancel={handleDragCancel}

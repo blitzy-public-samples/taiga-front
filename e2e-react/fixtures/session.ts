@@ -131,7 +131,9 @@ async function login(page: Page, baseURL: string | undefined): Promise<void> {
     try {
         await skip.waitFor({ state: 'visible', timeout: 2000 });
         await skip.click();
-        await page.waitForTimeout(600);
+        // Condition-based wait (no fixed sleep): the joyride overlay tears down
+        // after the skip click, so wait for the skip button to detach/hide.
+        await skip.waitFor({ state: 'hidden', timeout: 5000 });
     } catch {
         // Joyride not shown — nothing to close. Intentionally swallowed.
     }

@@ -74,4 +74,21 @@ describe("KanbanBoard swimlane mode", () => {
         const { container } = render(<KanbanBoard {...baseProps(s)} />);
         expect(container.querySelector(".kanban-swimlane-add")).not.toBeNull();
     });
+
+    it("hides the swimlane-add affordance on an archived project (QA-FUNC-11)", () => {
+        // Even for an admin with a single swimlane, "Create swimlane" is an
+        // editing affordance and must be disabled on an archived project
+        // (canEdit === false when archived).
+        const swimlanes: Swimlane[] = [{ id: 50, name: "SW", statuses }];
+        const archivedProject: KanbanProject = {
+            ...project,
+            archived_code: "blocked-by-owner-leaving",
+        };
+        let s = reduceInit(createInitialState(), archivedProject, swimlanes, {});
+        s = reduceSetUserstories(s, [usm({ id: 101, status: 1, swimlane: 50 })]);
+        const { container } = render(
+            <KanbanBoard {...baseProps(s)} project={archivedProject} />,
+        );
+        expect(container.querySelector(".kanban-swimlane-add")).toBeNull();
+    });
 });

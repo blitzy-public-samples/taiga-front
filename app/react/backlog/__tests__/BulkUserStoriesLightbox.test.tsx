@@ -133,22 +133,26 @@ function submitForm(container: HTMLElement): void {
 
 describe("BulkUserStoriesLightbox", () => {
     describe("visibility", () => {
-        it("hides the wrapper via display:none when closed", () => {
+        // [#3] The `.lightbox` SCSS mixin has base `display:none` and is revealed
+        // ONLY by the `.open` class (`.lightbox.open{display:flex}`). Visibility is
+        // therefore driven by the `open` CLASS, not an inline `display` style — the
+        // element stays in the DOM in both states (mirroring lightboxService).
+        it("keeps the wrapper in the DOM WITHOUT the `open` class when closed", () => {
             const props = makeProps({ open: false });
             const { container } = render(<BulkUserStoriesLightbox {...props} />);
 
             const wrapper = container.querySelector(".lightbox.lightbox-generic-bulk");
             expect(wrapper).not.toBeNull();
-            expect(wrapper).toHaveStyle({ display: "none" });
+            expect(wrapper).not.toHaveClass("open");
         });
 
-        it("shows the wrapper (no display override) when open", () => {
+        it("adds the `open` class (which the SCSS reveals) when open", () => {
             const props = makeProps({ open: true });
             const { container } = render(<BulkUserStoriesLightbox {...props} />);
 
             const wrapper = container.querySelector(".lightbox.lightbox-generic-bulk");
             expect(wrapper).not.toBeNull();
-            expect(wrapper).not.toHaveStyle({ display: "none" });
+            expect(wrapper).toHaveClass("open");
         });
 
         it("renders the title, textarea, both position radios and the save button", () => {

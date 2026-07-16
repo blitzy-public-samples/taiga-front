@@ -33,11 +33,13 @@
  * wrapper around each icon, which several SCSS rules target directly.
  */
 
-import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createElement, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 
-import type { Id, Project, UserStory, UserStoryActions } from "./types";
+import type { Id, Project, ProjectStats, UserStory, UserStoryActions } from "./types";
+import { emojify } from "../shared/emoji/emojify";
+import { t } from "../shared/i18n/translate";
 
 /* -------------------------------------------------------------------------- */
 /* Local helpers                                                              */
@@ -131,6 +133,62 @@ function usePopover(): PopoverController {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Doomline                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Compute the index (into the full, ordered `userstories` list) of the FIRST
+ * story at which the running backlog total exceeds the project's total points —
+ * i.e. the story before which the "Project Scope [Doomline]" banner is drawn.
+ *
+ * Faithful port of `linkDoomLine`/`reloadDoomLine`
+ * (app/coffee/modules/backlog/main.coffee L727-748):
+ *  - only when NOT forecasting (`!displayVelocity`) and `stats.total_points` is
+ *    a non-zero number,
+ *  - the running sum starts at `stats.assigned_points` (points already
+ *    committed to sprints) and accumulates each story's `total_points`,
+ *  - the doomline is placed before the first story whose accumulation makes the
+ *    running sum strictly greater than `total_points`.
+ *
+ * Returns `-1` when no doomline should be drawn.
+ */
+export function computeDoomlineBreakIndex(
+    userstories: readonly UserStory[],
+    stats: ProjectStats | null,
+    displayVelocity: boolean,
+): number {
+    if (displayVelocity || !stats) {
+        return -1;
+    }
+    const totalPoints = stats.total_points;
+    if (totalPoints == null || totalPoints === 0) {
+        return -1;
+    }
+    let currentSum = stats.assigned_points ?? 0;
+    for (let i = 0; i < userstories.length; i += 1) {
+        currentSum += userstories[i].total_points ?? 0;
+        if (currentSum > totalPoints) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * The doomline banner row. Reproduces the AngularJS
+ * `<div class="doom-line"><span>…</span></div>` template (main.coffee L723-724)
+ * so the compiled SCSS (`.backlog-table-body .doom-line`) themes it unchanged.
+ * i18n: BACKLOG.DOOMLINE.
+ */
+function DoomLine(): JSX.Element {
+    return (
+        <div className="doom-line">
+            <span>{t("BACKLOG.DOOMLINE", "Project Scope [Doomline]")}</span>
+        </div>
+    );
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public props                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -155,6 +213,11 @@ export interface BacklogTableProps {
     activeFilters: boolean;
     /** When true, the body gets the `forecasted-stories` class. */
     displayVelocity: boolean;
+    /**
+     * Project stats, used to place the "Project Scope [Doomline]" banner ([A]).
+     * When `null` (not yet loaded) no doomline is drawn.
+     */
+    stats: ProjectStats | null;
     /**
      * The `us.id` of the first story in the backlog; its options popup hides the
      * "move to top" action (there is nowhere higher to move it).
@@ -212,6 +275,7 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
         showTags,
         activeFilters,
         displayVelocity,
+        stats,
         firstUsInBacklog,
         loadingUserstories,
         dragEnabled,
@@ -283,6 +347,26 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
         [userstories, visibleRefs],
     );
 
+    // [A] Doomline placement: compute the break index against the FULL ordered
+    // list (as the AngularJS directive did), then resolve it to the id of the
+    // first VISIBLE row at or after that index, so the banner lands correctly
+    // even when filters hide some rows.
+    const doomBeforeRowId = useMemo<Id | null>(() => {
+        const breakIndex = computeDoomlineBreakIndex(userstories, stats, displayVelocity);
+        if (breakIndex < 0) {
+            return null;
+        }
+        const fullIndexById = new Map<Id, number>();
+        userstories.forEach((us, index) => fullIndexById.set(us.id, index));
+        for (const row of rows) {
+            const fullIndex = fullIndexById.get(row.id);
+            if (fullIndex !== undefined && fullIndex >= breakIndex) {
+                return row.id;
+            }
+        }
+        return null;
+    }, [userstories, rows, stats, displayVelocity]);
+
     // Backlog drop target; rows carry data-id so BacklogApp's resolveDrop can
     // read the resulting DOM order after a drop.
     const { setNodeRef: setBacklogDroppableRef } = useDroppable({ id: "backlog" });
@@ -346,12 +430,13 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
                 <div className="row backlog-table-title">
                     {canModifyUs && <div className="draggable-us-column" />}
                     {canModifyUs && <div className="input" />}
-                    {/* BACKLOG.TABLE.COLUMN_US */}
-                    <div className="user-stories">User Story</div>
-                    {/* COMMON.FIELDS.STATUS */}
-                    <div className="status">Status</div>
-                    {/* title: BACKLOG.TABLE.TITLE_COLUMN_POINTS */}
-                    <div className="points" title="Select view per Role" ref={rolePopover.ref}>
+                    <div className="user-stories">{t("BACKLOG.TABLE.COLUMN_US", "User Story")}</div>
+                    <div className="status">{t("COMMON.FIELDS.STATUS", "Status")}</div>
+                    <div
+                        className="points"
+                        title={t("BACKLOG.TABLE.TITLE_COLUMN_POINTS", "Select view per Role")}
+                        ref={rolePopover.ref}
+                    >
                         <div
                             className="inner"
                             role="button"
@@ -364,14 +449,19 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
                                 }
                             }}
                         >
-                            {/* COMMON.FIELDS.POINTS */}
-                            <span className="header-points">Points</span>
+                            <span className="header-points">{t("COMMON.FIELDS.POINTS", "Points")}</span>
                             <Svg icon="icon-filter" />
                         </div>
                         {rolePopover.open && (
-                            <ul className="popover pop-role">
+                            // [S] reveal: the `.popover` SCSS mixin sets `display:none`
+                            // as the base and provides NO `.active`/`.open` rule that
+                            // flips it back. The AngularJS popovers were revealed by
+                            // jQuery `fadeIn()`, which writes an inline `display:block`.
+                            // We reproduce that inline style so the compiled CSS renders
+                            // the list visible (jsdom cannot compute this; verified in a
+                            // real browser against theme-taiga.css).
+                            <ul className="popover pop-role" style={{ display: "block" }}>
                                 <li>
-                                    {/* COMMON.ROLES.ALL */}
                                     <a
                                         className={
                                             "clear-selection" +
@@ -384,7 +474,7 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
                                             rolePopover.setOpen(false);
                                         }}
                                     >
-                                        All points
+                                        {t("COMMON.ROLES.ALL", "All points")}
                                     </a>
                                 </li>
                                 {computableRoles.map((role) => (
@@ -425,20 +515,25 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
                             ? formatPoints(computeTotalPoints(us))
                             : formatPoints(roleValue);
                     return (
-                        <BacklogStoryRow
-                            key={us.ref}
-                            us={us}
-                            project={project}
-                            canModifyUs={canModifyUs}
-                            canDeleteUs={canDeleteUs}
-                            dragEnabled={dragEnabled}
-                            showTags={showTags}
-                            selected={Boolean(selectedRefs[String(us.ref)])}
-                            firstUsInBacklog={firstUsInBacklog}
-                            actions={actions}
-                            onToggleSelection={onToggleSelection}
-                            pointsDisplay={pointsDisplay}
-                        />
+                        <Fragment key={us.ref}>
+                            {/* [A] Doomline banner drawn immediately BEFORE the story
+                                where the cumulative backlog scope exceeds the project
+                                total points. */}
+                            {doomBeforeRowId === us.id && <DoomLine />}
+                            <BacklogStoryRow
+                                us={us}
+                                project={project}
+                                canModifyUs={canModifyUs}
+                                canDeleteUs={canDeleteUs}
+                                dragEnabled={dragEnabled}
+                                showTags={showTags}
+                                selected={Boolean(selectedRefs[String(us.ref)])}
+                                firstUsInBacklog={firstUsInBacklog}
+                                actions={actions}
+                                onToggleSelection={onToggleSelection}
+                                pointsDisplay={pointsDisplay}
+                            />
+                        </Fragment>
                     );
                 })}
                 {/* Infinite-scroll sentinel (replaces the AngularJS infinite-scroll directive). */}
@@ -476,6 +571,17 @@ function BacklogStoryRow({
     // The whole row is the draggable node; the .draggable-us-row handle carries
     // the activator listeners. useDraggable MUST be called unconditionally.
     const { attributes, listeners, setNodeRef } = useDraggable({ id: us.id });
+    // [N] The row is ALSO a droppable (same numeric id) so a drop — pointer or
+    // keyboard — can land at THIS row's position (single-step keyboard reorder).
+    const { setNodeRef: setRowDroppableRef } = useDroppable({ id: us.id });
+    // Merge the draggable + droppable node refs onto the single row element.
+    const setRowRef = useCallback(
+        (node: HTMLElement | null): void => {
+            setNodeRef(node);
+            setRowDroppableRef(node);
+        },
+        [setNodeRef, setRowDroppableRef],
+    );
 
     const statusPopover = usePopover();
     const pointsPopover = usePopover();
@@ -488,6 +594,14 @@ function BacklogStoryRow({
 
     const isFirst = us.id === firstUsInBacklog;
 
+    // [T] Emoji parity: the AngularJS row rendered `us.subject | emojify`
+    // (backlog-row.jade:39) via `ng-bind-html`. We instead run a SAFE, non-HTML
+    // transform that swaps `:shortcode:` for the unicode emoji CHARACTER and
+    // render the result as plain, auto-escaped React text (no
+    // dangerouslySetInnerHTML) — restoring emoji rendering without reopening the
+    // XSS surface. When `window.emojis` is unavailable this is a no-op.
+    const subjectText = emojify(us.subject);
+
     // Computable roles for the points popover (mirror _.filter(roles, "computable")).
     const computableRoles = project.roles.filter((role) => role.computable);
 
@@ -498,7 +612,7 @@ function BacklogStoryRow({
         (!canModifyUs ? " readonly" : "");
 
     return (
-        <div ref={setNodeRef} data-id={us.id} className={rowClassName}>
+        <div ref={setRowRef} data-id={us.id} className={rowClassName}>
             <div className="us-item-row-left">
                 {canModifyUs && (
                     // Drag activator: spread @dnd-kit attributes/listeners only when
@@ -508,6 +622,17 @@ function BacklogStoryRow({
                         className="draggable-us-row"
                         {...(dragEnabled ? attributes : {})}
                         {...(dragEnabled ? listeners : {})}
+                        // [P] Accessible name for the draggable handle. @dnd-kit's
+                        // `attributes` give it `role="button"` +
+                        // `aria-roledescription="draggable"` but NO name; without a
+                        // name screen readers announce only "button". Placed AFTER
+                        // the spreads so it always wins. Routed through the shared
+                        // catalog ([i18n]); US.DRAG_BUTTON_LABEL is net-new so the
+                        // template fallback below is interpolated locally.
+                        aria-label={t("US.DRAG_BUTTON_LABEL", "Reorder user story #{{ref}} {{subject}}", {
+                            ref: us.ref,
+                            subject: subjectText,
+                        })}
                     >
                         <Svg icon="icon-draggable" />
                     </div>
@@ -536,11 +661,12 @@ function BacklogStoryRow({
             <div className="user-stories user-story-main-data">
                 <a className="user-story-link" href={`#/project/${project.slug}/us/${us.ref}`}>
                     <span className="user-story-number">#{us.ref}</span>
-                    {/* XSS-safe: the subject is rendered as plain text and React
-                        auto-escapes it. NEVER use dangerouslySetInnerHTML here — the
-                        AngularJS `ng-bind-html="us.subject | emojify"` is deliberately
-                        NOT reproduced. */}
-                    <span className="user-story-name">{us.subject}</span>
+                    {/* XSS-safe: `subjectText` is the emojified subject as a PLAIN
+                        string (shortcodes → unicode chars), rendered as React
+                        auto-escaped text. NEVER use dangerouslySetInnerHTML here — the
+                        AngularJS `ng-bind-html="us.subject | emojify"` HTML injection
+                        is deliberately NOT reproduced ([T]). */}
+                    <span className="user-story-name">{subjectText}</span>
                 </a>
                 {us.due_date && (
                     // Placeholder for the shared tg-due-date widget (out of scope);
@@ -576,10 +702,28 @@ function BacklogStoryRow({
                     className="us-status"
                     href=""
                     title={statusName}
+                    // [R] The legacy markup was a bare `<a href="">` that behaves as
+                    // a menu trigger, not a navigational link. Expose the correct
+                    // semantics: `role="button"` + popover state so assistive tech
+                    // announces it as an (expandable) control. `aria-disabled`
+                    // reflects the read-only (no modify_us) case.
+                    role="button"
+                    aria-haspopup="menu"
+                    aria-expanded={statusPopover.open}
+                    aria-disabled={!canModifyUs}
                     onClick={(event) => {
                         event.preventDefault();
                         if (canModifyUs) {
                             statusPopover.toggle();
+                        }
+                    }}
+                    onKeyDown={(event) => {
+                        // Anchors already activate on Enter; add Space for button parity.
+                        if (event.key === " ") {
+                            event.preventDefault();
+                            if (canModifyUs) {
+                                statusPopover.toggle();
+                            }
                         }
                     }}
                 >
@@ -589,7 +733,10 @@ function BacklogStoryRow({
                     {canModifyUs && <Svg icon="icon-arrow-down" />}
                 </a>
                 {statusPopover.open && (
-                    <ul className="popover pop-status">
+                    // [S] reveal: inline `display:block` mirrors the AngularJS
+                    // jQuery `fadeIn()` (the `.popover` mixin's base is `display:none`
+                    // with no class-based reveal in the compiled CSS).
+                    <ul className="popover pop-status" style={{ display: "block" }}>
                         {project.us_statuses.map((usStatus) => (
                             <li key={usStatus.id}>
                                 <a
@@ -615,17 +762,32 @@ function BacklogStoryRow({
                 <a
                     className="us-points"
                     href=""
+                    // [R] Same as us-status: this is a popover trigger, not a link.
+                    role="button"
+                    aria-haspopup="menu"
+                    aria-expanded={pointsPopover.open}
+                    aria-disabled={!canModifyUs}
+                    aria-label={t("US.POINTS_LABEL", "Points: {{points}}", { points: pointsDisplay })}
                     onClick={(event) => {
                         event.preventDefault();
                         if (canModifyUs) {
                             pointsPopover.toggle();
                         }
                     }}
+                    onKeyDown={(event) => {
+                        if (event.key === " ") {
+                            event.preventDefault();
+                            if (canModifyUs) {
+                                pointsPopover.toggle();
+                            }
+                        }
+                    }}
                 >
                     {pointsDisplay}
                 </a>
                 {pointsPopover.open && (
-                    <ul className="popover pop-points">
+                    // [S] reveal: inline `display:block` mirrors AngularJS `fadeIn()`.
+                    <ul className="popover pop-points" style={{ display: "block" }}>
                         {computableRoles.map((role) => (
                             <li key={role.id}>
                                 <span className="item-text">{role.name}</span>
@@ -659,6 +821,12 @@ function BacklogStoryRow({
                         className={
                             "us-option-popup-button js-popup-button" + (isFirst ? " first" : "")
                         }
+                        // [Q] Icon-only kebab button had no accessible name — screen
+                        // readers announced only "button". Routed through the shared
+                        // catalog ([i18n]); US.OPTIONS_LABEL is net-new (English fallback).
+                        aria-label={t("US.OPTIONS_LABEL", "User story options")}
+                        aria-haspopup="menu"
+                        aria-expanded={optionsPopover.open}
                         onClick={optionsPopover.toggle}
                     >
                         <Svg icon="icon-more-vertical" />
@@ -667,9 +835,12 @@ function BacklogStoryRow({
                         // `.first` on the popup hides "move to top" via SCSS
                         // (`.us-option-popup.first .move-to-top { display: none }`);
                         // we ALSO omit the action entirely for the first story.
-                        <ul className={"popover us-option-popup" + (isFirst ? " first" : "")}>
+                        <ul
+                            className={"popover us-option-popup" + (isFirst ? " first" : "")}
+                            // [S] reveal: inline `display:block` mirrors AngularJS `fadeIn()`.
+                            style={{ display: "block" }}
+                        >
                             <li>
-                                {/* COMMON.EDIT */}
                                 <button
                                     type="button"
                                     className="e2e-edit edit-story"
@@ -679,12 +850,11 @@ function BacklogStoryRow({
                                     }}
                                 >
                                     <Svg icon="icon-edit" />
-                                    <span>Edit</span>
+                                    <span>{t("COMMON.EDIT", "Edit")}</span>
                                 </button>
                             </li>
                             {canDeleteUs && (
                                 <li>
-                                    {/* COMMON.DELETE */}
                                     <button
                                         type="button"
                                         className="e2e-delete"
@@ -694,13 +864,12 @@ function BacklogStoryRow({
                                         }}
                                     >
                                         <Svg icon="icon-trash" />
-                                        <span>Delete</span>
+                                        <span>{t("COMMON.DELETE", "Delete")}</span>
                                     </button>
                                 </li>
                             )}
                             {!isFirst && (
                                 <li>
-                                    {/* COMMON.MOVE_TO_TOP */}
                                     <button
                                         type="button"
                                         className="e2e-edit move-to-top"
@@ -710,7 +879,7 @@ function BacklogStoryRow({
                                         }}
                                     >
                                         <Svg icon="icon-move-to-top" />
-                                        <span>Move to top</span>
+                                        <span>{t("COMMON.MOVE_TO_TOP", "Move to top")}</span>
                                     </button>
                                 </li>
                             )}

@@ -27,6 +27,17 @@ const usersById: UsersById = {
 const project: KanbanProject = { id: 7, my_permissions: ["modify_us"] };
 /** A project granting BOTH modify + delete so the Delete action renders (QA F1). */
 const projectRW: KanbanProject = { id: 7, my_permissions: ["modify_us", "delete_us"] };
+/**
+ * QA-FUNC-11: an ARCHIVED project (truthy `archived_code`) that still grants
+ * modify + delete permissions. AngularJS `projectService.canEdit` returns false
+ * on an archived project regardless of `my_permissions`, so no edit/delete
+ * affordance may render.
+ */
+const projectArchived: KanbanProject = {
+    id: 7,
+    my_permissions: ["modify_us", "delete_us"],
+    archived_code: "blocked-by-owner-leaving",
+};
 
 /**
  * Open a card's actions popover via its real toggler button.
@@ -180,6 +191,22 @@ describe("Card assignee + actions", () => {
         expect(container.querySelector(".card-action-delete")).toBeNull();
     });
 
+    it("hides the card-actions trigger entirely on an archived project (QA-FUNC-11)", () => {
+        // Even with modify_us + delete_us granted, an archived project disables
+        // all editing affordances (canEdit === false when archived), so the ⋮
+        // trigger button itself must not render.
+        const { container } = render(
+            <Card
+                item={view({ id: 42, subject: "Hi" })}
+                project={projectArchived}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+            />,
+        );
+        expect(container.querySelector(".card-actions")).toBeNull();
+        expect(container.querySelector(".card-actions .js-popup-button")).toBeNull();
+    });
+
     it("closes the actions menu after an action is chosen", () => {
         const { container } = render(
             <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} onClickEdit={jest.fn()} />,
@@ -220,7 +247,7 @@ describe("Card rich render at max zoom", () => {
             <Card item={richView()} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
         );
         expect(container.querySelector(".card-data")).not.toBeNull();
-        expect(container.querySelector(".card-estimation")!.textContent).toBe("8");
+        expect(container.querySelector(".card-estimation")!.textContent).toBe("8 pts");
         expect(container.querySelector(".card-lock")).not.toBeNull();
         expect(container.querySelector(".card-attachments")).not.toBeNull();
         expect(container.querySelector(".card-comments")).not.toBeNull();
@@ -230,12 +257,12 @@ describe("Card rich render at max zoom", () => {
         expect(container.querySelector(".extra-assigned")!.textContent).toContain("3+");
     });
 
-    it("shows 'No pts' when the story has no points", () => {
+    it("shows 'N/E' when the story has no points", () => {
         const model = { id: 201, status: 1, swimlane: null, kanban_order: 1, subject: "NP" } as UserStoryModel;
         const { container } = render(
             <Card item={retrieveUserStoryData(model, richUsers, {})} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
         );
-        expect(container.querySelector(".card-estimation")!.textContent).toBe("No pts");
+        expect(container.querySelector(".card-estimation")!.textContent).toBe("N/E");
     });
 
     it("fires onToggleFold with the story id from the unfold affordance", () => {
@@ -284,5 +311,184 @@ describe("Card rich render at max zoom", () => {
             <Card item={richView()} project={project} zoom={ZOOM[3]} zoomLevel={3} resolveAvatar={resolveAvatar} />,
         );
         expect(resolveAvatar).toHaveBeenCalled();
+    });
+});
+
+describe("Card visual fidelity — due date, iocaine, points, avatar fallback", () => {
+    it("suffixes points with ' pts' and shows a title of 'Estimation' (QA-VIS-10)", () => {
+        const { container } = render(
+            <Card item={view({ id: 310, total_points: 2 })} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
+        );
+        const est = container.querySelector(".card-estimation")!;
+        expect(est.textContent).toBe("2 pts");
+        expect(est.getAttribute("title")).toBe("Estimation");
+    });
+
+    it("renders .card-due-date with an icon-clock and status-suffixed title (QA-VIS-08)", () => {
+        const { container } = render(
+            <Card
+                item={view({ id: 311, due_date: "2024-01-15" })}
+                project={project}
+                zoom={ZOOM[3]}
+                zoomLevel={3}
+            />,
+        );
+        const due = container.querySelector(".card-due-date");
+        expect(due).not.toBeNull();
+        // The sprite icon renders as <tg-svg><svg class="icon icon-clock">…</svg></tg-svg>.
+        expect(due!.querySelector("svg.icon.icon-clock")).not.toBeNull();
+        // A far-past date resolves to the "past due" appearance; the outer title
+        // is the formatted date with the status name, and the icon <title> is the
+        // localized "Due date: …" string.
+        expect(due!.getAttribute("title")).toContain("(past due)");
+        expect(due!.querySelector("svg title")!.textContent).toContain("Due date:");
+    });
+
+    it("omits .card-due-date when the story has no due_date (QA-VIS-08)", () => {
+        const { container } = render(
+            <Card item={view({ id: 312 })} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
+        );
+        expect(container.querySelector(".card-due-date")).toBeNull();
+    });
+
+    it("renders .card-iocaine with an icon-iocaine when is_iocaine (QA-VIS-09)", () => {
+        const { container } = render(
+            <Card
+                item={view({ id: 313, is_iocaine: true })}
+                project={project}
+                zoom={ZOOM[3]}
+                zoomLevel={3}
+            />,
+        );
+        const iocaine = container.querySelector(".card-iocaine");
+        expect(iocaine).not.toBeNull();
+        expect(iocaine!.querySelector("svg.icon.icon-iocaine")).not.toBeNull();
+        expect(iocaine!.getAttribute("title")).toBe("Is iocaine");
+    });
+
+    it("omits .card-iocaine when is_iocaine is falsy (QA-VIS-09)", () => {
+        const { container } = render(
+            <Card item={view({ id: 314 })} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
+        );
+        expect(container.querySelector(".card-iocaine")).toBeNull();
+    });
+
+    it("gives the not-assigned avatar an unnamed.png fallback src (QA-VIS-07)", () => {
+        const { container } = render(
+            <Card item={view({ id: 315 })} project={project} zoom={ZOOM[1]} zoomLevel={1} />,
+        );
+        const img = container.querySelector(".card-not-assigned img") as HTMLImageElement | null;
+        expect(img).not.toBeNull();
+        expect(img!.getAttribute("src")).toContain("images/unnamed.png");
+    });
+
+    it("falls back to unnamed.png for an assigned user without a photo (QA-VIS-07)", () => {
+        const nullPhotoUsers: UsersById = {
+            20: { id: 20, username: "z", full_name_display: "Z", photo: null },
+        };
+        const model = {
+            id: 316,
+            status: 1,
+            swimlane: null,
+            kanban_order: 1,
+            assigned_to: 20,
+            assigned_users: [20],
+        } as UserStoryModel;
+        const { container } = render(
+            <Card
+                item={retrieveUserStoryData(model, nullPhotoUsers, {})}
+                project={project}
+                zoom={ZOOM[1]}
+                zoomLevel={1}
+            />,
+        );
+        const img = container.querySelector(".card-assigned-to img") as HTMLImageElement | null;
+        expect(img).not.toBeNull();
+        expect(img!.getAttribute("src")).toContain("images/unnamed.png");
+    });
+});
+
+/* ==========================================================================
+ * QA-A11Y-02 — drag-affordance gating on non-draggable cards
+ * QA-FUNC-01 — ctrl/meta-click multi-select
+ * ========================================================================== */
+
+/** A read-only project (view but not modify) — DnD must be fully disabled. */
+const projectReadOnly: KanbanProject = { id: 7, my_permissions: ["view_us"] };
+
+describe("Card drag-affordance gating (QA-A11Y-02)", () => {
+    it("exposes the sortable keyboard/ARIA affordances when the board is draggable", () => {
+        // A draggable project (modify_us, not archived) must let a keyboard user
+        // tab onto the card and pick it up.
+        const { container } = render(
+            <Card item={view({ id: 201 })} project={project} zoom={ZOOM[1]} zoomLevel={1} />,
+        );
+        const el = container.querySelector("[data-id]")!;
+        expect(el).toHaveAttribute("tabindex", "0");
+        expect(el).toHaveAttribute("aria-roledescription", "sortable");
+        expect(el).toHaveAttribute("role", "button");
+    });
+
+    it("OMITS the sortable affordances on a read-only board", () => {
+        // No modify_us -> DnD disabled -> the card must NOT be a keyboard/ARIA
+        // drag target (no tabindex, no aria-roledescription, no role=button).
+        const { container } = render(
+            <Card item={view({ id: 202 })} project={projectReadOnly} zoom={ZOOM[1]} zoomLevel={1} />,
+        );
+        const el = container.querySelector("[data-id]")!;
+        expect(el).not.toHaveAttribute("tabindex");
+        expect(el).not.toHaveAttribute("aria-roledescription");
+        expect(el).not.toHaveAttribute("role");
+    });
+
+    it("OMITS the sortable affordances on an archived board even with modify_us (QA-A11Y-02)", () => {
+        const { container } = render(
+            <Card item={view({ id: 203 })} project={projectArchived} zoom={ZOOM[1]} zoomLevel={1} />,
+        );
+        const el = container.querySelector("[data-id]")!;
+        expect(el).not.toHaveAttribute("tabindex");
+        expect(el).not.toHaveAttribute("aria-roledescription");
+    });
+});
+
+describe("Card multi-select ctrl/meta-click (QA-FUNC-01)", () => {
+    it("toggles selection on ctrl-click and on meta-click, but NOT on a plain click", () => {
+        const onToggleSelect = jest.fn();
+        const { container } = render(
+            <Card
+                item={view({ id: 301 })}
+                project={project}
+                zoom={ZOOM[1]}
+                zoomLevel={1}
+                onToggleSelect={onToggleSelect}
+            />,
+        );
+        const el = container.querySelector("[data-id]")!;
+
+        fireEvent.click(el);
+        expect(onToggleSelect).not.toHaveBeenCalled();
+
+        fireEvent.click(el, { ctrlKey: true });
+        expect(onToggleSelect).toHaveBeenCalledWith(301);
+
+        fireEvent.click(el, { metaKey: true });
+        expect(onToggleSelect).toHaveBeenCalledTimes(2);
+    });
+
+    it("renders the selected classes when the card is selected", () => {
+        const { container } = render(
+            <Card item={view({ id: 302 })} project={project} zoom={ZOOM[1]} zoomLevel={1} selected />,
+        );
+        const el = container.querySelector("[data-id]")!;
+        expect(el.className).toContain("kanban-task-selected");
+        expect(el.className).toContain("ui-multisortable-multiple");
+    });
+
+    it("is a safe no-op on ctrl-click when no onToggleSelect handler is supplied", () => {
+        const { container } = render(
+            <Card item={view({ id: 303 })} project={project} zoom={ZOOM[1]} zoomLevel={1} />,
+        );
+        const el = container.querySelector("[data-id]")!;
+        expect(() => fireEvent.click(el, { ctrlKey: true })).not.toThrow();
     });
 });

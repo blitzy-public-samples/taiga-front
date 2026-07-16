@@ -6,7 +6,13 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { getRefreshToken, getToken } from "./auth";
+import {
+    clearSession,
+    getRefreshToken,
+    getToken,
+    setRefreshToken,
+    setToken,
+} from "./auth";
 
 describe("shared/session/auth", () => {
     beforeEach(() => {
@@ -68,6 +74,63 @@ describe("shared/session/auth", () => {
 
         it("returns null when no refresh token is stored", () => {
             expect(getRefreshToken()).toBeNull();
+        });
+    });
+
+    // Session WRITES — used only by the React-side 401 refresh flow to keep the
+    // SHARED AngularJS session in sync (React fetch bypasses the ng interceptor).
+    describe("setToken / setRefreshToken (round-trip via $tgStorage encoding)", () => {
+        it("JSON-encodes the token so it round-trips through getToken and $tgStorage.get", () => {
+            setToken("new-jwt");
+
+            // Stored WITH quotes (matches $tgStorage.set), decoded WITHOUT.
+            expect(window.localStorage.getItem("token")).toBe('"new-jwt"');
+            expect(getToken()).toBe("new-jwt");
+        });
+
+        it("JSON-encodes the refresh token symmetrically", () => {
+            setRefreshToken("new-refresh");
+
+            expect(window.localStorage.getItem("refresh")).toBe('"new-refresh"');
+            expect(getRefreshToken()).toBe("new-refresh");
+        });
+
+        it("overwrites a previously stored token", () => {
+            window.localStorage.setItem("token", JSON.stringify("old"));
+            setToken("rotated");
+            expect(getToken()).toBe("rotated");
+        });
+
+        it("is a best-effort no-op when localStorage.setItem throws", () => {
+            const spy = jest.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+                throw new Error("quota exceeded");
+            });
+            expect(() => setToken("x")).not.toThrow();
+            spy.mockRestore();
+        });
+    });
+
+    describe("clearSession", () => {
+        it("removes token, refresh AND userInfo (mirrors removeUser + refresh removal)", () => {
+            window.localStorage.setItem("token", JSON.stringify("t"));
+            window.localStorage.setItem("refresh", JSON.stringify("r"));
+            window.localStorage.setItem("userInfo", JSON.stringify({ id: 5 }));
+
+            clearSession();
+
+            expect(window.localStorage.getItem("token")).toBeNull();
+            expect(window.localStorage.getItem("refresh")).toBeNull();
+            expect(window.localStorage.getItem("userInfo")).toBeNull();
+            expect(getToken()).toBeNull();
+            expect(getRefreshToken()).toBeNull();
+        });
+
+        it("is a best-effort no-op when localStorage.removeItem throws", () => {
+            const spy = jest.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+                throw new Error("unavailable");
+            });
+            expect(() => clearSession()).not.toThrow();
+            spy.mockRestore();
         });
     });
 });

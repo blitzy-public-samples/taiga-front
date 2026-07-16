@@ -37,6 +37,8 @@ import moment from "moment";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 
 import type { Sprint, Project, UserStory, Epic } from "./types";
+import { emojify } from "../shared/emoji/emojify";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Concrete moment format for sprint start/finish dates. Equals the i18n value
@@ -95,6 +97,26 @@ function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintSto
     // the drag affordance itself is applied only when `dragEnabled` (below).
     const { attributes, listeners, setNodeRef } = useDraggable({ id: us.id });
 
+    // [N] Register the SAME row as a DROPPABLE (numeric id === us.id) so
+    // DndProvider's row-preferring collision detection and single-step keyboard
+    // coordinate getter can target an individual story row rather than falling
+    // through to the sprint-container droppable (which lands the item at the
+    // END). `resolveDrop` in BacklogApp already lands a numeric `overId` at that
+    // row's position, so registering the droppable is what enables single-step
+    // (down-one / up-one) keyboard reordering AND precise pointer drops.
+    const { setNodeRef: setRowDroppableRef } = useDroppable({ id: us.id });
+
+    // Merge the draggable and droppable refs onto one DOM node. @dnd-kit hands
+    // each hook its own ref setter; a row must be BOTH to support "drop onto a
+    // sibling row", so we fan the node out to both setters.
+    const setRowRef = useCallback(
+        (node: HTMLElement | null) => {
+            setNodeRef(node);
+            setRowDroppableRef(node);
+        },
+        [setNodeRef, setRowDroppableRef],
+    );
+
     // Row modifier classes — port ng-class={closedRow, blockedRow} +
     // tg-class-permission="{'readonly': '!modify_us'}" from sprint.jade.
     const rowClassName =
@@ -121,7 +143,7 @@ function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintSto
 
     return (
         <div
-            ref={setNodeRef}
+            ref={setRowRef}
             // `data-id` is ALWAYS present (even when not draggable): DndProvider.resolveDrop
             // reads it from the DOM to compute the ordered id list on drop.
             data-id={us.id}
@@ -135,12 +157,14 @@ function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintSto
                 >
                     <span className="us-ref-text">#{us.ref}</span>
                     {/*
-                      Subject is rendered as PLAIN TEXT: React escapes it automatically,
-                      so a subject like "<img src=x onerror=...>" appears verbatim and can
-                      never execute. NEVER use dangerouslySetInnerHTML here. The legacy
-                      `| emojify` transform is intentionally omitted (plain text).
+                      [T] Subject is rendered as PLAIN TEXT: `emojify` swaps
+                      `:shortcode:` for the unicode emoji CHARACTER (never HTML), and
+                      React escapes the result, so a subject like
+                      "<img src=x onerror=...>" appears verbatim and can never execute.
+                      NEVER use dangerouslySetInnerHTML here — this restores the legacy
+                      `| emojify` rendering without reopening the XSS surface.
                     */}
-                    <span className="us-name-text">{us.subject}</span>
+                    <span className="us-name-text">{emojify(us.subject)}</span>
                 </a>
                 {us.epics && us.epics.length > 0 ? (
                     // tg-belong-to-epics format="pill" — one colored pill per epic.
@@ -242,7 +266,11 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                         <div className="sprint-name">
                             <button
                                 className={`compact-sprint${!collapsed ? " active" : ""}`}
-                                title="Compact Sprint" /* i18n BACKLOG.COMPACT_SPRINT */
+                                title={t("BACKLOG.COMPACT_SPRINT", "Compact Sprint")}
+                                // [Q] Icon-only chevron toggle: give it an accessible
+                                // name and expose its expanded/collapsed state.
+                                aria-label={t("BACKLOG.COMPACT_SPRINT", "Compact Sprint")}
+                                aria-expanded={!collapsed}
                                 onClick={toggleCollapsed}
                                 type="button"
                             >
@@ -254,7 +282,9 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                             {view.isVisible ? (
                                 <a
                                     href={view.taskboardUrl}
-                                    title={`Go to the taskboard of ${sprint.name}`} /* i18n BACKLOG.GO_TO_TASKBOARD */
+                                    title={t("BACKLOG.GO_TO_TASKBOARD", "Go to the taskboard of {{name}}", {
+                                        name: sprint.name,
+                                    })}
                                 >
                                     <span>{sprint.name}</span>
                                 </a>
@@ -270,7 +300,11 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                             <a
                                 className="edit-sprint"
                                 href=""
-                                title="Edit Sprint" /* i18n BACKLOG.EDIT_SPRINT */
+                                title={t("BACKLOG.EDIT_SPRINT", "Edit Sprint")}
+                                // [Q] Icon-only edit control rendered as an anchor:
+                                // expose button semantics + an accessible name.
+                                role="button"
+                                aria-label={t("BACKLOG.EDIT_SPRINT", "Edit Sprint")}
                                 onClick={(event) => {
                                     event.preventDefault();
                                     onEditSprint(sprint);
@@ -286,13 +320,11 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                             <ul>
                                 <li>
                                     <span className="number">{formatNumber(view.closedPoints)}</span>
-                                    {/* i18n BACKLOG.CLOSED_POINTS */}
-                                    <span className="description">closed</span>
+                                    <span className="description">{t("BACKLOG.CLOSED_POINTS", "closed")}</span>
                                 </li>
                                 <li>
                                     <span className="number">{formatNumber(view.totalPoints)}</span>
-                                    {/* i18n BACKLOG.TOTAL_POINTS */}
-                                    <span className="description">total</span>
+                                    <span className="description">{t("BACKLOG.TOTAL_POINTS", "total")}</span>
                                 </li>
                             </ul>
                         </div>
@@ -315,11 +347,19 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                 {!hasStories ? (
                     <div className="sprint-empty">
                         {view.canModifyUs ? (
-                            // i18n BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT
-                            <span>Drop here Stories from your backlog to start a new sprint</span>
+                            <span>
+                                {t(
+                                    "BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT",
+                                    "Drop here Stories from your backlog to start a new sprint",
+                                )}
+                            </span>
                         ) : (
-                            // i18n BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS
-                            <span>This sprint has no user stories</span>
+                            <span>
+                                {t(
+                                    "BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS",
+                                    "This sprint has no user stories",
+                                )}
+                            </span>
                         )}
                     </div>
                 ) : (
@@ -340,10 +380,11 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                 <a
                     className="btn-small"
                     href={view.taskboardUrl}
-                    title={`Go to Taskboard of "${sprint.name}"`} /* i18n BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD */
+                    title={t("BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD", 'Go to Taskboard of "{{name}}"', {
+                        name: sprint.name,
+                    })}
                 >
-                    {/* i18n BACKLOG.SPRINTS.LINK_TASKBOARD */}
-                    <span>Sprint Taskboard</span>
+                    <span>{t("BACKLOG.SPRINTS.LINK_TASKBOARD", "Sprint Taskboard")}</span>
                 </a>
             ) : null}
         </>

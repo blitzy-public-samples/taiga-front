@@ -68,3 +68,71 @@ export const getToken = (): string | null => readStorageString("token");
  * JSON-decoded. Returns null when absent or malformed.
  */
 export const getRefreshToken = (): string | null => readStorageString("refresh");
+
+/*
+ * ---------------------------------------------------------------------------
+ * SESSION WRITES — narrowly scoped to the React-side 401 token-refresh flow.
+ * ---------------------------------------------------------------------------
+ *
+ * This module is READ-mostly by design: AngularJS owns login / logout. The one
+ * exception is the 401 recovery flow. Because the React screens issue their own
+ * `fetch` requests they DO NOT pass through the AngularJS `$httpProvider`
+ * `authHttpIntercept` (app/coffee/app.coffee L609-707). A mid-session 401 on a
+ * React request therefore has to be recovered by the React HTTP layer itself
+ * (`shared/api/httpInterceptor.ts`). When that refresh succeeds it MUST persist
+ * the rotated `token` + `refresh` back to the SAME shared localStorage keys so
+ * the surviving AngularJS app immediately sees the renewed session — exactly as
+ * the AngularJS interceptor does (`storage.set("token", data.auth_token)` /
+ * `storage.set("refresh", data.refresh)`, app.coffee L631-632). On refresh
+ * failure the session is cleared the same way AngularJS `removeUser()` does
+ * (remove "token" / "userInfo" / "refresh", app.coffee L629-630, L642).
+ *
+ * These writers replicate `$tgStorage.set` / `.remove` EXACTLY (JSON-encode on
+ * write; guarded against an unavailable localStorage) so the values round-trip
+ * through the read getters above and through AngularJS `$tgStorage.get`.
+ */
+
+/** Replicates `$tgStorage.set(key, value)`: JSON-encode then persist. Best-effort. */
+const writeStorageString = (key: string, value: string): void => {
+    try {
+        if (typeof window === "undefined" || window.localStorage == null) {
+            return;
+        }
+        window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+        /* best-effort: ignore storage failures (private mode, quota, jsdom) */
+    }
+};
+
+/** Replicates `$tgStorage.remove(key)`. Best-effort. */
+const removeStorageKey = (key: string): void => {
+    try {
+        if (typeof window === "undefined" || window.localStorage == null) {
+            return;
+        }
+        window.localStorage.removeItem(key);
+    } catch {
+        /* best-effort: ignore storage failures */
+    }
+};
+
+/**
+ * Persist a freshly issued JWT bearer token to the shared localStorage["token"],
+ * JSON-encoded to match `$tgStorage.set` so AngularJS reads it back verbatim.
+ */
+export const setToken = (token: string): void => writeStorageString("token", token);
+
+/** Persist a rotated refresh token to the shared localStorage["refresh"]. */
+export const setRefreshToken = (token: string): void => writeStorageString("refresh", token);
+
+/**
+ * Clear the shared session, mirroring AngularJS `removeUser()` + refresh removal
+ * (app.coffee L629-630, L642): drop the access token, the cached user info, and
+ * the refresh token. Called when a 401 cannot be recovered, immediately before
+ * redirecting to the login screen.
+ */
+export const clearSession = (): void => {
+    removeStorageKey("token");
+    removeStorageKey("userInfo");
+    removeStorageKey("refresh");
+};

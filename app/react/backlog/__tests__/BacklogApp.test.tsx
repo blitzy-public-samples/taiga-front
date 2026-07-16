@@ -40,6 +40,7 @@ import type { BurndownProps } from "../Burndown";
 import type { SprintListProps } from "../SprintList";
 import type { SprintEditLightboxProps } from "../SprintEditLightbox";
 import type { BulkUserStoriesLightboxProps } from "../BulkUserStoriesLightbox";
+import type { UserStoryEditLightboxProps } from "../UserStoryEditLightbox";
 import type {
     DndProviderProps,
     NormalizedDragEnd,
@@ -47,15 +48,31 @@ import type {
     DropNeighbors,
 } from "../../shared/dnd/DndProvider";
 
-import { httpGet, httpPatch, httpDelete, HttpError } from "../../shared/api/httpClient";
+import {
+    httpGet,
+    httpPatch,
+    httpDelete,
+    httpPut,
+    httpPost,
+    HttpError,
+} from "../../shared/api/httpClient";
+import { storageHash } from "../../shared/api/userStorage";
 import { list as listMilestones } from "../../shared/api/milestones";
 import {
     filtersData,
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
+    bulkCreate,
 } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
 import { createBacklogPersister, isDragEnabled } from "../../shared/dnd/DndProvider";
+// REAL modules (NOT mocked) — the same instances BacklogApp wires into, so the
+// test can drive the installed interceptor hooks and inspect the bus ([ERR-1/2]).
+import { getInterceptorHooks, resetInterceptorHooks } from "../../shared/api/httpInterceptor";
+import {
+    clearNotificationListeners,
+    subscribeNotifications,
+} from "../../shared/notifications/notificationCenter";
 
 /* -------------------------------------------------------------------------- */
 /* Module mocks — ALL of ../shared/** plus the presentational children.        */
@@ -85,6 +102,7 @@ interface Captured {
     sprintListProps: SprintListProps | null;
     sprintEditProps: SprintEditLightboxProps | null;
     bulkProps: BulkUserStoriesLightboxProps | null;
+    userStoryEditProps: UserStoryEditLightboxProps | null;
     burndownProps: BurndownProps | null;
 }
 const mockCaptured: Captured = {
@@ -93,6 +111,7 @@ const mockCaptured: Captured = {
     sprintListProps: null,
     sprintEditProps: null,
     bulkProps: null,
+    userStoryEditProps: null,
     burndownProps: null,
 };
 
@@ -224,6 +243,14 @@ jest.mock("../BulkUserStoriesLightbox", () => ({
     },
 }));
 
+jest.mock("../UserStoryEditLightbox", () => ({
+    __esModule: true,
+    UserStoryEditLightbox: (props: UserStoryEditLightboxProps) => {
+        mockCaptured.userStoryEditProps = props;
+        return null;
+    },
+}));
+
 /* -------------------------------------------------------------------------- */
 /* Typed handles to the mocked functions                                       */
 /* -------------------------------------------------------------------------- */
@@ -235,10 +262,13 @@ type AsyncMock = jest.MockedFunction<(...args: readonly unknown[]) => Promise<un
 const mockHttpGet = httpGet as unknown as AsyncMock;
 const mockHttpPatch = httpPatch as unknown as AsyncMock;
 const mockHttpDelete = httpDelete as unknown as AsyncMock;
+const mockHttpPut = httpPut as unknown as AsyncMock;
+const mockHttpPost = httpPost as unknown as AsyncMock;
 const mockListMilestones = listMilestones as unknown as AsyncMock;
 const mockFiltersData = filtersData as unknown as AsyncMock;
 const mockBulkUpdateBacklogOrder = bulkUpdateBacklogOrder as unknown as AsyncMock;
 const mockBulkUpdateMilestone = bulkUpdateMilestone as unknown as AsyncMock;
+const mockBulkCreate = bulkCreate as unknown as AsyncMock;
 const mockCreateEventsClient = jest.mocked(createEventsClient);
 const mockCreateBacklogPersister = createBacklogPersister as unknown as jest.Mock;
 const mockIsDragEnabled = isDragEnabled as unknown as jest.Mock;
@@ -354,6 +384,11 @@ function installHappyHttp(): void {
         if (path === `projects/${PROJECT_ID}`) {
             return Promise.resolve(mkRes(currentProject));
         }
+        // URL-slug fallback resolution (QA #1): `GET projects/by_slug?slug=...`
+        // returns the full project, exactly like `projects/{id}`.
+        if (path === "projects/by_slug") {
+            return Promise.resolve(mkRes(currentProject));
+        }
         if (path === "userstories") {
             return Promise.resolve(mkRes(currentUserstories, currentUsHeaders));
         }
@@ -365,6 +400,9 @@ function installHappyHttp(): void {
         return Promise.resolve(mkRes(makeUs({ ...body, id: 1000 })));
     });
     mockHttpDelete.mockImplementation(() => Promise.resolve(mkRes(undefined)));
+    // user-storage writes (custom filters, QA [J]) resolve happily by default.
+    mockHttpPut.mockImplementation(() => Promise.resolve(mkRes(undefined)));
+    mockHttpPost.mockImplementation(() => Promise.resolve(mkRes(undefined)));
     mockListMilestones.mockImplementation((...args: readonly unknown[]) => {
         const filters = (args[1] ?? {}) as { closed?: boolean };
         if (filters.closed) {
@@ -407,6 +445,7 @@ beforeEach(() => {
     mockCaptured.sprintListProps = null;
     mockCaptured.sprintEditProps = null;
     mockCaptured.bulkProps = null;
+    mockCaptured.userStoryEditProps = null;
     mockCaptured.burndownProps = null;
     installHappyHttp();
     // `clearMocks:true` resets call history but NOT implementations, so a test
@@ -467,6 +506,91 @@ test("renders the neutral loading shell (no crash) while projectId is NaN", () =
     expect(main).not.toBeNull();
     // No board content while the id is unresolved.
     expect(container.querySelector(".backlog-table")).toBeNull();
+});
+
+/* ========================================================================== */
+/* (a2) Project-id validity, URL-slug fallback, error-state reset (QA #1)      */
+/* ========================================================================== */
+
+test("treats projectId 0 as unresolved — never issues GET /projects/0 (QA #1)", async () => {
+    // An empty `data-project-id` interpolates to `Number("") === 0`. Zero is NOT
+    // a valid id and must never reach the network (the original defect issued
+    // `GET /projects/0` → 404). With no URL slug (jsdom's default "/" path)
+    // there is nothing to resolve, so no request is made.
+    const { container } = render(<BacklogApp projectId={0} projectSlug="my-project" />);
+
+    await act(async () => {
+        await Promise.resolve();
+    });
+
+    expect(mockHttpGet).not.toHaveBeenCalled();
+    expect(countGet((p) => p === "projects/0")).toBe(0);
+    expect(container.querySelector("main.main.scrum")).not.toBeNull();
+    expect(container.querySelector(".backlog-table")).toBeNull();
+});
+
+test("resolves the project from the URL slug via projects/by_slug when the prop id is unusable (QA #1)", async () => {
+    // Production reality: the migrated shell never interpolates a usable id, so
+    // the prop is NaN; the real slug lives in the route URL (/project/:pslug/…).
+    const original = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(null, "", "/project/my-project/backlog");
+    try {
+        const { container } = render(
+            <BacklogApp projectId={Number.NaN} projectSlug="" />,
+        );
+
+        // The board loads fully off the slug-resolved id — never GET /projects/0.
+        await waitFor(() => expect(container.querySelector(".backlog")).not.toBeNull());
+
+        // Resolution went through the by_slug endpoint with the URL slug…
+        expect(mockHttpGet).toHaveBeenCalledWith("projects/by_slug", { slug: "my-project" });
+        // …and NEVER through the invalid ids 0 / NaN.
+        expect(countGet((p) => p === "projects/0")).toBe(0);
+        expect(countGet((p) => p === "projects/NaN")).toBe(0);
+        // Downstream loaders keyed off the RESOLVED id (PROJECT_ID = 5).
+        expect(countGet((p) => p === `projects/${PROJECT_ID}/stats`)).toBeGreaterThan(0);
+        expect(mockListMilestones).toHaveBeenCalledWith(PROJECT_ID, { closed: false });
+        expect(mockEventsClient.subscribe).toHaveBeenCalledWith(
+            `changes.project.${PROJECT_ID}.userstories`,
+            expect.any(Function),
+        );
+    } finally {
+        window.history.replaceState(null, "", original);
+    }
+});
+
+test("[ERR-3] clears a stale permission-denied when the project changes to an accessible one", async () => {
+    // First project (id 5) is blocked (403) → permission-denied. A subsequent
+    // load of an accessible project must reset the stale gate state at the START
+    // of loadProject so the board renders instead of staying denied.
+    mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+        const path = String(args[0]);
+        if (path === `projects/${PROJECT_ID}`) {
+            return Promise.reject(new HttpError(403, "Forbidden", null, "projects/5"));
+        }
+        if (path === "projects/6") {
+            return Promise.resolve(mkRes(makeProject({ id: 6, slug: "other" })));
+        }
+        if (path.includes("/stats")) {
+            return Promise.resolve(mkRes(currentStats));
+        }
+        if (path === "userstories") {
+            return Promise.resolve(mkRes(currentUserstories, currentUsHeaders));
+        }
+        return Promise.resolve(mkRes({}));
+    });
+
+    const { container, rerender } = render(
+        <BacklogApp projectId={PROJECT_ID} projectSlug="my-project" />,
+    );
+    await waitFor(() =>
+        expect(container.querySelector(".permission-denied")).not.toBeNull(),
+    );
+
+    // Switch to an accessible project (id 6).
+    rerender(<BacklogApp projectId={6} projectSlug="other" />);
+    await waitFor(() => expect(container.querySelector(".backlog")).not.toBeNull());
+    expect(container.querySelector(".permission-denied")).toBeNull();
 });
 
 /* ========================================================================== */
@@ -717,13 +841,22 @@ test("onChangePoints PATCHes merged { points, version } and reloads stats", asyn
 });
 
 /* ========================================================================== */
-/* (e) broadcastToAngular is a no-op when window.angular is undefined          */
+/* (e) [#2] Edit entry point opens the React-owned UserStoryEditLightbox        */
 /* ========================================================================== */
 
-test("edit action does not throw when window.angular is undefined", async () => {
+// The migrated backlog.jade removed the Angular `tg-lb-create-edit` host, so the
+// old `broadcastToAngular("genericform:edit")` bridge was a dead no-op (QA #2).
+// The row-kebab "Edit" action now opens `UserStoryEditLightbox` in edit mode
+// seeded with the target story. These assertions encode that new contract
+// (rule D1: tests conform to the design, not vice-versa).
+
+test("edit action opens the React edit lightbox and does not PATCH by itself", async () => {
     await renderApp();
     const props = mockCaptured.backlogTableProps;
     expect(props).not.toBeNull();
+
+    // The lightbox starts closed.
+    expect(mockCaptured.userStoryEditProps?.open).toBe(false);
 
     expect(() => {
         act(() => {
@@ -731,43 +864,53 @@ test("edit action does not throw when window.angular is undefined", async () => 
         });
     }).not.toThrow();
 
+    // Merely opening the editor must not fire a PATCH — persistence happens only
+    // when the user saves (asserted by the create/edit persistence tests below).
     expect(mockHttpPatch).not.toHaveBeenCalled();
 });
 
-test("edit action broadcasts through the Angular injector when present", async () => {
+test("edit action opens the lightbox in edit mode seeded with the target story", async () => {
     await renderApp();
-    const broadcast = jest.fn();
-    const applyAsync = jest.fn();
-    (window as unknown as { angular?: unknown }).angular = {
-        element: () => ({
-            injector: () => ({
-                get: () => ({ $broadcast: broadcast, $applyAsync: applyAsync }),
-            }),
-        }),
-    };
 
     await act(async () => {
         mockCaptured.backlogTableProps?.actions.onEditUserStory(makeUs({ id: 7 }));
     });
 
-    expect(broadcast).toHaveBeenCalledWith(
-        "genericform:edit",
-        expect.objectContaining({ objType: "us" }),
-    );
-    expect(applyAsync).toHaveBeenCalled();
+    const usProps = mockCaptured.userStoryEditProps;
+    expect(usProps?.open).toBe(true);
+    expect(usProps?.mode).toBe("edit");
+    expect(usProps?.us?.id).toBe(7);
+    // The bulk lightbox must stay closed — the two are independent.
+    expect(mockCaptured.bulkProps?.open).toBe(false);
 });
 
 /* ========================================================================== */
 /* Delete user story: confirm + DELETE + reload; restore on failure           */
 /* ========================================================================== */
 
-test("onDeleteUserStory confirms, DELETEs, and reloads stats + sprints", async () => {
-    const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
+// [H] The delete confirmation is the themed ConfirmDialog (.lightbox-generic-delete),
+// NOT the native window.confirm. `onDeleteUserStory` OPENS the dialog; the DELETE
+// only runs after the dialog's confirm (.js-confirm) button is clicked.
+function openDeleteDialog(us: UserStory): HTMLElement {
+    act(() => {
+        mockCaptured.backlogTableProps?.actions.onDeleteUserStory(us);
+    });
+    const dialog = document.querySelector(".lightbox-generic-delete.open") as HTMLElement | null;
+    expect(dialog).not.toBeNull();
+    return dialog as HTMLElement;
+}
+
+test("onDeleteUserStory confirms via the themed dialog, DELETEs, and reloads stats + sprints", async () => {
     await renderApp();
     const sprintsBefore = mockListMilestones.mock.calls.length;
 
+    // Opening the delete flow shows the ConfirmDialog; no DELETE has fired yet.
+    const dialog = openDeleteDialog(makeUs({ id: 1000 }));
+    expect(mockHttpDelete).not.toHaveBeenCalled();
+
+    // Confirm → the DELETE runs.
     await act(async () => {
-        mockCaptured.backlogTableProps?.actions.onDeleteUserStory(makeUs({ id: 1000 }));
+        fireEvent.click(dialog.querySelector(".js-confirm") as HTMLElement);
         await Promise.resolve();
     });
 
@@ -777,32 +920,33 @@ test("onDeleteUserStory confirms, DELETEs, and reloads stats + sprints", async (
     await waitFor(() =>
         expect(mockListMilestones.mock.calls.length).toBeGreaterThan(sprintsBefore),
     );
-    confirmSpy.mockRestore();
 });
 
-test("onDeleteUserStory is a no-op when the confirm dialog is dismissed", async () => {
-    const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(false);
+test("onDeleteUserStory is a no-op when the confirm dialog is cancelled", async () => {
     await renderApp();
 
+    const dialog = openDeleteDialog(makeUs({ id: 1000 }));
+
+    // Cancel → dialog closes, nothing is deleted.
     await act(async () => {
-        mockCaptured.backlogTableProps?.actions.onDeleteUserStory(makeUs({ id: 1000 }));
+        fireEvent.click(dialog.querySelector(".js-cancel") as HTMLElement);
         await Promise.resolve();
     });
 
     expect(mockHttpDelete).not.toHaveBeenCalled();
-    confirmSpy.mockRestore();
+    expect(document.querySelector(".lightbox-generic-delete.open")).toBeNull();
 });
 
 test("onDeleteUserStory restores the story when the DELETE fails", async () => {
-    const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     await renderApp();
     mockHttpDelete.mockImplementation(() =>
         Promise.reject(new HttpError(500, "Server Error", null, "userstories/1000")),
     );
 
+    const dialog = openDeleteDialog(makeUs({ id: 1000 }));
     await act(async () => {
-        mockCaptured.backlogTableProps?.actions.onDeleteUserStory(makeUs({ id: 1000 }));
+        fireEvent.click(dialog.querySelector(".js-confirm") as HTMLElement);
         await Promise.resolve();
     });
 
@@ -813,7 +957,6 @@ test("onDeleteUserStory restores the story when the DELETE fails", async () => {
             mockCaptured.backlogTableProps?.userstories.some((u) => u.id === 1000),
         ).toBe(true),
     );
-    confirmSpy.mockRestore();
     errSpy.mockRestore();
 });
 
@@ -840,36 +983,23 @@ test("onMoveToTop reorders via bulkUpdateBacklogOrder(project, null, null, nextU
 /* Add user story (standard / bulk) + lightboxes                              */
 /* ========================================================================== */
 
-test("clicking Add broadcasts a standard create and does NOT open the bulk lightbox", async () => {
+test("clicking Add opens the React create lightbox and does NOT open the bulk lightbox", async () => {
     const { container } = await renderApp();
 
-    // F-M2: install an Angular injector spy BEFORE the click so the standard
-    // "Add" path is asserted at the bridge level. `broadcastToAngular` reads
-    // `window.angular` at call time (see the edit-broadcast test above), and
-    // beforeEach() deletes it, so this stays local to this test.
-    const broadcast = jest.fn();
-    const applyAsync = jest.fn();
-    (window as unknown as { angular?: unknown }).angular = {
-        element: () => ({
-            injector: () => ({
-                get: () => ({ $broadcast: broadcast, $applyAsync: applyAsync }),
-            }),
-        }),
-    };
-
+    // [#2] The header "+ ADD" standard-create path now opens the React-owned
+    // `UserStoryEditLightbox` in "create" mode (the old `genericform:new`
+    // broadcast targeted an Angular host removed by the migrated backlog.jade).
+    // Assert the create lightbox opens AND the bulk lightbox stays closed — the
+    // two "Add" affordances are independent.
     await act(async () => {
         fireEvent.click(container.querySelector(".new-us .btn-small") as HTMLElement);
     });
 
-    // Assert the broadcast NAME + payload — not merely that the React bulk
-    // lightbox stayed closed. A mutation renaming "genericform:new" (or routing
-    // "standard" into the bulk path) would leave `bulkProps.open === false`
-    // and thus survive the old assertion; it now fails here.
-    expect(broadcast).toHaveBeenCalledWith(
-        "genericform:new",
-        expect.objectContaining({ objType: "us" }),
-    );
-    expect(applyAsync).toHaveBeenCalled();
+    const usProps = mockCaptured.userStoryEditProps;
+    expect(usProps?.open).toBe(true);
+    expect(usProps?.mode).toBe("create");
+    // No pre-existing story is seeded in create mode.
+    expect(usProps?.us == null).toBe(true);
     expect(mockCaptured.bulkProps?.open).toBe(false);
 });
 
@@ -915,6 +1045,158 @@ test("onBulkCreated with position 'bottom' reloads without a top reorder", async
 
     await waitFor(() => expect(mockCaptured.bulkProps?.open).toBe(false));
     expect(mockBulkUpdateBacklogOrder).not.toHaveBeenCalled();
+});
+
+/* ========================================================================== */
+/* [#2] Single user-story create/edit persistence (UserStoryEditLightbox)      */
+/* ========================================================================== */
+
+// These exercise the `onCreate` / `onEdit` contract callbacks that BacklogApp
+// hands to `UserStoryEditLightbox`. They prove the round-trip that jsdom's
+// runtime cannot: create -> POST bulk_create (+ optional follow-up PATCH) ->
+// backlog re-read; edit -> PATCH userstories/{id} -> stats + backlog re-read.
+
+test("onCreate (no points/assignee) POSTs bulk_create with subject+status and reloads", async () => {
+    await renderApp();
+    // bulk_create returns the freshly created story so `onBulkCreated` has data.
+    mockBulkCreate.mockImplementationOnce(() =>
+        Promise.resolve(mkRes([makeUs({ id: 2000, subject: "Fresh", version: 1 })])),
+    );
+    const usBefore = countGet((p) => p === "userstories");
+
+    await act(async () => {
+        await mockCaptured.userStoryEditProps?.onCreate({
+            subject: "Fresh",
+            statusId: 1,
+            points: {},
+            assignedTo: null,
+            position: "bottom",
+        });
+    });
+
+    // subject + status carried by bulk_create; swimlane is null on the backlog.
+    expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "Fresh", null);
+    // No points/assignee => no follow-up PATCH.
+    expect(mockHttpPatch).not.toHaveBeenCalled();
+    // Backlog re-read (onBulkCreated).
+    await waitFor(() =>
+        expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
+    );
+});
+
+test("onCreate with points/assignee issues a follow-up PATCH on the new story", async () => {
+    await renderApp();
+    mockBulkCreate.mockImplementationOnce(() =>
+        Promise.resolve(mkRes([makeUs({ id: 2001, subject: "WithMeta", version: 4 })])),
+    );
+
+    await act(async () => {
+        await mockCaptured.userStoryEditProps?.onCreate({
+            subject: "WithMeta",
+            statusId: 1,
+            points: { "1": 11 },
+            assignedTo: 42,
+            position: "bottom",
+        });
+    });
+
+    expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "WithMeta", null);
+    // Follow-up PATCH persists points + assignee against the created story's id,
+    // carrying the created story's version for optimistic concurrency.
+    await waitFor(() =>
+        expect(mockHttpPatch).toHaveBeenCalledWith("userstories/2001", {
+            points: { "1": 11 },
+            assigned_to: 42,
+            version: 4,
+        }),
+    );
+});
+
+test("onCreate with position 'top' reorders the new story to the top", async () => {
+    await renderApp();
+    mockBulkCreate.mockImplementationOnce(() =>
+        Promise.resolve(mkRes([makeUs({ id: 2002, subject: "TopStory", version: 1 })])),
+    );
+
+    await act(async () => {
+        await mockCaptured.userStoryEditProps?.onCreate({
+            subject: "TopStory",
+            statusId: 1,
+            points: {},
+            assignedTo: null,
+            position: "top",
+        });
+    });
+
+    await waitFor(() =>
+        expect(mockBulkUpdateBacklogOrder).toHaveBeenCalledWith(
+            PROJECT_ID,
+            null,
+            null,
+            1000,
+            [2002],
+        ),
+    );
+});
+
+test("onEdit PATCHes userstories/{id} with the changed fields + version and reloads", async () => {
+    await renderApp();
+    const statsBefore = countGet((p) => p.includes("/stats"));
+    const usBefore = countGet((p) => p === "userstories");
+
+    await act(async () => {
+        await mockCaptured.userStoryEditProps?.onEdit(makeUs({ id: 1000, version: 7 }), {
+            subject: "Edited subject",
+            status: 101,
+            points: { "1": 11 },
+            assigned_to: 42,
+        });
+    });
+
+    expect(mockHttpPatch).toHaveBeenCalledWith("userstories/1000", {
+        subject: "Edited subject",
+        status: 101,
+        points: { "1": 11 },
+        assigned_to: 42,
+        version: 7,
+    });
+    await waitFor(() =>
+        expect(countGet((p) => p.includes("/stats"))).toBeGreaterThan(statsBefore),
+    );
+    await waitFor(() =>
+        expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
+    );
+});
+
+test("onEdit reloads the backlog and rethrows on a 409 version conflict", async () => {
+    await renderApp();
+    mockHttpPatch.mockImplementation(() =>
+        Promise.reject(new HttpError(409, "Conflict", null, "userstories/1000")),
+    );
+    const usBefore = countGet((p) => p === "userstories");
+
+    // Capture the rejection AS A VALUE inside act() so the internal reload's
+    // state updates settle within act (rethrowing straight out of act trips
+    // React's "not configured to support act(...)" guard). The lightbox keeps
+    // itself open on failure, so `onEdit` must still reject.
+    let caught: unknown;
+    await act(async () => {
+        caught = await mockCaptured.userStoryEditProps
+            ?.onEdit(makeUs({ id: 1000 }), {
+                subject: "Conflicting",
+                status: 101,
+                points: {},
+                assigned_to: null,
+            })
+            .then(() => undefined)
+            .catch((err: unknown) => err);
+    });
+    expect(caught).toBeInstanceOf(HttpError);
+
+    // A 409 triggers a fresh backlog re-read to pick up newer versions.
+    await waitFor(() =>
+        expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
+    );
 });
 
 /* ========================================================================== */
@@ -1011,6 +1293,21 @@ test("closing the sprint / bulk lightboxes flips their open flag back to false",
 /* Filters / search / toggles                                                 */
 /* ========================================================================== */
 
+/**
+ * Expand the collapsible filter category whose header title matches `title`
+ * (QA finding [L]: categories start collapsed, one open at a time). Returns the
+ * category `<li>` so callers can query its now-visible option list.
+ */
+async function expandCategory(container: HTMLElement, title: string): Promise<HTMLElement> {
+    const header = Array.from(
+        container.querySelectorAll(".filters-cat-single"),
+    ).find((el) => el.querySelector(".title")?.textContent === title) as HTMLElement;
+    await act(async () => {
+        fireEvent.click(header);
+    });
+    return header.closest("li") as HTMLElement;
+}
+
 test("toggling filters reveals the filter panel and expands the manager", async () => {
     currentFiltersData = {
         statuses: [{ id: 1, name: "New", color: "#ffcc00", count: 2 }],
@@ -1029,8 +1326,10 @@ test("toggling filters reveals the filter panel and expands the manager", async 
     await waitFor(() =>
         expect(container.querySelector("#backlog-filter")).not.toBeNull(),
     );
-    // The Status + Tags categories were built from the filters payload.
-    expect(container.querySelectorAll(".filter-category").length).toBeGreaterThanOrEqual(2);
+    // The Status + Tags categories were built (one collapsible header each), and
+    // [L] every category starts collapsed (no option list rendered yet).
+    expect(container.querySelectorAll(".filters-cat-single").length).toBeGreaterThanOrEqual(2);
+    expect(container.querySelector(".filter-list")).toBeNull();
     expect(container.querySelector(".backlog-manager.expanded")).toBeNull();
 });
 
@@ -1045,8 +1344,10 @@ test("selecting a filter reloads the backlog with the query param and shows the 
     });
     await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
 
+    // [L] Expand the Status category, then pick the option.
+    await expandCategory(container, "Status");
     await act(async () => {
-        fireEvent.click(container.querySelector(".filter-name") as HTMLElement);
+        fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
     });
 
     // The reload carried `status=7`, and the selected-filter badge appears.
@@ -1075,17 +1376,23 @@ test("removing a selected filter clears it and reloads without the param", async
     });
     await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
 
-    // Add, then remove via the applied-filter chip.
+    // Expand + add, then remove via the applied-filter chip's remove button. The
+    // chip appears in the "included" group (QA finding [K]).
+    await expandCategory(container, "Status");
     await act(async () => {
-        fireEvent.click(container.querySelector(".filter-name") as HTMLElement);
+        fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
     });
     await waitFor(() =>
-        expect(container.querySelector(".filters-applied .filter-applied")).not.toBeNull(),
+        expect(
+            container.querySelector(".filters-applied .filters-included .single-applied-filter"),
+        ).not.toBeNull(),
     );
 
     await act(async () => {
         fireEvent.click(
-            container.querySelector(".filters-applied .filter-applied") as HTMLElement,
+            container.querySelector(
+                ".filters-applied .single-applied-filter .remove-filter",
+            ) as HTMLElement,
         );
     });
 
@@ -1238,6 +1545,32 @@ test("move-to-sprint is a no-op when no rows are checked", async () => {
     });
 
     expect(mockBulkUpdateMilestone).not.toHaveBeenCalled();
+});
+
+test("[M] reveals the move-to-sprint button (display:flex) only once a row is checked", async () => {
+    // Default fixtures: one story (ref 1) + one open (past) sprint -> the
+    // move-to-latest variant is the one rendered.
+    const { container } = await renderApp();
+
+    // `.btn-filter.move-to-sprint` has a hard `display:none` base in the compiled
+    // CSS; with nothing selected the button must carry an inline `display:none`.
+    const before = container.querySelector("#move-to-latest-sprint") as HTMLElement;
+    expect(before).not.toBeNull();
+    expect(before).toHaveStyle({ display: "none" });
+
+    // Checking a story flips the inline display to flex — this mirrors the
+    // AngularJS `checkSelected()` `moveToSprintDom.css('display','flex')` behavior,
+    // gated on there being at least one open sprint to move into.
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(1, true, false);
+    });
+    expect(container.querySelector("#move-to-latest-sprint")).toHaveStyle({ display: "flex" });
+
+    // Unchecking hides it again.
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(1, false, false);
+    });
+    expect(container.querySelector("#move-to-latest-sprint")).toHaveStyle({ display: "none" });
 });
 
 test("move-to-current sprint targets the sprint spanning today", async () => {
@@ -1450,6 +1783,80 @@ test("resolveDrop over another row lands at that row's index", async () => {
     expect(resolved?.orderedIds[0]).toBe(3000);
 });
 
+test("[N] a same-container DOWNWARD drop over the adjacent row moves down ONE slot (not a no-op)", async () => {
+    // Regression guard for the single-step keyboard/pointer reorder fix. Dragging
+    // the FIRST row (1000, index 0) DOWN over the immediately-following row
+    // (2000, index 1) previously no-oped: filtering 1000 out of the id list
+    // shifted 2000 to index 0, so "insert before 2000" resolved back to the
+    // drag's original slot. The fix lands the item AFTER the over-row for
+    // downward same-container moves (canonical dnd-kit arrayMove semantics).
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+    const resolve = mockCaptured.dndProps?.resolveDrop;
+
+    const resolved = resolve?.(dragEnd(1000, 2000)) ?? null;
+    // A genuine move (NOT null / no-op).
+    expect(resolved).not.toBeNull();
+    expect(resolved?.origin.containerKey).toBe("backlog");
+    expect(resolved?.target.containerKey).toBe("backlog");
+    // 1000 landed immediately AFTER 2000 — exactly one slot down.
+    expect(resolved?.orderedIds).toEqual([2000, 1000, 3000]);
+    expect(resolved?.target.index).toBe(1);
+});
+
+test("[N] a same-container DOWNWARD drop over a lower non-adjacent row lands AFTER it", async () => {
+    // Dragging the first row (1000) DOWN over the LAST row (3000) lands 1000
+    // after 3000 (i.e. at the end) — arrayMove(0 -> 2) semantics, one slot per
+    // crossed row, symmetric with the pointer path.
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+    const resolve = mockCaptured.dndProps?.resolveDrop;
+
+    const resolved = resolve?.(dragEnd(1000, 3000)) ?? null;
+    expect(resolved).not.toBeNull();
+    expect(resolved?.orderedIds).toEqual([2000, 3000, 1000]);
+    expect(resolved?.target.index).toBe(2);
+});
+
+test("[N] downward single-step persists after=<over-row>, before=null via the backlog order endpoint", async () => {
+    // End-to-end: a single-ArrowDown reorder (1000 over 2000) must PERSIST with
+    // the correct neighbor mapping (previous -> afterUserstoryId). Before the fix
+    // no request fired at all because the drop resolved to a no-op.
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+    const dnd = mockCaptured.dndProps;
+    const resolved = dnd?.resolveDrop(dragEnd(1000, 2000)) ?? null;
+    expect(resolved).not.toBeNull();
+
+    // Neighbors the provider derives for target.index === 1 in [2000,1000,3000]:
+    // previous (scanning back) = 2000, next = null.
+    await act(async () => {
+        await dnd?.persist(resolved as ResolvedDrop, { previous: 2000, next: null });
+    });
+
+    expect(mockPersister).toHaveBeenCalledWith({
+        milestoneId: null,
+        afterUserstoryId: 2000,
+        beforeUserstoryId: null,
+        bulkUserstories: [1000],
+    });
+});
+
 test("builds all six filter categories (null-id assignees/roles, epics with & without id)", async () => {
     currentFiltersData = {
         statuses: [{ id: 1, name: "New", color: "#fff", count: 2 }],
@@ -1475,14 +1882,336 @@ test("builds all six filter categories (null-id assignees/roles, epics with & wi
     });
     await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
 
-    // All six categories present.
-    expect(container.querySelectorAll(".filter-category").length).toBe(6);
-    // Null-id assignee/role -> "Unassigned"; epic without id -> "Not in an epic".
-    const text = container.querySelector("#backlog-filter")?.textContent ?? "";
-    expect(text).toContain("Unassigned");
-    expect(text).toContain("Not in an epic");
-    expect(text).toContain("Bob");
-    expect(text).toContain("#12 Epic A");
+    // All six category headers present (one collapsible `.filters-cat-single` each).
+    expect(container.querySelectorAll(".filters-cat-single").length).toBe(6);
+    const titles = Array.from(container.querySelectorAll(".filters-cat-single .title")).map(
+        (el) => el.textContent,
+    );
+    expect(titles).toEqual(["Status", "Tags", "Assigned to", "Role", "Created by", "Epic"]);
+
+    // [L] Expand each relevant category to inspect its built options:
+    // null-id assignee/role -> "Unassigned"; epic without id -> "Not in an epic".
+    const assigned = await expandCategory(container, "Assigned to");
+    expect(assigned.textContent).toContain("Unassigned");
+    const role = await expandCategory(container, "Role");
+    expect(role.textContent).toContain("Unassigned");
+    const createdBy = await expandCategory(container, "Created by");
+    expect(createdBy.textContent).toContain("Bob");
+    const epic = await expandCategory(container, "Epic");
+    expect(epic.textContent).toContain("Not in an epic");
+    expect(epic.textContent).toContain("#12 Epic A");
+});
+
+/* -------------------------------------------------------------------------- */
+/* [L] Collapsible categories — single-open accordion                          */
+/* -------------------------------------------------------------------------- */
+
+test("[L] filter categories are a single-open accordion (opening one collapses the previous)", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+        tags: [{ name: "urgent", color: "#f00", count: 1 }],
+    };
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+
+    // Every category starts collapsed (FilterController.opened = null).
+    expect(container.querySelector(".filter-list")).toBeNull();
+
+    // Open Status → exactly one option list renders, under Status.
+    const statusLi = await expandCategory(container, "Status");
+    expect(statusLi.querySelector(".filter-list")).not.toBeNull();
+    expect(container.querySelectorAll(".filter-list").length).toBe(1);
+
+    // Open Tags → Status collapses (single-open), Tags now carries the list.
+    const tagsLi = await expandCategory(container, "Tags");
+    expect(tagsLi.querySelector(".filter-list")).not.toBeNull();
+    expect(statusLi.querySelector(".filter-list")).toBeNull();
+    expect(container.querySelectorAll(".filter-list").length).toBe(1);
+
+    // Re-click Tags → fully collapsed again.
+    await expandCategory(container, "Tags");
+    expect(container.querySelector(".filter-list")).toBeNull();
+});
+
+/* -------------------------------------------------------------------------- */
+/* [K] Include / Exclude mode                                                  */
+/* -------------------------------------------------------------------------- */
+
+test("[K] selecting a filter in Exclude mode builds an exclude_ query param and an 'Excluded' chip", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+    };
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+
+    // Switch to Exclude mode (QA finding [K]: React previously offered include only).
+    await act(async () => {
+        fireEvent.click(container.querySelector("#filter-mode-exclude") as HTMLElement);
+    });
+
+    // Expand Status + pick the option.
+    await expandCategory(container, "Status");
+    await act(async () => {
+        fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
+    });
+
+    // The reload carried `exclude_status=7` (NOT the plain `status` key).
+    await waitFor(() =>
+        expect(
+            mockHttpGet.mock.calls.some(
+                (c) =>
+                    String(c[0]) === "userstories" &&
+                    (c[1] as Record<string, unknown>)?.exclude_status === "7",
+            ),
+        ).toBe(true),
+    );
+    expect(
+        mockHttpGet.mock.calls.some(
+            (c) =>
+                String(c[0]) === "userstories" &&
+                (c[1] as Record<string, unknown>)?.status !== undefined,
+        ),
+    ).toBe(false);
+
+    // The applied chip appears in the "Excluded" group, not the "included" group.
+    await waitFor(() =>
+        expect(
+            container.querySelector(
+                ".filters-applied .filters-excluded .single-applied-filter",
+            ),
+        ).not.toBeNull(),
+    );
+    expect(container.querySelector(".filters-applied .filters-included")).toBeNull();
+});
+
+/* -------------------------------------------------------------------------- */
+/* [J] Custom (saved) filters — save / apply / delete via /user-storage        */
+/* -------------------------------------------------------------------------- */
+
+test("[J] saving a custom filter PUTs the selection to /user-storage and lists it", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+    };
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+
+    // "Add" is disabled until something is selected.
+    expect(
+        (container.querySelector(".add-custom-filter") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    // Select a Status filter, then the Add affordance enables.
+    await expandCategory(container, "Status");
+    await act(async () => {
+        fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
+    });
+    await waitFor(() =>
+        expect(
+            (container.querySelector(".add-custom-filter") as HTMLButtonElement).disabled,
+        ).toBe(false),
+    );
+
+    // Open the name form, type a name, submit.
+    await act(async () => {
+        fireEvent.click(container.querySelector(".add-custom-filter") as HTMLElement);
+    });
+    const input = container.querySelector(".e2e-filter-name-input") as HTMLInputElement;
+    await act(async () => {
+        fireEvent.change(input, { target: { value: "My work" } });
+    });
+    await act(async () => {
+        fireEvent.submit(container.querySelector(".custom-filters-add-form") as HTMLElement);
+    });
+
+    // storeFilters PUT the whole map to /user-storage/{hash} with the selection.
+    const hash = storageHash(PROJECT_ID, "backlog-custom-filters");
+    await waitFor(() =>
+        expect(
+            mockHttpPut.mock.calls.some((c) => String(c[0]) === `user-storage/${hash}`),
+        ).toBe(true),
+    );
+    const putCall = mockHttpPut.mock.calls.find(
+        (c) => String(c[0]) === `user-storage/${hash}`,
+    );
+    expect(putCall?.[1]).toEqual({ key: hash, value: { "My work": { status: "7" } } });
+
+    // The saved filter is now listed under "Custom filters".
+    await waitFor(() =>
+        expect(container.querySelector(".single-filter-type-custom")).not.toBeNull(),
+    );
+    expect(container.querySelector(".custom-filter-list")?.textContent).toContain("My work");
+});
+
+test("[J] rejects a blank or duplicate custom-filter name without persisting", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+    };
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+
+    await expandCategory(container, "Status");
+    await act(async () => {
+        fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
+    });
+    await waitFor(() =>
+        expect(
+            (container.querySelector(".add-custom-filter") as HTMLButtonElement).disabled,
+        ).toBe(false),
+    );
+    await act(async () => {
+        fireEvent.click(container.querySelector(".add-custom-filter") as HTMLElement);
+    });
+
+    // Submit with an empty name → length-zero error, nothing persisted.
+    await act(async () => {
+        fireEvent.submit(container.querySelector(".custom-filters-add-form") as HTMLElement);
+    });
+    expect(container.querySelector(".error-text")?.textContent).toContain(
+        "Please add a filter name",
+    );
+    expect(mockHttpPut).not.toHaveBeenCalled();
+    expect(mockHttpPost).not.toHaveBeenCalled();
+});
+
+test("[J] applying a saved custom filter reconstructs the selection and reloads", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+    };
+    const hash = storageHash(PROJECT_ID, "backlog-custom-filters");
+    // A previously-saved filter already lives in /user-storage.
+    mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+        const path = String(args[0]);
+        if (path.includes("/stats")) return Promise.resolve(mkRes(currentStats));
+        if (path === `projects/${PROJECT_ID}`) return Promise.resolve(mkRes(currentProject));
+        if (path === "projects/by_slug") return Promise.resolve(mkRes(currentProject));
+        if (path === "userstories") {
+            return Promise.resolve(mkRes(currentUserstories, currentUsHeaders));
+        }
+        if (path === `user-storage/${hash}`) {
+            return Promise.resolve(mkRes({ key: hash, value: { Saved: { status: "7" } } }));
+        }
+        return Promise.resolve(mkRes({}));
+    });
+
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+
+    // The saved filter is listed on load.
+    await waitFor(() =>
+        expect(container.querySelector(".single-filter-type-custom .name")).not.toBeNull(),
+    );
+    const usBefore = countGet((p) => p === "userstories");
+
+    // Apply it.
+    await act(async () => {
+        fireEvent.click(
+            container.querySelector(".single-filter-type-custom .name") as HTMLElement,
+        );
+    });
+
+    // A fresh reload carried status=7, and the custom filter is marked active.
+    await waitFor(() =>
+        expect(
+            mockHttpGet.mock.calls.some(
+                (c) =>
+                    String(c[0]) === "userstories" &&
+                    (c[1] as Record<string, unknown>)?.status === "7",
+            ),
+        ).toBe(true),
+    );
+    await waitFor(() =>
+        expect(container.querySelector(".single-filter-type-custom.active")).not.toBeNull(),
+    );
+    expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore);
+});
+
+test("[J] removing a saved custom filter DELETEs the row once it becomes empty", async () => {
+    currentFiltersData = {
+        statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+    };
+    const hash = storageHash(PROJECT_ID, "backlog-custom-filters");
+    mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+        const path = String(args[0]);
+        if (path.includes("/stats")) return Promise.resolve(mkRes(currentStats));
+        if (path === `projects/${PROJECT_ID}`) return Promise.resolve(mkRes(currentProject));
+        if (path === "projects/by_slug") return Promise.resolve(mkRes(currentProject));
+        if (path === "userstories") {
+            return Promise.resolve(mkRes(currentUserstories, currentUsHeaders));
+        }
+        if (path === `user-storage/${hash}`) {
+            return Promise.resolve(mkRes({ key: hash, value: { Saved: { status: "7" } } }));
+        }
+        return Promise.resolve(mkRes({}));
+    });
+
+    const { container } = await renderApp();
+    await act(async () => {
+        fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+    });
+    await waitFor(() => expect(container.querySelector("#backlog-filter")).not.toBeNull());
+    await waitFor(() =>
+        expect(container.querySelector(".e2e-remove-custom-filter")).not.toBeNull(),
+    );
+
+    // Remove the only saved filter.
+    await act(async () => {
+        fireEvent.click(container.querySelector(".e2e-remove-custom-filter") as HTMLElement);
+    });
+
+    // The stored map became empty → storeFilters issued a DELETE on the row hash.
+    await waitFor(() =>
+        expect(
+            mockHttpDelete.mock.calls.some((c) => String(c[0]) === `user-storage/${hash}`),
+        ).toBe(true),
+    );
+    // And it disappears from the panel.
+    await waitFor(() =>
+        expect(container.querySelector(".single-filter-type-custom")).toBeNull(),
+    );
+});
+
+/* -------------------------------------------------------------------------- */
+/* [I] No-results copy interpolates the search term                            */
+/* -------------------------------------------------------------------------- */
+
+test("[I] the no-results state interpolates the search term with curly quotes", async () => {
+    // Empty backlog + a search term → the empty-backlog (no-match) block shows.
+    currentUserstories = [];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "0" };
+    const { container } = await renderApp();
+
+    const input = container.querySelector("input.tg-input-search") as HTMLInputElement;
+    await act(async () => {
+        fireEvent.change(input, { target: { value: "zzz" } });
+    });
+
+    // The block becomes visible (not `.hidden`) and interpolates the term.
+    await waitFor(() => {
+        const box = container.querySelector(".empty-backlog") as HTMLElement;
+        expect(box.className).not.toContain("hidden");
+    });
+    const noMatch = container.querySelector(".no-match") as HTMLElement;
+    expect(noMatch.textContent).toBe(
+        "No matching search result found with \u201Czzz\u201D",
+    );
+    expect(container.querySelector(".no-match-help")?.textContent).toContain(
+        "Try again using more general search terms",
+    );
 });
 
 test("tolerates stats / sprints / userstories / filters load failures without crashing", async () => {
@@ -1584,10 +2313,13 @@ test("renders the empty-large state and its create button when the backlog is em
     // The show-tags control is gone (no stories).
     expect(container.querySelector("#show-tags")).toBeNull();
 
-    // Its create button triggers a standard add (broadcast no-op without Angular).
+    // [#2] Its create button opens the React create lightbox (standard add),
+    // leaving the bulk lightbox closed.
     await act(async () => {
         fireEvent.click(container.querySelector(".empty-large .btn-small") as HTMLElement);
     });
+    expect(mockCaptured.userStoryEditProps?.open).toBe(true);
+    expect(mockCaptured.userStoryEditProps?.mode).toBe("create");
     expect(mockCaptured.bulkProps?.open).toBe(false);
 });
 
@@ -1834,4 +2566,196 @@ test("canLoadMore is false when x-pagination-next is absent", async () => {
 
     await waitFor(() => expect(mockCaptured.backlogTableProps).not.toBeNull());
     expect(mockCaptured.backlogTableProps?.canLoadMore).toBe(false);
+});
+
+/* ========================================================================== */
+/* [ERR-1] — recoverable mutation failures surface a non-blocking toast        */
+/* ========================================================================== */
+
+test("[ERR-1] surfaces a non-blocking error toast when an inline status change fails", async () => {
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const { container } = await renderApp();
+    // A non-conflict server error (500): the handler rolls back and reports.
+    mockHttpPatch.mockImplementation(() =>
+        Promise.reject(new HttpError(500, "Server Error", null, "userstories/1000")),
+    );
+
+    await act(async () => {
+        mockCaptured.backlogTableProps?.actions.onChangeStatus(makeUs({ id: 1000 }), 9);
+        await Promise.resolve();
+    });
+
+    // A themed, dismissible error banner is now shown to the user — no longer a
+    // silent console-only failure.
+    await waitFor(() => {
+        expect(container.querySelector(".notification-message-error")).not.toBeNull();
+    });
+    expect(
+        screen.getByText("Could not update the status. Please try again."),
+    ).toBeInTheDocument();
+    // The board itself is still rendered (non-blocking).
+    expect(container.querySelector(".backlog")).not.toBeNull();
+    errSpy.mockRestore();
+});
+
+test("[ERR-1] surfaces an error toast when a delete fails, and it can be dismissed", async () => {
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const { container } = await renderApp();
+    mockHttpDelete.mockImplementation(() =>
+        Promise.reject(new HttpError(500, "Server Error", null, "userstories/1000")),
+    );
+
+    // [H] Confirm the themed delete dialog to trigger the (failing) DELETE.
+    const dialog = document.querySelector.bind(document);
+    await act(async () => {
+        mockCaptured.backlogTableProps?.actions.onDeleteUserStory(makeUs({ id: 1000 }));
+        await Promise.resolve();
+    });
+    await act(async () => {
+        fireEvent.click(
+            dialog(".lightbox-generic-delete.open .js-confirm") as HTMLElement,
+        );
+        await Promise.resolve();
+    });
+
+    await waitFor(() => {
+        expect(
+            screen.getByText("Could not delete the story. Please try again."),
+        ).toBeInTheDocument();
+    });
+
+    // The user can dismiss it (non-blocking, self-clearing).
+    await act(async () => {
+        fireEvent.click(screen.getByLabelText("Close notification"));
+    });
+    expect(container.querySelector(".notification-message-error")).toBeNull();
+
+    errSpy.mockRestore();
+});
+
+/* ========================================================================== */
+/* [ERR-2] — interceptor side effects mapped onto full-page overlays           */
+/* ========================================================================== */
+
+test("[ERR-2] installs an offline hook that shows a full-page connection-error overlay", async () => {
+    resetInterceptorHooks();
+    clearNotificationListeners();
+    const { container } = await renderApp();
+    expect(container.querySelector(".backlog")).not.toBeNull();
+
+    // Simulate the httpClient reporting an offline failure through the policy
+    // BacklogApp installed on mount.
+    await act(async () => {
+        getInterceptorHooks().onOffline(new TypeError("Failed to fetch"));
+    });
+
+    await waitFor(() => expect(screen.getByText("Connection lost")).toBeInTheDocument());
+    // The board is replaced by the full-page overlay (mirrors errorHandling.error()).
+    expect(container.querySelector(".backlog")).toBeNull();
+});
+
+test("[ERR-2] installs a blocked hook that shows the permission-denied overlay on 451", async () => {
+    resetInterceptorHooks();
+    clearNotificationListeners();
+    const { container } = await renderApp();
+    expect(container.querySelector(".backlog")).not.toBeNull();
+
+    await act(async () => {
+        getInterceptorHooks().onBlocked();
+    });
+
+    await waitFor(() => expect(screen.getByText("Permission denied")).toBeInTheDocument());
+    expect(container.querySelector(".backlog")).toBeNull();
+});
+
+test("[ERR-2] restores the DEFAULT interceptor policy when the Backlog root unmounts", async () => {
+    resetInterceptorHooks();
+    clearNotificationListeners();
+    const { unmount } = await renderApp();
+
+    // While mounted, the offline hook is BacklogApp's (drives the overlay).
+    // After unmount it must revert to the default bus policy so a later screen
+    // is not driven by a dead component's setState.
+    unmount();
+
+    // The default onOffline emits onto the shared bus and never throws.
+    const received: string[] = [];
+    const unsubscribe = subscribeNotifications((n) => received.push(n.message));
+
+    expect(() => getInterceptorHooks().onOffline(new Error("x"))).not.toThrow();
+    expect(received).toHaveLength(1);
+
+    unsubscribe();
+    resetInterceptorHooks();
+});
+
+/* ========================================================================== */
+/* [F] Heading order + [B][C][E] copy strings                                 */
+/* ========================================================================== */
+
+describe("headings and copy strings", () => {
+    test("[F] renders the 'Scrum' <h1> first, before the 'Backlog' <h2>", async () => {
+        const { container } = await renderApp();
+        const section = container.querySelector("section.backlog") as HTMLElement;
+
+        const h1 = section.querySelector("header h1");
+        expect(h1).not.toBeNull();
+        expect(h1).toHaveTextContent("Scrum");
+
+        // Heading order: the Scrum h1 precedes the Backlog h2 in DOM order.
+        const headings = Array.from(section.querySelectorAll("h1, h2"));
+        const scrumIdx = headings.findIndex((h) => h.textContent?.includes("Scrum"));
+        const backlogIdx = headings.findIndex((h) => h.textContent?.includes("Backlog"));
+        expect(scrumIdx).toBeGreaterThanOrEqual(0);
+        expect(backlogIdx).toBeGreaterThan(scrumIdx);
+    });
+
+    test("[B] shows the unfiltered story count as '{n} user stories'", async () => {
+        const { container } = await renderApp();
+        const count = container.querySelector(
+            ".backlog-header-title .backlog-stories-number",
+        );
+        expect(count).not.toBeNull();
+        expect((count?.textContent ?? "").trim()).toMatch(/^\d+ user stories$/);
+    });
+
+    test("[E] labels the add controls: '+ user story' text and bulk-add aria-label", async () => {
+        const { container } = await renderApp();
+
+        const addText = container.querySelector(".new-us .text");
+        expect(addText).toHaveTextContent("user story");
+
+        const bulk = container.querySelector(
+            '[aria-label="Add some new user stories in bulk"]',
+        );
+        expect(bulk).not.toBeNull();
+        expect(bulk).toHaveAttribute("title", "Add some new user stories in bulk");
+    });
+
+    test("[C] shows the filtered count as 'of {n} user stories' when a filter is selected", async () => {
+        currentFiltersData = {
+            statuses: [{ id: 7, name: "In progress", color: "#00f", count: 3 }],
+        };
+        const { container } = await renderApp();
+
+        await act(async () => {
+            fireEvent.click(container.querySelector("#show-filters-button") as HTMLElement);
+        });
+        await waitFor(() =>
+            expect(container.querySelector("#backlog-filter")).not.toBeNull(),
+        );
+        await expandCategory(container, "Status");
+        await act(async () => {
+            fireEvent.click(container.querySelector(".single-filter") as HTMLElement);
+        });
+
+        await waitFor(() =>
+            expect(container.querySelector(".selected-filters")).not.toBeNull(),
+        );
+
+        const numbers = Array.from(
+            container.querySelectorAll(".backlog-header-title .backlog-stories-number"),
+        ).map((el) => (el.textContent ?? "").trim());
+        expect(numbers.some((t) => /^of \d+ user stories$/.test(t))).toBe(true);
+    });
 });

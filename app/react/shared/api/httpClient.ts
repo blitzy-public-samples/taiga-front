@@ -28,8 +28,14 @@
  */
 
 import { getApiUrl, getDefaultLanguage } from "../config/taigaConfig";
-import { getToken } from "../session/auth";
+import { clearSession, getToken } from "../session/auth";
 import { getSessionId } from "../session/sessionId";
+import {
+    currentNextUrl,
+    getInterceptorHooks,
+    is401RecoveryEligible,
+    refreshSession,
+} from "./httpInterceptor";
 
 /** HTTP verbs used by the migrated screens. */
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -191,9 +197,35 @@ async function parseBody(response: Response): Promise<unknown> {
 }
 
 /**
+ * Issue the underlying `fetch`, replicating the AngularJS OFFLINE interceptor
+ * branch (`status == 0` → `errorHandlingService.error()`, app.coffee L620-623):
+ * a rejected `fetch` (no HTTP response — DNS/connection/offline) fires the
+ * `onOffline` hook, then the ORIGINAL rejection is re-thrown UNCHANGED so
+ * callers (and the existing "propagates the fetch rejection unchanged" contract)
+ * see the exact same error object.
+ */
+async function doFetch(url: string, init: RequestInit): Promise<Response> {
+    try {
+        return await fetch(url, init);
+    } catch (networkError) {
+        getInterceptorHooks().onOffline(networkError);
+        throw networkError;
+    }
+}
+
+/**
  * Perform an HTTP request against the API. Resolves to an {@link HttpResponse}
  * on 2xx; throws {@link HttpError} (with the parsed body) on any non-2xx status.
  * Network failures propagate the underlying `fetch` rejection unchanged.
+ *
+ * The request also replicates the AngularJS global HTTP interceptors that the
+ * React `fetch` path would otherwise bypass (QA finding [ERR-2]):
+ *   - 401 (recovery-eligible path): attempt a single token refresh + retry with
+ *     the renewed Bearer token; if refresh fails, fire `onSessionExpired`
+ *     (redirect to login) and surface the 401 as usual
+ *     (authHttpIntercept, app.coffee L624-701).
+ *   - 451: fire `onBlocked` (blocked-project surface) before throwing
+ *     (blockingIntercept, app.coffee L768-772).
  */
 export async function request<T = unknown>(
     method: HttpMethod,
@@ -212,7 +244,36 @@ export async function request<T = unknown>(
         init.signal = options.signal;
     }
 
-    const response = await fetch(url, init);
+    let response = await doFetch(url, init);
+
+    // --- 401: token-refresh + single retry, else redirect-to-login ----------
+    if (response.status === 401 && is401RecoveryEligible(path)) {
+        const refreshedToken = await refreshSession();
+
+        if (refreshedToken !== null) {
+            // Retry the ORIGINAL request once with the renewed bearer token, the
+            // React analog of re-issuing `response.config` (app.coffee L634-636).
+            const retryHeaders: Record<string, string> = {
+                ...(init.headers as Record<string, string>),
+                Authorization: `Bearer ${refreshedToken}`,
+            };
+            response = await doFetch(url, { ...init, headers: retryHeaders });
+        } else {
+            // No refresh token, or the refresh was rejected: the session is over.
+            // Clear the stale credentials BEFORE redirecting, mirroring the
+            // AngularJS `removeUser()` that precedes the login redirect
+            // (app.coffee L629-630, L642) — otherwise the invalid token would
+            // survive and provoke repeated 401s on any subsequent request.
+            clearSession();
+            getInterceptorHooks().onSessionExpired(currentNextUrl());
+        }
+    }
+
+    // --- 451: blocked project (fires on the final response) ------------------
+    if (response.status === 451) {
+        getInterceptorHooks().onBlocked();
+    }
+
     const body = await parseBody(response);
 
     if (!response.ok) {

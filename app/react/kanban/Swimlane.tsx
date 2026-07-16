@@ -10,6 +10,7 @@ import { useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import type { KanbanProject, Swimlane as SwimlaneModel } from "./useKanbanState";
 import { UNCLASSIFIED_SWIMLANE_ID } from "./useKanbanState";
+import { Icon } from "../shared/ui/Icon";
 
 /**
  * Kanban swimlane row.
@@ -91,15 +92,11 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                 onMouseLeave={clearTimer}
                 onClick={() => onToggle(swimlane.id)}
             >
-                <span
-                    className={
-                        "icon " +
-                        (folded
-                            ? "fold-action icon-folded-swimlane"
-                            : "unfold-action icon-unfolded-swimlane")
-                    }
-                    aria-hidden="true"
-                />
+                {folded ? (
+                    <Icon name="icon-folded-swimlane" wrapperClass="fold-action" />
+                ) : (
+                    <Icon name="icon-unfolded-swimlane" wrapperClass="unfold-action" />
+                )}
                 <h2
                     className={
                         "title-name" + (isUnclassified ? " unclassified-us-title" : "")
@@ -109,16 +106,13 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                 </h2>
                 {isUnclassified && (
                     <div className="unclassified-us-info">
-                        <span className="icon icon-help-circle" aria-hidden="true" />
+                        <Icon name="icon-help-circle" />
                         <div className="tooltip pop-help">{UNCLASSIFIED_TOOLTIP}</div>
                     </div>
                 )}
                 {isDefault && (
                     <div className="default-swimlane">
-                        <span
-                            className="icon default-swimlane-icon icon-star"
-                            aria-hidden="true"
-                        />
+                        <Icon name="icon-star" wrapperClass="default-swimlane-icon" />
                         <span className="default-text">{DEFAULT_SWIMLANE_LABEL}</span>
                     </div>
                 )}

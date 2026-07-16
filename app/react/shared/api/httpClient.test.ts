@@ -34,6 +34,8 @@ import {
     httpPut,
     request,
 } from "./httpClient";
+import { resetInterceptorHooks, setInterceptorHooks } from "./httpInterceptor";
+import { getToken } from "../session/auth";
 
 // --- Independent expectations (intentionally NOT imported from the SUT) ---
 const API_BASE = "http://localhost:8000/api/v1/";
@@ -89,6 +91,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    // Restore the default interceptor policy so a per-test spy hook never leaks.
+    resetInterceptorHooks();
     window.localStorage.clear();
     delete (window as unknown as { taiga?: unknown }).taiga;
     window.taigaConfig = undefined;
@@ -390,6 +394,113 @@ describe("shared/api/httpClient", () => {
             for (const spy of spies) {
                 expect(spy).not.toHaveBeenCalled();
             }
+        });
+    });
+
+    // The React `fetch` path re-implements the AngularJS global interceptors
+    // that it would otherwise bypass (QA finding [ERR-2]). These assert the
+    // behavior end-to-end with spy hooks injected via `setInterceptorHooks`.
+    describe("interceptor integration ([ERR-2])", () => {
+        it("recovers a 401 by refreshing the token and retrying the ORIGINAL request", async () => {
+            window.localStorage.setItem("refresh", JSON.stringify("old-refresh"));
+
+            // 1) original GET → 401; 2) POST auth/refresh → new tokens;
+            // 3) retried GET (with new Bearer) → 200 with the real payload.
+            fetchMock
+                .mockResolvedValueOnce(mockResponse({ status: 401, statusText: "Unauthorized" }))
+                .mockResolvedValueOnce(
+                    mockResponse({
+                        body: JSON.stringify({ auth_token: "new-access", refresh: "new-refresh" }),
+                    }),
+                )
+                .mockResolvedValueOnce(mockResponse({ body: '{"id":42}' }));
+
+            const res = await httpGet<{ id: number }>("userstories/42");
+
+            expect(res.status).toBe(200);
+            expect(res.data).toEqual({ id: 42 });
+            expect(fetchMock).toHaveBeenCalledTimes(3);
+
+            // The refresh call hit the correct endpoint.
+            expect(callArgs(1).url).toBe(`${API_BASE}auth/refresh`);
+            expect(callArgs(1).init.method).toBe("POST");
+
+            // The RETRY carried the refreshed bearer token, and the shared
+            // session was updated so AngularJS sees the new token too.
+            expect(sentHeaders(2)["Authorization"]).toBe("Bearer new-access");
+            expect(getToken()).toBe("new-access");
+        });
+
+        it("redirects to login (onSessionExpired) and CLEARS the stale session when a 401 cannot be refreshed", async () => {
+            // A (now invalid) access token is present from beforeEach, but NO
+            // refresh token is stored → refresh is impossible.
+            expect(getToken()).toBe(TOKEN);
+            const onSessionExpired = jest.fn();
+            setInterceptorHooks({ onSessionExpired });
+
+            fetchMock.mockResolvedValueOnce(mockResponse({ status: 401, statusText: "Unauthorized" }));
+
+            await expect(httpGet("userstories")).rejects.toBeInstanceOf(HttpError);
+            // No refresh token → NO extra fetch; the session-expired hook fired.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(onSessionExpired).toHaveBeenCalledTimes(1);
+            expect(typeof onSessionExpired.mock.calls[0][0]).toBe("string");
+            // The stale credentials were cleared BEFORE redirect, mirroring the
+            // AngularJS `removeUser()` that precedes the login redirect — so a
+            // lingering invalid token can no longer provoke repeat 401s.
+            expect(getToken()).toBeNull();
+        });
+
+        it("does NOT attempt recovery for a 401 on the refresh endpoint itself", async () => {
+            window.localStorage.setItem("refresh", JSON.stringify("old-refresh"));
+            const onSessionExpired = jest.fn();
+            setInterceptorHooks({ onSessionExpired });
+
+            fetchMock.mockResolvedValueOnce(mockResponse({ status: 401, statusText: "Unauthorized" }));
+
+            await expect(httpPost("auth/refresh", { refresh: "x" })).rejects.toBeInstanceOf(HttpError);
+            // Not recovery-eligible: exactly one call, no redirect, no loop.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(onSessionExpired).not.toHaveBeenCalled();
+        });
+
+        it("fires onBlocked for a 451 response before throwing", async () => {
+            const onBlocked = jest.fn();
+            setInterceptorHooks({ onBlocked });
+
+            fetchMock.mockResolvedValueOnce(
+                mockResponse({ status: 451, statusText: "Unavailable For Legal Reasons" }),
+            );
+
+            await expect(httpGet("userstories")).rejects.toBeInstanceOf(HttpError);
+            expect(onBlocked).toHaveBeenCalledTimes(1);
+        });
+
+        it("fires onOffline and RE-THROWS the same error on a network failure", async () => {
+            const onOffline = jest.fn();
+            setInterceptorHooks({ onOffline });
+
+            const networkError = new TypeError("Failed to fetch");
+            fetchMock.mockRejectedValueOnce(networkError);
+
+            await expect(httpGet("userstories")).rejects.toBe(networkError);
+            expect(onOffline).toHaveBeenCalledTimes(1);
+            expect(onOffline.mock.calls[0][0]).toBe(networkError);
+        });
+
+        it("leaves a normal 2xx request completely untouched (no hook fires)", async () => {
+            const onOffline = jest.fn();
+            const onBlocked = jest.fn();
+            const onSessionExpired = jest.fn();
+            setInterceptorHooks({ onOffline, onBlocked, onSessionExpired });
+
+            fetchMock.mockResolvedValueOnce(mockResponse({ body: '{"ok":true}' }));
+            await httpGet("userstories");
+
+            expect(onOffline).not.toHaveBeenCalled();
+            expect(onBlocked).not.toHaveBeenCalled();
+            expect(onSessionExpired).not.toHaveBeenCalled();
+            expect(fetchMock).toHaveBeenCalledTimes(1);
         });
     });
 });

@@ -14,6 +14,7 @@ import type {
 } from "../shared/dnd/DndProvider";
 import { ColumnHeader, KanbanColumn } from "./KanbanColumn";
 import { Swimlane } from "./Swimlane";
+import { Icon } from "../shared/ui/Icon";
 import type {
     BaseUser,
     KanbanProject,
@@ -54,6 +55,8 @@ export interface KanbanBoardProps {
     onClickEdit?: (id: number) => void;
     onClickDelete?: (id: number) => void;
     onClickAssignedTo?: (id: number) => void;
+    /** ctrl/meta-click multi-select toggle (QA-FUNC-01). */
+    onToggleSelect?: (id: number) => void;
     resolveAvatar?: (user: BaseUser) => string;
 }
 
@@ -83,6 +86,7 @@ export function KanbanBoard(props: KanbanBoardProps): JSX.Element {
         onClickEdit,
         onClickDelete,
         onClickAssignedTo,
+        onToggleSelect,
         resolveAvatar,
     } = props;
 
@@ -96,8 +100,14 @@ export function KanbanBoard(props: KanbanBoardProps): JSX.Element {
         rootClassName += " kanban-table-swimlane";
     }
 
+    // QA-FUNC-11: "Create swimlane" is an admin editing affordance and must be
+    // disabled on an archived project (truthy `archived_code`), consistent with
+    // AngularJS `projectService.canEdit` semantics (no editing on archived).
     const swimlaneAddVisible =
-        swimlaneMode && !!project.i_am_admin && swimlanesList.length <= 1;
+        swimlaneMode &&
+        !!project.i_am_admin &&
+        !project.archived_code &&
+        swimlanesList.length <= 1;
 
     const renderColumns = (swimlaneId: number | null): JSX.Element[] => {
         const statuses: Status[] = swimlaneId === null
@@ -133,6 +143,7 @@ export function KanbanBoard(props: KanbanBoardProps): JSX.Element {
                     onClickEdit={onClickEdit}
                     onClickDelete={onClickDelete}
                     onClickAssignedTo={onClickAssignedTo}
+                    onToggleSelect={onToggleSelect}
                     resolveAvatar={resolveAvatar}
                 />
             );
@@ -182,7 +193,7 @@ export function KanbanBoard(props: KanbanBoardProps): JSX.Element {
                         className="kanban-swimlane-add"
                         href={`/project/${project.slug ?? ""}/admin/project-values/kanban`}
                     >
-                        <span className="icon icon-add add-action" aria-hidden="true" />
+                        <Icon name="icon-add" wrapperClass="add-action" />
                         <span>{CREATE_SWIMLANE_LABEL}</span>
                     </a>
                 ) : null}

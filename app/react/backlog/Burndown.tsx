@@ -33,9 +33,25 @@
  */
 
 import { useCallback, useMemo } from "react";
-import type { KeyboardEvent } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 import type { BurndownPoint, Project, ProjectStats } from "./types";
+import { t } from "../shared/i18n/translate";
+
+/**
+ * Render a summary-stats label from the shared catalog ([i18n]) that embeds a
+ * `<br />` (e.g. `BACKLOG.SUMMARY.PROJECT_POINTS = 'project<br />points'`). The
+ * localized value is split on the `<br />` boundary and rendered as escaped React
+ * text separated by real `<br />` elements — preserving the two-line layout AND
+ * localization without `dangerouslySetInnerHTML`.
+ */
+function renderMultilineLabel(key: string, fallback: string): ReactNode {
+    const rendered = t(key, fallback);
+    const parts = rendered.split(/<br\s*\/?>/i);
+    return parts.flatMap((part, index) =>
+        index === 0 ? [part] : [<br key={`br-${index}`} />, part],
+    );
+}
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -224,6 +240,15 @@ const CHART_GRID_COLOR = "#D8DEE9";
 const CHART_AXIS_FONT = "Verdana, Arial, Helvetica, Tahoma, sans-serif";
 const CHART_AXIS_FONT_SIZE = 7;
 const CHART_AXIS_LABEL_COLOR = "#727e8c";
+// [G] Left gutter (viewBox units) reserved for the numeric y-axis tick labels,
+// which sit between the rotated "Points" axis label (far left) and the plot.
+const CHART_Y_TICK_LABEL_GUTTER = 24;
+// x-position of the rotated "Points" axis label, kept at the far left edge so it
+// never collides with the numeric tick labels that occupy the gutter.
+const CHART_Y_AXIS_LABEL_X = 3;
+// Target number of horizontal y-axis gridlines/ticks (Flot's default yaxis
+// tick density). The "nice numbers" algorithm may return a few more or fewer.
+const CHART_Y_TICK_TARGET = 5;
 
 /**
  * Per-series visual styling, indexed to match Flot's series order (0..4):
@@ -263,23 +288,121 @@ interface ChartPoint {
 function chartTooltip(seriesIndex: number, sprintName: string, value: number): string {
     switch (seriesIndex) {
         case 1:
-            // i18n: BACKLOG.CHART.OPTIMAL
-            return `Optimal pending points for sprint "${sprintName}" should be ${value}`;
+            return t(
+                "BACKLOG.CHART.OPTIMAL",
+                'Optimal pending points for sprint "{{sprintName}}" should be {{value}}',
+                { sprintName, value },
+            );
         case 2:
-            // i18n: BACKLOG.CHART.REAL
-            return `Real pending points for sprint "${sprintName}" is ${value}`;
+            return t("BACKLOG.CHART.REAL", 'Real pending points for sprint "{{sprintName}}" is {{value}}', {
+                sprintName,
+                value,
+            });
         case 3:
-            // i18n: BACKLOG.CHART.INCREMENT_CLIENT
-            return `Incremented points by client requirements for sprint "${sprintName}" is ${value}`;
+            return t(
+                "BACKLOG.CHART.INCREMENT_CLIENT",
+                'Incremented points by client requirements for sprint "{{sprintName}}" is {{value}}',
+                { sprintName, value },
+            );
         default:
-            // i18n: BACKLOG.CHART.INCREMENT_TEAM
-            return `Incremented points by team requirements for sprint "${sprintName}" is ${value}`;
+            return t(
+                "BACKLOG.CHART.INCREMENT_TEAM",
+                'Incremented points by team requirements for sprint "{{sprintName}}" is {{value}}',
+                { sprintName, value },
+            );
     }
 }
 
 /** Round to 2 dp for compact, deterministic SVG coordinate strings. */
 function round2(value: number): number {
     return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
+}
+
+/**
+ * Classic "nice number" rounding used by axis-tick generators (and by Flot's
+ * own tick algorithm): round `range` to a 1/2/5 × 10^n value. When `round` is
+ * true the nearest nice number is chosen; otherwise the ceiling nice number.
+ */
+function niceNum(range: number, round: boolean): number {
+    if (!(range > 0)) {
+        return 1;
+    }
+    const exponent = Math.floor(Math.log10(range));
+    const fraction = range / Math.pow(10, exponent);
+    let niceFraction: number;
+    if (round) {
+        if (fraction < 1.5) niceFraction = 1;
+        else if (fraction < 3) niceFraction = 2;
+        else if (fraction < 7) niceFraction = 5;
+        else niceFraction = 10;
+    } else if (fraction <= 1) {
+        niceFraction = 1;
+    } else if (fraction <= 2) {
+        niceFraction = 2;
+    } else if (fraction <= 5) {
+        niceFraction = 5;
+    } else {
+        niceFraction = 10;
+    }
+    return niceFraction * Math.pow(10, exponent);
+}
+
+/** The result of {@link niceScale}: enclosing bounds + the tick values. */
+export interface NiceScale {
+    niceMin: number;
+    niceMax: number;
+    ticks: number[];
+}
+
+/**
+ * Compute a "nice" numeric axis that ENCLOSES `[min, max]` and the evenly-spaced
+ * tick values along it — the y-axis the AngularJS burndown got for free from
+ * Flot (finding [G]: React drew the series but no numeric y-ticks). Handles
+ * negative ranges (the React series include negative increments) and the
+ * degenerate flat-series case (`min === max`).
+ */
+export function niceScale(min: number, max: number, maxTicks = CHART_Y_TICK_TARGET): NiceScale {
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        return { niceMin: 0, niceMax: 1, ticks: [0, 1] };
+    }
+    // Flat series: synthesize a small enclosing range so labels/scale exist.
+    if (min === max) {
+        if (min === 0) {
+            return { niceMin: 0, niceMax: 1, ticks: [0, 1] };
+        }
+        const pad = Math.abs(min) * 0.5 || 1;
+        min -= pad;
+        max += pad;
+    }
+    const effectiveTicks = Math.max(2, maxTicks);
+    const range = niceNum(max - min, false);
+    const tickSpacing = niceNum(range / (effectiveTicks - 1), true) || 1;
+    const niceMin = Math.floor(min / tickSpacing) * tickSpacing;
+    const niceMax = Math.ceil(max / tickSpacing) * tickSpacing;
+    const ticks: number[] = [];
+    // Guard against pathological spacing producing an unbounded loop.
+    const maxIterations = 1000;
+    let iterations = 0;
+    for (
+        let value = niceMin;
+        value <= niceMax + tickSpacing * 0.5 && iterations < maxIterations;
+        value += tickSpacing, iterations += 1
+    ) {
+        // Snap to the tick grid to avoid floating-point drift (e.g. 0.30000004).
+        ticks.push(Math.round(value / tickSpacing) * tickSpacing);
+    }
+    return { niceMin, niceMax, ticks };
+}
+
+/**
+ * Format a y-axis tick value compactly: integers verbatim, otherwise trimmed to
+ * at most 2 decimals (Flot's numeric ticks are unformatted, not thousands-grouped).
+ */
+function formatTick(value: number): string {
+    if (Number.isInteger(value)) {
+        return String(value);
+    }
+    return String(Math.round(value * 100) / 100);
 }
 
 /**
@@ -352,13 +475,23 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
             }
             return acc;
         }, []);
-        const minValue = allValues.length ? Math.min(...allValues) : 0;
-        const maxValue = allValues.length ? Math.max(...allValues) : 0;
+        const rawMin = allValues.length ? Math.min(...allValues) : 0;
+        const rawMax = allValues.length ? Math.max(...allValues) : 0;
+
+        // [G] Expand the data range to a "nice" enclosing axis so we can draw
+        // evenly-spaced, human-readable numeric y-ticks (0 / 250 / 500 …) — the
+        // axis Flot produced for the AngularJS burndown. The zero-line series
+        // guarantees 0 is inside [rawMin, rawMax], so it stays on the axis.
+        const scale = niceScale(rawMin, rawMax, CHART_Y_TICK_TARGET);
+        const minValue = scale.niceMin;
+        const maxValue = scale.niceMax;
         const valueRange = maxValue - minValue || 1;
 
         // Inset the data plot by the marker radius so top/bottom/edge markers are
-        // never clipped (Flot reserves this space outside its grid too).
-        const innerLeft = CHART_MARGIN.left + CHART_POINT_RADIUS;
+        // never clipped (Flot reserves this space outside its grid too). The left
+        // inset ALSO reserves a gutter for the numeric y-tick labels ([G]).
+        const innerLeft =
+            CHART_MARGIN.left + CHART_Y_TICK_LABEL_GUTTER + CHART_POINT_RADIUS;
         const innerRight = CHART_VIEWBOX_WIDTH - CHART_MARGIN.right - CHART_POINT_RADIUS;
         const innerTop = CHART_MARGIN.top + CHART_POINT_RADIUS;
         const innerBottom = CHART_VIEWBOX_HEIGHT - CHART_MARGIN.bottom - CHART_POINT_RADIUS;
@@ -380,6 +513,17 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
             bottom: round2(innerBottom),
         }));
 
+        // [G] Horizontal y-axis ticks: one gridline + numeric label per nice tick
+        // that falls within the plotted range.
+        const yTicks = scale.ticks
+            .filter((value) => value >= minValue - 1e-9 && value <= maxValue + 1e-9)
+            .map((value) => ({
+                key: `ytick-${value}`,
+                value,
+                label: formatTick(value),
+                y: round2(yFor(value)),
+            }));
+
         return {
             count,
             series,
@@ -389,6 +533,7 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
             innerBottom,
             baselineY: round2(baselineY),
             gridLines,
+            yTicks,
             xFor,
             yFor,
         };
@@ -398,8 +543,18 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
         return null;
     }
 
-    const { series, innerLeft, innerRight, innerTop, innerBottom, baselineY, gridLines, xFor, yFor } =
-        geometry;
+    const {
+        series,
+        innerLeft,
+        innerRight,
+        innerTop,
+        innerBottom,
+        baselineY,
+        gridLines,
+        yTicks,
+        xFor,
+        yFor,
+    } = geometry;
 
     return (
         <svg
@@ -412,12 +567,41 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
         >
             {/* Gridlines + zero baseline (Flot grid.color / borderColor #D8DEE9). */}
             <g stroke={CHART_GRID_COLOR} strokeWidth={0.5} aria-hidden="true">
+                {/* [G] Horizontal y-axis gridlines, one per numeric tick. */}
+                {yTicks.map((tick) => (
+                    <line
+                        key={tick.key}
+                        x1={round2(innerLeft)}
+                        y1={tick.y}
+                        x2={round2(innerRight)}
+                        y2={tick.y}
+                        opacity={0.5}
+                    />
+                ))}
                 {gridLines.map((line) => (
                     <line key={line.key} x1={line.x} y1={line.top} x2={line.x} y2={line.bottom} opacity={0.6} />
                 ))}
                 <line x1={round2(innerLeft)} y1={baselineY} x2={round2(innerRight)} y2={baselineY} />
                 {/* Flot grid.borderWidth right:1 — the single drawn plot border. */}
                 <line x1={round2(innerRight)} y1={round2(innerTop)} x2={round2(innerRight)} y2={round2(innerBottom)} strokeWidth={1} />
+            </g>
+
+            {/* [G] Numeric y-axis tick labels, right-aligned just left of the plot. */}
+            <g aria-hidden="true">
+                {yTicks.map((tick) => (
+                    <text
+                        key={`ylabel-${tick.value}`}
+                        x={round2(innerLeft - CHART_POINT_RADIUS - 2)}
+                        y={tick.y}
+                        textAnchor="end"
+                        dominantBaseline="middle"
+                        fontFamily={CHART_AXIS_FONT}
+                        fontSize={CHART_AXIS_FONT_SIZE}
+                        fill={CHART_AXIS_LABEL_COLOR}
+                    >
+                        {tick.label}
+                    </text>
+                ))}
             </g>
 
             {/* Data series: area fill, then line, then markers with tooltips. */}
@@ -480,20 +664,18 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
                 fontSize={CHART_AXIS_FONT_SIZE}
                 fill={CHART_AXIS_LABEL_COLOR}
             >
-                {/* i18n: BACKLOG.CHART.XAXIS_LABEL */}
-                Sprints
+                {t("BACKLOG.CHART.XAXIS_LABEL", "Sprints")}
             </text>
             <text
-                x={CHART_AXIS_FONT_SIZE}
+                x={CHART_Y_AXIS_LABEL_X}
                 y={CHART_VIEWBOX_HEIGHT / 2}
                 textAnchor="middle"
-                transform={`rotate(-90 ${CHART_AXIS_FONT_SIZE} ${CHART_VIEWBOX_HEIGHT / 2})`}
+                transform={`rotate(-90 ${CHART_Y_AXIS_LABEL_X} ${CHART_VIEWBOX_HEIGHT / 2})`}
                 fontFamily={CHART_AXIS_FONT}
                 fontSize={CHART_AXIS_FONT_SIZE}
                 fill={CHART_AXIS_LABEL_COLOR}
             >
-                {/* i18n: BACKLOG.CHART.YAXIS_LABEL */}
-                Points
+                {t("BACKLOG.CHART.YAXIS_LABEL", "Points")}
             </text>
         </svg>
     );
@@ -554,17 +736,17 @@ export function Burndown(props: BurndownProps): JSX.Element {
             <div className="summary">
                 {/* (B) tg-backlog-progress-bar="stats" — the 3-segment progress bar */}
                 <div className="summary-progress-bar">
-                    <div className="defined-points" title="Excess of points" />{/* i18n: BACKLOG.EXCESS_OF_POINTS */}
+                    <div className="defined-points" title={t("BACKLOG.EXCESS_OF_POINTS", "Excess of points")} />
                     <div
                         className="project-points-progress"
-                        title="Pending Points"
+                        title={t("BACKLOG.PENDING_POINTS", "Pending Points")}
                         style={{ width: `${projectPointsPercentaje}%` }}
-                    />{/* i18n: BACKLOG.PENDING_POINTS */}
+                    />
                     <div
                         className="closed-points-progress"
-                        title="closed"
+                        title={t("BACKLOG.CLOSED_POINTS", "closed")}
                         style={{ width: `${closedPointsPercentaje}%` }}
-                    />{/* i18n: BACKLOG.CLOSED_POINTS */}
+                    />
                 </div>
 
                 <div className="data">
@@ -574,37 +756,44 @@ export function Burndown(props: BurndownProps): JSX.Element {
                 {stats?.total_points != null ? (
                     <div className="summary-stats">
                         <span className="number">{formatNumber(stats.total_points)}</span>
-                        <span className="description">{/* i18n: BACKLOG.SUMMARY.PROJECT_POINTS */}project<br />points</span>
+                        <span className="description">
+                            {renderMultilineLabel("BACKLOG.SUMMARY.PROJECT_POINTS", "project<br />points")}
+                        </span>
                     </div>
                 ) : null}
 
                 <div className="summary-stats">
                     <span className="number">{formatNumber(stats?.defined_points)}</span>
-                    <span className="description">{/* i18n: BACKLOG.SUMMARY.DEFINED_POINTS */}defined<br />points</span>
+                    <span className="description">
+                        {renderMultilineLabel("BACKLOG.SUMMARY.DEFINED_POINTS", "defined<br />points")}
+                    </span>
                 </div>
 
                 <div className="summary-stats">
                     <span className="number">{formatNumber(stats?.closed_points)}</span>
-                    <span className="description">{/* i18n: BACKLOG.SUMMARY.CLOSED_POINTS */}closed<br />points</span>
+                    <span className="description">
+                        {renderMultilineLabel("BACKLOG.SUMMARY.CLOSED_POINTS", "closed<br />points")}
+                    </span>
                 </div>
 
                 <div className="summary-stats">
                     <span className="number">{formatNumber(stats?.speed, 0)}</span>
-                    <span className="description">{/* i18n: BACKLOG.SUMMARY.POINTS_PER_SPRINT */}points /<br />sprint</span>
+                    <span className="description">
+                        {renderMultilineLabel("BACKLOG.SUMMARY.POINTS_PER_SPRINT", "points /<br />sprint")}
+                    </span>
                 </div>
 
                 {showToggle ? (
                     <div
                         className={toggleClassName}
-                        title="Show/Hide burndown graph"
-                        aria-label="Show/Hide burndown graph"
+                        title={t("BACKLOG.SPRINT_SUMMARY.TOGGLE_BAKLOG_GRAPH", "Show/Hide burndown graph")}
+                        aria-label={t("BACKLOG.SPRINT_SUMMARY.TOGGLE_BAKLOG_GRAPH", "Show/Hide burndown graph")}
                         onClick={onToggleCollapsed}
                         onKeyDown={handleToggleKeyDown}
                         role="button"
                         tabIndex={0}
                         aria-pressed={graphVisible}
                     >
-                        {/* i18n: BACKLOG.SPRINT_SUMMARY.TOGGLE_BAKLOG_GRAPH (misspelling "BAKLOG" preserved) */}
                         <IconGraph />
                     </div>
                 ) : null}
@@ -615,14 +804,22 @@ export function Burndown(props: BurndownProps): JSX.Element {
                 <div className="empty-burndown">
                     <IconGraph />
                     <div className="empty-text">
-                        <p className="title">{/* i18n: BACKLOG.CUSTOMIZE_GRAPH */}Customize your backlog graph</p>
+                        <p className="title">
+                            {t("BACKLOG.CUSTOMIZE_GRAPH", "Customize your backlog graph")}
+                        </p>
                         <p>
-                            {/* i18n: BACKLOG.CUSTOMIZE_GRAPH_TEXT */}
-                            To have a nice graph that helps you follow the evolution of the project you have
-                            to set up the points and sprints through the{" "}
-                            <a href="" title="Set up the points and sprints through the Admin">
-                                {/* i18n: BACKLOG.CUSTOMIZE_GRAPH_ADMIN, title BACKLOG.CUSTOMIZE_GRAPH_TITLE */}
-                                Admin
+                            {t(
+                                "BACKLOG.CUSTOMIZE_GRAPH_TEXT",
+                                "To have a nice graph that helps you follow the evolution of the project you have to set up the points and sprints through the",
+                            )}{" "}
+                            <a
+                                href=""
+                                title={t(
+                                    "BACKLOG.CUSTOMIZE_GRAPH_TITLE",
+                                    "Set up the points and sprints through the Admin",
+                                )}
+                            >
+                                {t("BACKLOG.CUSTOMIZE_GRAPH_ADMIN", "Admin")}
                             </a>
                         </p>
                     </div>

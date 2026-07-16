@@ -292,8 +292,16 @@ export interface SelectedFilter {
 
 /** A saved custom filter, from the custom-filters store. */
 export interface CustomFilter {
-  id: Id;
+  /**
+   * Identity of the saved filter. In the AngularJS custom-filter store the
+   * saved-filter NAME doubles as its id (`{id: key, name: key, filter: value}`
+   * in controllerMixins.coffee L362-L364), so this is widened to allow the
+   * string key.
+   */
+  id: Id | string;
   name: string;
+  /** The stored query-param map (filter key → comma-joined ids). */
+  filter?: Record<string, string>;
   [key: string]: unknown;
 }
 

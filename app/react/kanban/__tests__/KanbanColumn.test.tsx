@@ -7,6 +7,7 @@
  */
 import { fireEvent, render } from "@testing-library/react";
 import {
+    AnimatedCounter,
     ColumnHeader,
     KanbanColumn,
     buildContainerKey,
@@ -61,6 +62,78 @@ describe("computeWipLimit (ported from KanbanWipLimitDirective)", () => {
     });
     it("returns null when comfortably under the limit", () => {
         expect(computeWipLimit(1, 5)).toBeNull();
+    });
+});
+
+describe("AnimatedCounter (QA-VIS-06 — WIP denominator)", () => {
+    // The directive renders three stacked `.result` frames; the MIDDLE one
+    // (index 1) is the visible frame (SCSS translateY(-14px) over a 14px inner).
+    function middleFrame(container: HTMLElement): Element {
+        const frames = container.querySelectorAll("tg-animated-counter .result");
+        expect(frames.length).toBe(3);
+        return frames[1];
+    }
+
+    it("renders tg-animated-counter with a plain count and NO denominator when wip is null", () => {
+        const { container } = render(<AnimatedCounter count={3} wip={null} />);
+        const counter = container.querySelector("tg-animated-counter")!;
+        expect(counter).not.toBeNull();
+        // React 18 must emit `class` (not `classname`) on the custom element.
+        expect(counter.outerHTML).not.toContain("classname");
+        expect(middleFrame(container).textContent).toBe("3");
+        expect(counter.textContent).not.toContain("/");
+        expect(container.querySelector(".animated-counter-inner.wip-amount")).toBeNull();
+    });
+
+    it("shows 'count / wip' and the .wip-amount class when a wip limit is set", () => {
+        const { container } = render(<AnimatedCounter count={2} wip={3} />);
+        expect(middleFrame(container).textContent).toBe("2 / 3");
+        expect(container.querySelector(".animated-counter-inner.wip-amount")).not.toBeNull();
+        expect(container.querySelector(".animated-counter-inner.limit-over")).toBeNull();
+    });
+
+    it("adds .limit-over when the count exceeds the wip limit", () => {
+        const { container } = render(<AnimatedCounter count={5} wip={3} />);
+        expect(middleFrame(container).textContent).toBe("5 / 3");
+        expect(container.querySelector(".animated-counter-inner.wip-amount.limit-over")).not.toBeNull();
+    });
+
+    it("carries the .vertical host class in the folded variant", () => {
+        const { container } = render(<AnimatedCounter count={4} wip={2} vertical />);
+        expect(container.querySelector("tg-animated-counter.vertical")).not.toBeNull();
+        expect(middleFrame(container).textContent).toBe("4 / 2");
+    });
+});
+
+describe("KanbanColumn counter WIP denominator (QA-VIS-06)", () => {
+    it("shows the WIP denominator in the expanded .kanban-task-counter", () => {
+        const { container } = render(
+            <KanbanColumn status={status({ id: 1, wip_limit: 3 })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
+                cardIds={[101, 102]} usMap={mkMap([101, 102])} folded={false} />,
+        );
+        const counter = container.querySelector(".kanban-task-counter tg-animated-counter")!;
+        expect(counter).not.toBeNull();
+        expect(counter.querySelectorAll(".result")[1].textContent).toBe("2 / 3");
+        expect(container.querySelector(".kanban-task-counter .wip-amount")).not.toBeNull();
+    });
+
+    it("shows the WIP denominator in the folded .ammount (vertical) counter", () => {
+        const { container } = render(
+            <KanbanColumn status={status({ id: 1, wip_limit: 3 })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
+                cardIds={[101, 102]} usMap={mkMap([101, 102])} folded={true} />,
+        );
+        const counter = container.querySelector(".ammount tg-animated-counter.vertical")!;
+        expect(counter).not.toBeNull();
+        expect(counter.querySelectorAll(".result")[1].textContent).toBe("2 / 3");
+    });
+
+    it("omits the denominator when the status has no wip limit", () => {
+        const { container } = render(
+            <KanbanColumn status={status({ id: 1, wip_limit: null })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
+                cardIds={[101, 102]} usMap={mkMap([101, 102])} folded={false} />,
+        );
+        const counter = container.querySelector(".kanban-task-counter tg-animated-counter")!;
+        expect(counter.textContent).not.toContain("/");
     });
 });
 

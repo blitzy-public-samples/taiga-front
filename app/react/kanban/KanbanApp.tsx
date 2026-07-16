@@ -6,7 +6,7 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useRef, useState } from "react";
 import sortBy from "lodash/sortBy";
 import { httpDelete, httpGet, HttpError } from "../shared/api/httpClient";
 import type { QueryParams } from "../shared/api/httpClient";
@@ -23,7 +23,16 @@ import type {
     ResolvedDrop,
 } from "../shared/dnd/DndProvider";
 import { KanbanBoard } from "./KanbanBoard";
+import { Icon } from "../shared/ui/Icon";
 import { buildContainerKey } from "./KanbanColumn";
+import {
+    loadColumnFolds,
+    loadKanbanFilters,
+    loadSwimlaneFolds,
+    saveColumnFolds,
+    saveKanbanFilters,
+    saveSwimlaneFolds,
+} from "./persistence";
 import { useKanbanState, UNCLASSIFIED_SWIMLANE_ID } from "./useKanbanState";
 import type {
     BaseUser,
@@ -66,6 +75,98 @@ const DEFAULT_ZOOM_LEVEL = 1;
 const MOVED_HIGHLIGHT_MS = 1000;
 const SEARCH_DEBOUNCE_MS = 200;
 
+// Section title (KANBAN.SECTION_NAME) rendered in the board header — the SCREEN
+// name, not the project name (the project name is owned by the surrounding
+// AngularJS `tg-project-menu`). Ported from `mainTitle.jade` (header > h1 > span).
+const SECTION_NAME = "Kanban";
+
+// Board-zoom control labels (ZOOM.TITLE + ZOOM.ZOOM-1..4), ported from
+// `board-zoom.jade` / `board-zoom.scss`. Index === zoom level (0-3).
+const ZOOM_TITLE = "Zoom:";
+const ZOOM_LABELS: ReadonlyArray<string> = [
+    "Compact",
+    "Default",
+    "Detailed",
+    "Expanded",
+];
+
+// Search affordance (COMMON.FILTERS.INPUT_PLACEHOLDER), ported from the
+// `tgInputSearch` component. `aria-label` is added for accessibility (QA-A11Y-01)
+// without altering the visual placeholder text.
+const SEARCH_PLACEHOLDER = "subject or reference";
+const SEARCH_ARIA_LABEL = "Search by subject or reference";
+const SEARCH_INPUT_ID = "kanban-search-input";
+const SEARCH_INPUT_NAME = "kanban-search";
+
+// Error-notification copy — ported from the AngularJS `$tgConfirm.notify("error")`
+// path (common/confirm.coffee: NOTIFICATION_MSG.error -> NOTIFICATION.WARNING /
+// NOTIFICATION.WARNING_TEXT, and NOTIFICATION.CLOSE for the dismiss control).
+// The React roots cannot call the Angular `$tgConfirm` service, so the same copy
+// is surfaced through an in-board, className-driven banner (no injected <style>).
+const NOTIFY_ERROR_TITLE = "Oops, something went wrong...";
+const NOTIFY_ERROR_MESSAGE = "Your changes were not saved!";
+const NOTIFY_CLOSE_LABEL = "Close notification";
+
+// Permission-denied copy (QA-FUNC-10) — ported verbatim from the AngularJS
+// permission-denied page (`app/partials/error/permission-denied.jade`) and the
+// locale strings it references: ERROR.PERMISSION_DENIED / ERROR.PERMISSION_DENIED_TEXT
+// (locale-en.json L1500-1501). The board renders a VISIBLE message for the
+// permission-denied / module-off / 403 / 451 states instead of a blank section,
+// mirroring the (QA-praised) `.kanban-load-error` visible-message pattern.
+const PERMISSION_DENIED_TITLE = "Permission denied";
+const PERMISSION_DENIED_TEXT =
+    "You don't have permission to access this page.";
+
+// Bulk-create lightbox copy (QA-FUNC-04) — ported verbatim from
+// `lightbox-us-bulk.jade` and the locale strings it references: COMMON.NEW_BULK,
+// LIGHTBOX.CREATE_EDIT.{SELECT_STATUS,LOCATION,CREATE_BOTTOM,CREATE_TOP,
+// SELECT_SWIMLANE,DEFAULT}, KANBAN.UNCLASSIFIED_USER_STORIES, COMMON.ONE_ITEM_LINE
+// and COMMON.SAVE. The lightbox reproduces the same DOM/class names so the
+// compiled `lightbox.scss` themes it unchanged (no injected <style>).
+const BULK_TITLE = "New bulk insert";
+const BULK_SELECT_STATUS = "Select status";
+const BULK_LOCATION = "Location";
+const BULK_CREATE_BOTTOM = "at the bottom";
+const BULK_CREATE_TOP = "on top";
+const BULK_SELECT_SWIMLANE = "Select swimlane";
+const BULK_DEFAULT_SWIMLANE = "Default";
+const BULK_UNCLASSIFIED = "Unclassified user stories";
+const BULK_PLACEHOLDER = "One item per line...";
+const BULK_SAVE = "Save";
+
+// Bulk-textarea validation (QA-FUNC-07) — the AngularJS lightbox wired two
+// `checksley` validators on the textarea: `data-required="true"` and
+// `data-linewidth="200"`. The latter is the custom validator registered in
+// app.coffee (L907): every line must be strictly shorter than the width, i.e.
+// `line.length < 200`. The messages are the exact COMMON.FORM_ERRORS strings.
+const BULK_LINE_WIDTH = 200;
+const BULK_ERROR_REQUIRED = "This value is required.";
+const BULK_ERROR_LINEWIDTH =
+    "One or more lines is perhaps too long. Try to keep under " +
+    BULK_LINE_WIDTH +
+    " characters.";
+
+/**
+ * Client-side reproduction of the two `checksley` validators bound to the bulk
+ * textarea (QA-FUNC-07). Returns the error message to display, or `null` when
+ * the input is valid.
+ *  - required  : the value must contain at least one non-whitespace character.
+ *  - linewidth : every line must be strictly shorter than `BULK_LINE_WIDTH`
+ *                (mirrors the `_.every lines, (line) -> line.length < width`
+ *                validator in app.coffee L907).
+ */
+export function validateBulkText(text: string): string | null {
+    if (!text.trim()) {
+        return BULK_ERROR_REQUIRED;
+    }
+    const lines = text.split(/\r\n|\r|\n/);
+    const anyTooLong = lines.some((line) => line.length >= BULK_LINE_WIDTH);
+    if (anyTooLong) {
+        return BULK_ERROR_LINEWIDTH;
+    }
+    return null;
+}
+
 export function zoomKeysFor(level: number): string[] {
     let clamped = Number(level);
     if (!Number.isFinite(clamped)) {
@@ -87,6 +188,46 @@ export function zoomKeysFor(level: number): string[] {
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for unit testing)
 // ---------------------------------------------------------------------------
+
+/**
+ * First user-story id currently in the (status, swimlane) column, or `null`
+ * when the column is empty. Used by the bulk "on top" placement (QA-FUNC-04) to
+ * find the story the newly-created stories must be ordered BEFORE — captured
+ * BEFORE the create request because the new stories are not yet in state
+ * (mirrors AngularJS `moveUsToTop`, kanban/main.coffee L160-L182: `nextUsId =
+ * userstories.get(0)`). In swimlane mode the bucket is
+ * `usByStatusSwimlanes[swimlane][status]` (a `null` swimlane maps to the
+ * unclassified `-1` bucket); otherwise it is `usByStatus[status]`.
+ */
+export function firstUsInColumn(
+    state: KanbanState,
+    statusId: number,
+    swimlaneId: number | null,
+): number | null {
+    let ids: number[] | undefined;
+    if (state.swimlanesList.length > 0) {
+        const bucketSwimlane =
+            swimlaneId === null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneId;
+        ids = state.usByStatusSwimlanes[bucketSwimlane]?.[statusId];
+    } else {
+        ids = state.usByStatus[String(statusId)];
+    }
+    return ids && ids.length ? ids[0] : null;
+}
+
+/**
+ * Whether the board currently has any UNCLASSIFIED user stories (the `-1`
+ * swimlane bucket). Mirrors the AngularJS `noSwimlaneUserStories` flag that
+ * gates the bulk lightbox's "Unclassified" swimlane option
+ * (`tg-swimlane-selector` has-unclassified-stories, swimlane-selector.jade L26).
+ */
+export function hasUnclassifiedStories(state: KanbanState): boolean {
+    const bucket = state.usByStatusSwimlanes[UNCLASSIFIED_SWIMLANE_ID];
+    if (!bucket) {
+        return false;
+    }
+    return Object.values(bucket).some((ids) => ids.length > 0);
+}
 
 /** Parse a `${statusId}::${swimlaneId}` container key. Swimlane id is RAW. */
 export function parseContainerKey(key: string): {
@@ -153,10 +294,22 @@ function buildContainerIndex(state: KanbanState): ContainerIndex {
  * Resolve a normalized drag-end into a `ResolvedDrop`. The consumer computes
  * the target container's final ordered id list + the dragged card's index;
  * `DndProvider.computeNeighbors` then derives the before/after neighbors.
+ *
+ * MULTI-SELECT GROUP DRAG (QA-FUNC-01): the optional `selectedIds` argument
+ * carries the ids of the currently multi-selected cards (AngularJS
+ * `ctrl.selectedUss`). When the dragged card is part of an active selection of
+ * more than one card, the WHOLE selection is moved together as one contiguous
+ * block to the drop location and every moved id is reported in `draggedIds`
+ * (so the bulk-order endpoint receives `bulk_userstories` with >1 id), exactly
+ * as the legacy `dragMultipleItems` path did (kanban/sortable.coffee). When
+ * there is no active multi-selection — or the dragged card is not part of it —
+ * only the single dragged card moves and the single-item behavior is preserved
+ * bit-for-bit.
  */
 export function resolveKanbanDrop(
     state: KanbanState,
     event: NormalizedDragEnd,
+    selectedIds?: number[],
 ): ResolvedDrop | null {
     const { activeId, overId } = event;
     if (overId === null || overId === undefined) {
@@ -168,6 +321,35 @@ export function resolveKanbanDrop(
     if (!origin) {
         return null;
     }
+
+    // --- Resolve the moved group -----------------------------------------
+    // Default: the single dragged card. When a multi-selection (>1 card) is
+    // active AND the dragged card belongs to it, the moved group becomes every
+    // selected card that still exists on the board, ordered by board reading
+    // order (container-construction order, then index within the container) so
+    // the relative sequence of the selected cards is stable across the move.
+    let group: number[] = [activeId];
+    if (
+        Array.isArray(selectedIds) &&
+        selectedIds.length > 1 &&
+        selectedIds.indexOf(activeId) !== -1
+    ) {
+        const onBoard = selectedIds.filter((id) => containerOf[id] !== undefined);
+        if (onBoard.length > 1) {
+            const rank = new Map<number, number>();
+            let r = 0;
+            for (const key of Object.keys(listOf)) {
+                for (const id of listOf[key]) {
+                    rank.set(id, r);
+                    r += 1;
+                }
+            }
+            group = Array.from(new Set(onBoard)).sort(
+                (a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0),
+            );
+        }
+    }
+    const groupSet = new Set(group);
 
     let targetKey: string;
     let targetIndexRaw: number;
@@ -183,29 +365,37 @@ export function resolveKanbanDrop(
         targetIndexRaw = (listOf[targetKey] ?? []).length;
     }
 
-    const targetList = (listOf[targetKey] ?? []).slice();
-    const existing = targetList.indexOf(activeId);
-    if (existing !== -1) {
-        targetList.splice(existing, 1);
+    const targetListRaw = (listOf[targetKey] ?? []).slice();
+
+    // Number of group members sitting BEFORE the raw target index inside the
+    // target container. Removing them shifts the insertion point left by that
+    // many slots (for a single-item drag this reduces to the original
+    // `existing < targetIndexRaw` decrement).
+    let removedBefore = 0;
+    for (let i = 0; i < targetListRaw.length && i < targetIndexRaw; i += 1) {
+        if (groupSet.has(targetListRaw[i])) {
+            removedBefore += 1;
+        }
     }
 
-    let insertAt = targetIndexRaw;
-    if (existing !== -1 && existing < targetIndexRaw) {
-        insertAt = targetIndexRaw - 1;
-    }
+    // Strip every group member out of the target container list.
+    const targetList = targetListRaw.filter((id) => !groupSet.has(id));
+
+    let insertAt = targetIndexRaw - removedBefore;
     if (insertAt < 0) {
         insertAt = 0;
     }
     if (insertAt > targetList.length) {
         insertAt = targetList.length;
     }
-    targetList.splice(insertAt, 0, activeId);
+    // Insert the whole group (in reading order) contiguously at the drop point.
+    targetList.splice(insertAt, 0, ...group);
 
     return {
         origin: { containerKey: origin.key, index: origin.index },
         target: { containerKey: targetKey, index: insertAt },
         orderedIds: targetList,
-        draggedIds: [activeId],
+        draggedIds: group,
     };
 }
 
@@ -549,39 +739,338 @@ function KanbanFilterPanel(props: KanbanFilterPanelProps): JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk create lightbox — reproduces lightbox-us-bulk.jade behavior: a textarea
-// of newline-separated subjects submitted to the bulk_create endpoint.
+// Error notification banner — the React-owned equivalent of the AngularJS
+// `$tgConfirm.notify("error")` toast (QA-FUNC-14). It reproduces the
+// notification-message DOM (icon + title + message + dismiss) but uses a
+// DISTINCT, React-owned class prefix (`kanban-notification*`) rather than the
+// global `.notification-message-error` class, so the cross-framework
+// `$tgConfirm.notify` selector never targets this element. Dismissed by the
+// user via the close control (the surviving AngularJS shell owns any auto-hide
+// timing for its own toasts; here the board keeps the banner until dismissed or
+// superseded, matching the "a message is shown" requirement).
 // ---------------------------------------------------------------------------
 
-interface BulkLightboxProps {
-    onSubmit: (subjects: string) => void;
+interface KanbanNotificationProps {
+    message: string;
     onClose: () => void;
 }
 
+function KanbanNotification(props: KanbanNotificationProps): JSX.Element {
+    return (
+        <div
+            className="kanban-notification kanban-notification-error"
+            role="alert"
+        >
+            <Icon name="icon-error" wrapperClass="kanban-notification-icon" />
+            <div className="text">
+                <h4 className="warning">{NOTIFY_ERROR_TITLE}</h4>
+                <p>{props.message}</p>
+            </div>
+            <button
+                type="button"
+                className="close kanban-notification-close"
+                aria-label={NOTIFY_CLOSE_LABEL}
+                title={NOTIFY_CLOSE_LABEL}
+                onClick={props.onClose}
+            >
+                <Icon name="icon-close" />
+            </button>
+        </div>
+    );
+}
+
+// Bulk create lightbox (QA-FUNC-04) — a faithful React reproduction of
+// `lightbox-us-bulk.jade` + `CreateBulkUserstoriesDirective`
+// (common/lightboxes.coffee L315-L410). It renders the same regions the
+// AngularJS lightbox did — title, status selector, top/bottom position radios,
+// swimlane selector (in swimlane mode), and the `cols=200` textarea with the
+// "One item per line..." placeholder — using the same DOM/class names so the
+// compiled `lightbox.scss` themes it unchanged. On submit it validates the
+// textarea (QA-FUNC-07: required + linewidth<200) and, only when valid, hands
+// the subjects together with the SELECTED status, swimlane (QA-FUNC-05) and
+// position to `onSubmit`.
+// ---------------------------------------------------------------------------
+
+interface BulkLightboxProps {
+    /** All project statuses shown in the status selector. */
+    statuses: Status[];
+    /** Status whose "+bulk" affordance opened the lightbox (initial selection). */
+    initialStatusId: number;
+    /** Real swimlanes for the swimlane selector (empty on a no-swimlane board). */
+    swimlanes: Swimlane[];
+    /** Project default swimlane — the swimlane pre-selected on open (QA-FUNC-05). */
+    defaultSwimlaneId: number | null;
+    /** Whether the board is in swimlane mode (gates the swimlane selector). */
+    swimlaneMode: boolean;
+    /** Whether an "Unclassified" swimlane option should be offered. */
+    hasUnclassified: boolean;
+    onSubmit: (
+        subjects: string,
+        statusId: number,
+        swimlaneId: number | null,
+        position: "top" | "bottom",
+    ) => void;
+    onClose: () => void;
+    /** Inline error surfaced when a bulk-create request fails (QA-FUNC-06). */
+    error?: string | null;
+}
+
 function BulkLightbox(props: BulkLightboxProps): JSX.Element {
+    const {
+        statuses,
+        initialStatusId,
+        swimlanes,
+        defaultSwimlaneId,
+        swimlaneMode,
+        hasUnclassified,
+        onSubmit,
+        onClose,
+        error,
+    } = props;
+
     const [text, setText] = useState("");
+    const [statusId, setStatusId] = useState<number>(initialStatusId);
+    const [displayStatusSelector, setDisplayStatusSelector] = useState(false);
+    const [swimlaneId, setSwimlaneId] = useState<number | null>(defaultSwimlaneId);
+    const [displaySwimlaneSelector, setDisplaySwimlaneSelector] = useState(false);
+    const [position, setPosition] = useState<"top" | "bottom">("bottom");
+    // Client-side validation message (QA-FUNC-07); takes precedence over the
+    // server-side failure error (QA-FUNC-06) in the shared `.bulk-error` slot.
+    const [validationError, setValidationError] = useState<string | null>(null);
+
+    const currentStatus =
+        statuses.find((status) => status.id === statusId) ?? statuses[0];
+    const currentSwimlane =
+        swimlaneId === null
+            ? null
+            : swimlanes.find((swimlane) => swimlane.id === swimlaneId) ?? null;
+    const showSwimlaneSelector = swimlaneMode && swimlanes.length > 0;
+    const shownError = validationError ?? error ?? null;
+
+    const handleSubmit = (): void => {
+        const message = validateBulkText(text);
+        if (message !== null) {
+            setValidationError(message);
+            return;
+        }
+        setValidationError(null);
+        onSubmit(text, statusId, swimlaneId, position);
+    };
+
     return (
         <div className="lightbox lightbox-generic-bulk open">
             <div className="lightbox-us-bulk">
-                <textarea
-                    className="bulk-subjects e2e-bulk-subjects"
-                    value={text}
-                    onChange={(event) => setText(event.target.value)}
-                />
                 <button
                     type="button"
-                    className="btn-submit e2e-bulk-submit"
-                    onClick={() => props.onSubmit(text)}
+                    className="close lightbox-close e2e-bulk-close"
+                    aria-label={NOTIFY_CLOSE_LABEL}
+                    title={NOTIFY_CLOSE_LABEL}
+                    onClick={onClose}
                 >
-                    Create
+                    <Icon name="icon-close" />
                 </button>
-                <button
-                    type="button"
-                    className="btn-close e2e-bulk-close"
-                    onClick={props.onClose}
+                <form
+                    onSubmit={(event) => {
+                        event.preventDefault();
+                        handleSubmit();
+                    }}
                 >
-                    Close
-                </button>
+                    <h2 className="title">{BULK_TITLE}</h2>
+
+                    {statuses.length ? (
+                        <fieldset>
+                            <div className="label">{BULK_SELECT_STATUS}</div>
+                            <div className="bulk-status-selector-wrapper">
+                                <button
+                                    type="button"
+                                    className={
+                                        "bulk-status-selector" +
+                                        (displayStatusSelector ? " active" : "")
+                                    }
+                                    style={
+                                        currentStatus
+                                            ? { backgroundColor: currentStatus.color }
+                                            : undefined
+                                    }
+                                    onClick={() =>
+                                        setDisplayStatusSelector((open) => !open)
+                                    }
+                                >
+                                    <span>{currentStatus?.name}</span>
+                                    <Icon name="icon-arrow-down" />
+                                </button>
+                                {displayStatusSelector ? (
+                                    <div className="bulk-status-option-wrapper">
+                                        {statuses.map((status) => (
+                                            <button
+                                                key={status.id}
+                                                type="button"
+                                                className={
+                                                    "bulk-status-option" +
+                                                    (status.id === statusId
+                                                        ? " selected"
+                                                        : "")
+                                                }
+                                                onClick={() => {
+                                                    setStatusId(status.id);
+                                                    setDisplayStatusSelector(false);
+                                                }}
+                                            >
+                                                {status.name}
+                                            </button>
+                                        ))}
+                                    </div>
+                                ) : null}
+                            </div>
+                        </fieldset>
+                    ) : null}
+
+                    <fieldset className="creation-position">
+                        <div className="label">{BULK_LOCATION}</div>
+                        <div className="creation-position-fields">
+                            <label className="custom-radio">
+                                <input
+                                    type="radio"
+                                    name="us_position"
+                                    value="bottom"
+                                    checked={position === "bottom"}
+                                    onChange={() => setPosition("bottom")}
+                                />
+                                <span className="radio-control" />
+                                <span className="radio-label">
+                                    {BULK_CREATE_BOTTOM}
+                                </span>
+                            </label>
+                            <label className="custom-radio">
+                                <input
+                                    type="radio"
+                                    name="us_position"
+                                    value="top"
+                                    checked={position === "top"}
+                                    onChange={() => setPosition("top")}
+                                />
+                                <span className="radio-control" />
+                                <span className="radio-label">
+                                    {BULK_CREATE_TOP}
+                                </span>
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    {showSwimlaneSelector ? (
+                        <fieldset className="swimlane-select">
+                            <div className="label">{BULK_SELECT_SWIMLANE}</div>
+                            <div className="swimlane-selector">
+                                <button
+                                    type="button"
+                                    className="select"
+                                    onClick={() =>
+                                        setDisplaySwimlaneSelector((open) => !open)
+                                    }
+                                >
+                                    {currentSwimlane ? (
+                                        <span className="swimlane-select-text">
+                                            <span>{currentSwimlane.name}</span>
+                                            {currentSwimlane.id ===
+                                                defaultSwimlaneId &&
+                                            swimlanes.length > 1 ? (
+                                                <span className="swimlane-default">
+                                                    {" (" +
+                                                        BULK_DEFAULT_SWIMLANE +
+                                                        ")"}
+                                                </span>
+                                            ) : null}
+                                        </span>
+                                    ) : (
+                                        <span className="swimlane-select-text unclassified">
+                                            {BULK_UNCLASSIFIED}
+                                        </span>
+                                    )}
+                                    <Icon name="icon-arrow-down" />
+                                </button>
+                                {displaySwimlaneSelector ? (
+                                    <div className="options">
+                                        {hasUnclassified ? (
+                                            <button
+                                                type="button"
+                                                className={
+                                                    "option unclassified" +
+                                                    (swimlaneId === null
+                                                        ? " selected"
+                                                        : "")
+                                                }
+                                                onClick={() => {
+                                                    setSwimlaneId(null);
+                                                    setDisplaySwimlaneSelector(
+                                                        false,
+                                                    );
+                                                }}
+                                            >
+                                                {BULK_UNCLASSIFIED}
+                                            </button>
+                                        ) : null}
+                                        {swimlanes.map((swimlane) => (
+                                            <button
+                                                key={swimlane.id}
+                                                type="button"
+                                                className={
+                                                    "option" +
+                                                    (swimlane.id === swimlaneId
+                                                        ? " selected"
+                                                        : "")
+                                                }
+                                                onClick={() => {
+                                                    setSwimlaneId(swimlane.id);
+                                                    setDisplaySwimlaneSelector(
+                                                        false,
+                                                    );
+                                                }}
+                                            >
+                                                <span>{swimlane.name}</span>
+                                                {defaultSwimlaneId ===
+                                                    swimlane.id &&
+                                                swimlanes.length > 1 ? (
+                                                    <span className="swimlane-default">
+                                                        {" (" +
+                                                            BULK_DEFAULT_SWIMLANE +
+                                                            ")"}
+                                                    </span>
+                                                ) : null}
+                                            </button>
+                                        ))}
+                                    </div>
+                                ) : null}
+                            </div>
+                        </fieldset>
+                    ) : null}
+
+                    <fieldset>
+                        <textarea
+                            className="bulk-subjects e2e-bulk-subjects"
+                            cols={BULK_LINE_WIDTH}
+                            wrap="off"
+                            placeholder={BULK_PLACEHOLDER}
+                            value={text}
+                            onChange={(event) => setText(event.target.value)}
+                        />
+                    </fieldset>
+
+                    {shownError ? (
+                        <div className="bulk-error e2e-bulk-error" role="alert">
+                            {shownError}
+                        </div>
+                    ) : null}
+
+                    <div className="lb-action-wrapper">
+                        <button
+                            type="submit"
+                            className="btn-small js-submit-button e2e-bulk-submit"
+                            title={BULK_SAVE}
+                        >
+                            {BULK_SAVE}
+                        </button>
+                    </div>
+                </form>
             </div>
         </div>
     );
@@ -602,18 +1091,26 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const [folds, setFolds] = useState<Record<number, boolean>>({});
     const [unfold, setUnfold] = useState<number | null>(null);
     const [foldedSwimlane, setFoldedSwimlane] = useState<Record<number, boolean>>({});
-    // F5 / multi-select: the AngularJS board supported multi-card selection for
-    // group drag (`ui-multisortable-multiple`). That interaction is intentionally
-    // NOT reproduced in the React port — it is absent from the AAP §0.1.1
-    // functional surface, and no selection affordance exists. The leaf
-    // `Card` / `KanbanColumn` / `KanbanBoard` retain an OPTIONAL `selected` prop
-    // that simply defaults to `false`, so no inert, always-empty selection map is
-    // threaded through the tree (which would imply an unimplemented capability).
+    // Multi-select group drag (QA-FUNC-01): the AngularJS board supported
+    // ctrl/meta-click multi-card selection for group drag, tracked in
+    // `ctrl.selectedUss` (a `{ [usId]: boolean }` map) and reflected on each card
+    // via the `kanban-task-selected` / `ui-multisortable-multiple` classes
+    // (kanban-table.jade). Selecting one card and dragging it moves the whole
+    // selection together, and the selection is cleared whenever the board
+    // reloads (`cleanSelectedUss`, main.coffee L597). This state reproduces that
+    // map; `toggleSelectedUs` flips a single card and it is threaded to the leaf
+    // `Card` (via `selectedUss` + `onToggleSelect`) which already renders the
+    // matching classes.
+    const [selectedUss, setSelectedUss] = useState<Record<number, boolean>>({});
     const [movedUs, setMovedUs] = useState<number[]>([]);
     const [notFound, setNotFound] = useState(false);
     const [projectLoaded, setProjectLoaded] = useState<KanbanProject | null>(null);
     const [permissionDenied, setPermissionDenied] = useState(false);
     const [loadError, setLoadError] = useState(false);
+    // Board-level error banner (QA-FUNC-14) and bulk-lightbox inline error
+    // (QA-FUNC-06). `null` = hidden.
+    const [errorNotice, setErrorNotice] = useState<string | null>(null);
+    const [bulkError, setBulkError] = useState<string | null>(null);
 
     // Sidebar filter state (F2). `filters` are the five category widgets built
     // from `filters_data`; `selectedFilters` are the user's active choices and
@@ -628,6 +1125,10 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const filterQRef = useRef(filterQ);
     const selectedFiltersRef = useRef(selectedFilters);
     const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // In-flight guard for the bulk-create submit — preserves the double-submit
+    // prevention (QA verified PASS) now that the lightbox closes only on success
+    // (QA-FUNC-06), not synchronously at submit time.
+    const bulkSubmittingRef = useRef<boolean>(false);
     // Unmount guard: async resolvers must not `setState` after the root has been
     // unmounted (F-C). Mirrors the Backlog root's `aliveRef` pattern.
     const aliveRef = useRef<boolean>(true);
@@ -662,6 +1163,10 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const userstories = (usResponse.data as unknown as UserStoryModel[]) ?? [];
         kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
         kanban.setUserstories(userstories);
+        // Multi-select group drag (QA-FUNC-01): clear the card selection whenever
+        // the board reloads, mirroring `cleanSelectedUss` (main.coffee L597) so a
+        // stale selection cannot outlive the cards it referenced.
+        setSelectedUss({});
         setNotFound(userstories.length === 0 && !!query);
     };
 
@@ -697,6 +1202,29 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         if (!Number.isFinite(projectId)) {
             return;
         }
+        // QA-FUNC-09: restore the persisted sidebar filters + search query
+        // BEFORE the first userstories/filters fetch so the board loads already
+        // filtered (mirrors the AngularJS filtersMixin `applyStoredFilters`,
+        // storeFiltersName "kanban-filters"). Writing the refs SYNCHRONOUSLY
+        // guarantees the initial `listUserstories` and `filtersData` requests
+        // (which read `selectedFiltersRef` / `filterQRef`) honor the restored
+        // selection; the matching `setState` calls refresh the visible filter
+        // chips + search box on the next render.
+        const storedFilters = loadKanbanFilters<KanbanSelectedFilter>(projectId);
+        if (storedFilters) {
+            selectedFiltersRef.current = storedFilters.selected;
+            filterQRef.current = storedFilters.q;
+            setSelectedFilters(storedFilters.selected);
+            setFilterQ(storedFilters.q);
+        }
+        // QA-FUNC-03: restore the persisted swimlane fold modes now, and capture
+        // the persisted column fold modes for the archived-override merge below
+        // (port of `getSwimlanesModes` / `getStatusColumnModes`).
+        const storedColumnFolds = loadColumnFolds(projectId);
+        const storedSwimlaneFolds = loadSwimlaneFolds(projectId);
+        if (storedSwimlaneFolds) {
+            setFoldedSwimlane(storedSwimlaneFolds);
+        }
         try {
             const projectResponse = await httpGet<KanbanProject>(
                 `/projects/${projectId}`,
@@ -714,6 +1242,23 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 (project.us_statuses as Status[] | undefined) ?? [],
                 "order",
             );
+            // QA-FUNC-03 + QA-FUNC-02: seed the column fold modes from the
+            // persisted state (`storedColumnFolds`, falling back to the current
+            // state), then force every archived status folded ON TOP so archived
+            // columns always render squished on a fresh board load regardless of
+            // the stored/prior mode. This mirrors the AngularJS `ctrl.initialLoad`
+            // watcher, which restores `getStatusColumnModes` and then forces
+            // `folds[status.id] = true` for every `is_archived` status
+            // (kanban/main.coffee L797-803).
+            setFolds((previous) => {
+                const next = { ...(storedColumnFolds ?? previous) };
+                for (const status of project.us_statuses as Status[]) {
+                    if (status.is_archived) {
+                        next[status.id] = true;
+                    }
+                }
+                return next;
+            });
             projectRef.current = project;
             setProjectLoaded(project);
 
@@ -849,6 +1394,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const changeQ = (query: string): void => {
         setFilterQ(query);
         filterQRef.current = query;
+        // QA-FUNC-09: persist the search query alongside the active filter
+        // selection so it survives a reload (mirrors the AngularJS filtersMixin
+        // which stored `q` as part of the applied filters). Persisting is
+        // immediate; only the board reload below is debounced.
+        saveKanbanFilters(projectId, {
+            q: query,
+            selected: selectedFiltersRef.current,
+        });
         if (searchTimer.current !== null) {
             clearTimeout(searchTimer.current);
         }
@@ -879,21 +1432,81 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             });
             return;
         }
+        setBulkError(null);
         setBulkStatusId(statusId);
     };
 
-    const submitBulk = (subjects: string): void => {
-        const statusId = bulkStatusId;
-        setBulkStatusId(null);
-        if (statusId === null || !subjects.trim()) {
+    const submitBulk = (
+        subjects: string,
+        statusId: number,
+        swimlaneId: number | null,
+        position: "top" | "bottom",
+    ): void => {
+        // The lightbox has already validated `subjects` (QA-FUNC-07); this guard
+        // is defensive only.
+        if (!subjects.trim()) {
             return;
         }
-        void bulkCreate(projectId, statusId, subjects, null).then(() => {
-            if (!aliveRef.current) {
-                return;
-            }
-            void reloadUserstories();
-        });
+        // Double-submit prevention: the lightbox now stays OPEN until the request
+        // succeeds (QA-FUNC-06), so a second click while a submit is in flight
+        // must be ignored (previously the synchronous close guarded this).
+        if (bulkSubmittingRef.current) {
+            return;
+        }
+        // QA-FUNC-04 "on top": capture the target column's current first story
+        // BEFORE creating (the new stories are not yet in state) so the created
+        // ids can be ordered ahead of it — mirrors AngularJS `moveUsToTop`
+        // (kanban/main.coffee L160). Only needed for the non-default "top" case.
+        const beforeFirstId =
+            position === "top"
+                ? firstUsInColumn(kanban.state, statusId, swimlaneId)
+                : null;
+        bulkSubmittingRef.current = true;
+        setBulkError(null);
+        // QA-FUNC-05: pass the SELECTED swimlane (defaulting to the project
+        // default_swimlane on a swimlane board) instead of the previously
+        // hardcoded `null`, so bulk-created stories land in the chosen swimlane.
+        void bulkCreate(projectId, statusId, subjects, swimlaneId)
+            .then((response) => {
+                if (position !== "top" || beforeFirstId === null) {
+                    return undefined;
+                }
+                const createdIds = (response.data ?? []).map((us) => us.id);
+                if (createdIds.length === 0) {
+                    return undefined;
+                }
+                // Reorder the freshly-created stories to the TOP of the column,
+                // ahead of the previously-first story (mirrors moveUsToTop).
+                return bulkUpdateKanbanOrder(
+                    projectId,
+                    statusId,
+                    swimlaneId,
+                    null,
+                    beforeFirstId,
+                    createdIds,
+                ).then(() => undefined);
+            })
+            .then(() => {
+                bulkSubmittingRef.current = false;
+                if (!aliveRef.current) {
+                    return;
+                }
+                // Close the lightbox ONLY on success, then refresh the board.
+                setBulkStatusId(null);
+                setBulkError(null);
+                void reloadUserstories();
+            })
+            .catch(() => {
+                // QA-FUNC-06: on failure keep the lightbox open (do NOT clear
+                // `bulkStatusId`) so the typed text is retained, and surface an
+                // inline error so the user can correct and retry. Mirrors the
+                // AngularJS bulk-create error handling that left the form open.
+                bulkSubmittingRef.current = false;
+                if (!aliveRef.current) {
+                    return;
+                }
+                setBulkError(NOTIFY_ERROR_MESSAGE);
+            });
     };
 
     /**
@@ -965,6 +1578,9 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const next = [...current, added];
         selectedFiltersRef.current = next;
         setSelectedFilters(next);
+        // QA-FUNC-09: persist the updated filter selection (with the current
+        // search query) so it survives a reload (port of `storeFilters`).
+        saveKanbanFilters(projectId, { q: filterQRef.current, selected: next });
         void reloadUserstories();
         void loadFilters(next);
     };
@@ -977,21 +1593,32 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         );
         selectedFiltersRef.current = next;
         setSelectedFilters(next);
+        // QA-FUNC-09: persist the reduced filter selection (port of
+        // `storeFilters`).
+        saveKanbanFilters(projectId, { q: filterQRef.current, selected: next });
         void reloadUserstories();
         void loadFilters(next);
     };
 
     const foldStatus = (status: Status): void => {
         const nextFolded = !folds[status.id];
-        setFolds((previous) => ({ ...previous, [status.id]: nextFolded }));
+        const next = { ...folds, [status.id]: nextFolded };
+        setFolds(next);
+        // QA-FUNC-03: persist the column fold modes so the squish/unfold state
+        // survives a reload (port of `storeStatusColumnModes`).
+        saveColumnFolds(projectId, next);
         setUnfold(nextFolded ? null : status.id);
     };
 
     const toggleSwimlane = (swimlaneId: number): void => {
-        setFoldedSwimlane((previous) => ({
-            ...previous,
-            [swimlaneId]: !previous[swimlaneId],
-        }));
+        const next = {
+            ...foldedSwimlane,
+            [swimlaneId]: !foldedSwimlane[swimlaneId],
+        };
+        setFoldedSwimlane(next);
+        // QA-FUNC-03: persist the swimlane fold modes (port of
+        // `storeSwimlanesModes`).
+        saveSwimlaneFolds(projectId, next);
     };
 
     const handleToggleFold = (usId: number): void => {
@@ -1006,12 +1633,23 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         ) {
             return;
         }
-        void httpDelete(`/userstories/${usId}`).then(() => {
-            if (!aliveRef.current) {
-                return;
-            }
-            void reloadUserstories();
-        });
+        void httpDelete(`/userstories/${usId}`)
+            .then(() => {
+                if (!aliveRef.current) {
+                    return;
+                }
+                void reloadUserstories();
+            })
+            .catch(() => {
+                // QA-FUNC-14: mirror the AngularJS `deleteUserStory` error branch
+                // (`promise.then null, -> @confirm.notify("error")`,
+                // kanban/main.coffee L313-314). Surface an error notification and
+                // SKIP the reload so the (still-present) card stays on the board.
+                if (!aliveRef.current) {
+                    return;
+                }
+                setErrorNotice(NOTIFY_ERROR_MESSAGE);
+            });
     };
 
     const isArchivedHidden = (usId: number): boolean => {
@@ -1043,11 +1681,36 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     };
 
     // -----------------------------------------------------------------------
+    // Multi-select (QA-FUNC-01)
+    // -----------------------------------------------------------------------
+
+    // Toggle a single card's membership in the selection (ctrl/meta-click),
+    // mirroring `toggleSelectedUs` (main.coffee L109-110). A deselected card is
+    // removed from the map so it only ever holds truthy entries.
+    const toggleSelectedUs = (usId: number): void => {
+        setSelectedUss((previous) => {
+            const next = { ...previous };
+            if (next[usId]) {
+                delete next[usId];
+            } else {
+                next[usId] = true;
+            }
+            return next;
+        });
+    };
+
+    // The active selection as an id list (map keys with a truthy value), handed
+    // to `resolveKanbanDrop` so a drag of any selected card moves the whole group.
+    const selectedIdList = Object.keys(selectedUss)
+        .filter((key) => selectedUss[Number(key)])
+        .map(Number);
+
+    // -----------------------------------------------------------------------
     // Drag and drop
     // -----------------------------------------------------------------------
 
     const resolveDrop = (event: NormalizedDragEnd): ResolvedDrop | null =>
-        resolveKanbanDrop(kanban.state, event);
+        resolveKanbanDrop(kanban.state, event, selectedIdList);
 
     const persist = (
         resolved: ResolvedDrop,
@@ -1086,20 +1749,43 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // -----------------------------------------------------------------------
 
     if (permissionDenied) {
-        return <section className="main kanban permission-denied" />;
+        // QA-FUNC-10: render a VISIBLE explanatory message (title + text) rather
+        // than an empty section. Uses a dedicated, className-driven wrapper that
+        // — like the (QA-praised) `.kanban-load-error` message — renders legibly
+        // with default browser styling (React-owned class, no injected <style>).
+        // A DISTINCT class (not `.kanban-load-error`) keeps the permission-denied
+        // state cleanly separable from the generic 500 load-error state.
+        return (
+            <section className="main kanban permission-denied">
+                <div className="kanban-permission-denied-message" role="alert">
+                    <h1>{PERMISSION_DENIED_TITLE}</h1>
+                    <p>{PERMISSION_DENIED_TEXT}</p>
+                </div>
+            </section>
+        );
     }
 
     const project = projectLoaded;
     const swimlaneMode = kanban.state.swimlanesList.length > 0;
+    // QA-FUNC-11: mirror AngularJS `projectService.canEdit(add_us)` — which is
+    // `!isArchived() && hasPermission()` (project.service.coffee L108-110). An
+    // archived project (truthy `archived_code`) disables the add-us affordances,
+    // exactly like the `tg-check-permission="add_us"` directive (common.coffee
+    // L87-90 -> canEdit) that gated the AngularJS add buttons.
     const canAddUs =
         !!project &&
+        !project.archived_code &&
         Array.isArray(project.my_permissions) &&
         project.my_permissions.indexOf("add_us") !== -1;
 
     return (
         <section className={"main kanban" + (swimlaneMode ? " swimlane" : "")}>
             <div className="kanban-header">
-                <div className="main-title">{project ? project.name : ""}</div>
+                <header>
+                    <h1>
+                        <span>{SECTION_NAME}</span>
+                    </h1>
+                </header>
                 <div className="taskboard-actions">
                     <div className="kanban-table-options-start">
                         <button
@@ -1110,33 +1796,57 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                             }
                             onClick={() => setOpenFilter(!openFilter)}
                         >
-                            <span className="icon icon-filters" aria-hidden="true" />
+                            <Icon name="icon-filters" />
                             <span className="text">
                                 {openFilter ? "Hide filters" : "Filters"}
                             </span>
                         </button>
-                        <input
-                            className="kanban-search e2e-search"
-                            type="search"
-                            value={filterQ}
-                            placeholder="Search"
-                            onChange={(event) => changeQ(event.target.value)}
-                        />
+                        {/*
+                          * tg-input-search: a real custom element (styled by tag
+                          * name in input-search.component.scss — position:relative
+                          * host with an absolutely-positioned magnifier). Rendered
+                          * via createElement so we don't augment JSX.IntrinsicElements
+                          * (matching the Icon/Svg precedent). No `class` is needed on
+                          * the host — the SCSS targets the tag — so the React-18
+                          * className->class caveat for custom elements does not apply.
+                          */}
+                        {createElement(
+                            "tg-input-search",
+                            null,
+                            <input
+                                key="search-input"
+                                id={SEARCH_INPUT_ID}
+                                name={SEARCH_INPUT_NAME}
+                                className="kanban-search e2e-search"
+                                type="search"
+                                value={filterQ}
+                                placeholder={SEARCH_PLACEHOLDER}
+                                aria-label={SEARCH_ARIA_LABEL}
+                                onChange={(event) => changeQ(event.target.value)}
+                            />,
+                            <Icon key="search-icon" name="icon-search" />,
+                        )}
                     </div>
                     <div className="kanban-table-options-end">
                         <div className="board-zoom">
+                            <div className="board-zoom-title">{ZOOM_TITLE}</div>
                             {[0, 1, 2, 3].map((level) => (
-                                <button
+                                <label
                                     key={level}
-                                    type="button"
-                                    className={
-                                        "zoom-level" +
-                                        (zoomLevel === level ? " active" : "")
-                                    }
-                                    onClick={() => changeZoom(level)}
+                                    className="zoom-radio"
+                                    title={ZOOM_LABELS[level]}
                                 >
-                                    {level}
-                                </button>
+                                    <input
+                                        type="radio"
+                                        name="kanban-board-zoom"
+                                        value={level}
+                                        checked={zoomLevel === level}
+                                        onChange={() => changeZoom(level)}
+                                    />
+                                    <div className="checkmark">
+                                        <span>{ZOOM_LABELS[level]}</span>
+                                    </div>
+                                </label>
                             ))}
                         </div>
                     </div>
@@ -1157,6 +1867,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     <div className="kanban-load-error">Unable to load the board.</div>
                 ) : null}
 
+                {errorNotice ? (
+                    <KanbanNotification
+                        message={errorNotice}
+                        onClose={() => setErrorNotice(null)}
+                    />
+                ) : null}
+
                 {project ? (
                     <KanbanBoard
                         state={kanban.state}
@@ -1167,6 +1884,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         unfold={unfold}
                         foldedSwimlane={foldedSwimlane}
                         movedUs={movedUs}
+                        selectedUss={selectedUss}
                         canAddUs={canAddUs}
                         isArchivedHidden={isArchivedHidden}
                         showPlaceholder={showPlaceholder}
@@ -1180,14 +1898,28 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         onClickEdit={onEditUs}
                         onClickAssignedTo={onAssignUs}
                         onClickDelete={handleDeleteUs}
+                        onToggleSelect={toggleSelectedUs}
                     />
                 ) : null}
             </div>
 
-            {bulkStatusId !== null ? (
+            {bulkStatusId !== null && project ? (
                 <BulkLightbox
+                    statuses={project.us_statuses ?? []}
+                    initialStatusId={bulkStatusId}
+                    swimlanes={kanban.state.swimlanesList}
+                    defaultSwimlaneId={project.default_swimlane ?? null}
+                    swimlaneMode={
+                        !!project.is_kanban_activated &&
+                        kanban.state.swimlanesList.length > 0
+                    }
+                    hasUnclassified={hasUnclassifiedStories(kanban.state)}
                     onSubmit={submitBulk}
-                    onClose={() => setBulkStatusId(null)}
+                    onClose={() => {
+                        setBulkStatusId(null);
+                        setBulkError(null);
+                    }}
+                    error={bulkError}
                 />
             ) : null}
         </section>

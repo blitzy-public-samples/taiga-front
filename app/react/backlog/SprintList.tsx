@@ -43,6 +43,7 @@
 
 import type { Project, Sprint } from "./types";
 import { Sprint as SprintCard } from "./Sprint";
+import { t } from "../shared/i18n/translate";
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -116,8 +117,8 @@ export function SprintList(props: SprintListProps): JSX.Element {
     // SHOW otherwise. Derived directly from visibility + loaded count here.
     const closedSprintsLabel =
         closedSprintsVisible && closedSprints.length > 0
-            ? "Hide closed sprints" // i18n BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS
-            : "Show closed sprints"; // i18n BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS
+            ? t("BACKLOG.SPRINTS.ACTION_HIDE_CLOSED_SPRINTS", "Hide closed sprints")
+            : t("BACKLOG.SPRINTS.ACTION_SHOW_CLOSED_SPRINTS", "Show closed sprints");
 
     return (
         <section className="sprints">
@@ -127,15 +128,14 @@ export function SprintList(props: SprintListProps): JSX.Element {
                     {totalMilestones ? (
                         <span className="number">{totalMilestones}</span>
                     ) : null}
-                    {/* i18n BACKLOG.SPRINTS.TITLE */}
-                    <span className="title">SPRINTS</span>
+                    <span className="title">{t("BACKLOG.SPRINTS.TITLE", "SPRINTS")}</span>
                 </h1>
                 {/* ng-if="totalMilestones" + tg-check-permission="add_milestone" */}
                 {!!totalMilestones && canAddMilestone ? (
                     <a
                         className="btn-link"
                         href=""
-                        title="Add a sprint" /* i18n BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT */
+                        title={t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT", "Add a sprint")}
                         onClick={(event) => {
                             event.preventDefault();
                             onAddNewSprint();
@@ -156,10 +156,9 @@ export function SprintList(props: SprintListProps): JSX.Element {
                 <div className="empty-small">
                     <img
                         src={`${baseHref}images/empty/empty_sprint.png`}
-                        alt="There are no sprints yet" /* i18n BACKLOG.SPRINTS.EMPTY */
+                        alt={t("BACKLOG.SPRINTS.EMPTY", "There are no sprints yet")}
                     />
-                    {/* i18n BACKLOG.SPRINTS.EMPTY */}
-                    <p className="title">There are no sprints yet</p>
+                    <p className="title">{t("BACKLOG.SPRINTS.EMPTY", "There are no sprints yet")}</p>
                     {/* tg-check-permission="add_milestone" */}
                     {canAddMilestone ? (
                         <a
@@ -171,8 +170,7 @@ export function SprintList(props: SprintListProps): JSX.Element {
                                 onAddNewSprint();
                             }}
                         >
-                            {/* i18n BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT */}
-                            <span>Add a sprint</span>
+                            <span>{t("BACKLOG.SPRINTS.TITLE_ACTION_NEW_SPRINT", "Add a sprint")}</span>
                             {/* tg-svg icon-add (decorative) */}
                             <svg className="icon icon-add" aria-hidden="true" focusable="false">
                                 <use xlinkHref="#icon-add" href="#icon-add" />

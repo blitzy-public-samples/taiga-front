@@ -197,6 +197,19 @@ describe("SprintEditLightbox — closed state", () => {
     });
 });
 
+describe("SprintEditLightbox — open state reveal [#3]", () => {
+    // The `.lightbox` SCSS mixin's base is `display:none` and it is revealed ONLY
+    // by the `.open` class. When open, the rendered root must carry that class so
+    // the compiled CSS makes it visible.
+    it("renders the `.lightbox.lightbox-sprint-add-edit` root WITH the `open` class when open", () => {
+        const { container } = renderLightbox({ open: true });
+
+        const root = container.querySelector(".lightbox.lightbox-sprint-add-edit");
+        expect(root).not.toBeNull();
+        expect(root).toHaveClass("open");
+    });
+});
+
 /* -------------------------------------------------------------------------- */
 /* Validation gates the API                                                   */
 /* -------------------------------------------------------------------------- */
@@ -459,7 +472,10 @@ describe("SprintEditLightbox — delete flow", () => {
         expect(container.querySelector(".delete-sprint")).not.toBeNull();
     });
 
-    it("deletes via remove(sprint.id) after a confirmed native confirm, then fires onChanged + onClose", async () => {
+    it("deletes via remove(sprint.id) after confirming the themed dialog, then fires onChanged + onClose", async () => {
+        // [H] Delete confirmation is the themed ConfirmDialog (.lightbox-generic-delete),
+        // NOT the native window.confirm. Clicking the delete button OPENS the dialog;
+        // deletion only runs after the dialog's confirm (.js-confirm) button is clicked.
         removeMock.mockResolvedValue(ok<unknown>({}));
 
         const { container, onChanged, onClose } = renderLightbox({
@@ -476,26 +492,37 @@ describe("SprintEditLightbox — delete flow", () => {
         const del = container.querySelector(".delete-sprint") as HTMLElement | null;
         expect(del).not.toBeNull();
 
+        // Open the confirm dialog — no removal yet.
         fireEvent.click(del as HTMLElement);
+        const dialog = document.querySelector(".lightbox-generic-delete.open");
+        expect(dialog).not.toBeNull();
+        expect(removeMock).not.toHaveBeenCalled();
 
-        expect(window.confirm).toHaveBeenCalledTimes(1);
+        // Confirm the deletion.
+        fireEvent.click(dialog!.querySelector(".js-confirm") as HTMLElement);
+
         await waitFor(() => expect(removeMock).toHaveBeenCalledWith(42));
         await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
         expect(onClose).toHaveBeenCalledTimes(1);
     });
 
-    it("does not delete when the native confirm is dismissed", () => {
-        window.confirm = jest.fn(() => false);
-
+    it("does not delete when the themed confirm dialog is cancelled", () => {
+        // [H] Cancelling the ConfirmDialog (.js-cancel) dismisses it without deleting.
         const { container, onChanged, onClose } = renderLightbox({
             mode: "edit",
             sprint: makeSprint({ id: 42 }),
             canDelete: true,
         });
 
+        // Open the confirm dialog.
         fireEvent.click(container.querySelector(".delete-sprint") as HTMLElement);
+        const dialog = document.querySelector(".lightbox-generic-delete.open");
+        expect(dialog).not.toBeNull();
 
-        expect(window.confirm).toHaveBeenCalledTimes(1);
+        // Cancel it — dialog closes, nothing deleted.
+        fireEvent.click(dialog!.querySelector(".js-cancel") as HTMLElement);
+
+        expect(document.querySelector(".lightbox-generic-delete.open")).toBeNull();
         expect(removeMock).not.toHaveBeenCalled();
         expect(onChanged).not.toHaveBeenCalled();
         expect(onClose).not.toHaveBeenCalled();

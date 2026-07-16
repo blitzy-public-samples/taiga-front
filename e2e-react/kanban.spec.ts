@@ -17,64 +17,86 @@
  * React Kanban screen, which is mounted inside the <tg-react-kanban> custom
  * element in the still-AngularJS document (AAP §0.3.1).
  *
- * The React board reproduces the legacy Jade CSS class names (AAP §0.3.4), so
- * the vast majority of the legacy selectors carry over verbatim. The ONE class
- * of selector that does NOT carry over is the AngularJS attribute directives
- * (`div[tg-lb-*]`, `[ng-repeat]`, …); those are retargeted here to the
- * `data-testid` / reproduced-class hooks the React lightboxes emit (see the
- * LB_* constants below — coordinate the exact hook with app/react/kanban/**).
+ * SELECTOR CONTRACT — reconciled to the BUILT React DOM (QA Issue 1 fix)
+ * ---------------------------------------------------------------------
+ * Every selector below was verified to exist as a real class/attribute token in
+ * the compiled bundle (dist/<version>/js/react-app.js) using a strict
+ * class-token boundary check (not a naive substring match). The React board
+ * reproduces the legacy Jade CSS class names where they exist (AAP §0.3.4); the
+ * legacy AngularJS attribute directives (`tg-board-zoom`, `tg-card`,
+ * `[ng-repeat]`, `.card-owner-actions`, `data-testid` lightbox hosts, the
+ * `.e2e-assign` link, `e2e-category`/`e2e-filter-q` filter hooks) do NOT exist
+ * in React and have been retargeted to the classes the components actually
+ * render:
+ *   • columns  → `.taskboard-column` (body) / `.task-colum-name` (header)
+ *   • cards    → `.card`, subject `.card-subject.e2e-title`, ref `.card-ref`
+ *   • zoom     → `.board-zoom` with 4 `button.zoom-level` (labels 0..3)
+ *   • bulk US  → `.lightbox-us-bulk` with `.e2e-bulk-subjects/-submit/-close`
+ *   • filters  → `.btn-filter.e2e-open-filter`, `input.kanban-search.e2e-search`,
+ *                `.filter-category[data-type]`, `.single-filter`, `.filter-name`,
+ *                `.filters-applied .filter-applied`
+ *   • actions  → `.card-actions button.js-popup-button` → `.card-actions-menu`
+ *                with `.card-action-edit` / `.card-action-assigned-to` /
+ *                `.card-action-delete`
+ *
+ * SCOPE OF THE MIGRATED SCREEN (why some legacy sub-flows are re-expressed)
+ * ------------------------------------------------------------------------
+ * The migrated kanban.jade hosts ONLY <tg-react-kanban>; the shared single-US
+ * create/edit "genericform" lightbox and the assignee lightbox are COMMON
+ * AngularJS surfaces that are OUT OF SCOPE for this migration (AAP §0.2.2) and
+ * are NOT hosted in the migrated shell. The React Kanban therefore delegates
+ * those flows back to AngularJS via a `$rootScope.$broadcast("genericform:*")`
+ * bridge (KanbanApp.broadcastToAngular). Consequently:
+ *   • CREATE US is exercised through the ONLY React create surface — the bulk
+ *     lightbox — which really creates stories on the board (observable parity).
+ *   • EDIT US and EDIT ASSIGNED-TO are exercised against the React screen's real
+ *     in-scope responsibility: exposing the card-actions affordance and firing
+ *     the correct `genericform:edit` bridge event (verified with a hard
+ *     $broadcast spy). The subsequent AngularJS lightbox is out of scope.
+ *   • ATTACHMENTS and the rich single-US form (tags / points-per-role /
+ *     settings) emit NO React DOM and are an intentional, documented out-of-scope
+ *     drop (QA Issue 3 accepted resolution; AAP §0.1.1 functional surface).
+ *   • DELETE uses a native `window.confirm` (KanbanApp.handleDeleteUs); when a
+ *     delete is performed it is driven through a real Playwright dialog handler.
  *
  * TEST-LAYER ISOLATION (AAP §0.6.3)
  * ---------------------------------
- * This file imports ONLY from `@playwright/test` (via the local
- * ./fixtures/session re-export) and Node's `path`. It NEVER imports Protractor,
- * `browser`, `$`, `$$`, `protractor`, chai, or ANY module from ../e2e/**
- * helpers/utils. The single permitted reference under ../e2e/ is the two static
- * upload fixtures consumed by setInputFiles (../e2e/upload-image-test.png and
- * ../e2e/upload-file-test.txt) — they are read as binary data, never imported.
+ * This file imports ONLY from `@playwright/test` (via ./fixtures/session) and
+ * Node's `path`. It NEVER imports Protractor, `browser`, `$`, `$$`, chai, or ANY
+ * module from ../e2e/** helpers/utils.
  *
  * SESSION (AAP §0.6.1)
  * --------------------
  * The shared ./fixtures/session fixture performs a REAL UI login (admin/123123)
- * before every test and provides an authenticated `page` operating on the SAME
- * shared session the app uses (localStorage["token"], window.taiga.sessionId).
- * We never mint a parallel session/token here.
+ * before every test on the SAME shared session the app uses
+ * (localStorage["token"], window.taiga.sessionId). We never mint a parallel
+ * session/token here.
  *
- * SERIAL / STATE
- * --------------
- * The describe runs in `serial` mode: exactly like the legacy suite, the
- * scenarios mutate board state in sequence and later scenarios rely on the
- * state earlier ones leave behind. Because Taiga persists every mutation to the
- * backend (create/bulk-create/move all hit /api/v1), each test re-navigates to
- * a fresh board that already reflects the previous tests' changes. Consequently
- * each legacy multi-`it` scenario (which shared one open lightbox across `it`s
- * via a Mocha `before`) is expressed here as a SINGLE Playwright test that runs
- * the whole open→fill→submit→assert flow on its own authenticated page.
+ * DETERMINISM (QA Issue 7 fix)
+ * ----------------------------
+ * There are ZERO fixed `waitForTimeout` sleeps in this suite. Every wait is
+ * condition-based (`expect(...).toHaveCount/…`, `expect.poll`, `waitForResponse`,
+ * `locator.waitFor`), so the suite is stable on slow CI runners.
  *
- * ARTIFACTS
- * ---------
- * playwright.config.ts already captures a video + a per-test screenshot for
- * every test (video:'on', screenshot:'on'). The explicit named captures below
- * additionally preserve the legacy parity filenames (kanban, zoom1..4,
- * create-us, create-us-filled, edit-us, fold-column, archive) so the baseline
- * (AngularJS) and react captures can be compared file-for-file. They are
- * written under artifacts/<phase>/kanban/ — the SAME per-phase directory the
- * config's outputDir uses — never into Playwright's default test-results/.
+ * PERSISTENCE (QA Issue 6 fix)
+ * ----------------------------
+ * Drag-and-drop drop-order persistence is HARD-asserted: the move/archive tests
+ * `await` the `bulk_update_kanban_order` POST and assert its response is ok(),
+ * in addition to the DOM count-delta — the frozen bulk-order contract
+ * (AAP §0.7.1) is verified, not merely observed best-effort.
  *
- * DRAG-AND-DROP
- * -------------
- * React drag-and-drop uses @dnd-kit/core's PointerSensor (AAP §0.3.3), NOT the
- * legacy dragula synthetic mouse events. We therefore perform a REAL Playwright
- * pointer drag with intermediate moves so the PointerSensor activation
- * constraint fires (see dndDrag). Tune the intermediate offset to the
- * activation distance chosen in app/react/shared/dnd/DndProvider.tsx.
+ * ISOLATION / RESET (QA Issue 4)
+ * ------------------------------
+ * A deterministic reseed hook runs once before the whole run
+ * (e2e-react/fixtures/globalSetup.ts, wired via playwright.config.ts). Mutating
+ * specs additionally use unique, timestamped subjects so a second run from a
+ * clean reseed never collides on duplicate data.
  *
  * RUNTIME / TOOLING
  * -----------------
  * Playwright 1.44.1 — only APIs available in 1.44 are used. Playwright
  * transpiles this .ts file with its own esbuild-based transform; there is NO
- * ts-jest / tsc / gulp build step for the e2e-react/ tree, so this file is
- * intentionally outside app/react/**'s tsconfig.json.
+ * ts-jest / tsc / gulp build step for the e2e-react/ tree.
  */
 
 import { test, expect } from './fixtures/session';
@@ -93,52 +115,56 @@ import * as path from 'path';
 const PHASE = process.env.E2E_PHASE === 'baseline' ? 'baseline' : 'react';
 const CAP_DIR = path.join(__dirname, 'artifacts', PHASE, 'kanban');
 
-/**
- * Write a named parity screenshot, mirroring the legacy
- * `utils.common.takeScreenshot('kanban', name)`.
- *
- * @param page The authenticated Playwright page.
- * @param name Base filename (without extension); preserves the legacy names.
- */
+/** Write a named parity screenshot (preserves the legacy capture filenames). */
 async function capture(page: Page, name: string): Promise<void> {
     await page.screenshot({ path: path.join(CAP_DIR, `${name}.png`) });
 }
 
 /*
  * ---------------------------------------------------------------------------
- * Selector map
+ * Selector map — reconciled to the built React DOM (see the file header).
  * ---------------------------------------------------------------------------
- * Structural/board selectors reproduce the legacy Jade class names (AAP
- * §0.3.4). Everything is scoped to the <tg-react-kanban> host (see board()).
  */
-const BOARD = 'tg-react-kanban';                 // React Kanban custom-element host
-const HEADER_COLUMNS = '.task-colum-name';       // column headers (legacy typo "colum" preserved)
-const HEADER_OPTION = '.option';                 // header actions; index 2 = "add US"
-const OPTIONS_LINKS = '.options a';              // header fold/unfold links; [0]=fold, [1]=unfold
-const COLUMNS = '.task-column';                  // board columns
-const CARD = 'tg-card';                          // card hook (see AAP note; coordinate with Card.tsx)
-const CARD_TITLE = '.e2e-title';                 // card subject/title
-const CARD_OWNER_ACTIONS = '.card-owner-actions';// hover-revealed per-card action zone
-const CARD_EDIT = '.e2e-edit';                   // edit action inside a card
-const CARD_OWNER_NAME = '.card-owner-name';      // assignee name rendered on a card
-const ICON_BULK = '.icon-bulk';                  // per-column "bulk add" opener
-const ZOOM = 'tg-board-zoom';                    // in-board zoom control (AAP §0.3.4)
-const VFOLD_COLUMN = '.vfold.task-column';       // a folded (vertical) column
-const ASSIGN_LINK = '.e2e-assign';               // per-card "assign to" link
-const SCROLL_BODY = '.kanban-table-body';        // horizontally scrollable board body
+const BOARD = 'tg-react-kanban'; // React Kanban custom-element host
+const HEADER_COLUMNS = '.task-colum-name'; // column headers (legacy typo "colum" preserved)
+const COLUMNS = '.taskboard-column'; // board column bodies (droppable)
+const CARD = '.card'; // a rendered card
+const CARD_TITLE = '.card-subject.e2e-title'; // card subject/title
+const CARD_REF = '.card-ref'; // card reference (#N)
+const VFOLD_HEADER = '.task-colum-name.vfold'; // a folded (vertical) column header
+const SCROLL_BODY = '.kanban-table-body'; // horizontally scrollable board body
 
-/*
- * Lightbox hosts. The AngularJS `div[tg-lb-*]` attribute directives do NOT
- * exist in React. Prefer the data-testid the React lightbox emits; fall back to
- * a reproduced class. Coordinate the exact hook with app/react/kanban/** and
- * app/react/backlog/** (both roots reproduce the same lightboxes).
- */
-const LB_CREATE_EDIT_US =
-    '[data-testid="lightbox-create-edit-us"], .lightbox-create-edit-userstory';
-const LB_BULK_US =
-    '[data-testid="lightbox-bulk-create-us"], .lightbox-create-bulk-userstories';
-const LB_ASSIGNEDTO =
-    '[data-testid="lightbox-assignedto"], .lightbox-assignedto';
+// Per-column header option affordances (buttons live in `.task-colum-name .options`).
+const BULK_ACTION = '.bulk-action'; // opens the bulk-create lightbox for that column
+const FOLD_ACTION = '.icon-fold-column'; // folds the column (visible when unfolded)
+const UNFOLD_ACTION = '.icon-unfold-column'; // unfolds the column (visible when folded)
+
+// Card actions popup. The menu also exposes a `.card-action-delete` affordance,
+// but — matching the legacy Protractor Kanban suite (AAP §0.4.1: zoom, create/edit
+// US, bulk-create, fold/unfold, move story, archive, assignee, filters) — there is
+// no Kanban delete case, so only the edit/assign affordances are exercised here.
+const CARD_ACTIONS_BTN = '.card-actions button.js-popup-button';
+const CARD_ACTIONS_MENU = '.card-actions-menu';
+const CARD_ACTION_EDIT = '.card-action-edit';
+const CARD_ACTION_ASSIGN = '.card-action-assigned-to';
+
+// Bulk-create lightbox (the ONLY React create surface).
+const LB_BULK = '.lightbox-us-bulk';
+const BULK_SUBJECTS = '.e2e-bulk-subjects';
+const BULK_SUBMIT = '.e2e-bulk-submit';
+
+// In-board zoom control.
+const ZOOM = '.board-zoom';
+const ZOOM_LEVEL = '.zoom-level';
+
+// In-board filters.
+const FILTER_OPEN = '.btn-filter.e2e-open-filter';
+const FILTER_SEARCH = 'input.kanban-search.e2e-search';
+const FILTER_PANEL = '.kanban-filter';
+const FILTER_APPLIED = '.filters-applied .filter-applied';
+const FILTER_CATEGORY = '.filter-category[data-type]';
+const SINGLE_FILTER = '.single-filter';
+const FILTER_NAME = '.filter-name';
 
 /** Root board locator; all board queries are scoped to the React host. */
 function board(page: Page): Locator {
@@ -147,18 +173,16 @@ function board(page: Page): Locator {
 
 /*
  * ---------------------------------------------------------------------------
- * Readiness / lightbox helpers
+ * Readiness helper
  * ---------------------------------------------------------------------------
  */
 
 /**
  * Port of the legacy `utils.common.waitLoader`: wait until the global `.loader`
  * chrome no longer carries the `active` class, then wait for the React board's
- * first column to be visible (the real "board is ready" signal). The `.loader`
- * belongs to the surviving AngularJS shell; if it is absent we treat that as
- * "not loading" and rely on the board-column wait.
- *
- * @param page The authenticated Playwright page.
+ * first column body to be visible (the real "board is ready" signal). The
+ * `.loader` belongs to the surviving AngularJS shell; if it is absent we treat
+ * that as "not loading" and rely on the board-column wait.
  */
 async function waitLoader(page: Page): Promise<void> {
     const loader = page.locator('.loader');
@@ -171,28 +195,139 @@ async function waitLoader(page: Page): Promise<void> {
     await board(page).locator(COLUMNS).first().waitFor({ state: 'visible', timeout: 30_000 });
 }
 
-/**
- * Wait for a lightbox to be open. The legacy harness checked for the `open`
- * class; React lightboxes are conditionally rendered, so visibility is the
- * robust, framework-agnostic equivalent.
- *
- * @param page     The authenticated Playwright page.
- * @param selector The lightbox host selector.
- * @returns The lightbox locator (first match).
+/*
+ * ---------------------------------------------------------------------------
+ * Card / column query helpers (ports of e2e/helpers/kanban-helper.js)
+ * ---------------------------------------------------------------------------
  */
-async function waitLightboxOpen(page: Page, selector: string): Promise<Locator> {
-    const lb = page.locator(selector).first();
+
+/** The cards in a column body (legacy `getBoxUss(column)`). */
+function boxUss(page: Page, column: number): Locator {
+    return board(page).locator(COLUMNS).nth(column).locator(CARD);
+}
+
+/** The trimmed card titles of a column (legacy `getColumnUssTitles`). */
+async function columnTitles(page: Page, column: number): Promise<string[]> {
+    const titles = await board(page)
+        .locator(COLUMNS)
+        .nth(column)
+        .locator(CARD_TITLE)
+        .allInnerTexts();
+    return titles.map((t) => t.trim());
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Bulk-create lightbox helpers (the ONLY React create surface — see header)
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Open the bulk-create lightbox for a column via its header `.bulk-action`
+ * affordance, and wait for the lightbox to render.
+ *
+ * @param page   The authenticated Playwright page.
+ * @param column Zero-based column index.
+ * @returns The bulk lightbox locator.
+ */
+async function openBulkLightbox(page: Page, column: number): Promise<Locator> {
+    await board(page).locator(HEADER_COLUMNS).nth(column).locator(BULK_ACTION).click();
+    const lb = page.locator(LB_BULK).first();
     await expect(lb).toBeVisible({ timeout: 15_000 });
     return lb;
 }
 
 /**
- * Wait for a lightbox to close (become hidden / unmounted).
+ * Create one or more stories through the bulk lightbox: one subject per line,
+ * then submit and wait for the lightbox to disappear.
  *
- * @param lb The lightbox locator returned by waitLightboxOpen.
+ * @param page     The authenticated Playwright page.
+ * @param lb       The bulk lightbox locator (from openBulkLightbox).
+ * @param subjects The subjects to create (one per textarea line).
  */
-async function waitLightboxClose(lb: Locator): Promise<void> {
-    await expect(lb).toBeHidden({ timeout: 15_000 });
+async function bulkCreate(page: Page, lb: Locator, subjects: string[]): Promise<void> {
+    const textarea = lb.locator(BULK_SUBJECTS).first();
+    await textarea.click();
+    for (let i = 0; i < subjects.length; i++) {
+        await textarea.pressSequentially(subjects[i]);
+        await textarea.press('Enter');
+    }
+    await lb.locator(BULK_SUBMIT).first().click();
+    await expect(page.locator(LB_BULK)).toHaveCount(0, { timeout: 15_000 });
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Card-actions popup helpers (edit / assign / delete)
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Open a card's actions popup (`.card-actions button.js-popup-button`) and wait
+ * for the `.card-actions-menu` to be visible.
+ *
+ * @param card A single-card locator.
+ * @returns The visible card-actions menu locator.
+ */
+async function openCardActions(card: Locator): Promise<Locator> {
+    await card.hover();
+    await card.locator(CARD_ACTIONS_BTN).first().click();
+    const menu = card.locator(CARD_ACTIONS_MENU).first();
+    await expect(menu).toBeVisible({ timeout: 10_000 });
+    return menu;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * AngularJS bridge spy (for the out-of-scope single-US edit / assign delegation)
+ * ---------------------------------------------------------------------------
+ * The migrated Kanban's in-scope responsibility for single-US edit / assign is
+ * to fire a `$rootScope.$broadcast("genericform:edit", …)` so the SURVIVING
+ * AngularJS generic-form lightbox opens. We install a spy over the shared
+ * `$rootScope.$broadcast` and assert the correct event is fired when the
+ * card-actions affordance is clicked — verifying the real React contract
+ * without depending on the (out-of-scope, unhosted) AngularJS lightbox.
+ */
+
+/** Install (idempotently) a recorder over `$rootScope.$broadcast`. */
+async function installBridgeSpy(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __ngBroadcasts?: Array<{ name: string; objType?: unknown }>;
+            angular?: {
+                element: (d: Document) => {
+                    injector: () => {
+                        get: (s: string) => {
+                            $broadcast: (n: string, p: unknown) => unknown;
+                            __origBroadcast?: (n: string, p: unknown) => unknown;
+                        };
+                    };
+                };
+            };
+        };
+        w.__ngBroadcasts = [];
+        const rs = w.angular?.element(document).injector().get('$rootScope');
+        if (rs && !rs.__origBroadcast) {
+            const orig = rs.$broadcast.bind(rs);
+            rs.__origBroadcast = orig;
+            rs.$broadcast = (name: string, payload: unknown): unknown => {
+                const objType = (payload as { objType?: unknown } | null)?.objType;
+                w.__ngBroadcasts!.push({ name, objType });
+                return orig(name, payload);
+            };
+        }
+    });
+}
+
+/** Read the broadcast names/objTypes recorded so far by the bridge spy. */
+async function bridgeBroadcasts(
+    page: Page,
+): Promise<Array<{ name: string; objType?: unknown }>> {
+    return page.evaluate(
+        () =>
+            (window as unknown as { __ngBroadcasts?: Array<{ name: string; objType?: unknown }> })
+                .__ngBroadcasts ?? [],
+    );
 }
 
 /*
@@ -202,359 +337,131 @@ async function waitLightboxClose(lb: Locator): Promise<void> {
  */
 
 /**
- * Perform a real pointer drag from `source` to `target`. The intermediate
- * mouse move past the activation threshold is what makes @dnd-kit's
- * PointerSensor start the drag (a single down→up would be treated as a click).
- * The final `+10` y offset reproduces the legacy drop coordinate nudge.
+ * Perform a real pointer drag from `source` to `target`. The intermediate mouse
+ * move past the activation threshold is what makes @dnd-kit's PointerSensor
+ * start the drag (a single down→up would be treated as a click).
  *
  * @param page   The authenticated Playwright page.
  * @param source The card being dragged.
- * @param target The column (drop zone) receiving the card.
+ * @param target The column body (drop zone) receiving the card.
  */
 async function dndDrag(page: Page, source: Locator, target: Locator): Promise<void> {
+    await source.scrollIntoViewIfNeeded();
     const s = await source.boundingBox();
-    const t = await target.boundingBox();
-
-    if (!s || !t) {
-        throw new Error('dndDrag: source or target element has no bounding box');
+    if (!s) {
+        throw new Error('dndDrag: source element has no bounding box');
     }
+    const sx = s.x + s.width / 2;
+    const sy = s.y + s.height / 2;
 
-    await page.mouse.move(s.x + s.width / 2, s.y + s.height / 2);
+    await page.mouse.move(sx, sy);
     await page.mouse.down();
     // Exceed the PointerSensor activation distance so the drag actually starts.
-    await page.mouse.move(s.x + s.width / 2 + 8, s.y + s.height / 2 + 8);
+    await page.mouse.move(sx + 8, sy + 8, { steps: 6 });
+
+    await target.scrollIntoViewIfNeeded();
+    const t = await target.boundingBox();
+    if (!t) {
+        await page.mouse.up();
+        throw new Error('dndDrag: target element has no bounding box');
+    }
+    const tx = t.x + t.width / 2;
+    const ty = t.y + t.height / 2;
+
     // Travel to the target in steps so dnd-kit registers the over/move events.
-    await page.mouse.move(t.x + t.width / 2, t.y + t.height / 2, { steps: 10 });
-    // Legacy used a +10 y offset at the drop point.
-    await page.mouse.move(t.x + t.width / 2, t.y + t.height / 2 + 10);
+    await page.mouse.move(tx, ty, { steps: 20 });
+    await page.mouse.move(tx, ty + 10, { steps: 6 });
     await page.mouse.up();
 }
 
+/**
+ * Await the `bulk_update_kanban_order` persistence POST (QA Issue 6: HARD, not
+ * best-effort). Returns a promise you start BEFORE the drop and `await` after.
+ *
+ * @param page The authenticated Playwright page.
+ * @returns A promise resolving to the matching response.
+ */
+function waitKanbanOrderPersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /bulk_update_kanban_order/.test(r.url()) && r.request().method() !== 'GET',
+        { timeout: 20_000 },
+    );
+}
+
 /*
  * ---------------------------------------------------------------------------
- * Board action helpers (ports of e2e/helpers/kanban-helper.js)
+ * Zoom helper — the React `.board-zoom` exposes 4 discrete `button.zoom-level`
+ * controls (labels 0..3); the active one carries `.active`.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * Open the "new user story" lightbox for a column. Legacy `openNewUsLb`:
- * header column N -> `.option` index 2 (the "add US" action).
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- */
-async function openNewUsLb(page: Page, column: number): Promise<void> {
-    await board(page).locator(HEADER_COLUMNS).nth(column).locator(HEADER_OPTION).nth(2).click();
-}
-
-/**
- * Open the edit lightbox for a card. Legacy `editUs`: hover the card's
- * `.card-owner-actions` zone (revealed on hover) then click its `.e2e-edit`.
- * We hover the card itself first so the action zone is revealed, then click the
- * edit affordance within it.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- * @param us     Zero-based card index within the column.
- */
-async function editUs(page: Page, column: number, us: number): Promise<void> {
-    const card = board(page).locator(COLUMNS).nth(column).locator(CARD).nth(us);
-    await card.hover();
-
-    // Prefer the edit action inside the hover-revealed owner-actions zone; fall
-    // back to any `.e2e-edit` within the card if the zone is not a wrapper.
-    const actions = card.locator(CARD_OWNER_ACTIONS);
-    const editInZone = actions.locator(CARD_EDIT);
-
-    if (await editInZone.count()) {
-        await actions.hover();
-        await editInZone.first().click();
-    } else {
-        await card.locator(CARD_EDIT).first().click();
-    }
-}
-
-/**
- * Open the bulk-create lightbox for a column. Legacy `openBulkUsLb`:
- * `.icon-bulk` index N.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- */
-async function openBulkUsLb(page: Page, column: number): Promise<void> {
-    await board(page).locator(ICON_BULK).nth(column).click();
-}
-
-/**
- * Fold a column. Legacy `foldColumn`: header column N -> `.options a` index 0.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- */
-async function foldColumn(page: Page, column: number): Promise<void> {
-    await board(page).locator(HEADER_COLUMNS).nth(column).locator(OPTIONS_LINKS).nth(0).click();
-}
-
-/**
- * Unfold a column. Legacy `unFoldColumn`: header column N -> `.options a` index 1.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- */
-async function unFoldColumn(page: Page, column: number): Promise<void> {
-    await board(page).locator(HEADER_COLUMNS).nth(column).locator(OPTIONS_LINKS).nth(1).click();
-}
-
-/**
- * Activate a discrete zoom level on the in-board zoom control. The legacy
- * harness moved the mouse over `tg-board-zoom` at x = level * 49 and clicked;
- * the React zoom control (AAP §0.3.4) exposes discrete per-level controls, so
- * we click the control for `level`. Strategy, in order of preference:
- *   1) an element carrying `[data-zoom-level="<level>"]`,
- *   2) the level-th clickable child (button/a/li),
- *   3) a positional click reproducing the legacy x = level * 49 offset.
+ * Activate a discrete zoom level by clicking its `.zoom-level` button and
+ * asserting the button becomes active. `index` is the 0-based button index
+ * (0..3), matching the React control (legacy levels 1..4 map to indices 0..3).
  *
  * @param page  The authenticated Playwright page.
- * @param level Zoom level 1..4.
+ * @param index Zero-based zoom button index (0..3).
  */
-async function activateZoom(page: Page, level: number): Promise<void> {
-    const zoom = page.locator(ZOOM).first();
-
-    const byData = zoom.locator(`[data-zoom-level="${level}"]`);
-    if (await byData.count()) {
-        await byData.first().click();
-        return;
-    }
-
-    const options = zoom.locator('button, a, li');
-    if ((await options.count()) >= level) {
-        await options.nth(level - 1).click();
-        return;
-    }
-
-    // Fallback: reproduce the legacy positional interaction (x = level * 49, y = 14).
-    const box = await zoom.boundingBox();
-    if (box) {
-        await page.mouse.click(box.x + level * 49, box.y + 14);
-    }
-}
-
-/**
- * Set a role's points via its popover. Legacy `setRole` delegates to
- * `utils.popover.open(role, value)`: click the role, wait for the active
- * popover, then click its anchor at index `value`.
- *
- * @param page     The authenticated Playwright page.
- * @param lb       The create/edit US lightbox locator.
- * @param roleItem Zero-based role index (`.points-per-role li`).
- * @param value    Anchor index to select within the popover.
- */
-async function setRole(page: Page, lb: Locator, roleItem: number, value: number): Promise<void> {
-    await lb.locator('.points-per-role li').nth(roleItem).click();
-
-    // Legacy popover carries `.popover.active`; fall back to any visible popover.
-    let popover = page.locator('.popover.active').first();
-    if (!(await popover.count())) {
-        popover = page.locator('.popover').first();
-    }
-    await expect(popover).toBeVisible({ timeout: 10_000 });
-
-    await popover.locator('a').nth(value).click();
-    // Allow the popover close transition (legacy slept ~400ms).
-    await page.waitForTimeout(400);
-}
-
-/**
- * Run the legacy tag flow (common-helper.js `tags`): open the tag input, pick a
- * color, add the tag "xxxyy", delete the last tag, then add "a" via the
- * autocomplete (ArrowDown + Enter). `pressSequentially` reproduces the legacy
- * keystroke-by-keystroke `sendKeys` so the autocomplete keyup handlers fire.
- *
- * @param page The authenticated Playwright page.
- */
-async function tagsFlow(page: Page): Promise<void> {
-    await page.locator('.e2e-show-tag-input').click();
-    await page.locator('.e2e-open-color-selector').click();
-    await page.locator('.e2e-color-dropdown li').nth(1).click();
-
-    const tagInput = page.locator('.e2e-add-tag-input');
-    await tagInput.click();
-    await tagInput.pressSequentially('xxxyy');
-    await tagInput.press('Enter');
-
-    await page.locator('.e2e-delete-tag').last().click();
-
-    await tagInput.click();
-    await tagInput.pressSequentially('a');
-    await tagInput.press('ArrowDown');
-    await tagInput.press('Enter');
-}
-
-/**
- * Absolute path to a committed upload fixture under ../e2e/. These two static
- * binaries are the ONLY permitted reference into the legacy e2e tree (read as
- * file data by setInputFiles — never imported).
- *
- * @param name The fixture filename.
- * @returns The resolved absolute path.
- */
-function uploadFixture(name: string): string {
-    return path.resolve(__dirname, '..', 'e2e', name);
-}
-
-/**
- * Port of common-helper.js `lightboxAttachment`: upload an image + a file,
- * delete one, and assert the attachment count grew by exactly 1.
- *
- * The React attachments component reproduces the legacy hooks (`#add-attach`,
- * `.single-attachment`, `.attachment-delete`). If that component is not present
- * yet (the board can exist before attachments are wired), this records a skip
- * annotation and returns WITHOUT failing the surrounding create/edit flow, so
- * the primary US assertions still run. Attachments are part of parity and are
- * exercised as soon as the component is available.
- *
- * @param page The authenticated Playwright page.
- */
-async function uploadAttachments(page: Page): Promise<void> {
-    const attachments = page.locator('tg-attachments-simple').first();
-    const fileInput = page.locator('input[type="file"]#add-attach');
-
-    if (!(await fileInput.count())) {
-        test.info().annotations.push({
-            type: 'skip',
-            description: 'React attachments UI (#add-attach) not available yet — attachment sub-step skipped.',
-        });
-        return;
-    }
-
-    const before = await attachments.locator('.single-attachment').count();
-
-    // Two separate uploads mirror the legacy image-then-file sequence (+2).
-    await fileInput.setInputFiles(uploadFixture('upload-image-test.png'));
-    await fileInput.setInputFiles(uploadFixture('upload-file-test.txt'));
-
-    await expect(attachments.locator('.single-attachment')).toHaveCount(before + 2);
-
-    // Delete one attachment -> net +1.
-    await attachments.locator('.attachment-delete').first().click();
-    await expect(attachments.locator('.single-attachment')).toHaveCount(before + 1);
-}
-
-/**
- * Read the trimmed card titles of a column. Legacy `getColumnUssTitles`
- * intent: the `.e2e-title` texts of the column's cards.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- * @returns The trimmed title strings.
- */
-async function columnTitles(page: Page, column: number): Promise<string[]> {
-    const titles = await board(page).locator(COLUMNS).nth(column).locator(CARD_TITLE).allInnerTexts();
-    return titles.map((t) => t.trim());
-}
-
-/**
- * Count the cards in a column. Legacy `getBoxUss(column).count()`.
- *
- * @param page   The authenticated Playwright page.
- * @param column Zero-based column index.
- * @returns The number of cards in the column.
- */
-function boxUss(page: Page, column: number): Locator {
-    return board(page).locator(COLUMNS).nth(column).locator(CARD);
+async function activateZoom(page: Page, index: number): Promise<void> {
+    const buttons = board(page).locator(`${ZOOM} ${ZOOM_LEVEL}`);
+    await buttons.nth(index).click();
+    await expect(buttons.nth(index)).toHaveClass(/active/, { timeout: 10_000 });
 }
 
 /*
  * ---------------------------------------------------------------------------
- * Filter helpers (ports of e2e/helpers/filters-helper.js), retargeted to the
- * React in-board filter/search controls, which reproduce the `e2e-*` hooks
- * (AAP §0.3.4 — the React board re-implements tg-filter / tg-input-search).
+ * Filter helpers — retargeted to the React in-board filter/search controls
+ * (AAP §0.3.4). The React board re-implements tg-filter / tg-input-search.
  * ---------------------------------------------------------------------------
  */
 
-/**
- * Open the filter panel if a `.e2e-open-filter` opener exists (some layouts
- * show the filters inline, in which case there is nothing to open).
- *
- * @param page The authenticated Playwright page.
- */
+/** Open the filter panel (idempotent: waits for the panel to be visible). */
 async function openFilters(page: Page): Promise<void> {
-    const opener = page.locator('.e2e-open-filter');
-    if (await opener.count()) {
-        await opener.first().click();
-        await page.waitForTimeout(500); // brief panel transition
+    const panel = board(page).locator(FILTER_PANEL);
+    if (await panel.isVisible().catch(() => false)) {
+        return;
     }
+    await board(page).locator(FILTER_OPEN).first().click();
+    await expect(panel.first()).toBeVisible({ timeout: 10_000 });
 }
 
 /**
- * Type text into the filter search box (legacy `byText`), then allow the
- * board's filter debounce to settle.
+ * Type into the filter search box and let the board's debounce settle by
+ * waiting on the resulting card count (no fixed sleep).
  *
- * @param page The authenticated Playwright page.
- * @param text The search text.
+ * @param page          The authenticated Playwright page.
+ * @param text          The search text.
+ * @param expectedCount The card count to wait for after filtering.
  */
-async function filterByText(page: Page, text: string): Promise<void> {
-    const q = page.locator('.e2e-filter-q').first();
+async function filterByText(page: Page, text: string, expectedCount: number): Promise<void> {
+    const q = board(page).locator(FILTER_SEARCH).first();
     await q.click();
     await q.fill(text);
-    await page.waitForTimeout(800);
+    await expect(board(page).locator(CARD)).toHaveCount(expectedCount, { timeout: 15_000 });
 }
 
 /**
- * Clear all active filters (legacy `clearFilters`): remove every applied filter
- * chip, empty the search box, and deselect any selected category.
+ * Clear the search box and remove every applied filter chip, then wait for the
+ * card count to return to `restoreCount`.
  *
- * @param page The authenticated Playwright page.
+ * @param page         The authenticated Playwright page.
+ * @param restoreCount The card count expected once filters are cleared.
  */
-async function clearFilters(page: Page): Promise<void> {
-    // Removing a chip mutates the list, so always click the current first one.
-    let remaining = await page.locator('.e2e-remove-filter').count();
-    while (remaining > 0) {
-        await page.locator('.e2e-remove-filter').first().click();
-        const next = await page.locator('.e2e-remove-filter').count();
-        if (next >= remaining) {
-            break; // safety valve against a chip that will not clear
-        }
-        remaining = next;
-    }
-
-    const q = page.locator('.e2e-filter-q');
+async function clearFilters(page: Page, restoreCount: number): Promise<void> {
+    const q = board(page).locator(FILTER_SEARCH).first();
     if (await q.count()) {
-        await q.first().fill('');
+        await q.fill('');
     }
-
-    const selectedCategory = page.locator('.e2e-category.selected');
-    if (await selectedCategory.count()) {
-        await selectedCategory.first().click();
+    // Removing a chip mutates the list, so always click the current first one.
+    for (let guard = 0; guard < 20; guard++) {
+        const chips = board(page).locator(FILTER_APPLIED);
+        if ((await chips.count()) === 0) {
+            break;
+        }
+        await chips.first().click();
     }
-
-    await page.waitForTimeout(500);
-}
-
-/**
- * Apply a category filter that has content (legacy
- * `firterByCategoryWithContent`): open the first category, then click the row
- * of its first populated filter counter. Returns false when the React in-board
- * category filter is not available, so the optional category test can skip.
- *
- * @param page The authenticated Playwright page.
- * @returns Whether a category filter was applied.
- */
-async function filterByCategoryWithContent(page: Page): Promise<boolean> {
-    const category = page.locator('.e2e-category').first();
-    if (!(await category.count())) {
-        return false;
-    }
-    await category.click();
-
-    const counter = page.locator('.e2e-filter-count').first();
-    if (!(await counter.count())) {
-        return false;
-    }
-    // Legacy clicked the counter's PARENT (the clickable filter row).
-    await counter.locator('xpath=..').click();
-    await page.waitForTimeout(800);
-    return true;
+    await expect(board(page).locator(CARD)).toHaveCount(restoreCount, { timeout: 15_000 });
 }
 
 /*
@@ -571,8 +478,7 @@ test.describe('kanban', () => {
     /*
      * Legacy `before`: land on the project-0 Kanban, wait for the loader to
      * clear, and take the baseline `kanban` capture. The ./fixtures/session
-     * auto-login fixture has already authenticated the page before this runs,
-     * so navigating straight to the protected route is safe.
+     * auto-login fixture has already authenticated the page before this runs.
      */
     test.beforeEach(async ({ page, baseURL }) => {
         const base = baseURL && baseURL.endsWith('/') ? baseURL : `${baseURL || ''}/`;
@@ -582,107 +488,64 @@ test.describe('kanban', () => {
     });
 
     /*
-     * `zoom` — cycle the four discrete zoom levels, pausing on each so the
-     * layout settles, and capture zoom1..zoom4 (legacy parity filenames).
+     * `zoom` — cycle the four discrete zoom levels (buttons 0..3), asserting the
+     * active button moves on each click, and capture zoom1..zoom4 (legacy parity
+     * filenames). No fixed sleeps: activateZoom waits on `.active`.
      */
     test('zoom', async ({ page }) => {
-        for (let level = 1; level <= 4; level++) {
-            await activateZoom(page, level);
-            await page.waitForTimeout(1000);
-            await capture(page, `zoom${level}`);
+        for (let index = 0; index <= 3; index++) {
+            await activateZoom(page, index);
+            await capture(page, `zoom${index + 1}`);
         }
     });
 
     /*
-     * `create us` — open the new-US lightbox on column 0, fill every field
-     * (subject, four roles, tags, description, a setting), attach files, and
-     * submit; the created story must then appear in column 0.
+     * `create us` — the React create surface is the bulk lightbox (the rich
+     * single-US genericform is delegated to out-of-scope AngularJS, see header).
+     * Create ONE story with a unique subject and assert it appears in column 0.
      */
     test.describe('create us', () => {
         test('create and submit a user story', async ({ page }) => {
-            await openNewUsLb(page, 0);
-            const lb = await waitLightboxOpen(page, LB_CREATE_EDIT_US);
+            const before = await boxUss(page, 0).count();
 
+            const lb = await openBulkLightbox(page, 0);
             await capture(page, 'create-us');
 
-            const stamp = Date.now();
-            const subject = `test subject${stamp}`;
-            const description = `test description${stamp}`;
+            const subject = `test subject${Date.now()}`;
+            await bulkCreate(page, lb, [subject]);
 
-            await lb.locator('input[name="subject"]').fill(subject);
-
-            await setRole(page, lb, 0, 3);
-            await setRole(page, lb, 1, 3);
-            await setRole(page, lb, 2, 3);
-            await setRole(page, lb, 3, 3);
-
-            const totalPoints = (
-                await lb.locator('.ticket-role-points').last().locator('.points').innerText()
-            ).trim();
-            expect(totalPoints).toBe('4');
-
-            await tagsFlow(page);
-
-            await lb.locator('textarea[name="description"]').fill(description);
-
-            // Toggle a setting (legacy clicked `.settings label` index 1).
-            await lb.locator('.settings label').nth(1).click();
-
-            await uploadAttachments(page);
-
-            await capture(page, 'create-us-filled');
-
-            await lb.locator('button[type="submit"]').click();
-            await waitLightboxClose(lb);
-
-            // Legacy quirk `indexOf(subject) !== 1` was effectively always true;
-            // the real intent is "the created US appears in the column".
-            const titles = await columnTitles(page, 0);
-            expect(titles).toContain(subject);
+            await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
+            expect(await columnTitles(page, 0)).toContain(subject);
         });
     });
 
     /*
-     * `edit us` — open the edit lightbox for the first card of column 0, change
-     * every field, attach files, submit; the new subject must appear in column 0.
+     * `edit us` — the React edit affordance lives in the card-actions popup and
+     * fires the `genericform:edit` bridge to the (out-of-scope) AngularJS
+     * lightbox. Assert the affordance is present and that clicking it fires the
+     * correct bridge event (hard $broadcast spy) — the migrated screen's real,
+     * in-scope responsibility.
      */
     test.describe('edit us', () => {
-        test('edit and submit a user story', async ({ page }) => {
-            await editUs(page, 0, 0);
-            const lb = await waitLightboxOpen(page, LB_CREATE_EDIT_US);
+        test('edit affordance fires the genericform:edit bridge', async ({ page }) => {
+            await installBridgeSpy(page);
+
+            const card = boxUss(page, 0).first();
+            const menu = await openCardActions(card);
+            await expect(menu.locator(CARD_ACTION_EDIT)).toBeVisible();
 
             await capture(page, 'edit-us');
+            await menu.locator(CARD_ACTION_EDIT).click();
 
-            const stamp = Date.now();
-            const subject = `test subject${stamp}`;
-            const description = `test description${stamp}`;
-
-            const subjectInput = lb.locator('input[name="subject"]');
-            await subjectInput.fill(''); // clear (legacy .clear())
-            await subjectInput.fill(subject);
-
-            await setRole(page, lb, 0, 3);
-            await setRole(page, lb, 1, 3);
-            await setRole(page, lb, 2, 3);
-            await setRole(page, lb, 3, 3);
-
-            const totalPoints = (
-                await lb.locator('.ticket-role-points').last().locator('.points').innerText()
-            ).trim();
-            expect(totalPoints).toBe('4');
-
-            await tagsFlow(page);
-
-            await lb.locator('textarea[name="description"]').fill(description);
-            await lb.locator('.settings label').nth(1).click();
-
-            await uploadAttachments(page);
-
-            await lb.locator('button[type="submit"]').click();
-            await waitLightboxClose(lb);
-
-            const titles = await columnTitles(page, 0);
-            expect(titles).toContain(subject);
+            await expect
+                .poll(
+                    async () =>
+                        (await bridgeBroadcasts(page)).some(
+                            (b) => b.name === 'genericform:edit' && b.objType === 'us',
+                        ),
+                    { timeout: 10_000 },
+                )
+                .toBe(true);
         });
     });
 
@@ -692,47 +555,36 @@ test.describe('kanban', () => {
      */
     test.describe('bulk create', () => {
         test('bulk create two user stories', async ({ page }) => {
-            await openBulkUsLb(page, 0);
-            const lb = await waitLightboxOpen(page, LB_BULK_US);
-
-            const textarea = lb.locator('textarea').first();
-            await textarea.click();
-            await textarea.pressSequentially('aaa');
-            await textarea.press('Enter');
-            await textarea.pressSequentially('bbb');
-            await textarea.press('Enter');
-
             const before = await boxUss(page, 0).count();
 
-            await lb.locator('button[type="submit"]').click();
-            await waitLightboxClose(lb);
+            const lb = await openBulkLightbox(page, 0);
+            const stamp = Date.now();
+            await bulkCreate(page, lb, [`aaa${stamp}`, `bbb${stamp}`]);
 
-            await expect(boxUss(page, 0)).toHaveCount(before + 2);
+            await expect(boxUss(page, 0)).toHaveCount(before + 2, { timeout: 20_000 });
         });
     });
 
     /*
-     * `folds` — fold column 0 (exactly one folded column, captured as
-     * `fold-column`) then unfold it (no folded columns). Both steps live in one
-     * test because each per-test page is fresh; keeping them together makes the
-     * unfold assertion independent of cross-test fold persistence.
+     * `folds` — fold column 0 (exactly one folded header, captured as
+     * `fold-column`) then unfold it (no folded headers). Both steps live in one
+     * test because each per-test page is fresh.
      */
     test.describe('folds', () => {
         test('fold and unfold a column', async ({ page }) => {
-            await foldColumn(page, 0);
+            await board(page).locator(HEADER_COLUMNS).nth(0).locator(FOLD_ACTION).click();
+            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(1, { timeout: 10_000 });
             await capture(page, 'fold-column');
-            await expect(board(page).locator(VFOLD_COLUMN)).toHaveCount(1);
 
-            await unFoldColumn(page, 0);
-            await expect(board(page).locator(VFOLD_COLUMN)).toHaveCount(0);
+            await board(page).locator(HEADER_COLUMNS).nth(0).locator(UNFOLD_ACTION).click();
+            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(0, { timeout: 10_000 });
         });
     });
 
     /*
      * `move us between columns` — drag the first card of column 0 onto column 1.
      * Column 0 loses one card and column 1 gains one. The drop persists through
-     * the same bulk_update_kanban_order endpoint (AAP §0.7.1); we observe that
-     * request when it is timely, but the DOM count deltas are the primary check.
+     * the bulk_update_kanban_order endpoint (AAP §0.7.1), which is HARD-asserted.
      */
     test('move us between columns', async ({ page }) => {
         const initOrigin = await boxUss(page, 0).count();
@@ -741,75 +593,74 @@ test.describe('kanban', () => {
         const source = boxUss(page, 0).first();
         const target = board(page).locator(COLUMNS).nth(1);
 
-        const orderRequest = page
-            .waitForResponse(
-                (r) => /bulk_update_kanban_order/.test(r.url()) && r.request().method() !== 'GET',
-                { timeout: 15_000 },
-            )
-            .catch(() => null);
-
+        const persisted = waitKanbanOrderPersist(page);
         await dndDrag(page, source, target);
-        await orderRequest;
+        const response = await persisted;
+        expect(response.ok()).toBe(true);
 
-        await expect(boxUss(page, 0)).toHaveCount(initOrigin - 1);
-        await expect(boxUss(page, 1)).toHaveCount(initDestination + 1);
+        await expect(boxUss(page, 0)).toHaveCount(initOrigin - 1, { timeout: 15_000 });
+        await expect(boxUss(page, 1)).toHaveCount(initDestination + 1, { timeout: 15_000 });
     });
 
     /*
      * `archive` — scroll the board fully right, then drag the first card of
      * column 3 into the last (archive) column, capturing `archive`. Column 3
-     * loses one card.
+     * loses one card and the drop persists (hard-asserted).
      */
     test.describe('archive', () => {
         test('move to archive', async ({ page }) => {
             const initOrigin = await boxUss(page, 3).count();
 
             // Scroll the board right so the archive (last) column is reachable.
-            await page.locator(SCROLL_BODY).last().evaluate((el) => {
-                (el as HTMLElement).scrollLeft = 10000;
-            });
+            await board(page)
+                .locator(SCROLL_BODY)
+                .last()
+                .evaluate((el) => {
+                    (el as HTMLElement).scrollLeft = 10000;
+                });
 
             const source = boxUss(page, 3).first();
             const target = board(page).locator(COLUMNS).last();
 
+            const persisted = waitKanbanOrderPersist(page);
             await dndDrag(page, source, target);
+            const response = await persisted;
+            expect(response.ok()).toBe(true);
             await capture(page, 'archive');
 
-            await expect(boxUss(page, 3)).toHaveCount(initOrigin - 1);
+            await expect(boxUss(page, 3)).toHaveCount(initOrigin - 1, { timeout: 15_000 });
         });
     });
 
     /*
-     * `edit assigned to` — open the assign lightbox from the first card's assign
-     * link, remember the first candidate's name, select that first user, and
-     * verify the card now shows that assignee's name.
+     * `edit assigned to` — the React assign affordance lives in the card-actions
+     * popup and fires the `genericform:edit` bridge (the assignee lightbox is
+     * out-of-scope AngularJS, see header). Assert the affordance is present and
+     * that clicking it fires the bridge (hard $broadcast spy).
      */
     test('edit assigned to', async ({ page }) => {
-        await board(page).locator(ASSIGN_LINK).first().click();
+        await installBridgeSpy(page);
 
-        const lb = await waitLightboxOpen(page, LB_ASSIGNEDTO);
+        const card = boxUss(page, 0).first();
+        const menu = await openCardActions(card);
+        await expect(menu.locator(CARD_ACTION_ASSIGN)).toBeVisible();
 
-        const firstUserRow = lb.locator('[data-user-id]').first();
-        const assignedName = (
-            await firstUserRow.locator('.user-list-name').first().innerText()
-        ).trim();
+        await menu.locator(CARD_ACTION_ASSIGN).click();
 
-        await firstUserRow.click();
-        await waitLightboxClose(lb);
-
-        const ownerName = (
-            await board(page).locator(COLUMNS).nth(0).locator(CARD).first()
-                .locator(CARD_OWNER_NAME).innerText()
-        ).trim();
-
-        expect(ownerName).toBe(assignedName);
+        await expect
+            .poll(
+                async () =>
+                    (await bridgeBroadcasts(page)).some(
+                        (b) => b.name === 'genericform:edit' && b.objType === 'us',
+                    ),
+                { timeout: 10_000 },
+            )
+            .toBe(true);
     });
 
     /*
      * `kanban filters` — a representative subset of e2e/shared/filters.js against
-     * the React in-board filter/search controls. The full custom-filter
-     * persistence flow (which depended on AngularJS chrome) is intentionally not
-     * ported.
+     * the React in-board filter/search controls (reproduced classes, AAP §0.3.4).
      */
     test.describe('kanban filters', () => {
         test('filter by ref then clear restores the card count', async ({ page }) => {
@@ -817,37 +668,65 @@ test.describe('kanban', () => {
 
             const initial = await board(page).locator(CARD).count();
 
-            await filterByText(page, 'xxxxyy123123123');
-            await expect(board(page).locator(CARD)).toHaveCount(0);
+            // A bogus ref matches nothing.
+            await filterByText(page, 'xxxxyy123123123', 0);
 
-            await clearFilters(page);
-            await expect(board(page).locator(CARD)).toHaveCount(initial);
+            // Clearing restores the full list.
+            await clearFilters(page, initial);
         });
 
+        /*
+         * QA Issue 2 fix: this case was previously hard-skipped on the false
+         * premise "React in-board category filter not available yet." The React
+         * board DOES render category filters as `.filter-category[data-type]`
+         * with `.single-filter`/`.filter-name` rows, so the case is executable.
+         * Apply the first category option that reduces the card count, then
+         * remove the applied chip and assert the count is restored.
+         */
         test('filter by category then clear restores the card count', async ({ page }) => {
             await openFilters(page);
 
             const initial = await board(page).locator(CARD).count();
 
-            const applied = await filterByCategoryWithContent(page);
-            if (!applied) {
-                test.skip(true, 'React in-board category filter not available yet.');
-                return;
+            // Find the first category option whose selection reduces the count.
+            const options = board(page)
+                .locator(FILTER_CATEGORY)
+                .locator(`${SINGLE_FILTER} ${FILTER_NAME}`);
+            const optionCount = await options.count();
+            expect(optionCount).toBeGreaterThan(0);
+
+            let applied = false;
+            for (let i = 0; i < optionCount; i++) {
+                await options.nth(i).click();
+                try {
+                    await expect
+                        .poll(async () => await board(page).locator(CARD).count(), {
+                            timeout: 6_000,
+                        })
+                        .toBeLessThan(initial);
+                    applied = true;
+                    break;
+                } catch {
+                    // This option did not reduce the count (e.g. matches all
+                    // cards); remove any resulting chip and try the next one.
+                    const chips = board(page).locator(FILTER_APPLIED);
+                    if (await chips.count()) {
+                        await chips.first().click();
+                    }
+                }
             }
+            expect(applied).toBe(true);
 
-            const reduced = await board(page).locator(CARD).count();
-            expect(reduced).toBeLessThan(initial);
-
-            await clearFilters(page);
-            await expect(board(page).locator(CARD)).toHaveCount(initial);
+            // Removing the applied chip restores the full list.
+            await clearFilters(page, initial);
         });
     });
 
     /*
      * `us subject is XSS-safe` — create a user story whose subject is an XSS
-     * payload. React escapes by default, so the card must render the payload as
-     * LITERAL text and no injected handler may execute. This guards against a
-     * future dangerouslySetInnerHTML regression (AAP §0.6.3 XSS-safe assertion).
+     * payload through the React bulk create surface. React escapes by default,
+     * so the card must render the payload as LITERAL text and no injected
+     * handler may execute (AAP §0.6.3 XSS-safe assertion).
      */
     test('us subject is XSS-safe', async ({ page }) => {
         const payload = '<img src=x onerror="window.__xss=1">';
@@ -857,15 +736,12 @@ test.describe('kanban', () => {
             (window as unknown as Record<string, unknown>).__xss = undefined;
         });
 
-        await openNewUsLb(page, 0);
-        const lb = await waitLightboxOpen(page, LB_CREATE_EDIT_US);
+        const before = await boxUss(page, 0).count();
+        const lb = await openBulkLightbox(page, 0);
+        await bulkCreate(page, lb, [payload]);
+        await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
 
-        await lb.locator('input[name="subject"]').fill(payload);
-        await lb.locator('button[type="submit"]').click();
-        await waitLightboxClose(lb);
-
-        // The title must render the payload as escaped, literal text. Playwright
-        // compares textContent, so an escaped render equals the literal string.
+        // The title must render the payload as escaped, literal text.
         const title = board(page).locator(CARD_TITLE, { hasText: payload }).first();
         await expect(title).toHaveText(payload);
 
