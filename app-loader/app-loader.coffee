@@ -109,9 +109,13 @@ mainLoad = ->
 
 loadApp = (emojisPromise) ->
     loadJS("#{window._version}/js/elements.js").then () ->
-        loadJS("#{window._version}/js/app.js").then () ->
-            emojisPromise.then ->
-                angular.bootstrap(document, ['taiga'])
+        # React bundle hosting the migrated Kanban/Backlog Web Components
+        # (tg-react-kanban / tg-react-backlog). Loaded before app.js so
+        # customElements.define(...) completes before angular.bootstrap.
+        loadJS("#{window._version}/js/react.js").then () ->
+            loadJS("#{window._version}/js/app.js").then () ->
+                emojisPromise.then ->
+                    angular.bootstrap(document, ['taiga'])
 
 promise = fetch "conf.json"
 promise
