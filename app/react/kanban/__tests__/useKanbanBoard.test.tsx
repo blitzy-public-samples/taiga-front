@@ -124,9 +124,20 @@ jest.mock('../../shared/events/eventsClient', () => {
   };
 });
 
+// session — keep every real accessor (token/session/language reads) via
+// `jest.requireActual`, and replace ONLY `redirectToLogin` with a spy so the
+// F-READ-1 login-redirect assertion never performs a real jsdom navigation.
+jest.mock('../../shared/session', () => {
+  const actual = jest.requireActual<typeof import('../../shared/session')>(
+    '../../shared/session',
+  );
+  return { __esModule: true, ...actual, redirectToLogin: jest.fn() };
+});
+
 import httpClient from '../../shared/api/httpClient';
 import userstories from '../../shared/api/userstories';
 import { createEventsClient, routingKeys } from '../../shared/events/eventsClient';
+import { redirectToLogin } from '../../shared/session';
 
 // ---------------------------------------------------------------------------
 // Typed mock accessors (stable across tests; `clearMocks` resets call state only,
@@ -137,6 +148,10 @@ const getMock = httpClient.get as unknown as jest.Mock;
 const bulkKanbanMock = userstories.bulkUpdateKanbanOrder as unknown as jest.Mock;
 const bulkCreateMock = userstories.bulkCreate as unknown as jest.Mock;
 const createEventsClientMock = createEventsClient as unknown as jest.Mock;
+const redirectToLoginMock = redirectToLogin as unknown as jest.Mock;
+
+/** Minimal HttpError shape for asserting the surfaced `loadError.status`. */
+type HttpErrorLike = { status?: number };
 
 // The hook computes ONE shared debounce delay
 // `700 + Math.floor(Math.random() * (1000 - 700 + 1))`; stubbing `Math.random()`
@@ -379,6 +394,113 @@ describe('useKanbanBoard', () => {
       const keys = mockEventsClient.subscribe.mock.calls.map((c: unknown[]) => c[0]);
       expect(keys).toContain(routingKeys.userstories(7)); // 'changes.project.7.userstories'
       expect(keys).toContain(routingKeys.projects(7)); //    'changes.project.7.projects'
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase C2 — read/init error handling (F-READ-1, F-READ-2)
+  //
+  // Legacy `$tgHttp` surfaces load failures and redirects to /login on 401. The
+  // React hook must NOT leave an uncaught promise rejection or a silently-broken
+  // board. `loadError` being set is the deterministic proof the internal
+  // `catch` ran (an UNhandled rejection would leave `loadError` null), so these
+  // tests assert on `loadError` + the `redirectToLogin` spy rather than relying
+  // on flaky cross-runtime unhandled-rejection events.
+  // -------------------------------------------------------------------------
+  describe('read/init error handling', () => {
+    /** Build an `HttpError`-shaped rejection (Error + numeric `status`). */
+    function httpError(status: number, url = 'projects/by_slug'): Error {
+      return Object.assign(new Error(`HTTP ${status} for GET ${url}`), { status });
+    }
+
+    it('F-READ-1: a 401 on the project load is caught, surfaced, and redirects to /login', async () => {
+      getMock.mockImplementation((path: string) => {
+        if (path === 'projects/by_slug') {
+          return Promise.reject(httpError(401));
+        }
+        return Promise.resolve([]);
+      });
+
+      const view = await loadHook();
+
+      // The load promise did NOT reject uncaught — the catch ran and surfaced it.
+      expect(view.result.current.loadError).toBeInstanceOf(Error);
+      expect((view.result.current.loadError as HttpErrorLike).status).toBe(401);
+      // 401 => login redirect (legacy `$tgHttp` parity), exactly once.
+      expect(redirectToLoginMock).toHaveBeenCalledTimes(1);
+      // The board is not populated, but the app did not crash.
+      expect(view.result.current.projectId).toBeNull();
+    });
+
+    it('F-READ-1: a 500 on the userstories read is caught and surfaced WITHOUT a redirect', async () => {
+      getMock.mockImplementation((path: string) => {
+        if (path === 'projects/by_slug') {
+          return Promise.resolve(makeProject());
+        }
+        if (path === 'swimlanes') {
+          return Promise.resolve(makeSwimlanes());
+        }
+        if (path === 'userstories') {
+          return Promise.reject(httpError(500, 'userstories'));
+        }
+        return Promise.resolve([]);
+      });
+
+      const view = await loadHook();
+
+      expect(view.result.current.loadError).toBeInstanceOf(Error);
+      expect((view.result.current.loadError as HttpErrorLike).status).toBe(500);
+      // Non-401 failures surface an error but must NOT redirect.
+      expect(redirectToLoginMock).not.toHaveBeenCalled();
+    });
+
+    it('F-READ-2: a 204/null userstories body loads as an empty board without throwing', async () => {
+      getMock.mockImplementation((path: string) => {
+        if (path === 'projects/by_slug') {
+          return Promise.resolve(makeProject());
+        }
+        if (path === 'swimlanes') {
+          return Promise.resolve(makeSwimlanes());
+        }
+        if (path === 'userstories') {
+          // httpClient returns `null` for a 204 / empty body.
+          return Promise.resolve(null);
+        }
+        return Promise.resolve([]);
+      });
+
+      const view = await loadHook();
+
+      // The load COMPLETED (no TypeError on null.length): isFirstLoad cleared,
+      // no error surfaced, and the board is simply empty.
+      expect(view.result.current.isFirstLoad).toBe(false);
+      expect(view.result.current.loadError == null).toBe(true);
+      expect(Object.keys(view.result.current.usMap)).toHaveLength(0);
+      const usByStatus = view.result.current.usByStatus;
+      expect(usByStatus['1'] ?? []).toHaveLength(0);
+      expect(usByStatus['2'] ?? []).toHaveLength(0);
+    });
+
+    it('F-READ-2: a null swimlanes body does not throw and loads userstories normally', async () => {
+      getMock.mockImplementation((path: string) => {
+        if (path === 'projects/by_slug') {
+          return Promise.resolve(makeProject());
+        }
+        if (path === 'swimlanes') {
+          return Promise.resolve(null); // 204 / empty body
+        }
+        if (path === 'userstories') {
+          return Promise.resolve(makeUserstories());
+        }
+        return Promise.resolve([]);
+      });
+
+      const view = await loadHook();
+
+      expect(view.result.current.isFirstLoad).toBe(false);
+      expect(view.result.current.loadError == null).toBe(true);
+      // Userstories still projected despite the null swimlanes response.
+      expect(view.result.current.usByStatus['1']).toEqual(expect.arrayContaining([11, 12]));
     });
   });
 
@@ -669,6 +791,50 @@ describe('useKanbanBoard', () => {
         await view.result.current.moveUs([{ id: 13 }], 2, -1, 0, null, null);
       });
       expect(bulkKanbanMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('F-WRITE-2: rolls back the optimistic move and surfaces writeError when the write fails', async () => {
+      const view = await loadHook();
+      // Baseline projection: {'1':[11,12], '2':[13]}.
+      const before = JSON.parse(JSON.stringify(view.result.current.usByStatus));
+      expect(before['2']).toEqual([13]);
+
+      // Force the single write to reject (500).
+      const err = Object.assign(
+        new Error('HTTP 500 for POST userstories/bulk_update_kanban_order'),
+        { status: 500 },
+      );
+      bulkKanbanMock.mockRejectedValueOnce(err);
+
+      // Move us 13 from status 2 into status 1 (a real, visible cross-column change).
+      await act(async () => {
+        // Must NOT reject — moveUs handles the failure internally (no uncaught rejection).
+        await view.result.current.moveUs([{ id: 13 }], 1, -1, 0, null, 11);
+      });
+
+      // Exactly ONE write attempted (no retry storm).
+      expect(bulkKanbanMock).toHaveBeenCalledTimes(1);
+      // ROLLED BACK to the pre-move projection: card 13 is back in status 2, not
+      // left falsely in status 1 (this is what would diverge without the fix).
+      expect(view.result.current.usByStatus).toEqual(before);
+      expect(view.result.current.usByStatus['2']).toEqual([13]);
+      // The error is SURFACED (proof the catch ran; an uncaught rejection would
+      // leave writeError null).
+      expect(view.result.current.writeError).toBeInstanceOf(Error);
+      expect((view.result.current.writeError as HttpErrorLike).status).toBe(500);
+    });
+
+    it('F-WRITE-2: a successful move persists optimistically and leaves writeError null', async () => {
+      const view = await loadHook();
+
+      await act(async () => {
+        await view.result.current.moveUs([{ id: 13 }], 1, -1, 0, null, 11);
+      });
+
+      expect(view.result.current.writeError == null).toBe(true);
+      // 13 moved out of status 2 into status 1 (optimistic state retained on success).
+      expect(view.result.current.usByStatus['1']).toEqual(expect.arrayContaining([13]));
+      expect(view.result.current.usByStatus['2'] ?? []).not.toContain(13);
     });
   });
 

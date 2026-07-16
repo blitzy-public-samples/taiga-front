@@ -285,3 +285,26 @@ export function getUser(): SessionUser | null {
 export function isAuthenticated(): boolean {
   return getUser() !== null;
 }
+
+/**
+ * Redirects the browser to the login screen.
+ *
+ * Reproduces the legacy 401 handling: the AngularJS `$tgHttp` response
+ * interceptor sends the user to the login route on an unauthenticated
+ * response (`app/coffee/app.coffee:1025` -> `$location.path($navUrls.resolve("login"))`,
+ * i.e. the `/login` route registered at `app/coffee/app.coffee:519`). The React
+ * screens reuse the SAME AngularJS session/auth state, so on a `401` during an
+ * initial board load they must perform the same navigation rather than leaving
+ * a silently-broken board (see `useKanbanBoard`'s load error handling).
+ *
+ * The app runs in HTML5 (non-hash) location mode — the live routes are real
+ * paths such as `/project/:pslug/kanban` — so `/login` is the correct absolute
+ * path. `location.assign` is used (rather than assigning `location.href`) so the
+ * call is a plain, spy-able method invocation in tests, and it is guarded for
+ * non-browser/test runtimes where `window` may be absent.
+ */
+export function redirectToLogin(): void {
+  if (typeof window !== 'undefined' && window.location) {
+    window.location.assign('/login');
+  }
+}

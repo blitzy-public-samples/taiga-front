@@ -130,6 +130,12 @@ const I18N: Record<string, string> = {
   'COMMON.DELETE': 'Delete',
   'US.BULK_PLACEHOLDER': 'One user story per line',
   'COMMON.PERMISSION_DENIED': 'You do not have permission to view this board.',
+  // Generic error strings reused from the legacy notification service
+  // (`app/locales/taiga/locale-en.json` -> NOTIFICATION.*) so the failed-load
+  // (F-READ-1) and failed-write (F-WRITE-2) states surface the SAME user-facing
+  // copy the AngularJS screen showed, rather than a raw i18n key.
+  'NOTIFICATION.WARNING': 'Oops, something went wrong...',
+  'NOTIFICATION.WARNING_TEXT': 'Your changes were not saved!',
 };
 
 /** Translate a message key to its English source string (or the key itself). */
@@ -430,6 +436,8 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     isFirstLoad,
     notFoundUserstories,
     permissionError,
+    loadError,
+    writeError,
     moveUs,
     moveUsToTop,
     addUsBulk,
@@ -850,6 +858,27 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
           {permissionError ? (
             <div className="permission-error">{t('COMMON.PERMISSION_DENIED')}</div>
+          ) : null}
+
+          {/* Surface a failed INITIAL board load (F-READ-1) instead of leaving a
+              silently-broken board. A 401 has already navigated to /login; this
+              renders for other failures (e.g. 500) so the user gets feedback.
+              `NOTIFICATION.WARNING` ("Oops, something went wrong...") is the same
+              generic error string the legacy notification service shows. */}
+          {loadError ? (
+            <div className="load-error" role="alert">
+              {t('NOTIFICATION.WARNING')}
+            </div>
+          ) : null}
+
+          {/* Surface a failed move write (F-WRITE-2). The optimistic change has
+              already been rolled back; `NOTIFICATION.WARNING_TEXT` ("Your changes
+              were not saved!") is the legacy save-failure string, telling the user
+              the reorder did not persist. */}
+          {writeError ? (
+            <div className="write-error" role="alert">
+              {t('NOTIFICATION.WARNING_TEXT')}
+            </div>
           ) : null}
 
           {boardProps ? (

@@ -315,6 +315,10 @@ export interface CardProps {
   inViewPort: boolean; // usCardVisibility[usId] -> .card-inner rendered only when true
   statusId: number; // for drag data
   swimlaneId: number | null; // for drag data (null == unclassified/-1 handled by parent)
+  index: number; // position within the column's ordered list -> drag data `oldIndex`
+  // (F-WRITE-1). The Kanban drag-end handler compares the drop index against this
+  // original index and short-circuits an identical-position drop to ZERO writes
+  // (shared/dnd/sortable.ts no-op guard). Supplied by Column via `cardPropsFor`.
   selected?: boolean; // ctrl.selectedUss[usId] -> 'kanban-task-selected' + 'ui-multisortable-multiple'
   moved?: boolean; // ctrl.movedUs includes usId -> 'kanban-moved' (swimlane mode only)
   // NOTE: `maximized`/`minimized` are intentional no-ops. In the AngularJS source
@@ -483,6 +487,7 @@ const Card = ({
   inViewPort,
   statusId,
   swimlaneId,
+  index,
   selected = false,
   moved = false,
   canModify,
@@ -496,12 +501,22 @@ const Card = ({
   onSelect,
 }: CardProps) => {
   // ----- drag-and-drop wiring -----------------------------------------------
-  // The card carries `{ usId, statusId, swimlaneId }` as its drag data so the
-  // Kanban drag-end handler can read the source column/swimlane from
-  // `event.active.data.current` (see shared/dnd/sortable.ts).
+  // The card carries `{ usId, statusId, swimlaneId, oldIndex }` as its drag data
+  // so the Kanban drag-end handler can read the source column/swimlane AND the
+  // original index from `event.active.data.current` (see shared/dnd/sortable.ts).
+  //  - `oldIndex` (F-WRITE-1): without it the handler's no-op guard
+  //    (`sameContainer && oldIndex !== null && index === oldIndex`) can never
+  //    fire, so a drop onto the card's EXACT original position wrongly issues a
+  //    `bulk_update_kanban_order` write. Wiring the source index makes an
+  //    identical-position drop a true ZERO-write no-op.
+  //  - `disabled: !canModify` (F-WRITE-3): reproduces `kanban/sortable.coffee:37`,
+  //    which never initializes the sortable without `modify_us`. A readonly user
+  //    must not be able to initiate a drag (which would fire a doomed 403 write);
+  //    disabling the sortable makes the card undraggable, matching legacy parity.
   const { setNodeRef, attributes, listeners, style, className: dragClassName } = useSortableCard(
     usId,
-    { usId, statusId, swimlaneId },
+    { usId, statusId, swimlaneId, oldIndex: index },
+    { disabled: !canModify },
   );
 
   // ----- raw-model lens (see RawModel) --------------------------------------

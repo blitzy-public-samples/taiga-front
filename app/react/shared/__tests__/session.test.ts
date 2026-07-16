@@ -42,7 +42,14 @@
  * `@types/jest` + ts-jest; they are deliberately NOT imported.
  */
 
-import { getToken, getUser, getSessionId, getPreferredLanguage, isAuthenticated } from '../session';
+import {
+  getToken,
+  getUser,
+  getSessionId,
+  getPreferredLanguage,
+  isAuthenticated,
+  redirectToLogin,
+} from '../session';
 
 /**
  * Installs the shared `window.taiga` global. `session.ts` OWNS this typing
@@ -368,6 +375,40 @@ describe('shared/session auth adapter', () => {
     it('returns false for a JSON null userInfo value', () => {
       localStorage.setItem('userInfo', JSON.stringify(null));
       expect(isAuthenticated()).toBe(false);
+    });
+  });
+
+  /**
+   * `redirectToLogin()` reproduces the legacy `$tgHttp` 401 -> /login navigation
+   * (`app/coffee/app.coffee:1025`). It calls `window.location.assign('/login')`.
+   * jsdom's real `location.assign` is a non-implemented no-op that logs noise, so
+   * the tests swap `window.location` for a stub carrying a spy and restore it
+   * afterwards.
+   */
+  describe('redirectToLogin()', () => {
+    let originalLocation: Location;
+    let assignSpy: jest.Mock;
+
+    beforeEach(() => {
+      originalLocation = window.location;
+      assignSpy = jest.fn();
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: { assign: assignSpy } as unknown as Location,
+      });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        value: originalLocation,
+      });
+    });
+
+    it('navigates the browser to the /login route', () => {
+      redirectToLogin();
+      expect(assignSpy).toHaveBeenCalledTimes(1);
+      expect(assignSpy).toHaveBeenCalledWith('/login');
     });
   });
 });

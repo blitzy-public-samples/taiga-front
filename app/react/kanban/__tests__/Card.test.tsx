@@ -145,6 +145,7 @@ const makeProps = (over: Partial<CardProps> = {}): CardProps => ({
   inViewPort: true,
   statusId: 3,
   swimlaneId: null,
+  index: 0,
   selected: false,
   moved: false,
   canModify: true,
@@ -184,12 +185,38 @@ describe('<tg-card> host element and drag wiring', () => {
     expect(cls).toContain('ng-animate-disabled');
   });
 
-  it('passes { usId, statusId, swimlaneId } as the drag data to useSortable', () => {
-    renderCard({ usId: 55, statusId: 9, swimlaneId: 2 });
+  it('passes { usId, statusId, swimlaneId, oldIndex } + disabled:false as the drag config to useSortable', () => {
+    // index:4 -> drag-data oldIndex:4 (F-WRITE-1); canModify defaults true -> disabled:false (F-WRITE-3).
+    renderCard({ usId: 55, statusId: 9, swimlaneId: 2, index: 4 });
     expect(mockUseSortable).toHaveBeenCalledWith({
       id: 55,
-      data: { usId: 55, statusId: 9, swimlaneId: 2 },
+      data: { usId: 55, statusId: 9, swimlaneId: 2, oldIndex: 4 },
+      disabled: false,
     });
+  });
+
+  it('F-WRITE-1: wires the column index as the drag-data oldIndex', () => {
+    renderCard({ usId: 55, index: 7 });
+    const call = mockUseSortable.mock.calls.find(
+      (c: unknown[]) => (c[0] as { id?: number }).id === 55,
+    )?.[0] as { data?: Record<string, unknown> } | undefined;
+    expect(call?.data).toEqual(expect.objectContaining({ oldIndex: 7 }));
+  });
+
+  it('F-WRITE-3: disables the sortable (drag) for a readonly user (canModify=false)', () => {
+    renderCard({ usId: 55, canModify: false });
+    const call = mockUseSortable.mock.calls.find(
+      (c: unknown[]) => (c[0] as { id?: number }).id === 55,
+    )?.[0] as { disabled?: boolean } | undefined;
+    expect(call?.disabled).toBe(true);
+  });
+
+  it('F-WRITE-3: keeps the sortable enabled for an editor (canModify=true)', () => {
+    renderCard({ usId: 55, canModify: true });
+    const call = mockUseSortable.mock.calls.find(
+      (c: unknown[]) => (c[0] as { id?: number }).id === 55,
+    )?.[0] as { disabled?: boolean } | undefined;
+    expect(call?.disabled).toBe(false);
   });
 
   it('appends the gu-transit class to tg-card while dragging', () => {

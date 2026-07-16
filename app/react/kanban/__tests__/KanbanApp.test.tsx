@@ -258,6 +258,8 @@ function makeHookResult(overrides: Partial<UseKanbanBoardResult> = {}): UseKanba
     isLightboxOpened: false,
     notFoundUserstories: false,
     permissionError: false,
+    loadError: null,
+    writeError: null,
     // --- dispatchers (promise-returning ones resolve so `.then` chains work) ---
     moveUs: jest.fn(() => Promise.resolve()),
     moveUsToTop: jest.fn(() => Promise.resolve()),
@@ -597,6 +599,59 @@ describe('KanbanApp - zoom control wiring', () => {
 
     // KanbanApp lifts the zoom level and re-runs the hook with the new value.
     expect(mockUseKanbanBoard).toHaveBeenCalledWith(expect.objectContaining({ zoomLevel: 3 }));
+  });
+});
+
+/* ================================================================== *
+ * Error-state rendering (F-READ-1 load failure, F-WRITE-2 write failure)
+ * ------------------------------------------------------------------
+ * The hook surfaces `loadError` / `writeError`; KanbanApp must render a
+ * user-visible, role="alert" banner for each rather than leaving the board
+ * silently broken (the QA complaint). These specs pin the consumer wiring:
+ * the correct container class, the ARIA alert role, the friendly legacy copy
+ * (NOT a raw i18n key), and the negative case (no banners when no error).
+ * ================================================================== */
+
+describe('KanbanApp - error-state rendering', () => {
+  it('renders NO error banners on the happy path (no loadError / writeError)', () => {
+    const { container } = renderApp();
+
+    expect(container.querySelector('.load-error')).not.toBeInTheDocument();
+    expect(container.querySelector('.write-error')).not.toBeInTheDocument();
+  });
+
+  it('renders a role="alert" .load-error banner with the legacy warning copy when loadError is set (F-READ-1)', () => {
+    const { container } = renderApp(undefined, { loadError: new Error('boom') });
+
+    const banner = container.querySelector('.load-error');
+    expect(banner).toBeInTheDocument();
+    // ARIA alert so assistive tech announces the failed board load.
+    expect(banner).toHaveAttribute('role', 'alert');
+    // Friendly legacy string, NOT the raw `NOTIFICATION.WARNING` key.
+    expect(banner).toHaveTextContent('Oops, something went wrong...');
+    // A load failure must not masquerade as a write failure.
+    expect(container.querySelector('.write-error')).not.toBeInTheDocument();
+  });
+
+  it('renders a role="alert" .write-error banner with the legacy save-failure copy when writeError is set (F-WRITE-2)', () => {
+    const { container } = renderApp(undefined, { writeError: new Error('save failed') });
+
+    const banner = container.querySelector('.write-error');
+    expect(banner).toBeInTheDocument();
+    expect(banner).toHaveAttribute('role', 'alert');
+    // The optimistic move has been rolled back; tell the user it did not persist.
+    expect(banner).toHaveTextContent('Your changes were not saved!');
+    expect(container.querySelector('.load-error')).not.toBeInTheDocument();
+  });
+
+  it('renders BOTH banners independently when both errors are set', () => {
+    const { container } = renderApp(undefined, {
+      loadError: new Error('load boom'),
+      writeError: new Error('write boom'),
+    });
+
+    expect(container.querySelector('.load-error')).toBeInTheDocument();
+    expect(container.querySelector('.write-error')).toBeInTheDocument();
   });
 });
 

@@ -476,12 +476,28 @@ export interface SortableItemState {
  * `event.active.data.current` (e.g. `{ usId, statusId, swimlaneId, oldIndex }`).
  * Must be called from a React render context (it is a hook).
  */
+/**
+ * Per-item sortable options.
+ *
+ * `disabled` reproduces the legacy permission gate: `kanban/sortable.coffee:37`
+ * returns early (never initializing the dragula sortable) when the user lacks
+ * `modify_us`, so a readonly user can NEVER initiate a drag. `@dnd-kit` accepts
+ * `disabled?: boolean | { draggable?; droppable? }` on `useSortable`; a boolean
+ * `true` disables dragging entirely (it maps to `{ draggable: true, droppable:
+ * false }` internally). The object form is admitted for parity with the
+ * `@dnd-kit` surface. `undefined` is equivalent to not disabling (the default).
+ */
+export interface SortableItemOptions {
+  disabled?: boolean | { draggable?: boolean; droppable?: boolean };
+}
+
 export function useSortableItem(
   usId: UsId,
   data?: Record<string, unknown>,
+  options?: SortableItemOptions,
 ): SortableItemState {
   const { setNodeRef, attributes, listeners, transform, transition, isDragging } =
-    useSortable({ id: usId, data });
+    useSortable({ id: usId, data, disabled: options?.disabled });
 
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -503,8 +519,9 @@ export function useSortableItem(
 export function useSortableCard(
   usId: UsId,
   data?: Record<string, unknown>,
+  options?: SortableItemOptions,
 ): SortableItemState {
-  return useSortableItem(usId, data);
+  return useSortableItem(usId, data, options);
 }
 
 /**
@@ -516,8 +533,9 @@ export function useSortableCard(
 export function useSortableRow(
   usId: UsId,
   data?: Record<string, unknown>,
+  options?: SortableItemOptions,
 ): SortableItemState {
-  return useSortableItem(usId, data);
+  return useSortableItem(usId, data, options);
 }
 
 /* ========================================================================== *

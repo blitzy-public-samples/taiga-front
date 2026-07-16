@@ -79,11 +79,14 @@ import {
 
 // Shared adapters (globals-only interop layer over the frozen /api/v1/ + WS).
 import httpClient from '../../shared/api/httpClient';
+import type { HttpError } from '../../shared/api/httpClient';
 import userstories from '../../shared/api/userstories';
 import { createEventsClient, routingKeys } from '../../shared/events/eventsClient';
-// `config`/`session` are read indirectly by httpClient/eventsClient (Bearer
-// token, X-Session-Id, Accept-Language, API/events URLs), so they are NOT
-// imported here.
+// `config` and most of `session` are read indirectly by httpClient/eventsClient
+// (Bearer token, X-Session-Id, Accept-Language, API/events URLs). The one direct
+// use is `redirectToLogin`, invoked from the load-error handler to reproduce the
+// legacy `$tgHttp` 401 -> /login navigation.
+import { redirectToLogin } from '../../shared/session';
 
 // ---------------------------------------------------------------------------
 // Local types
@@ -330,6 +333,10 @@ export interface UseKanbanBoardResult {
   isLightboxOpened: boolean;
   notFoundUserstories?: boolean;
   permissionError?: boolean;
+  /** A failed INITIAL board load (F-READ-1); `null` when the load succeeded. */
+  loadError?: Error | null;
+  /** A failed optimistic move write, after rollback (F-WRITE-2); `null` when clear. */
+  writeError?: Error | null;
   // --- dispatchers ---
   moveUs: (
     usList: Array<{ id: number }> | null,
@@ -392,6 +399,14 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
   const [isLightboxOpened, setIsLightboxOpened] = useState<boolean>(false);
   const [notFoundUserstories, setNotFoundUserstories] = useState<boolean>(false);
   const [permissionError, setPermissionError] = useState<boolean>(false);
+  // Error surfaces (parity with legacy `$tgHttp` error handling):
+  //  - `loadError` (F-READ-1): a failed INITIAL board load. Surfacing it lets the
+  //    consumer render an error state instead of a silently-broken board, and it
+  //    ensures the load promise no longer rejects uncaught.
+  //  - `writeError` (F-WRITE-2): a failed optimistic move write, after the board
+  //    has been rolled back to the pre-move state.
+  const [loadError, setLoadError] = useState<Error | null>(null);
+  const [writeError, setWriteError] = useState<Error | null>(null);
   const [foldedSwimlane, setFoldedSwimlane] = useState<Record<string, boolean>>({});
   const [projectId, setProjectId] = useState<number | null>(null);
   const [project, setProject] = useState<Project | null>(null);
@@ -456,12 +471,19 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
    * serialization - we NEVER hand-build a URL.
    */
   const listAll = useCallback(
-    (pid: number, queryParams: Record<string, unknown>): Promise<UserStory[]> =>
-      httpClient.get<UserStory[]>(
+    async (pid: number, queryParams: Record<string, unknown>): Promise<UserStory[]> => {
+      const result = await httpClient.get<UserStory[]>(
         'userstories',
         { project: pid, ...queryParams },
         { headers: { 'x-disable-pagination': '1' } },
-      ),
+      );
+      // Robustness (F-READ-2): `httpClient` returns `null` for a 204 / empty
+      // body (transformResponseBody). The declared return type is
+      // `Promise<UserStory[]>` and every caller relies on it (`.concat`,
+      // `.length`, `sortBy`), so coalesce a null/undefined body to `[]` here —
+      // at the single source — instead of forcing each caller to null-check.
+      return result ?? [];
+    },
     [],
   );
 
@@ -471,12 +493,16 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
    * `init`/`refreshSwimlanes` derive `swimlanesList`/`usByStatusSwimlanes` from
    * the swimlanes + project statuses, so we simply return the fetched list.
    */
-  const loadSwimlanes = useCallback((): Promise<Swimlane[]> => {
+  const loadSwimlanes = useCallback(async (): Promise<Swimlane[]> => {
     const pid = projectIdRef.current;
     if (pid == null) {
-      return Promise.resolve([]);
+      return [];
     }
-    return httpClient.get<Swimlane[]>('swimlanes', { project: pid });
+    const result = await httpClient.get<Swimlane[]>('swimlanes', { project: pid });
+    // Robustness (F-READ-2): coalesce a 204 / null body to `[]` so the declared
+    // `Promise<Swimlane[]>` contract holds and the reducer's swimlane
+    // derivations never receive `null`.
+    return result ?? [];
   }, []);
 
   /**
@@ -639,8 +665,33 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
    * tag chips); the essential board data is `loadUserstories()`, so tag-color
    * fetching is intentionally left to the consumer and omitted here.
    */
+  /**
+   * Centralized handler for a failed board LOAD (F-READ-1).
+   *
+   * Legacy parity: the AngularJS `$tgHttp` response interceptor surfaces load
+   * failures and, on a `401`, redirects to the login route
+   * (`app/coffee/app.coffee:1025`). Reproducing that here (a) surfaces the error
+   * via `loadError` so the consumer renders an error state instead of a
+   * silently-broken board, and (b) navigates to `/login` on a `401`.
+   *
+   * It deliberately does NOT re-throw: the load is kicked off fire-and-forget
+   * (`void loadInitialData()` / `void loadUserstories()` in the init effect), so
+   * swallowing the error HERE — after surfacing it — is precisely what prevents
+   * the uncaught promise rejection the QA flagged. It also handles the
+   * fail-closed empty-config throw (a non-HTTP `Error` with no `status`), which
+   * rides the same path: the error is surfaced without a spurious redirect.
+   */
+  const handleLoadError = useCallback((err: unknown): void => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    setLoadError(error);
+    if ((error as HttpError).status === 401) {
+      redirectToLogin();
+    }
+  }, []);
+
   const loadInitialData = useCallback(async (): Promise<void> => {
     setLoading(true);
+    setLoadError(null); // clear any prior error on a fresh (re)load attempt.
     try {
       const proj = await loadProject();
       if (proj == null) {
@@ -650,10 +701,15 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       setFoldedSwimlane(readSwimlanesModes(proj.id));
       await loadUserstories();
       setIsFirstLoad(false); // firstLoad().then(() => isFirstLoad = false) (main.coffee:112-125)
+    } catch (err) {
+      // F-READ-1: a failed initial load (401/500 read, or the fail-closed
+      // empty-config throw) must not escape as an uncaught rejection. Surface an
+      // error state and, on 401, redirect to login — matching legacy behavior.
+      handleLoadError(err);
     } finally {
       setLoading(false);
     }
-  }, [loadProject, loadUserstories]);
+  }, [loadProject, loadUserstories, handleLoadError]);
 
   /** Public reload = re-run `loadUserstories` (used by KanbanApp after filter changes). */
   const reload = useCallback(async (): Promise<void> => {
@@ -776,6 +832,9 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
         previousCard,
         nextCard,
       );
+      // Optimistic update FIRST (matching the AngularJS `$scope.$apply` ordering:
+      // state then request). Clear any stale write error on a fresh move.
+      setWriteError(null);
       applyState(() => next);
 
       // Fire the frozen endpoint via the typed adapter. `bulk_userstories` is a
@@ -783,18 +842,37 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       // last param `number[]` — matching the frozen contract
       // (kanban/main.coffee:610 `usList.map((it) => it.id)`). So
       // `payload.bulkUserstories` is passed straight through with NO cast.
-      await userstories.bulkUpdateKanbanOrder(
-        pid,
-        newStatusId,
-        apiNewSwimlaneId,
-        payload.afterUserstoryId,
-        payload.beforeUserstoryId,
-        payload.bulkUserstories,
-      );
+      //
+      // F-WRITE-2: the write is wrapped so a failed request (4xx/5xx/offline)
+      // (a) never escapes as an uncaught promise rejection, and (b) ROLLS BACK
+      // the optimistic update to the exact pre-move snapshot (`current`) so the
+      // board reconverges with the server (which — the request having failed —
+      // never mutated). This reproduces legacy parity where a rejected reorder
+      // does not leave the card falsely shown in its new column. Exactly ONE
+      // write is attempted (no retry), preserving the single-call invariant.
+      try {
+        await userstories.bulkUpdateKanbanOrder(
+          pid,
+          newStatusId,
+          apiNewSwimlaneId,
+          payload.afterUserstoryId,
+          payload.beforeUserstoryId,
+          payload.bulkUserstories,
+        );
+      } catch (err) {
+        // Roll the board back to the pre-move state and surface the error. Do
+        // NOT re-throw: the caller (`KanbanApp`'s `onMove`) invokes this
+        // fire-and-forget (`void moveUs(...)`), so re-throwing would produce the
+        // uncaught rejection the QA flagged.
+        applyState(() => current);
+        setWriteError(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
 
       // .then tail (main.coffee:627-632): WIP recompute is AUTOMATIC on
       // re-render in React (no `redraw:wip` event needed); filters are
-      // regenerated by KanbanApp via the injected callback.
+      // regenerated by KanbanApp via the injected callback. Only runs on a
+      // SUCCESSFUL write.
       callbacksRef.current.onFiltersChanged?.();
     },
     [applyState],
@@ -1099,9 +1177,12 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     const currZoom = params.zoomLevel;
     prevZoomRef.current = currZoom;
     if (currZoom > 2 && prevZoom <= 2) {
-      void loadUserstories();
+      // Guard this fire-and-forget reload the same way as the initial load: a
+      // rejected fetch must surface via `loadError`, never as an uncaught
+      // rejection (F-READ-1, same latent pattern as `loadInitialData`).
+      void loadUserstories().catch(handleLoadError);
     }
-  }, [params.zoomLevel, params.projectSlug, loadInitialData, loadUserstories]);
+  }, [params.zoomLevel, params.projectSlug, loadInitialData, loadUserstories, handleLoadError]);
 
   // --- Result --------------------------------------------------------------
 
@@ -1123,6 +1204,8 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     isLightboxOpened,
     notFoundUserstories,
     permissionError,
+    loadError,
+    writeError,
     // dispatchers
     moveUs,
     moveUsToTop,

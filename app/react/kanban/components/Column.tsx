@@ -420,6 +420,7 @@ const Column = ({
     inViewPort: cardVisibility?.[usId] ?? false,
     statusId: status.id,
     swimlaneId,
+    index, // ordered position -> Card drag data `oldIndex` (F-WRITE-1 no-op guard)
     selected: !!selectedUss?.[usId],
     moved: swimlaneMode ? movedUs?.includes(usId) ?? false : false,
     canModify,
