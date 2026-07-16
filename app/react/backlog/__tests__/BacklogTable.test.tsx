@@ -27,9 +27,22 @@
  *    NEVER mutated (a fresh `Set` is always emitted).
  *  - Infinite scroll: `onLoadMore` fires only when enabled
  *    (`!disablePagination && firstLoadComplete`) AND the body is within 100px of
- *    the bottom.
+ *    the bottom, including the exact 100px boundary, successive paging, the
+ *    both-gates-unmet case, and re-enabling after a terminal page.
  *  - Row prop wiring: `selected`, `canModify`, `isFirstInBacklog`, `detailUrl`,
  *    `statusName`, `statusColor`, `pointsLabel`, and the status/options adapters.
+ *  - Role-points filter control accessibility + popover anchor (M-25 / M-09): the
+ *    `.points .inner` control exposes a button role, an accessible name, a tab
+ *    stop, and a popup relationship, activates on Enter/Space, and forwards the
+ *    DOM event (so a popover can anchor to `event.currentTarget`).
+ *  - Loading live region (M-27): the trailing element is a persistent
+ *    `role="status"` / `aria-live="polite"` region whose `aria-busy` and
+ *    visually-hidden label track `loadingUserstories`.
+ *  - Production drag-end integration (C-02 / M-20): the REAL
+ *    `createBacklogDragEndHandler` is driven with the ACTUAL container drag data
+ *    BacklogTable registers (`orderedIds` + `isBacklog`/`sprintId` marker) to
+ *    prove one correct `bulk_update_backlog_order` call per drop, none on a
+ *    cancel/no-op, correct neighbor geometry, and multi-selection handling.
  *
  * TEST ISOLATION (AAP 0.6.2 / 0.7): browserless. Jest + jsdom + React Testing
  * Library ONLY — NO Playwright, NO real browser, NO network. The sibling
@@ -49,6 +62,16 @@ import { render, screen, fireEvent, within } from '@testing-library/react';
 import { BacklogTable } from '../components/BacklogTable';
 import type { BacklogTableProps } from '../components/BacklogTable';
 import type { UserStory } from '../state/backlogReducer';
+// The REAL shared backlog drag-end handler + its structural contract types. These
+// are imported (not mocked) so the "production drag-end integration" suite below
+// proves the container drag data BacklogTable actually registers is SUFFICIENT to
+// drive the frozen `/userstories/bulk_update_backlog_order` call — the true
+// component -> provider -> handler seam. `sortable.ts` imports `@dnd-kit/core`
+// only as TYPES (erased at runtime), so it coexists with the `@dnd-kit/core`
+// value-mock below; its `@dnd-kit/sortable` value import (`useSortable`) is never
+// invoked on this path (see the sortable mock's defensive stub).
+import { createBacklogDragEndHandler } from '../../shared/dnd/sortable';
+import type { BacklogDragResult, BacklogOrderApi } from '../../shared/dnd/types';
 
 // --- Mock the sibling row so this spec targets ONLY BacklogTable ------------
 // The stub renders a `user-story-row` element that surfaces the row props as
@@ -115,6 +138,12 @@ jest.mock('../components/UserStoryRow', () => {
 });
 
 // --- Mock @dnd-kit/sortable: passthrough SortableContext + strategy sentinel --
+// A `useSortable` stub is included defensively: importing the real
+// `createBacklogDragEndHandler` (above) transitively loads `shared/dnd/sortable.ts`,
+// which imports `useSortable` from this module. It is NEVER called on this spec's
+// paths (the sibling `UserStoryRow` — the only `useSortable` consumer — is mocked
+// out, and the drag-end handler is a plain function), but stubbing it keeps the
+// module contract complete and future-proof.
 jest.mock('@dnd-kit/sortable', () => {
   const react = require('react');
   return {
@@ -126,6 +155,14 @@ jest.mock('@dnd-kit/sortable', () => {
         props.children,
       ),
     verticalListSortingStrategy: 'vertical-list-sorting-strategy',
+    useSortable: () => ({
+      attributes: {},
+      listeners: {},
+      setNodeRef: jest.fn(),
+      transform: null,
+      transition: undefined,
+      isDragging: false,
+    }),
   };
 });
 
@@ -248,6 +285,102 @@ describe('BacklogTable — header', () => {
   });
 });
 
+// --- M-25 (accessible control) + M-09 (popover anchor): the role-points filter
+// is a non-<button> element, so it must expose an explicit button role, an
+// accessible name, focusability, a popup relationship, and keyboard activation —
+// and it must forward the DOM event so the caller can anchor the popover. ---
+describe('BacklogTable — role-points filter control (accessibility + popover anchor)', () => {
+  /** The `.points .inner` control (kept a <div> for visual parity). */
+  const control = (container: HTMLElement): HTMLElement =>
+    container.querySelector('.points .inner') as HTMLElement;
+
+  it('exposes button role, accessible name, focusability and a popup relationship', () => {
+    const { container } = render(<BacklogTable {...makeProps({ onRolePointsFilterClick: jest.fn() })} />);
+    const el = control(container);
+
+    // Discoverable as a button with a name (queryable by accessible role+name).
+    expect(screen.getByRole('button', { name: 'Select view per Role' })).toBe(el);
+    expect(el).toHaveAttribute('aria-haspopup', 'dialog');
+    // Keyboard-focusable (a real tab stop), not a dead control.
+    expect(el).toHaveAttribute('tabindex', '0');
+    // Visual parity: it is still a <div> carrying the `.inner` class the SCSS
+    // targets (NOT a native <button> that would introduce UA chrome).
+    expect(el.tagName).toBe('DIV');
+    expect(el).toHaveClass('inner');
+  });
+
+  it('forwards the DOM event on click so the popover can anchor to the control (currentTarget)', () => {
+    // React nulls `currentTarget` after the handler returns, so the anchor MUST be
+    // read synchronously inside the handler (mirrors how a real caller reads it to
+    // position a popover). Capturing it here proves the anchor is the control.
+    let anchor: EventTarget | null | undefined;
+    const onRolePointsFilterClick = jest.fn((event?: { currentTarget?: EventTarget | null }) => {
+      anchor = event?.currentTarget ?? null;
+    });
+    const { container } = render(<BacklogTable {...makeProps({ onRolePointsFilterClick })} />);
+    const el = control(container);
+
+    fireEvent.click(el);
+    expect(onRolePointsFilterClick).toHaveBeenCalledTimes(1);
+    // M-09: the anchor is the control element itself.
+    expect(anchor).toBe(el);
+  });
+
+  it('activates on Enter and forwards the keyboard event (with default prevented)', () => {
+    let anchor: EventTarget | null | undefined;
+    let prevented: boolean | undefined;
+    const onRolePointsFilterClick = jest.fn(
+      (event?: { currentTarget?: EventTarget | null; defaultPrevented?: boolean }) => {
+        anchor = event?.currentTarget ?? null;
+        prevented = event?.defaultPrevented;
+      },
+    );
+    const { container } = render(<BacklogTable {...makeProps({ onRolePointsFilterClick })} />);
+    const el = control(container);
+
+    fireEvent.keyDown(el, { key: 'Enter' });
+    expect(onRolePointsFilterClick).toHaveBeenCalledTimes(1);
+    expect(anchor).toBe(el);
+    expect(prevented).toBe(true);
+  });
+
+  it('activates on Space and forwards the keyboard event', () => {
+    let prevented: boolean | undefined;
+    const onRolePointsFilterClick = jest.fn(
+      (event?: { defaultPrevented?: boolean }) => {
+        prevented = event?.defaultPrevented;
+      },
+    );
+    const { container } = render(<BacklogTable {...makeProps({ onRolePointsFilterClick })} />);
+    const el = control(container);
+
+    fireEvent.keyDown(el, { key: ' ' });
+    expect(onRolePointsFilterClick).toHaveBeenCalledTimes(1);
+    expect(prevented).toBe(true);
+  });
+
+  it('does NOT activate on unrelated keys (e.g. Tab, ArrowDown)', () => {
+    const onRolePointsFilterClick = jest.fn();
+    const { container } = render(<BacklogTable {...makeProps({ onRolePointsFilterClick })} />);
+    const el = control(container);
+
+    fireEvent.keyDown(el, { key: 'Tab' });
+    fireEvent.keyDown(el, { key: 'ArrowDown' });
+    expect(onRolePointsFilterClick).not.toHaveBeenCalled();
+  });
+
+  it('keyboard activation is a harmless no-op when no handler is supplied', () => {
+    // No onRolePointsFilterClick -> the control still renders and Enter/Space do
+    // nothing (covers the guard branch in handleRolePointsKeyDown).
+    const { container } = render(<BacklogTable {...makeProps()} />);
+    const el = control(container);
+    expect(() => {
+      fireEvent.keyDown(el, { key: 'Enter' });
+      fireEvent.keyDown(el, { key: ' ' });
+    }).not.toThrow();
+  });
+});
+
 describe('BacklogTable — body ng-class', () => {
   it('is just "backlog-table-body" when all flags are false', () => {
     const { container } = render(<BacklogTable {...makeProps()} />);
@@ -275,11 +408,24 @@ describe('BacklogTable — body ng-class', () => {
 });
 
 describe('BacklogTable — droppable + sortable topology', () => {
-  it('registers the body droppable with id "backlog" and the isBacklog/null-sprint marker', () => {
+  it('registers the body droppable with id "backlog", the isBacklog/null-sprint marker, and the ordered ids', () => {
     render(<BacklogTable {...makeProps()} />);
+    // C-02: the container droppable must carry `orderedIds` (the current row
+    // order) so the shared backlog drag-end handler can resolve the drop position
+    // when a story is dropped onto the backlog BODY (not onto a specific row).
     expect(mockUseDroppable).toHaveBeenCalledWith({
       id: 'backlog',
-      data: { sprintId: null, isBacklog: true },
+      data: { sprintId: null, isBacklog: true, orderedIds: [10, 20, 30] },
+    });
+  });
+
+  it('keeps the droppable orderedIds in sync with the visible (filtered/reordered) rows', () => {
+    // A different visible order/subset must be reflected verbatim in the drag data
+    // so the handler never computes against a stale order.
+    render(<BacklogTable {...makeProps({ userstories: [makeUs(30), makeUs(10)] })} />);
+    expect(mockUseDroppable).toHaveBeenCalledWith({
+      id: 'backlog',
+      data: { sprintId: null, isBacklog: true, orderedIds: [30, 10] },
     });
   });
 
@@ -479,6 +625,66 @@ describe('BacklogTable — infinite scroll', () => {
     fireEvent.scroll(body);
     expect(onLoadMore).not.toHaveBeenCalled();
   });
+
+  it('fires at EXACTLY the 100px threshold but not one pixel beyond it', () => {
+    const onLoadMore = jest.fn();
+    const { container } = render(<BacklogTable {...makeProps({ onLoadMore })} />);
+    const body = getBody(container);
+
+    // distance = 1000 - 600 - 300 = 100 -> `<= 100` fires.
+    setScrollMetrics(body, { scrollHeight: 1000, clientHeight: 300, scrollTop: 600 });
+    fireEvent.scroll(body);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+
+    // distance = 1000 - 599 - 300 = 101 -> just past the threshold, no fire.
+    setScrollMetrics(body, { scrollHeight: 1000, clientHeight: 300, scrollTop: 599 });
+    fireEvent.scroll(body);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
+  it('can fire on successive near-bottom scrolls (paging through multiple pages)', () => {
+    const onLoadMore = jest.fn();
+    const { container } = render(<BacklogTable {...makeProps({ onLoadMore })} />);
+    const body = getBody(container);
+
+    setScrollMetrics(body, { scrollHeight: 1000, clientHeight: 300, scrollTop: 700 });
+    fireEvent.scroll(body);
+    fireEvent.scroll(body);
+    expect(onLoadMore).toHaveBeenCalledTimes(2);
+  });
+
+  it('stays disabled at the bottom while BOTH gates are unmet (disabled AND first load incomplete)', () => {
+    const onLoadMore = jest.fn();
+    const { container } = render(
+      <BacklogTable
+        {...makeProps({ onLoadMore, disablePagination: true, firstLoadComplete: false })}
+      />,
+    );
+    const body = getBody(container);
+    setScrollMetrics(body, { scrollHeight: 1000, clientHeight: 300, scrollTop: 700 });
+    fireEvent.scroll(body);
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it('re-enables loading the next page once disablePagination flips false (terminal-page reversal)', () => {
+    const onLoadMore = jest.fn();
+    const { container, rerender } = render(
+      <BacklogTable {...makeProps({ onLoadMore, disablePagination: true })} />,
+    );
+    const body = getBody(container);
+    setScrollMetrics(body, { scrollHeight: 1000, clientHeight: 300, scrollTop: 700 });
+
+    // Terminal page reached -> disabled -> no fetch.
+    fireEvent.scroll(body);
+    expect(onLoadMore).not.toHaveBeenCalled();
+
+    // Pagination re-enabled (e.g. filters changed) -> a near-bottom scroll now pages.
+    rerender(<BacklogTable {...makeProps({ onLoadMore, disablePagination: false })} />);
+    const body2 = getBody(container);
+    setScrollMetrics(body2, { scrollHeight: 1000, clientHeight: 300, scrollTop: 700 });
+    fireEvent.scroll(body2);
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('BacklogTable — loading spinner', () => {
@@ -488,5 +694,255 @@ describe('BacklogTable — loading spinner', () => {
 
     rerender(<BacklogTable {...makeProps({ loadingUserstories: false })} />);
     expect(container.querySelector('.loading-spinner')).not.toBeInTheDocument();
+  });
+
+  // --- M-27: the loading element must be an accessible, color-independent live
+  // region so screen-reader users perceive the loading state that sighted users
+  // infer from the spinner animation. ---
+
+  it('is ALWAYS a polite status live region (present even when idle) so AT registers it', () => {
+    // Idle: the element exists as an empty role="status" region with aria-busy
+    // false and no spinner classes (so it is visually empty — no layout change).
+    const { container } = render(<BacklogTable {...makeProps({ loadingUserstories: false })} />);
+    const region = container.querySelector('.backlog-table-body > [role="status"]') as HTMLElement;
+    expect(region).toBeInTheDocument();
+    expect(region).toHaveAttribute('aria-live', 'polite');
+    expect(region).toHaveAttribute('aria-busy', 'false');
+    expect(region).not.toHaveClass('is-loading');
+    // No visually-hidden label while idle.
+    expect(region).toHaveTextContent('');
+  });
+
+  it('exposes aria-busy=true and a screen-reader-only label while loading', () => {
+    const { container } = render(<BacklogTable {...makeProps({ loadingUserstories: true })} />);
+    const region = container.querySelector('.backlog-table-body > [role="status"]') as HTMLElement;
+    expect(region).toHaveAttribute('aria-busy', 'true');
+
+    // The status region is announced by name — a visually-hidden label carries the
+    // color-independent loading text.
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('Loading more user stories');
+
+    // The label is visually hidden (clip-rect technique) — it must NOT occupy a
+    // visible box, so the zero-visual-change contract holds.
+    const label = region.querySelector('span') as HTMLElement;
+    expect(label).toBeInTheDocument();
+    expect(label.style.position).toBe('absolute');
+    expect(label.style.width).toBe('1px');
+    expect(label.style.height).toBe('1px');
+    expect(label.style.overflow).toBe('hidden');
+  });
+
+  it('toggles aria-busy and the hidden label as loading flips false -> true -> false', () => {
+    const { container, rerender } = render(<BacklogTable {...makeProps({ loadingUserstories: false })} />);
+    const region = () => container.querySelector('.backlog-table-body > [role="status"]') as HTMLElement;
+
+    expect(region()).toHaveAttribute('aria-busy', 'false');
+    expect(region().querySelector('span')).toBeNull();
+
+    rerender(<BacklogTable {...makeProps({ loadingUserstories: true })} />);
+    expect(region()).toHaveAttribute('aria-busy', 'true');
+    expect(region().querySelector('span')).not.toBeNull();
+
+    rerender(<BacklogTable {...makeProps({ loadingUserstories: false })} />);
+    expect(region()).toHaveAttribute('aria-busy', 'false');
+    expect(region().querySelector('span')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C-02 / M-20: production drag-end integration (component -> provider -> handler)
+// ---------------------------------------------------------------------------
+// The unit suites above mock `@dnd-kit` to inspect what BacklogTable REGISTERS.
+// This suite closes the loop: it takes the ACTUAL container drag data the
+// component hands to the `@dnd-kit` provider (captured from the real
+// `useDroppable(...)` argument) and feeds it into the REAL
+// `createBacklogDragEndHandler` from `shared/dnd/sortable.ts`. That proves the
+// registered data is SUFFICIENT for the shared handler to (a) resolve the correct
+// drop geometry when a story lands on the backlog BODY, (b) issue EXACTLY ONE
+// frozen `/userstories/bulk_update_backlog_order` call per drop, (c) issue NONE on
+// a cancel or a no-op, and (d) honor the multi-selection. Without the `orderedIds`
+// the component now supplies (C-02), the handler would compute index -1 / null
+// neighbors — so these assertions would fail, which is exactly the regression the
+// finding required be covered.
+describe('BacklogTable — production drag-end integration (real handler)', () => {
+  /**
+   * Derive the handler's event parameter type from its return signature (the same
+   * pattern the shared DnD spec uses) so no value is imported from the mocked
+   * `@dnd-kit/core` module.
+   */
+  type DragEndEventLike = Parameters<ReturnType<typeof createBacklogDragEndHandler>>[0];
+
+  /** Build a minimal drag-end event exposing only the fields the handler reads. */
+  const makeBacklogEvent = (
+    activeId: number,
+    activeData: Record<string, unknown> | undefined,
+    overData: Record<string, unknown> | null,
+  ): DragEndEventLike => {
+    const active = {
+      id: activeId,
+      data: { current: activeData },
+      rect: { current: { initial: null, translated: null } },
+    };
+    const over =
+      overData === null
+        ? null
+        : { id: 'backlog', rect: {}, data: { current: overData }, disabled: false };
+    return {
+      activatorEvent: new Event('pointerup'),
+      active,
+      collisions: null,
+      delta: { x: 0, y: 0 },
+      over,
+    } as unknown as DragEndEventLike;
+  };
+
+  /**
+   * Render BacklogTable and return the EXACT `data` object it registered on its
+   * body droppable (the real `useDroppable(...)` first argument). This is the
+   * container drag data the shared handler consumes as `over.data.current`.
+   */
+  const registeredBacklogData = (
+    over: Partial<BacklogTableProps> = {},
+  ): Record<string, unknown> => {
+    render(<BacklogTable {...makeProps(over)} />);
+    const calls = mockUseDroppable.mock.calls;
+    const lastArg = calls[calls.length - 1][0] as { id: string; data: Record<string, unknown> };
+    return lastArg.data;
+  };
+
+  /** A fresh injected API whose one method resolves; asserted for call shape. */
+  const makeApi = () =>
+    ({ bulkUpdateBacklogOrder: jest.fn().mockResolvedValue({}) }) as unknown as BacklogOrderApi & {
+      bulkUpdateBacklogOrder: jest.Mock;
+    };
+
+  // The handler cleans up a body drag-state class + `.doom-line` nodes on every
+  // dragend; reset the body between cases so nothing leaks.
+  afterEach(() => {
+    document.body.className = '';
+    document.body.innerHTML = '';
+  });
+
+  it('the registered container data carries the exact visible order the handler needs', () => {
+    const data = registeredBacklogData();
+    expect(data).toMatchObject({ sprintId: null, isBacklog: true, orderedIds: [10, 20, 30] });
+  });
+
+  it('drives EXACTLY ONE bulk_update_backlog_order call with correct geometry for a body drop', async () => {
+    const overData = registeredBacklogData(); // { sprintId:null, isBacklog:true, orderedIds:[10,20,30] }
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
+
+    // Story 10 dropped onto the backlog body; it originated at index 2, so this is
+    // a real reorder (not a no-op). Final order places it first -> previous=null,
+    // next=20 (after-precedence).
+    await handler(
+      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 2 }, overData),
+    );
+
+    expect(onMove).toHaveBeenCalledTimes(1);
+    const result = onMove.mock.calls[0][0] as BacklogDragResult;
+    expect(result).toEqual({
+      movedIds: [10],
+      targetSprintId: null,
+      index: 0,
+      previousUs: null,
+      nextUs: 20,
+      isBacklog: true,
+    });
+
+    // Frozen contract: bulkUpdateBacklogOrder(project, milestone|null, after, before, ids).
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, null, 20, [10]);
+  });
+
+  it('resolves an interior body drop to the correct previous neighbor', async () => {
+    const overData = registeredBacklogData(); // orderedIds [10,20,30]
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
+
+    // Story 30 lands at index 2 having started at index 0 -> previous=20.
+    await handler(
+      makeBacklogEvent(30, { sprintId: null, isBacklog: true, oldIndex: 0 }, overData),
+    );
+
+    const result = onMove.mock.calls[0][0] as BacklogDragResult;
+    expect(result.index).toBe(2);
+    expect(result.previousUs).toBe(20);
+    expect(result.nextUs).toBeNull();
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, 20, null, [30]);
+  });
+
+  it('issues NO request and NO optimistic move on a no-op drop (same container, same index)', async () => {
+    const overData = registeredBacklogData();
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
+
+    // Story 10 is already at index 0 and originated at index 0 -> no-op guard.
+    await handler(
+      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 0 }, overData),
+    );
+
+    expect(onMove).not.toHaveBeenCalled();
+    expect(api.bulkUpdateBacklogOrder).not.toHaveBeenCalled();
+  });
+
+  it('issues NO request and NO optimistic move on a cancelled drop (no drop target)', async () => {
+    registeredBacklogData();
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
+
+    // over === null -> the drag was released outside any droppable.
+    await handler(makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 2 }, null));
+
+    expect(onMove).not.toHaveBeenCalled();
+    expect(api.bulkUpdateBacklogOrder).not.toHaveBeenCalled();
+  });
+
+  it('honors the multi-selection: moved ids carry the whole selection when it includes the active row', async () => {
+    const overData = registeredBacklogData();
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({
+      projectId: 7,
+      onMove,
+      api,
+      getSelectedIds: () => [10, 20],
+    });
+
+    await handler(
+      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 2 }, overData),
+    );
+
+    const result = onMove.mock.calls[0][0] as BacklogDragResult;
+    expect(result.movedIds).toEqual([10, 20]);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, null, 20, [10, 20]);
+  });
+
+  it('routes a story dragged FROM a sprint INTO the backlog (targetSprintId null)', async () => {
+    const overData = registeredBacklogData();
+    const onMove = jest.fn();
+    const api = makeApi();
+    const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
+
+    // Active story 20 came from sprint 9 (isBacklog:false) and is dropped onto the
+    // backlog body -> isBacklog true, targetSprintId null; it lands at index 1.
+    await handler(
+      makeBacklogEvent(20, { sprintId: 9, isBacklog: false, oldIndex: 0 }, overData),
+    );
+
+    const result = onMove.mock.calls[0][0] as BacklogDragResult;
+    expect(result.isBacklog).toBe(true);
+    expect(result.targetSprintId).toBeNull();
+    expect(result.index).toBe(1);
+    expect(result.previousUs).toBe(10);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, 10, null, [20]);
   });
 });

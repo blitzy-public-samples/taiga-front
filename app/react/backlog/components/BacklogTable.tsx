@@ -59,7 +59,7 @@
  */
 
 import { useRef } from 'react';
-import type { MouseEvent, UIEvent } from 'react';
+import type { CSSProperties, KeyboardEvent, MouseEvent, UIEvent } from 'react';
 import type { UserStory } from '../state/backlogReducer';
 import { UserStoryRow } from './UserStoryRow';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
@@ -81,6 +81,27 @@ function Svg({ icon }: { icon: string }) {
     </svg>
   );
 }
+
+/**
+ * The canonical "visually hidden" style — content that is available to assistive
+ * technology (screen readers) but occupies NO visible space and never affects
+ * layout, so the AAP 0.3.4 zero-visual-change contract holds. Applied INLINE
+ * (rather than via a class) because the compiled global SCSS ships no `.sr-only`
+ * / visually-hidden utility, so a class-based approach would render the label as
+ * ordinary visible text. This is the standard clip-rect technique used by design
+ * systems for accessible-but-invisible labels.
+ */
+const VISUALLY_HIDDEN: CSSProperties = {
+  position: 'absolute',
+  width: '1px',
+  height: '1px',
+  padding: 0,
+  margin: '-1px',
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
+};
 
 /**
  * Props for {@link BacklogTable}. All data + callbacks are supplied by
@@ -134,8 +155,21 @@ export interface BacklogTableProps {
    * always omitted from a row-triggered invocation.
    */
   onOptionsClick?: (us: UserStory, event?: MouseEvent) => void;
-  /** Optional click on the header role-points filter icon (tg-us-role-points-selector). */
-  onRolePointsFilterClick?: () => void;
+  /**
+   * Optional activation of the header role-points filter control
+   * (`tg-us-role-points-selector` in `backlog-table.jade:14-16`, which opens the
+   * per-role points popover — `us-role-points-popover.jade`).
+   *
+   * The DOM event is forwarded so a caller can ANCHOR the popover to the control
+   * (`event.currentTarget` is the `.inner` element) and manage focus — mirroring
+   * how the AngularJS `tgUsRolePointsSelector` directive positioned its popover
+   * relative to the clicked element. The parameter is OPTIONAL: keyboard
+   * activation forwards a `KeyboardEvent`, pointer activation a `MouseEvent`, and
+   * a programmatic caller may omit it entirely.
+   */
+  onRolePointsFilterClick?: (
+    event?: MouseEvent<HTMLElement> | KeyboardEvent<HTMLElement>,
+  ) => void;
 }
 
 /**
@@ -171,15 +205,34 @@ export function BacklogTable(props: BacklogTableProps) {
   // toggle and must NOT trigger a re-render on its own.
   const lastClickedIndexRef = useRef<number | null>(null);
 
+  // Sortable item ids for the ordered visible backlog. @dnd-kit accepts numeric
+  // ids (UniqueIdentifier = string | number). Computed BEFORE the droppable
+  // registration below so the same authoritative order can be attached to the
+  // container's drag data (see `orderedIds` on `useDroppable`).
+  const itemIds = userstories.map((us) => us.id);
+
   // The body is a @dnd-kit droppable. `data.isBacklog`/`sprintId: null` is the
   // marker the shared backlog drag-end handler reads to route a drop back to the
   // unassigned backlog (targetSprintId = null). `BacklogApp` supplies the single
   // outer <DndContext>; this component never renders one and never a nested one.
-  const { setNodeRef } = useDroppable({ id: 'backlog', data: { sprintId: null, isBacklog: true } });
-
-  // Sortable item ids for the ordered visible backlog. @dnd-kit accepts numeric
-  // ids (UniqueIdentifier = string | number).
-  const itemIds = userstories.map((us) => us.id);
+  //
+  // `orderedIds` carries the CURRENT ordered id list of this container's rows
+  // (C-02 fix). When a story is dropped onto the backlog BODY itself — rather
+  // than onto a specific `<UserStoryRow>` sortable — `over` is THIS droppable,
+  // so `over.data.current` is the ONLY place the shared drag-end handler can
+  // recover the destination order. `createBacklogDragEndHandler`'s data path
+  // reads it via `readOrderedIds(overData)` (`shared/dnd/sortable.ts`), which
+  // prefers an explicit `orderedIds: number[]` and otherwise finds nothing on a
+  // bare `useDroppable` (which, unlike `useSortable`, attaches no
+  // `sortable.items`). Without it the handler computes `index = -1` and null
+  // neighbors, corrupting the drop position; with it the handler derives the
+  // correct `previousUs`/`nextUs`/`index` for the frozen
+  // `/userstories/bulk_update_backlog_order` call. The field is drag metadata
+  // only — it is never rendered, so visual output is unchanged.
+  const { setNodeRef } = useDroppable({
+    id: 'backlog',
+    data: { sprintId: null, isBacklog: true, orderedIds: itemIds },
+  });
 
   // Body class list: the base class plus the three `ng-class` toggles from the
   // jade (kept as a joined string so the exact class names reach the SCSS).
@@ -232,6 +285,26 @@ export function BacklogTable(props: BacklogTableProps) {
     }
   };
 
+  /**
+   * Keyboard activation for the role-points filter control (M-25 accessibility).
+   * The control is a non-`<button>` element (kept a `<div>` so the existing
+   * class-based SCSS renders it identically — see the JSX comment), so it does
+   * NOT get the browser's built-in Enter/Space activation. This handler restores
+   * it: Enter or Space activate the control and forward the event to
+   * `onRolePointsFilterClick` so the caller can anchor/focus the popover, exactly
+   * as a pointer click does. `preventDefault` on Space stops the page from
+   * scrolling on activation.
+   */
+  const handleRolePointsKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!onRolePointsFilterClick) {
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+      event.preventDefault();
+      onRolePointsFilterClick(event);
+    }
+  };
+
   return (
     <>
       <div className="backlog-table-header">
@@ -243,7 +316,29 @@ export function BacklogTable(props: BacklogTableProps) {
           <div className="user-stories">User Story</div>
           <div className="status">Status</div>
           <div className="points" title="Select view per Role">
-            <div className="inner" onClick={onRolePointsFilterClick}>
+            {/* Role-points filter control (`div.inner(tg-us-role-points-selector)`
+                in backlog-table.jade:14). It STAYS a `<div>` — not a `<button>` —
+                so the class-based SCSS (`.points .inner { display: flex }`,
+                `backlog-table.scss`) renders it byte-identically and no
+                user-agent button chrome (border/background/font) leaks in,
+                preserving the AAP 0.3.4 zero-visual-change contract. Accessibility
+                (M-25) is added WITHOUT a visual change: `role="button"` +
+                `tabIndex=0` make it a focusable, screen-reader-announced control;
+                `aria-haspopup="dialog"` tells AT it opens the role-points popover;
+                `aria-label` gives it the accessible name the AngularJS `title`
+                conveyed only visually. The DOM event is forwarded to
+                `onRolePointsFilterClick` (M-09) so the caller can anchor the
+                popover to `event.currentTarget`. Keyboard Enter/Space activation
+                is restored by `handleRolePointsKeyDown`. */}
+            <div
+              className="inner"
+              role="button"
+              tabIndex={0}
+              aria-haspopup="dialog"
+              aria-label="Select view per Role"
+              onClick={onRolePointsFilterClick}
+              onKeyDown={handleRolePointsKeyDown}
+            >
               <span className="header-points">Points</span>
               <Svg icon="icon-filter" />
             </div>
@@ -277,10 +372,30 @@ export function BacklogTable(props: BacklogTableProps) {
             />
           ))}
         </SortableContext>
-        {/* Trailing `div(tg-loading="ctrl.loadingUserstories")`: an
-            otherwise-empty element that carries the spinner classes only while a
-            page is loading (`tg-loading` is a reference-only Angular directive). */}
-        <div className={loadingUserstories ? 'loading-spinner is-loading' : undefined} />
+        {/* Trailing `div(tg-loading="ctrl.loadingUserstories")`: carries the
+            spinner classes only while a page is loading (`tg-loading` is a
+            reference-only Angular directive), so the VISUAL output is unchanged
+            (empty when idle, spinner classes when loading — AAP 0.3.4).
+
+            Accessibility (M-27): the element is ALWAYS a live status region
+            (`role="status"` + `aria-live="polite"`) so assistive technology
+            registers it up front and announces changes without stealing focus.
+            `aria-busy` communicates the loading state independently of the
+            purely-visual spinner (color/animation), and a visually-hidden label
+            gives screen-reader users the same "loading more user stories"
+            information a sighted user infers from the spinner. The visually-hidden
+            span is rendered ONLY while loading and uses the inline
+            {@link VISUALLY_HIDDEN} clip-rect style, so it adds no visible box. */}
+        <div
+          role="status"
+          aria-live="polite"
+          aria-busy={loadingUserstories}
+          className={loadingUserstories ? 'loading-spinner is-loading' : undefined}
+        >
+          {loadingUserstories ? (
+            <span style={VISUALLY_HIDDEN}>Loading more user stories…</span>
+          ) : null}
+        </div>
       </div>
     </>
   );
