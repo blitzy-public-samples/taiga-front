@@ -685,6 +685,55 @@ describe("KanbanApp — WebSocket", () => {
         ).toBe(before);
     });
 
+    it("does NOT tear down and recreate the socket on a data refresh (QA F2)", async () => {
+        const { projCb } = await loadAndGetCallbacks();
+
+        // Exactly one socket established after the initial load.
+        expect(mockEventsClient.connect).toHaveBeenCalledTimes(1);
+        const disconnectsBefore = mockEventsClient.disconnect.mock.calls.length;
+
+        // Faithfully mirror the real transport: each `GET /projects/{id}` yields
+        // a FRESH object reference (as fetch + JSON.parse does), so the refresh
+        // sets a NEW `projectLoaded` object. Keying the WS effect on that object
+        // (the pre-fix bug) would tear the socket down and recreate it here; the
+        // stable projectId + "loaded" flag must not.
+        mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+            const path = String(args[0]);
+            if (path.startsWith("/projects/")) {
+                return Promise.resolve(mkRes({ ...currentProject }));
+            }
+            if (path === "/swimlanes") {
+                return Promise.resolve(mkRes(currentSwimlanes));
+            }
+            if (path === "/userstories/filters_data") {
+                return Promise.resolve(mkRes(currentFiltersData));
+            }
+            return Promise.resolve(mkRes({}));
+        });
+
+        // A matching projects event triggers a FULL board refresh
+        // (refreshAll → loadInitialData → setProjectLoaded(newObject)).
+        const projectGetsBefore = mockHttpGet.mock.calls.filter((c) =>
+            String(c[0]).startsWith("/projects/"),
+        ).length;
+        await act(async () => {
+            projCb({ matches: "projects.swimlane" });
+        });
+        await waitFor(() =>
+            expect(
+                mockHttpGet.mock.calls.filter((c) =>
+                    String(c[0]).startsWith("/projects/"),
+                ).length,
+            ).toBeGreaterThan(projectGetsBefore),
+        );
+
+        // The refresh must NOT churn the WebSocket effect: the subscription
+        // lifecycle keys on a stable projectId + "loaded" flag, so there is no
+        // extra connect() and no disconnect() from a spurious effect re-run.
+        expect(mockEventsClient.connect).toHaveBeenCalledTimes(1);
+        expect(mockEventsClient.disconnect.mock.calls.length).toBe(disconnectsBefore);
+    });
+
     it("unsubscribes both keys and disconnects on unmount", async () => {
         const { unmount } = await loadAndGetCallbacks();
         await act(async () => {

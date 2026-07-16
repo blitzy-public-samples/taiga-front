@@ -38,6 +38,45 @@ export interface HostElementProps {
 const OBSERVED_ATTRIBUTES: readonly string[] = ["data-project-id", "data-project-slug"];
 
 /**
+ * Parse a `data-project-id` attribute value into a project id, returning `NaN`
+ * for every value that is not a genuine, resolved id.
+ *
+ * The AngularJS Jade shells bind `data-project-id="{{project.id}}"`. Before the
+ * `$digest` that resolves `project.id` runs, that interpolation yields the
+ * attribute either absent OR present as an EMPTY STRING. A naive `Number(raw)`
+ * maps the empty string to `0` — and because `Number.isFinite(0)` is `true`,
+ * the app roots' finite-id guards would treat `0` as a real id and fire a
+ * spurious `GET /api/v1/projects/0` (QA finding F4). Whitespace-only values
+ * collapse to `0` the same way.
+ *
+ * Project ids are Django auto-increment primary keys and are therefore always
+ * positive integers, so this helper deliberately maps `undefined`/`null`, empty
+ * or whitespace-only strings, non-numeric strings, and any non-finite or
+ * non-positive number to `NaN`. That keeps the "transient NaN projectId before
+ * AngularJS interpolates the value" contract documented above intact for the
+ * empty-string case too, so the downstream `Number.isFinite(projectId)` guards
+ * defer all network/WebSocket work until a real id settles in.
+ *
+ * @param raw The raw `dataset.projectId` value (`string | undefined`).
+ * @returns The positive project id, or `NaN` when the id is not yet resolved.
+ */
+export function parseProjectId(raw: string | undefined): number {
+    if (raw === undefined || raw === null) {
+        return NaN;
+    }
+
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+        return NaN;
+    }
+
+    const parsed = Number(trimmed);
+    // Only a finite, strictly-positive number is a genuine project id; 0,
+    // negatives, and non-finite results all mean "not resolved yet" -> NaN.
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : NaN;
+}
+
+/**
  * Build a custom-element (Web Component) class that hosts a React root rendering
  * `Component`, wrapped in an {@link ErrorBoundary} for fault isolation.
  *
@@ -84,7 +123,10 @@ export function defineElement(Component: ComponentType<HostElementProps>): Custo
         /** Map the host `data-*` dataset into typed props for the React root. */
         private readProps(): HostElementProps {
             return {
-                projectId: Number(this.dataset.projectId),
+                // `parseProjectId` returns NaN for absent / empty-string /
+                // whitespace / non-positive values so the app roots' finite-id
+                // guards never fire a spurious GET /projects/0 (QA finding F4).
+                projectId: parseProjectId(this.dataset.projectId),
                 projectSlug: this.dataset.projectSlug ?? "",
             };
         }

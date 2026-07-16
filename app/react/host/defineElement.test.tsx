@@ -18,7 +18,7 @@
 import { act } from "@testing-library/react";
 import type { ComponentType } from "react";
 
-import { defineElement } from "./defineElement";
+import { defineElement, parseProjectId } from "./defineElement";
 import type { HostElementProps } from "./defineElement";
 
 /** Unique tag per registration — customElements.define rejects duplicate names. */
@@ -104,6 +104,36 @@ describe("host/defineElement", () => {
         expect(el.textContent).toContain("id:NaN");
     });
 
+    it("maps an empty-string data-project-id to NaN (never 0) so no GET /projects/0 fires (QA F4)", () => {
+        const tag = registerHost(PropsProbe);
+        const el = document.createElement(tag);
+        // AngularJS binds data-project-id="{{project.id}}"; before the $digest
+        // resolves project.id, the attribute is PRESENT but an EMPTY STRING.
+        // Number("") === 0 would pass the app roots' Number.isFinite guard and
+        // trigger a spurious GET /projects/0 — the host must yield NaN instead.
+        el.setAttribute("data-project-id", "");
+
+        mount(el);
+
+        expect(el.textContent).toContain("id:NaN");
+        expect(el.textContent).not.toContain("id:0");
+    });
+
+    it("settles from an empty-string id to the real value once AngularJS interpolates it (QA F4)", () => {
+        const tag = registerHost(PropsProbe);
+        const el = document.createElement(tag);
+        el.setAttribute("data-project-id", "");
+
+        mount(el);
+        expect(el.textContent).toContain("id:NaN");
+
+        act(() => {
+            el.setAttribute("data-project-id", "55");
+        });
+
+        expect(el.textContent).toContain("id:55");
+    });
+
     it("re-renders with the settled value when the data-project-id attribute changes", () => {
         const tag = registerHost(PropsProbe);
         const el = document.createElement(tag);
@@ -178,5 +208,31 @@ describe("host/defineElement", () => {
         expect(document.body.contains(el)).toBe(true);
 
         consoleErrorSpy.mockRestore();
+    });
+});
+
+describe("host/parseProjectId (QA F4)", () => {
+    it("returns NaN for an absent (undefined) value", () => {
+        expect(Number.isNaN(parseProjectId(undefined))).toBe(true);
+    });
+
+    // Every "not yet resolved" or invalid value must collapse to NaN so the
+    // downstream Number.isFinite(projectId) guards defer all network work.
+    // "" and whitespace are the AngularJS pre-$digest interpolation cases;
+    // "0"/negatives are the specific GET /projects/0 hazard from F4.
+    it.each(["", "   ", "\t", "\n", "abc", "0", "-1", "-42", "NaN", "Infinity"])(
+        "returns NaN for the not-yet-resolved / invalid value %p",
+        (raw) => {
+            expect(Number.isNaN(parseProjectId(raw))).toBe(true);
+        },
+    );
+
+    it.each([
+        ["1", 1],
+        ["42", 42],
+        ["55", 55],
+        [" 7 ", 7],
+    ])("parses the positive id %p to %d", (raw, expected) => {
+        expect(parseProjectId(raw)).toBe(expected);
     });
 });

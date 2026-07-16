@@ -59,6 +59,12 @@ export interface EventsClient {
 interface Subscription {
     routingKey: string;
     callback: SubscriptionCallback;
+    /**
+     * Per-subscription options forwarded verbatim inside the `subscribe` frame.
+     * Retained on the record (not just sent once) so the subscription can be
+     * faithfully RE-sent — with its options — after a reconnect (QA F3).
+     */
+    options?: SubscriptionOptions;
 }
 
 interface OutgoingMessage {
@@ -112,18 +118,25 @@ class EventsClientImpl implements EventsClient {
             return;
         }
 
-        this.subscriptions[routingKey] = { routingKey, callback };
-
-        const message: OutgoingMessage = {
-            cmd: "subscribe",
-            routing_key: routingKey,
-        };
-
+        // Retain the subscription (with its options) in the map. The map — not
+        // the pending-message queue — is the single source of truth for which
+        // routing keys are active, so it can be replayed verbatim on every
+        // (re)connection from `handleOpen` (QA F3).
+        const subscription: Subscription = { routingKey, callback };
         if (options) {
-            message.options = options;
+            subscription.options = options;
         }
+        this.subscriptions[routingKey] = subscription;
 
-        this.sendMessage(message);
+        // Send the `subscribe` frame NOW only if the socket is already open.
+        // While the socket is still connecting (or after a drop), the frame is
+        // intentionally NOT queued here — it is (re)sent from the retained
+        // `subscriptions` map inside `handleOpen`, AFTER the `auth` frame. This
+        // guarantees auth-before-subscribe (QA F1) and re-subscription on
+        // reconnect (QA F3) without ever double-subscribing on the initial open.
+        if (this.connected && this.ws) {
+            this.sendMessage(this.buildSubscribeMessage(subscription));
+        }
     }
 
     unsubscribe(routingKey: string): void {
@@ -262,7 +275,15 @@ class EventsClientImpl implements EventsClient {
 
     private sendMessage(message: OutgoingMessage): void {
         this.pendingMessages.push(message);
+        this.flushPending();
+    }
 
+    /**
+     * Flush every queued frame, in FIFO order, once the socket is open. While
+     * the socket is closed/connecting this is a no-op and frames accumulate in
+     * `pendingMessages` until the next `open`.
+     */
+    private flushPending(): void {
         if (!this.connected || !this.ws) {
             return;
         }
@@ -273,6 +294,20 @@ class EventsClientImpl implements EventsClient {
         for (const item of queued) {
             this.ws.send(JSON.stringify(item));
         }
+    }
+
+    /** Build the wire `subscribe` frame for a retained subscription record. */
+    private buildSubscribeMessage(subscription: Subscription): OutgoingMessage {
+        const message: OutgoingMessage = {
+            cmd: "subscribe",
+            routing_key: subscription.routingKey,
+        };
+
+        if (subscription.options) {
+            message.options = subscription.options;
+        }
+
+        return message;
     }
 
     private processMessage(data: IncomingMessage): void {
@@ -327,15 +362,32 @@ class EventsClientImpl implements EventsClient {
     private readonly handleOpen = (): void => {
         this.connected = true;
 
-        // Authenticate by reusing the SHARED token + session id — never mint a
-        // new session (the events backend uses the session id to suppress
-        // echoing a client's own optimistic changes back to it).
-        const message: OutgoingMessage = {
+        // Authenticate FIRST on every (re)connection, reusing the SHARED token +
+        // session id — never mint a new session (the events backend uses the
+        // session id to suppress echoing a client's own optimistic changes back
+        // to it). The taiga-events backend establishes the socket's identity /
+        // permission context on `auth` and DROPS any `subscribe` frame received
+        // before it, so `auth` MUST be the first frame flushed on open (QA F1).
+        // It is unshifted to the HEAD of the pending queue so it precedes any
+        // frame that may have been queued while the socket was connecting.
+        const authMessage: OutgoingMessage = {
             cmd: "auth",
             data: { token: getToken(), sessionId: getSessionId() },
         };
+        this.pendingMessages.unshift(authMessage);
 
-        this.sendMessage(message);
+        // Re-subscribe every retained routing key AFTER auth. On the initial
+        // connection this sends the screen's subscriptions for the first time;
+        // on a reconnection it restores them so real-time updates resume WITHOUT
+        // requiring the React screen to remount (QA F3). Appended after auth, so
+        // the flushed wire order is always [auth, subscribe, ...].
+        for (const routingKey of Object.keys(this.subscriptions)) {
+            this.pendingMessages.push(
+                this.buildSubscribeMessage(this.subscriptions[routingKey]),
+            );
+        }
+
+        this.flushPending();
         this.startHeartBeatMessages();
     };
 

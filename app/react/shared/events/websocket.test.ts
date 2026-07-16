@@ -204,15 +204,56 @@ describe("shared/events/websocket", () => {
             });
         });
 
-        it("flushes queued subscriptions and auth in FIFO wire order (subscribe-before-open)", () => {
+        it("flushes auth BEFORE a subscription requested before open (QA F1)", () => {
             client.connect();
             client.subscribe("changes.project.1.userstories", jest.fn());
             MockWebSocket.latest.emitOpen();
 
-            // Faithful to events.coffee: a subscribe queued before open flushes
-            // ahead of the auth frame pushed inside onOpen (INFO-1).
+            // The taiga-events backend authenticates the socket on `auth` and
+            // drops any `subscribe` received before it. A subscription requested
+            // while the socket was still connecting must therefore be (re)sent
+            // AFTER auth from the retained subscriptions map — never queued ahead
+            // of auth (the pre-fix order was the buggy `[subscribe, auth]`).
             const cmds = MockWebSocket.latest.frames.map((frame) => frame.cmd);
-            expect(cmds).toEqual(["subscribe", "auth"]);
+            expect(cmds).toEqual(["auth", "subscribe"]);
+        });
+
+        it("re-subscribes every retained routing key after auth on reconnect (QA F3)", () => {
+            // Deterministic lower-bound (5000ms) reconnect backoff.
+            jest.spyOn(Math, "random").mockReturnValue(0);
+
+            client.connect();
+            client.subscribe("changes.project.1.userstories", jest.fn());
+            client.subscribe("changes.project.1.projects", jest.fn());
+            MockWebSocket.latest.emitOpen();
+
+            // Initial connection: auth precedes both subscribe frames.
+            expect(MockWebSocket.latest.frames.map((f) => f.cmd)).toEqual([
+                "auth",
+                "subscribe",
+                "subscribe",
+            ]);
+
+            // Transient network drop → bounded reconnect creates a fresh socket.
+            MockWebSocket.latest.emitClose();
+            jest.advanceTimersByTime(5000);
+            expect(MockWebSocket.instances).toHaveLength(2);
+
+            // The reconnected socket re-authenticates AND replays BOTH retained
+            // subscriptions (in insertion order) so real-time updates resume
+            // without the React screen having to remount — auth still first.
+            MockWebSocket.latest.emitOpen();
+            expect(MockWebSocket.latest.frames.map((f) => f.cmd)).toEqual([
+                "auth",
+                "subscribe",
+                "subscribe",
+            ]);
+            expect(
+                MockWebSocket.latest.framesOfCmd("subscribe").map((f) => f.routing_key),
+            ).toEqual([
+                "changes.project.1.userstories",
+                "changes.project.1.projects",
+            ]);
         });
     });
 

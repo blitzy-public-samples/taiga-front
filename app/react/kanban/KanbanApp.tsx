@@ -776,8 +776,19 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     }, [projectId]);
 
     // WebSocket subscription — mirrors initializeSubscription.
+    //
+    // F2: the subscription lifecycle depends ONLY on the stable `projectId` and
+    // a boolean "project loaded" flag — NEVER on the `projectLoaded` OBJECT
+    // identity. A projects-key change triggers `refreshAllRef → loadInitialData
+    // → setProjectLoaded(newObject)`; keying the effect on that object reference
+    // would tear the socket down and recreate it on every data refresh (churn,
+    // a brief event-loss window, and re-incurring the auth-ordering path each
+    // time). The AngularJS baseline uses one app-level socket that survives data
+    // reloads; `projectReady` flips false→true exactly once per mount, so this
+    // effect connects once and is not disturbed by subsequent refreshes.
+    const projectReady = projectLoaded !== null;
     useEffect(() => {
-        if (!Number.isFinite(projectId) || !projectLoaded) {
+        if (!Number.isFinite(projectId) || !projectReady) {
             return undefined;
         }
         const client = createEventsClient();
@@ -803,7 +814,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             client.disconnect();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [projectId, projectLoaded]);
+    }, [projectId, projectReady]);
 
     useEffect(() => {
         // F-C: mark the root alive for the duration of the mount so async
