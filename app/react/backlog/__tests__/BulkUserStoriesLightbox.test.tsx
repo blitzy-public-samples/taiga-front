@@ -416,6 +416,26 @@ describe("BulkUserStoriesLightbox", () => {
             fireEvent.click(screen.getByRole("button", { name: "close" }));
             expect(props.onClose).toHaveBeenCalledTimes(1);
         });
+
+        // [#7] Escape-to-close: pressing Escape while the lightbox is open is
+        // equivalent to the ✕ close control, matching the shared ConfirmDialog.
+        it("closes on Escape when open", () => {
+            const props = makeProps();
+            render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.keyDown(document, { key: "Escape" });
+            expect(props.onClose).toHaveBeenCalledTimes(1);
+        });
+
+        // The Escape listener is only registered while open, so a closed
+        // lightbox must never intercept the key.
+        it("ignores Escape while closed", () => {
+            const props = makeProps({ open: false });
+            render(<BulkUserStoriesLightbox {...props} />);
+
+            fireEvent.keyDown(document, { key: "Escape" });
+            expect(props.onClose).not.toHaveBeenCalled();
+        });
     });
 
     // Backlog-context DOM fidelity: the bulk lightbox reproduces the Jade markup

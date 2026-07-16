@@ -721,9 +721,19 @@ test("renders the header controls: add, bulk, filters button, search, move-to-la
     // addnewus.jade (add_us permission present).
     expect(container.querySelector(".new-us .btn-small")).not.toBeNull();
     expect(container.querySelector(".new-us .btn-icon")).not.toBeNull();
-    // Filters toggle + search.
+    // Filters toggle + search. [#6] The search box is a REAL `tg-input-search`
+    // custom element (tag, not a class) wrapping the input and a `tg-svg`
+    // magnifier, mirroring the Kanban search so the tag-selector SCSS applies.
     expect(container.querySelector("#show-filters-button")).not.toBeNull();
-    expect(container.querySelector("input.tg-input-search")).not.toBeNull();
+    const searchHost = container.querySelector("tg-input-search");
+    expect(searchHost).not.toBeNull();
+    const searchInput = searchHost?.querySelector(
+        "input.backlog-search.e2e-search",
+    ) as HTMLInputElement | null;
+    expect(searchInput).not.toBeNull();
+    expect(searchInput?.getAttribute("placeholder")).toBe("subject or reference");
+    // The magnifier icon child (positioned by input-search.component.scss).
+    expect(searchHost?.querySelector("tg-svg svg.icon-search")).not.toBeNull();
     // No current sprint (past dates) -> move-to-latest button.
     expect(container.querySelector("#move-to-latest-sprint")).not.toBeNull();
     expect(container.querySelector("#move-to-current-sprint")).toBeNull();
@@ -1047,6 +1057,28 @@ test("onBulkCreated with position 'bottom' reloads without a top reorder", async
     expect(mockBulkUpdateBacklogOrder).not.toHaveBeenCalled();
 });
 
+test("[#3] onBulkCreated at the bottom refreshes project stats (not just the 'top' path)", async () => {
+    await renderApp();
+    const usBefore = countGet((p) => p === "userstories");
+    const statsBefore = countGet((p) => p.includes("/stats"));
+
+    await act(async () => {
+        await mockCaptured.bulkProps?.onCreated([makeUs({ id: 3100 })], "bottom");
+    });
+
+    await waitFor(() => expect(mockCaptured.bulkProps?.open).toBe(false));
+    // Backlog list reloaded ...
+    expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore);
+    // ... AND stats were reloaded even though position is "bottom" (no top reorder).
+    // Regression guard for QA #3: sidebar totals / burndown were previously stale
+    // after a bottom bulk-create because loadProjectStats() was gated on the
+    // `position === "top"` branch.
+    await waitFor(() =>
+        expect(countGet((p) => p.includes("/stats"))).toBeGreaterThan(statsBefore),
+    );
+    expect(mockBulkUpdateBacklogOrder).not.toHaveBeenCalled();
+});
+
 /* ========================================================================== */
 /* [#2] Single user-story create/edit persistence (UserStoryEditLightbox)      */
 /* ========================================================================== */
@@ -1248,7 +1280,7 @@ test("onEditSprint sets canDelete=false without the delete_milestone permission"
     expect(mockCaptured.sprintEditProps?.canDelete).toBe(false);
 });
 
-test("onChanged closes the sprint lightbox and reloads open + closed sprints + stats", async () => {
+test("onChanged closes the sprint lightbox and reloads open + closed sprints + stats + backlog", async () => {
     await renderApp();
 
     // Open it first so the close is observable.
@@ -1258,6 +1290,7 @@ test("onChanged closes the sprint lightbox and reloads open + closed sprints + s
     await waitFor(() => expect(mockCaptured.sprintEditProps?.open).toBe(true));
 
     const statsBefore = countGet((p) => p.includes("/stats"));
+    const usBefore = countGet((p) => p === "userstories");
 
     await act(async () => {
         await mockCaptured.sprintEditProps?.onChanged();
@@ -1266,6 +1299,11 @@ test("onChanged closes the sprint lightbox and reloads open + closed sprints + s
     await waitFor(() => expect(mockCaptured.sprintEditProps?.open).toBe(false));
     expect(mockListMilestones).toHaveBeenCalledWith(PROJECT_ID, { closed: true });
     expect(countGet((p) => p.includes("/stats"))).toBeGreaterThan(statsBefore);
+    // [#5] The unified sprint-change handler MUST also reload the backlog list:
+    // deleting a sprint SET_NULLs its stories' milestone, returning them to the
+    // backlog, so the list has to be re-read or the returned stories never
+    // reappear without a full page reload.
+    expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore);
 });
 
 test("closing the sprint / bulk lightboxes flips their open flag back to false", async () => {
@@ -1403,7 +1441,9 @@ test("removing a selected filter clears it and reloads without the param", async
 
 test("typing in the search box debounces a reset reload carrying q", async () => {
     const { container } = await renderApp();
-    const input = container.querySelector("input.tg-input-search") as HTMLInputElement;
+    const input = container.querySelector(
+        "tg-input-search input.backlog-search",
+    ) as HTMLInputElement;
 
     await act(async () => {
         fireEvent.change(input, { target: { value: "widget" } });
@@ -1534,6 +1574,38 @@ test("move-to-latest sprint moves the CHECKED backlog stories via bulkUpdateMile
             { us_id: 1000, order: 0 },
         ]),
     );
+});
+
+test("[#4] a successful move-to-sprint clears the checkbox selection", async () => {
+    const { container } = await renderApp();
+
+    // Select the loaded story so the move affordance is revealed.
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(1, true, false);
+    });
+    expect(container.querySelector("#move-to-latest-sprint")).toHaveStyle({ display: "flex" });
+    expect(
+        Object.values(mockCaptured.backlogTableProps?.selectedRefs ?? {}).filter(Boolean).length,
+    ).toBe(1);
+
+    await act(async () => {
+        fireEvent.click(container.querySelector("#move-to-latest-sprint") as HTMLElement);
+        await Promise.resolve();
+    });
+
+    // The move persists ...
+    await waitFor(() => expect(mockBulkUpdateMilestone).toHaveBeenCalled());
+    // ... and the selection is cleared: the moved rows have left the backlog, so
+    // the checkbox state (QA #4) must reset — the "N selected" move button hides
+    // again and no ref remains checked. Previously the checked refs lingered,
+    // leaving orphaned selection UI for rows no longer in the backlog list.
+    await waitFor(() =>
+        expect(
+            Object.values(mockCaptured.backlogTableProps?.selectedRefs ?? {}).filter(Boolean)
+                .length,
+        ).toBe(0),
+    );
+    expect(container.querySelector("#move-to-latest-sprint")).toHaveStyle({ display: "none" });
 });
 
 test("move-to-sprint is a no-op when no rows are checked", async () => {
@@ -2195,7 +2267,9 @@ test("[I] the no-results state interpolates the search term with curly quotes", 
     currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "0" };
     const { container } = await renderApp();
 
-    const input = container.querySelector("input.tg-input-search") as HTMLInputElement;
+    const input = container.querySelector(
+        "tg-input-search input.backlog-search",
+    ) as HTMLInputElement;
     await act(async () => {
         fireEvent.change(input, { target: { value: "zzz" } });
     });

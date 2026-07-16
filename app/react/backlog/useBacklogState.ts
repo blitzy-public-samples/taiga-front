@@ -202,6 +202,13 @@ export interface UseBacklogStateResult {
     restoreUserstories: (prev: UserStory[]) => void;
     patchUserStory: (id: Id, changes: Partial<UserStory>) => void;
     setSelection: (ref: number, checked: boolean, shiftKey: boolean) => void;
+    /**
+     * Clear the entire per-row checkbox selection (and its shift-range anchor).
+     * Used after a bulk action consumes the selection — e.g. moving the selected
+     * stories to a sprint — so the "N selected" affordance and its actions
+     * disappear once the action succeeds.
+     */
+    clearSelection: () => void;
     setNewUs: (ids: number[]) => void;
 }
 
@@ -719,6 +726,15 @@ export function useBacklogState(): UseBacklogStateResult {
         [],
     );
 
+    const clearSelection = useCallback((): void => {
+        setState((prev) =>
+            produce(prev, (draft) => {
+                draft.selection.checked = {};
+                draft.selection.lastCheckedRef = null;
+            }),
+        );
+    }, []);
+
     const setNewUs = useCallback((ids: number[]): void => {
         setState((prev) => produce(prev, (draft) => {
             draft.newUs = ids;
@@ -750,6 +766,7 @@ export function useBacklogState(): UseBacklogStateResult {
             restoreUserstories,
             patchUserStory,
             setSelection,
+            clearSelection,
             setNewUs,
         }),
         [
@@ -774,6 +791,7 @@ export function useBacklogState(): UseBacklogStateResult {
             restoreUserstories,
             patchUserStory,
             setSelection,
+            clearSelection,
             setNewUs,
         ],
     );

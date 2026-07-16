@@ -1170,6 +1170,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         restoreUserstories,
         patchUserStory,
         setSelection,
+        clearSelection,
         setNewUs,
         toggleShowTags: bsToggleShowTags,
         toggleActiveFilters: bsToggleActiveFilters,
@@ -2119,11 +2120,27 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         [resolvedId],
     );
 
-    /** After a create/edit/delete sprint: close the lightbox and reload. */
+    /**
+     * After a create/edit/delete sprint: close the lightbox and reload.
+     *
+     * [#5] The backlog user-story list MUST be reloaded here too. This handler is
+     * unified across create/edit/delete and previously reloaded only the sprint
+     * lists and project stats — so when a sprint containing stories was DELETED,
+     * the backend `SET_NULL`-ed those stories' milestone (returning them to the
+     * backlog) but the on-screen backlog list was never refreshed, so the
+     * returned stories did not reappear until a full page reload. Reloading the
+     * user stories unconditionally is correct on delete and a harmless refresh on
+     * create/edit (where the backlog set is unchanged).
+     */
     const onSprintChanged = useCallback(async (): Promise<void> => {
         setSprintLightbox((s) => ({ ...s, open: false }));
-        await Promise.all([loadSprints(), loadClosedSprints(), loadProjectStats()]);
-    }, [loadSprints, loadClosedSprints, loadProjectStats]);
+        await Promise.all([
+            loadSprints(),
+            loadClosedSprints(),
+            loadProjectStats(),
+            loadUserstories({ reset: true }),
+        ]);
+    }, [loadSprints, loadClosedSprints, loadProjectStats, loadUserstories]);
 
     /**
      * Port of `usform:bulk:success` (common lightbox L375): flag the created
@@ -2137,6 +2154,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             setBulkLightbox({ open: false });
 
             await loadUserstories({ reset: true });
+            if (!aliveRef.current) {
+                return;
+            }
+
+            // [#3] Refresh project stats (total points / completion) unconditionally
+            // after a bulk create. Previously stats were reloaded only inside the
+            // `position === "top"` reorder branch below, so creating stories at the
+            // BOTTOM (the default) left the sidebar totals and the burndown graph
+            // stale until a full page reload. Newly created stories add points
+            // regardless of insert position, so the stats reload must not be gated
+            // on position.
+            await loadProjectStats();
             if (!aliveRef.current) {
                 return;
             }
@@ -2551,6 +2580,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 if (!aliveRef.current) {
                     return;
                 }
+                // [#4] The moved stories have left the backlog, so the checkbox
+                // selection that drove this action is now stale. Clear it BEFORE
+                // reloading so the "N selected" affordance (and its move-to-sprint
+                // buttons) disappears immediately; previously the checked refs
+                // lingered, leaving orphaned selection UI for rows that no longer
+                // existed in the backlog list.
+                clearSelection();
                 await loadBacklog();
                 if (!aliveRef.current) {
                     return;
@@ -2566,7 +2602,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 );
             }
         },
-        [resolvedId, loadBacklog, loadClosedSprints],
+        [resolvedId, loadBacklog, loadClosedSprints, clearSelection],
     );
 
     /* ---------------------------------------------------------------------- */
@@ -2837,15 +2873,43 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                             )}
                                         </button>
 
-                                        {/* Reproduces tg-input-search. */}
-                                        <input
-                                            className="tg-input-search"
-                                            type="search"
-                                            value={state.filterQ}
-                                            placeholder={t("COMMON.SEARCH", "Search")}
-                                            aria-label={t("COMMON.SEARCH", "Search")}
-                                            onChange={(e) => changeQ(e.target.value)}
-                                        />
+                                        {/*
+                                          * tg-input-search: a REAL custom element (styled by tag
+                                          * name in input-search.component.scss — a position:relative
+                                          * host with an absolutely-positioned `tg-svg` magnifier —
+                                          * and sized to 185px by `.backlog-table-options-start
+                                          * tg-input-search` in backlog.scss L127). The previous markup
+                                          * put `tg-input-search` as a CLASS on the bare <input>, which
+                                          * the tag-selector SCSS never matched, so the search box was
+                                          * unstyled and the magnifier icon was missing (QA MINOR #6).
+                                          * Rendered via createElement — matching the sibling Svg/Icon
+                                          * precedent — so we don't augment JSX.IntrinsicElements. The
+                                          * placeholder now uses the shared catalog key
+                                          * COMMON.FILTERS.INPUT_PLACEHOLDER ("subject or reference"),
+                                          * identical to the Kanban search, restoring parity with the
+                                          * AngularJS `tg-input-search` component. */}
+                                        {createElement(
+                                            "tg-input-search",
+                                            null,
+                                            <input
+                                                key="search-input"
+                                                id="backlog-search-input"
+                                                name="backlog-search"
+                                                className="backlog-search e2e-search"
+                                                type="search"
+                                                value={state.filterQ}
+                                                placeholder={t(
+                                                    "COMMON.FILTERS.INPUT_PLACEHOLDER",
+                                                    "subject or reference",
+                                                )}
+                                                aria-label={t(
+                                                    "COMMON.FILTERS.INPUT_PLACEHOLDER",
+                                                    "subject or reference",
+                                                )}
+                                                onChange={(e) => changeQ(e.target.value)}
+                                            />,
+                                            <Svg key="search-icon" icon="icon-search" />,
+                                        )}
 
                                         {hasStories && (
                                             <div id="show-tags" className="display-tags-button">

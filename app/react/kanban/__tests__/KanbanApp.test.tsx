@@ -69,7 +69,7 @@ import type {
     ResolvedDrop,
 } from "../../shared/dnd/DndProvider";
 
-import { httpGet, httpPost, httpDelete, HttpError } from "../../shared/api/httpClient";
+import { httpGet, httpPost, httpDelete, httpPatch, HttpError } from "../../shared/api/httpClient";
 import { listUserstories, bulkCreate } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
 
@@ -165,6 +165,7 @@ type AsyncMock = jest.MockedFunction<
 const mockHttpGet = httpGet as unknown as AsyncMock;
 const mockHttpPost = httpPost as unknown as AsyncMock;
 const mockHttpDelete = httpDelete as unknown as AsyncMock;
+const mockHttpPatch = httpPatch as unknown as AsyncMock;
 const mockListUserstories = listUserstories as unknown as AsyncMock;
 const mockBulkCreate = bulkCreate as unknown as AsyncMock;
 const mockCreateEventsClient = createEventsClient as unknown as jest.Mock;
@@ -278,24 +279,7 @@ function installHappyHttp(): void {
     mockBulkCreate.mockImplementation(() => Promise.resolve(mkRes([])));
     mockHttpPost.mockImplementation(() => Promise.resolve(mkRes([])));
     mockHttpDelete.mockImplementation(() => Promise.resolve(mkRes({})));
-}
-
-/**
- * Install a minimal `window.angular` whose injector returns a `$rootScope` with
- * spied `$broadcast` / `$applyAsync`, so the `broadcastToAngular` bridge (F1/F3)
- * can be asserted. Mirrors the Backlog root's test harness.
- */
-function installAngularSpy(): { broadcast: jest.Mock; applyAsync: jest.Mock } {
-    const broadcast = jest.fn();
-    const applyAsync = jest.fn();
-    (window as unknown as { angular?: unknown }).angular = {
-        element: () => ({
-            injector: () => ({
-                get: () => ({ $broadcast: broadcast, $applyAsync: applyAsync }),
-            }),
-        }),
-    };
-    return { broadcast, applyAsync };
+    mockHttpPatch.mockImplementation(() => Promise.resolve(mkRes({})));
 }
 
 beforeEach(() => {
@@ -600,6 +584,73 @@ describe("KanbanApp — transient NaN tolerance", () => {
         expect(mockCaptured.boardProps).toBeNull();
         expect(document.querySelector("section.main.kanban")).not.toBeNull();
         expect(document.querySelector(".board-zoom")).not.toBeNull();
+    });
+});
+
+describe("KanbanApp — URL-slug resolution (QA: blank Kanban board)", () => {
+    it("resolves the project from the URL slug via projects/by_slug when the host id is unusable, then loads and subscribes off the resolved id", async () => {
+        // Production reality: the migrated Jade shell interpolates
+        // data-project-id="{{project.id}}" to an EMPTY string once the AngularJS
+        // KanbanController is gone, so `parseInt("")` yields NaN. The real slug
+        // lives in the route URL (/project/:pslug/kanban), exactly as it does for
+        // the Backlog root. The board must resolve the id from the slug and load
+        // fully rather than render blank.
+        const original = `${window.location.pathname}${window.location.search}`;
+        window.history.replaceState(null, "", "/project/my-project/kanban");
+        // Route by_slug (NO leading slash — matches the frozen contract path) to
+        // the full project, exactly like the by-id endpoint; keep the
+        // leading-slash routes the happy mock installs for swimlanes/filters.
+        mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+            const path = String(args[0]);
+            if (path === "projects/by_slug") {
+                return Promise.resolve(mkRes(currentProject));
+            }
+            if (path.startsWith("/projects/")) {
+                return Promise.resolve(mkRes(currentProject));
+            }
+            if (path === "/swimlanes") {
+                return Promise.resolve(mkRes(currentSwimlanes));
+            }
+            if (path === "/userstories/filters_data") {
+                return Promise.resolve(mkRes(currentFiltersData));
+            }
+            return Promise.resolve(mkRes({}));
+        });
+        try {
+            render(<KanbanApp projectId={NaN} projectSlug="" />);
+            await waitFor(() =>
+                expect(mockCaptured.boardProps).not.toBeNull(),
+            );
+
+            // Resolution went through the by_slug endpoint with the URL slug…
+            expect(mockHttpGet).toHaveBeenCalledWith("projects/by_slug", {
+                slug: "my-project",
+            });
+            // …and NEVER through an invalid by-id path (…/projects/NaN or /0).
+            const badById = mockHttpGet.mock.calls.filter((c: readonly unknown[]) =>
+                /^\/projects\/(NaN|0)(\/|$)/.test(String(c[0])),
+            );
+            expect(badById).toHaveLength(0);
+            // Downstream loaders keyed off the RESOLVED id (PROJECT_ID = 5).
+            expect(mockListUserstories).toHaveBeenCalledWith(
+                PROJECT_ID,
+                expect.objectContaining({ status__is_archived: false }),
+            );
+            expect(mockHttpGet).toHaveBeenCalledWith("/swimlanes", {
+                project: PROJECT_ID,
+            });
+            // …and the WebSocket subscribes on the resolved id's keys.
+            expect(mockEventsClient.subscribe).toHaveBeenCalledWith(
+                `changes.project.${PROJECT_ID}.userstories`,
+                expect.any(Function),
+            );
+            expect(mockEventsClient.subscribe).toHaveBeenCalledWith(
+                `changes.project.${PROJECT_ID}.projects`,
+                expect.any(Function),
+            );
+        } finally {
+            window.history.replaceState(null, "", original);
+        }
     });
 });
 
@@ -949,8 +1000,8 @@ describe("KanbanApp — bulk create", () => {
 
     it("does not call bulk_create when the textarea is empty (whitespace only)", async () => {
         await renderLoaded();
-        // NOTE: the empty-guard lives on the BULK path; the "standard" path no
-        // longer opens this lightbox (F1 — it dispatches `genericform:new`).
+        // NOTE: the empty-guard lives on the BULK path; the "standard" path opens
+        // the React create lightbox (F1) instead of this bulk textarea.
         await act(async () => {
             mockCaptured.boardProps?.onAddUs?.("bulk", 200);
         });
@@ -1412,24 +1463,63 @@ describe("KanbanApp — board callbacks", () => {
 });
 
 /* ========================================================================== */
-/* F1 — single ("standard") create dispatches genericform:new                 */
+/* F1 — single ("standard") create opens the React create lightbox            */
 /* ========================================================================== */
-
+/*
+ * QA finding — create/edit/assign were silent no-ops: the migrated `kanban.jade`
+ * removed the Angular `tg-lb-create-edit` generic-form host, so the old
+ * `genericform:new` / `genericform:edit` broadcasts reached no receiver. The
+ * create/edit/assign flows are now re-owned by the React `UserStoryEditLightbox`
+ * (persisting via the frozen `bulk_create` + `PATCH` endpoints), so these specs
+ * assert the React form opens/persists rather than an Angular broadcast.
+ */
 describe("KanbanApp — standard create (F1)", () => {
-    it("dispatches genericform:new via the Angular bridge and does NOT open the bulk lightbox", async () => {
-        const { broadcast, applyAsync } = installAngularSpy();
+    it("opens the React create lightbox seeded with the clicked column and does NOT open the bulk lightbox", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onAddUs?.("standard", 100);
         });
-        expect(broadcast).toHaveBeenCalledWith(
-            "genericform:new",
-            expect.objectContaining({ objType: "us", statusId: 100 }),
+        // The React create form is revealed (the `open` class drives the SCSS
+        // reveal), titled "New user story", seeded with the clicked column status.
+        const lb = document.querySelector(".lightbox-create-edit.open");
+        expect(lb).not.toBeNull();
+        expect(lb?.querySelector(".title")?.textContent).toContain("New user story");
+        expect(lb?.querySelector(".status-dropdown .status-text")?.textContent).toBe(
+            "Status 100",
         );
-        expect(applyAsync).toHaveBeenCalled();
-        // A standard create must NOT open the bulk textarea, and must not create.
+        // A standard create must NOT open the bulk textarea, and must not create
+        // until the form is submitted.
         expect(document.querySelector(".bulk-subjects")).toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
+    });
+
+    it("persists a new story via bulk_create on the clicked column when the form is submitted", async () => {
+        mockBulkCreate.mockImplementation(() =>
+            Promise.resolve(mkRes([{ id: 555, version: 1 }])),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("standard", 100);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        const subject = lb.querySelector('input[name="subject"]') as HTMLInputElement;
+        fireEvent.change(subject, { target: { value: "Brand new story" } });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+            await Promise.resolve();
+        });
+        // Persists to the frozen contract: bulk_create on the resolved project id
+        // + clicked column status (no points/assignee → no follow-up PATCH).
+        expect(mockBulkCreate).toHaveBeenCalledWith(
+            PROJECT_ID,
+            100,
+            "Brand new story",
+            null,
+        );
+        // Form closes on success.
+        await waitFor(() =>
+            expect(document.querySelector(".lightbox-create-edit.open")).toBeNull(),
+        );
     });
 
     it("still opens the React bulk lightbox for a bulk create", async () => {
@@ -1440,73 +1530,88 @@ describe("KanbanApp — standard create (F1)", () => {
         expect(document.querySelector(".bulk-subjects")).not.toBeNull();
     });
 
-    it("standard create is a safe no-op when Angular is absent (no throw, no create)", async () => {
+    it("standard create opens the form regardless of AngularJS (no dependency, no throw)", async () => {
         await renderLoaded();
         expect(() => {
             act(() => {
                 mockCaptured.boardProps?.onAddUs?.("standard", 100);
             });
         }).not.toThrow();
-        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        // The React form opens with no AngularJS present, and no create fires yet.
+        expect(document.querySelector(".lightbox-create-edit.open")).not.toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
     });
 });
 
 /* ========================================================================== */
-/* F3 — edit / assignee board callbacks dispatch genericform:edit             */
+/* F3 — edit / assignee board callbacks open the React edit lightbox          */
 /* ========================================================================== */
 
 describe("KanbanApp — edit & assignee callbacks (F3)", () => {
-    it("onClickEdit dispatches genericform:edit for the clicked story", async () => {
-        const { broadcast, applyAsync } = installAngularSpy();
+    it("onClickEdit opens the React edit form seeded from the clicked story", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickEdit?.(1);
         });
-        expect(broadcast).toHaveBeenCalledWith(
-            "genericform:edit",
-            expect.objectContaining({
-                objType: "us",
-                obj: expect.objectContaining({ id: 1 }),
-            }),
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        expect(lb).not.toBeNull();
+        expect(lb.querySelector(".title")?.textContent).toContain("Edit user story");
+        // Seeded from the clicked story (id 1, subject "A story").
+        expect((lb.querySelector('input[name="subject"]') as HTMLInputElement).value).toBe(
+            "A story",
         );
-        expect(applyAsync).toHaveBeenCalled();
     });
 
     it("onClickAssignedTo opens the edit form focused on the assignee field", async () => {
-        const { broadcast } = installAngularSpy();
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickAssignedTo?.(1);
         });
-        expect(broadcast).toHaveBeenCalledWith(
-            "genericform:edit",
-            expect.objectContaining({
-                objType: "us",
-                obj: expect.objectContaining({ id: 1 }),
-                focusField: "assigned_to",
-            }),
-        );
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        expect(lb).not.toBeNull();
+        expect(lb.querySelector(".title")?.textContent).toContain("Edit user story");
+        // The assignee control receives focus (ports the quick-assign focus).
+        expect(document.activeElement).toBe(lb.querySelector(".assigned-to-select"));
     });
 
-    it("does not broadcast for an unknown story id", async () => {
-        const { broadcast } = installAngularSpy();
+    it("does not open the form for an unknown story id", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickEdit?.(999999);
             mockCaptured.boardProps?.onClickAssignedTo?.(999999);
         });
-        expect(broadcast).not.toHaveBeenCalled();
+        expect(document.querySelector(".lightbox-create-edit.open")).toBeNull();
     });
 
-    it("edit / assign are inert (no throw) when Angular is absent", async () => {
+    it("edit persists via PATCH userstories/{id} with the story version when submitted", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickEdit?.(1);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        const subject = lb.querySelector('input[name="subject"]') as HTMLInputElement;
+        fireEvent.change(subject, { target: { value: "Edited subject" } });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+            await Promise.resolve();
+        });
+        expect(mockHttpPatch).toHaveBeenCalledWith(
+            "/userstories/1",
+            expect.objectContaining({ subject: "Edited subject", status: 100 }),
+        );
+        await waitFor(() =>
+            expect(document.querySelector(".lightbox-create-edit.open")).toBeNull(),
+        );
+    });
+
+    it("edit / assign are inert (no throw) and open the React form regardless of AngularJS", async () => {
         await renderLoaded();
         expect(() => {
             act(() => {
                 mockCaptured.boardProps?.onClickEdit?.(1);
-                mockCaptured.boardProps?.onClickAssignedTo?.(1);
             });
         }).not.toThrow();
+        expect(document.querySelector(".lightbox-create-edit.open")).not.toBeNull();
     });
 });
 

@@ -211,6 +211,49 @@ describe("SprintEditLightbox — open state reveal [#3]", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Escape-to-close [#7]                                                        */
+/* -------------------------------------------------------------------------- */
+
+describe("SprintEditLightbox — Escape-to-close [#7]", () => {
+    it("closes on Escape when open", () => {
+        const { onClose } = renderLightbox({ open: true });
+
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores Escape while closed", () => {
+        const { onClose } = renderLightbox({ open: false });
+
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(onClose).not.toHaveBeenCalled();
+    });
+
+    it("defers Escape to the nested delete-confirm dialog while it is open", () => {
+        // When the themed delete-confirm is showing, a single Escape must dismiss
+        // ONLY that dialog (via its own handler) — never the whole lightbox — so
+        // the two layers can't collapse at once. The lightbox handler is gated on
+        // `!deleteConfirmOpen`, and the confirm's Escape == Cancel (no delete).
+        const { container, onChanged, onClose } = renderLightbox({
+            mode: "edit",
+            sprint: makeSprint({ id: 42 }),
+            canDelete: true,
+        });
+
+        fireEvent.click(container.querySelector(".delete-sprint") as HTMLElement);
+        expect(document.querySelector(".lightbox-generic-delete.open")).not.toBeNull();
+
+        fireEvent.keyDown(document, { key: "Escape" });
+
+        // The confirm dialog closed; the lightbox stayed open; nothing deleted.
+        expect(document.querySelector(".lightbox-generic-delete.open")).toBeNull();
+        expect(removeMock).not.toHaveBeenCalled();
+        expect(onChanged).not.toHaveBeenCalled();
+        expect(onClose).not.toHaveBeenCalled();
+    });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Validation gates the API                                                   */
 /* -------------------------------------------------------------------------- */
 

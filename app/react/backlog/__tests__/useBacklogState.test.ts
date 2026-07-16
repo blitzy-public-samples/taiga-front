@@ -438,6 +438,70 @@ describe("useBacklogState.setSelection", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Hook: clearSelection  ([#4] used after moving the selection to a sprint)
+// ---------------------------------------------------------------------------
+
+describe("useBacklogState.clearSelection", () => {
+    function seedVisible(result: { current: ReturnType<typeof useBacklogState> }) {
+        act(() => {
+            result.current.appendUserstories(
+                [
+                    makeUs({ id: 1, ref: 10, backlog_order: 1 }),
+                    makeUs({ id: 2, ref: 20, backlog_order: 2 }),
+                    makeUs({ id: 3, ref: 30, backlog_order: 3 }),
+                ],
+                {
+                    reset: true,
+                    hasNextPage: false,
+                    totalUserStories: 3,
+                    noSwimlane: false,
+                    newUsIds: [],
+                },
+            );
+        });
+    }
+
+    it("empties the checked map and resets the shift-range anchor", () => {
+        const { result } = renderHook(() => useBacklogState());
+        seedVisible(result);
+
+        act(() => {
+            result.current.setSelection(10, true, false);
+        });
+        act(() => {
+            result.current.setSelection(30, true, true);
+        });
+
+        // Precondition: a multi-row selection with an anchor exists.
+        expect(result.current.state.selection.checked).toEqual({
+            "10": true,
+            "20": true,
+            "30": true,
+        });
+        expect(result.current.state.selection.lastCheckedRef).toBe(30);
+
+        act(() => {
+            result.current.clearSelection();
+        });
+
+        expect(result.current.state.selection.checked).toEqual({});
+        expect(result.current.state.selection.lastCheckedRef).toBeNull();
+    });
+
+    it("is a no-op when nothing is selected", () => {
+        const { result } = renderHook(() => useBacklogState());
+        seedVisible(result);
+
+        act(() => {
+            result.current.clearSelection();
+        });
+
+        expect(result.current.state.selection.checked).toEqual({});
+        expect(result.current.state.selection.lastCheckedRef).toBeNull();
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Hook: patchUserStory
 // ---------------------------------------------------------------------------
 

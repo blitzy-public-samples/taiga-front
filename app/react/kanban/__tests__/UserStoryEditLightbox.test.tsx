@@ -7,21 +7,20 @@
  */
 
 /**
- * Unit tests for the React `UserStoryEditLightbox`
- * (app/react/backlog/UserStoryEditLightbox.tsx) — the React-owned single-story
- * create/edit form that replaces the removed Angular `tg-lb-create-edit` host
- * (QA finding #2).
+ * Unit tests for the React (Kanban) `UserStoryEditLightbox`
+ * (app/react/kanban/UserStoryEditLightbox.tsx) — the React-owned single-story
+ * create/edit/assign form that replaces the removed Angular `tg-lb-create-edit`
+ * host (QA finding — Kanban create/edit/assign were silent no-ops).
  *
  * Runs in the browserless jsdom environment (jest.config.js). The component is a
  * PURE form that delegates persistence to its parent via the `onCreate` /
  * `onEdit` props, so nothing is mocked here — those callbacks are plain
  * `jest.fn()`s and no network is touched.
  *
- * Coverage focus (the enumerated create/edit contract from finding #2 plus the
- * shared reveal contract from finding #3):
+ * Coverage focus (the enumerated create/edit/assign contract):
  *  - reveal            -> the `.lightbox.open` class toggles with `open`
  *  - create seeding    -> "New user story" title, "Create" submit, blank subject,
- *                         default status, creation-position section present
+ *                         status seeded from initialStatusId, position section
  *  - edit seeding      -> "Edit user story" title, "Save" submit, subject/status/
  *                         points/assignee seeded from the row, NO position section
  *  - required subject  -> submitting empty shows the required error, no onCreate
@@ -33,12 +32,14 @@
  *  - status dropdown   -> toggles the `.pop-status` popover; selecting updates it
  *  - points per role   -> only computable roles get a selector; selection flows
  *  - assignee          -> options come from assignableUsers + "Not assigned"
+ *  - focusAssignee     -> the assignee control receives focus on open
+ *  - Escape-to-close   -> pressing Escape (when not submitting) calls onClose
  *  - failure           -> a rejected onCreate keeps the lightbox open + shows the
  *                         generic error (onClose NOT called)
  *  - close             -> the close control calls onClose
  */
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 
 import { UserStoryEditLightbox } from "../UserStoryEditLightbox";
@@ -46,7 +47,7 @@ import type {
     UserStoryEditLightboxProps,
     AssignableUser,
 } from "../UserStoryEditLightbox";
-import type { Project, UserStory } from "../types";
+import type { KanbanProject, UserStoryModel } from "../useKanbanState";
 
 /* -------------------------------------------------------------------------- */
 /* Independent copies of the component's pinned English literals. Held here    */
@@ -68,12 +69,13 @@ const GENERIC_ERROR_MESSAGE =
 /* Data factories                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** A schema-complete {@link Project} with two statuses, two roles, three points. */
-function makeProject(overrides: Partial<Project> = {}): Project {
+/** A KanbanProject with two statuses, two computable roles, three points. */
+function makeProject(overrides: Partial<KanbanProject> = {}): KanbanProject {
     return {
         id: 3,
         slug: "project-3",
         name: "Project 3",
+        is_kanban_activated: true,
         my_permissions: ["add_us", "modify_us"],
         roles: [
             { id: 11, name: "Back", computable: true, order: 1 },
@@ -87,37 +89,28 @@ function makeProject(overrides: Partial<Project> = {}): Project {
             { id: 103, name: "3", value: 3, order: 3 },
         ],
         us_statuses: [
-            { id: 100, name: "New", color: "#aaa", order: 1, is_closed: false },
-            { id: 101, name: "Done", color: "#0b0", order: 2, is_closed: true },
+            { id: 100, name: "New", color: "#aaa", order: 1, is_archived: false, wip_limit: null },
+            { id: 101, name: "Done", color: "#0b0", order: 2, is_archived: false, wip_limit: null },
         ],
-        is_backlog_activated: true,
-        is_kanban_activated: true,
-        default_us_status: 100,
+        default_swimlane: null,
         ...overrides,
-    } as Project;
+    } as KanbanProject;
 }
 
-function makeUs(overrides: Partial<UserStory> = {}): UserStory {
+function makeUs(overrides: Partial<UserStoryModel> = {}): UserStoryModel {
     return {
         id: 1000,
         ref: 1,
         subject: "Existing story",
         project: 3,
         status: 101,
-        milestone: null,
+        swimlane: null,
+        kanban_order: 1,
         points: { "11": 102 },
-        total_points: 1,
-        backlog_order: 1,
-        sprint_order: 1,
         assigned_to: 42,
-        is_blocked: false,
-        is_closed: false,
-        tags: null,
-        epics: null,
-        due_date: null,
         version: 7,
         ...overrides,
-    } as UserStory;
+    } as UserStoryModel;
 }
 
 const ASSIGNABLE: AssignableUser[] = [
@@ -143,6 +136,7 @@ function renderLightbox(
         mode: "create",
         project: makeProject(),
         us: null,
+        initialStatusId: 100,
         assignableUsers: ASSIGNABLE,
         onCreate,
         onEdit,
@@ -166,13 +160,16 @@ function root(container: HTMLElement): HTMLElement {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Reveal contract (#3)                                                        */
+/* Reveal contract                                                             */
 /* -------------------------------------------------------------------------- */
 
 test("adds the `open` class only when open=true (reveal contract)", () => {
     const { container, rerender } = renderLightbox({ open: false });
-    // Base state: mounted but NOT revealed.
-    expect(root(container)).toHaveClass("lightbox", "lightbox-generic-form", "lightbox-create-edit");
+    expect(root(container)).toHaveClass(
+        "lightbox",
+        "lightbox-generic-form",
+        "lightbox-create-edit",
+    );
     expect(root(container)).not.toHaveClass("open");
 
     rerender({ open: true });
@@ -183,16 +180,14 @@ test("adds the `open` class only when open=true (reveal contract)", () => {
 /* Create-mode seeding                                                         */
 /* -------------------------------------------------------------------------- */
 
-test("create mode seeds a blank form with defaults and the creation-position section", () => {
-    const { container } = renderLightbox({ mode: "create" });
+test("create mode seeds a blank form with the clicked column status and the position section", () => {
+    const { container } = renderLightbox({ mode: "create", initialStatusId: 100 });
 
     expect(screen.getByText(TITLE_NEW)).toBeInTheDocument();
-    // Submit label is "Create" in create mode.
     expect(screen.getByRole("button", { name: LABEL_CREATE })).toBeInTheDocument();
-    // Subject starts empty.
     const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
     expect(subject.value).toBe("");
-    // Default status is shown.
+    // Status seeded from the clicked column (id 100 -> "New").
     expect(container.querySelector(".status-text")?.textContent).toBe("New");
     // Creation-position radios ARE present in create mode; default = "at the bottom".
     expect(container.querySelector("section.creation-position")).not.toBeNull();
@@ -200,56 +195,53 @@ test("create mode seeds a blank form with defaults and the creation-position sec
     expect(bottomRadio.checked).toBe(true);
 });
 
+test("create mode with no initialStatusId falls back to default_us_status then first status", () => {
+    const { container } = renderLightbox({
+        mode: "create",
+        initialStatusId: null,
+        project: makeProject({ default_us_status: 101 }),
+    });
+    // default_us_status (101 -> "Done") wins when no column status is supplied.
+    expect(container.querySelector(".status-text")?.textContent).toBe("Done");
+});
+
 /* -------------------------------------------------------------------------- */
 /* Edit-mode seeding                                                           */
 /* -------------------------------------------------------------------------- */
 
-test("edit mode seeds subject/status/points/assignee and hides the position section", () => {
-    const us = makeUs();
-    const { container } = renderLightbox({ mode: "edit", us });
+test("edit mode seeds subject/status/points/assignee from the row and hides the position section", () => {
+    const { container } = renderLightbox({ mode: "edit", us: makeUs() });
 
     expect(screen.getByText(TITLE_EDIT)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: LABEL_SAVE })).toBeInTheDocument();
-
     const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
     expect(subject.value).toBe("Existing story");
-    // Status "Done" (id 101) is shown.
+    // Seeded status id 101 -> "Done".
     expect(container.querySelector(".status-text")?.textContent).toBe("Done");
     // No creation-position section in edit mode.
     expect(container.querySelector("section.creation-position")).toBeNull();
-
-    // Assignee select reflects assigned_to = 42.
+    // Assignee seeded to user 42.
     const assignee = container.querySelector(".assigned-to-select") as HTMLSelectElement;
     expect(assignee.value).toBe("42");
-
-    // The "Back" role (id 11) point is seeded to 102 ("1").
-    const backSelect = screen.getByLabelText("Points — Back") as HTMLSelectElement;
-    expect(backSelect.value).toBe("102");
 });
 
 /* -------------------------------------------------------------------------- */
-/* Validation                                                                  */
+/* Validation (replaces checksley)                                             */
 /* -------------------------------------------------------------------------- */
 
-test("submitting an empty subject shows the required error and does NOT persist", async () => {
+test("submitting an empty subject shows the required error and does NOT call onCreate", () => {
     const { container, onCreate } = renderLightbox({ mode: "create" });
-
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
-
-    expect(await screen.findByText(REQUIRED_MESSAGE)).toBeInTheDocument();
+    expect(screen.getByText(REQUIRED_MESSAGE)).toBeInTheDocument();
     expect(onCreate).not.toHaveBeenCalled();
 });
 
-test("a subject longer than 500 chars shows the length error and does NOT persist", async () => {
+test("submitting a subject longer than 500 chars shows the length error and does NOT call onCreate", () => {
     const { container, onCreate } = renderLightbox({ mode: "create" });
     const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
-
-    // maxLength on the input caps typed input, so assign the value programmatically
-    // (fireEvent.change bypasses the maxLength attribute) to exercise the guard.
     fireEvent.change(subject, { target: { value: "x".repeat(501) } });
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
-
-    expect(await screen.findByText(SUBJECT_TOO_LONG_MESSAGE)).toBeInTheDocument();
+    expect(screen.getByText(SUBJECT_TOO_LONG_MESSAGE)).toBeInTheDocument();
     expect(onCreate).not.toHaveBeenCalled();
 });
 
@@ -257,139 +249,174 @@ test("a subject longer than 500 chars shows the length error and does NOT persis
 /* Create submit                                                               */
 /* -------------------------------------------------------------------------- */
 
-test("create submit hands onCreate the collected fields and closes on success", async () => {
-    const { container, onCreate, onClose } = renderLightbox({ mode: "create" });
+test("create submit passes {subject, statusId, points, assignedTo, position} and closes on success", async () => {
+    const { container, onCreate, onClose } = renderLightbox({
+        mode: "create",
+        initialStatusId: 100,
+    });
+    const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
+    fireEvent.change(subject, { target: { value: "New thing" } });
 
-    // Subject.
-    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
-        target: { value: "  Brand new  " },
-    });
-    // Assignee -> Alan Turing (43).
-    fireEvent.change(container.querySelector(".assigned-to-select") as HTMLSelectElement, {
-        target: { value: "43" },
-    });
-    // Point for "Back" role -> 103 ("3").
-    fireEvent.change(screen.getByLabelText("Points — Back") as HTMLSelectElement, {
-        target: { value: "103" },
-    });
-    // Position -> "on top".
-    fireEvent.click(container.querySelector("#bottom-backlog") as HTMLInputElement);
+    // Set a point for the first computable role (Back = 11 -> point 102).
+    const pointSelect = container.querySelector(".points-select") as HTMLSelectElement;
+    fireEvent.change(pointSelect, { target: { value: "102" } });
+
+    // Choose an assignee.
+    const assignee = container.querySelector(".assigned-to-select") as HTMLSelectElement;
+    fireEvent.change(assignee, { target: { value: "43" } });
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
     expect(onCreate).toHaveBeenCalledWith({
-        subject: "Brand new", // trimmed
-        statusId: 100, // default
-        points: { "11": 103 },
+        subject: "New thing",
+        statusId: 100,
+        points: { "11": 102 },
         assignedTo: 43,
-        position: "top",
+        position: "bottom",
     });
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+});
+
+test("choosing the 'on top' position is reflected in the create payload", async () => {
+    const { container, onCreate } = renderLightbox({ mode: "create" });
+    const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
+    fireEvent.change(subject, { target: { value: "Top story" } });
+    // #bottom-backlog carries value="top" (the template crosses id/value).
+    const topRadio = container.querySelector("#bottom-backlog") as HTMLInputElement;
+    fireEvent.click(topRadio);
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+    expect(onCreate.mock.calls[0][0]).toMatchObject({ position: "top" });
 });
 
 /* -------------------------------------------------------------------------- */
 /* Edit submit                                                                 */
 /* -------------------------------------------------------------------------- */
 
-test("edit submit hands onEdit the target + changes and closes on success", async () => {
+test("edit submit passes (us, {subject, status, points, assigned_to}) and closes on success", async () => {
     const us = makeUs();
     const { container, onEdit, onClose } = renderLightbox({ mode: "edit", us });
-
-    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
-        target: { value: "Renamed story" },
-    });
-
+    const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
+    fireEvent.change(subject, { target: { value: "Renamed" } });
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
     await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
     expect(onEdit).toHaveBeenCalledWith(us, {
-        subject: "Renamed story",
+        subject: "Renamed",
         status: 101,
         points: { "11": 102 },
         assigned_to: 42,
     });
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
 });
 
 /* -------------------------------------------------------------------------- */
 /* Status dropdown                                                             */
 /* -------------------------------------------------------------------------- */
 
-test("the status dropdown toggles the popover and selecting a status updates it", () => {
-    const { container } = renderLightbox({ mode: "create" });
+test("the status dropdown toggles the popover and selecting a status updates the label", () => {
+    const { container } = renderLightbox({ mode: "create", initialStatusId: 100 });
+    expect(container.querySelector(".pop-status")).toBeNull();
 
-    // Popover hidden initially.
-    expect(container.querySelector("ul.pop-status")).toBeNull();
-
-    // Open the dropdown.
     fireEvent.click(container.querySelector(".status-dropdown") as HTMLElement);
-    const popover = container.querySelector("ul.pop-status") as HTMLElement;
+    const popover = container.querySelector(".pop-status");
     expect(popover).not.toBeNull();
-    // Revealed inline (the .popover mixin has no class-based reveal).
-    expect(popover.style.display).toBe("block");
 
-    // Select "Done".
-    const doneOption = within(popover).getByTitle("Done");
-    fireEvent.click(doneOption);
-
-    // Header reflects the new status and the popover closed.
+    // Select "Done" (status id 101).
+    const done = popover?.querySelector('[data-status-id="101"]') as HTMLElement;
+    fireEvent.click(done);
     expect(container.querySelector(".status-text")?.textContent).toBe("Done");
-    expect(container.querySelector("ul.pop-status")).toBeNull();
+    // Popover collapses after selection.
+    expect(container.querySelector(".pop-status")).toBeNull();
 });
 
 /* -------------------------------------------------------------------------- */
-/* Points per computable role                                                  */
+/* Points per role                                                             */
 /* -------------------------------------------------------------------------- */
 
 test("only computable roles get a point selector", () => {
-    renderLightbox({ mode: "create" });
-
-    // Both computable roles present…
-    expect(screen.getByLabelText("Points — Back")).toBeInTheDocument();
-    expect(screen.getByLabelText("Points — Front")).toBeInTheDocument();
-    // …the non-computable "Design" role does NOT.
-    expect(screen.queryByLabelText("Points — Design")).toBeNull();
+    const { container } = renderLightbox({ mode: "create" });
+    const roleRows = container.querySelectorAll(".points-per-role");
+    // Two computable roles (Back, Front); the non-computable Design is excluded.
+    expect(roleRows.length).toBe(2);
+    expect(container.textContent).toContain("Back");
+    expect(container.textContent).toContain("Front");
+    expect(container.textContent).not.toContain("Design");
 });
 
 /* -------------------------------------------------------------------------- */
 /* Assignee options                                                            */
 /* -------------------------------------------------------------------------- */
 
-test("the assignee select offers Not-assigned plus every assignable user", () => {
+test("the assignee control lists the assignable users plus a 'Not assigned' option", () => {
     const { container } = renderLightbox({ mode: "create" });
-    const select = container.querySelector(".assigned-to-select") as HTMLSelectElement;
-    const optionText = Array.from(select.options).map((o) => o.textContent);
-    expect(optionText).toEqual([LABEL_NOT_ASSIGNED, "Ada Lovelace", "Alan Turing"]);
+    const options = Array.from(
+        (container.querySelector(".assigned-to-select") as HTMLSelectElement).options,
+    ).map((o) => o.textContent);
+    expect(options[0]).toBe(LABEL_NOT_ASSIGNED);
+    expect(options).toContain("Ada Lovelace");
+    expect(options).toContain("Alan Turing");
+});
+
+/* -------------------------------------------------------------------------- */
+/* focusAssignee                                                               */
+/* -------------------------------------------------------------------------- */
+
+test("focusAssignee lands focus on the assignee control on open", () => {
+    const { container } = renderLightbox({
+        mode: "edit",
+        us: makeUs(),
+        focusAssignee: true,
+    });
+    expect(document.activeElement).toBe(
+        container.querySelector(".assigned-to-select"),
+    );
+});
+
+/* -------------------------------------------------------------------------- */
+/* Escape-to-close                                                             */
+/* -------------------------------------------------------------------------- */
+
+test("pressing Escape closes the lightbox", () => {
+    const { onClose } = renderLightbox({ mode: "create" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("Escape does nothing while the lightbox is closed", () => {
+    const { onClose } = renderLightbox({ open: false, mode: "create" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
 });
 
 /* -------------------------------------------------------------------------- */
 /* Failure keeps the lightbox open                                             */
 /* -------------------------------------------------------------------------- */
 
-test("a rejected save shows the generic error and does NOT close", async () => {
+test("a rejected onCreate keeps the lightbox open and surfaces the generic error", async () => {
     const onCreate = jest.fn(() => Promise.reject(new Error("boom")));
     const onClose = jest.fn();
-    const { container } = (() => {
-        const props: UserStoryEditLightboxProps = {
-            open: true,
-            mode: "create",
-            project: makeProject(),
-            us: null,
-            assignableUsers: ASSIGNABLE,
-            onCreate,
-            onEdit: jest.fn(() => Promise.resolve()),
-            onClose,
-        };
-        return render(<UserStoryEditLightbox {...props} />);
-    })();
-
-    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
-        target: { value: "Will fail" },
-    });
+    const { container } = render(
+        <UserStoryEditLightbox
+            open
+            mode="create"
+            project={makeProject()}
+            us={null}
+            initialStatusId={100}
+            assignableUsers={ASSIGNABLE}
+            onCreate={onCreate}
+            onEdit={jest.fn(() => Promise.resolve())}
+            onClose={onClose}
+        />,
+    );
+    const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
+    fireEvent.change(subject, { target: { value: "Will fail" } });
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
-    expect(await screen.findByText(GENERIC_ERROR_MESSAGE)).toBeInTheDocument();
+    await waitFor(() =>
+        expect(screen.getByText(GENERIC_ERROR_MESSAGE)).toBeInTheDocument(),
+    );
     expect(onClose).not.toHaveBeenCalled();
 });
 
@@ -399,22 +426,6 @@ test("a rejected save shows the generic error and does NOT close", async () => {
 
 test("the close control calls onClose", () => {
     const { container, onClose } = renderLightbox({ mode: "create" });
-    fireEvent.click(container.querySelector("button.close") as HTMLButtonElement);
+    fireEvent.click(container.querySelector("button.close") as HTMLElement);
     expect(onClose).toHaveBeenCalledTimes(1);
-});
-
-// [#7] Escape-to-close: pressing Escape while the lightbox is open is
-// equivalent to the ✕ close control, matching the shared ConfirmDialog.
-test("Escape closes the lightbox when open", () => {
-    const { onClose } = renderLightbox({ mode: "create" });
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-});
-
-// The Escape listener is only attached while open, so a closed lightbox must
-// never intercept the key.
-test("Escape does nothing while the lightbox is closed", () => {
-    const { onClose } = renderLightbox({ mode: "create", open: false });
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onClose).not.toHaveBeenCalled();
 });

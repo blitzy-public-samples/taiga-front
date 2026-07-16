@@ -226,6 +226,25 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         setServerError(null);
     }, [open, mode, sprint, initialValues]);
 
+    // Escape closes the lightbox (equivalent to the ✕ close button) — but never
+    // while a submit is in flight, and never while the nested delete-confirm
+    // dialog is open (that dialog owns its own Escape handler, so deferring to it
+    // here prevents a single Escape from dismissing both layers at once). Mirrors
+    // the shared ConfirmDialog behavior for consistent keyboard-driven chrome.
+    useEffect(() => {
+        if (!open) {
+            return undefined;
+        }
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape" && !submitting && !deleteConfirmOpen) {
+                event.preventDefault();
+                onClose();
+            }
+        };
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [open, submitting, deleteConfirmOpen, onClose]);
+
     // Map a thrown adapter error onto the form. Ports `form.setErrors(data)` +
     // the `_error_message` / `__all__` notify branches (lightboxes.coffee
     // L97-101). Non-HttpError (e.g. a network failure) falls back to the

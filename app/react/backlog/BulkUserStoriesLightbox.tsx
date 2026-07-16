@@ -160,6 +160,23 @@ export function BulkUserStoriesLightbox(
         }
     }, [open, defaultStatusId]);
 
+    // Escape closes the lightbox (equivalent to the ✕ close button) — but never
+    // while a submit is in flight, mirroring the shared ConfirmDialog behavior so
+    // the whole board's modal chrome dismisses consistently via the keyboard.
+    useEffect(() => {
+        if (!open) {
+            return undefined;
+        }
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape" && !submitting) {
+                event.preventDefault();
+                onClose();
+            }
+        };
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [open, submitting, onClose]);
+
     // Ports getCurrentStatus(): the status whose id matches the selected statusId.
     const currentStatus = useMemo<UsStatus | undefined>(
         () => project.us_statuses.find((status) => status.id === statusId),

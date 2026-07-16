@@ -8,8 +8,13 @@
 
 import { createElement, useEffect, useRef, useState } from "react";
 import sortBy from "lodash/sortBy";
-import { httpDelete, httpGet, HttpError } from "../shared/api/httpClient";
-import type { QueryParams } from "../shared/api/httpClient";
+import {
+    httpDelete,
+    httpGet,
+    httpPatch,
+    HttpError,
+} from "../shared/api/httpClient";
+import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import {
     bulkCreate,
     bulkUpdateKanbanOrder,
@@ -25,6 +30,12 @@ import type {
 import { KanbanBoard } from "./KanbanBoard";
 import { Icon } from "../shared/ui/Icon";
 import { buildContainerKey } from "./KanbanColumn";
+import { UserStoryEditLightbox } from "./UserStoryEditLightbox";
+import type {
+    AssignableUser,
+    UserStoryCreateFields,
+    UserStoryEditChanges,
+} from "./UserStoryEditLightbox";
 import {
     loadColumnFolds,
     loadKanbanFilters,
@@ -56,6 +67,37 @@ import type {
 export interface HostElementProps {
     projectId: number;
     projectSlug: string;
+}
+
+/**
+ * Guard the host-supplied project id. The migrated `kanban.jade` binds
+ * `data-project-id="{{project.id}}"`, but the Kanban route lost its controller
+ * scope so the interpolation resolves to the empty string (→ `NaN`) or, in a
+ * degenerate parse, `0`. BOTH must be rejected — treating `0` as an id would
+ * issue `GET /projects/0` → 404 (mirrors the Backlog fix for QA finding #1).
+ * Only a finite positive integer unlocks any network / WebSocket work.
+ */
+export function isValidProjectId(id: number): boolean {
+    return Number.isInteger(id) && id > 0;
+}
+
+/**
+ * Resolve the project slug from the current URL. The Kanban route is
+ * `/project/:pslug/kanban` (app.coffee), so the slug is ALWAYS present in the
+ * path even though `data-project-slug` (like `data-project-id`) fails to
+ * interpolate in the migrated shell. This is the RELIABLE fallback source used
+ * to look the project up via `GET /projects/by_slug` when the host attribute
+ * did not yield a usable id (QA finding #1 — CRITICAL). Returns `null` when no
+ * slug segment is present (e.g. jsdom's default `/` path), which keeps the
+ * transient-NaN "no network until resolvable" contract intact.
+ */
+export function slugFromLocation(): string | null {
+    try {
+        const match = /\/project\/([^/]+)/.exec(window.location.pathname);
+        return match ? decodeURIComponent(match[1]) : null;
+    } catch {
+        return null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -603,42 +645,6 @@ export function pickSelectedFilterParams(
     return params;
 }
 
-/**
- * The one unavoidable coupling to AngularJS: dispatch a `$rootScope` broadcast
- * so the SURVIVING generic-form lightbox still opens. `common/lightboxes.coffee`
- * handles `genericform:new` (L622) and `genericform:edit` (L638) — those events
- * are owned by a COMMON module that is NOT part of the migrated Kanban
- * controller, so the bridge remains valid. SAFE NO-OP when Angular / its
- * injector is absent (e.g. under jsdom in unit tests) because the whole body is
- * guarded.
- */
-function broadcastToAngular(name: string, payload: unknown): void {
-    try {
-        const ng = (
-            window as unknown as {
-                angular?: {
-                    element: (d: Document) => {
-                        injector: () => {
-                            get: (s: string) => {
-                                $broadcast: (n: string, p: unknown) => void;
-                                $applyAsync: () => void;
-                            };
-                        };
-                    };
-                };
-            }
-        ).angular;
-        if (!ng) {
-            return; // no-op in jsdom / tests
-        }
-        const rootScope = ng.element(document).injector().get("$rootScope");
-        rootScope.$broadcast(name, payload);
-        rootScope.$applyAsync();
-    } catch {
-        /* no-op when Angular / injector is absent */
-    }
-}
-
 // ---------------------------------------------------------------------------
 // KanbanFilterPanel — in-board reimplementation of the shared `tg-filter`
 // directive. The root carries `.kanban-filter` so the already-compiled SCSS
@@ -1084,6 +1090,21 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const { projectId } = props;
     const kanban = useKanbanState();
 
+    // The EFFECTIVE project id the whole board keys off. It is the prop id when
+    // that is already a valid positive integer; otherwise it stays `NaN` until
+    // `loadInitialData` resolves it from the URL slug via `GET projects/by_slug`
+    // (QA finding — blank Kanban board). The prop is populated from the Jade host
+    // attribute `data-project-id="{{project.id}}"`, but with the AngularJS
+    // `KanbanController` removed that interpolation stays empty, so `parseInt("")`
+    // yields `NaN` and every id-gated loader silently skips. Mirroring the Backlog
+    // root, we fall back to resolving the id from the `/project/:slug/kanban` URL.
+    // `resolvedIdRef` mirrors this so the async loaders can read the freshest id
+    // the instant it is published — WITHIN the same `loadInitialData` run —
+    // without being re-created on every change.
+    const [resolvedId, setResolvedId] = useState<number>(() =>
+        isValidProjectId(projectId) ? projectId : NaN,
+    );
+
     const [zoomLevel, setZoomLevel] = useState(DEFAULT_ZOOM_LEVEL);
     const [zoom, setZoom] = useState<string[]>(() => zoomKeysFor(DEFAULT_ZOOM_LEVEL));
     const [openFilter, setOpenFilter] = useState(false);
@@ -1121,6 +1142,10 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     );
 
     const projectRef = useRef<KanbanProject | null>(null);
+    // Mirrors `resolvedId` so the memoised async loaders never read a stale
+    // closure and can pick up the id the instant `loadInitialData` publishes it.
+    const resolvedIdRef = useRef<number>(resolvedId);
+    resolvedIdRef.current = resolvedId;
     const zoomLevelRef = useRef(zoomLevel);
     const filterQRef = useRef(filterQ);
     const selectedFiltersRef = useRef(selectedFilters);
@@ -1145,17 +1170,18 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         queryOverride?: string,
     ): Promise<void> => {
         const project = projectRef.current;
-        if (!Number.isFinite(projectId) || !project) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id) || !project) {
             return;
         }
         const level = levelOverride ?? zoomLevelRef.current;
         const query = queryOverride ?? filterQRef.current;
         const [usResponse, swimlaneResponse] = await Promise.all([
             listUserstories(
-                projectId,
+                id,
                 buildUserstoriesParams(level, query, selectedFiltersRef.current),
             ),
-            httpGet<Swimlane[]>("/swimlanes", { project: projectId }),
+            httpGet<Swimlane[]>("/swimlanes", { project: id }),
         ]);
         if (!aliveRef.current) {
             return;
@@ -1180,13 +1206,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const loadFilters = async (
         overrideSelected?: KanbanSelectedFilter[],
     ): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
             return;
         }
         const selected = overrideSelected ?? selectedFiltersRef.current;
         try {
             const response = await filtersData({
-                project: projectId,
+                project: id,
                 ...pickSelectedFilterParams(selected),
             });
             if (!aliveRef.current) {
@@ -1199,44 +1226,74 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     };
 
     const loadInitialData = async (): Promise<void> => {
-        if (!Number.isFinite(projectId)) {
+        // Resolve the project FIRST, mirroring the Backlog root. The host attribute
+        // `data-project-id="{{project.id}}"` interpolates to `NaN` now that the
+        // AngularJS `KanbanController` is gone (QA finding — blank Kanban board),
+        // so a valid positive-integer prop uses the by-id path and everything else
+        // falls back to the `/project/:slug/kanban` URL slug via
+        // `GET projects/by_slug`. When neither an id nor a slug is available there
+        // is nothing to resolve yet, so no request is issued (keeps a transient
+        // render network-silent).
+        if (!isValidProjectId(projectId) && slugFromLocation() === null) {
             return;
         }
-        // QA-FUNC-09: restore the persisted sidebar filters + search query
-        // BEFORE the first userstories/filters fetch so the board loads already
-        // filtered (mirrors the AngularJS filtersMixin `applyStoredFilters`,
-        // storeFiltersName "kanban-filters"). Writing the refs SYNCHRONOUSLY
-        // guarantees the initial `listUserstories` and `filtersData` requests
-        // (which read `selectedFiltersRef` / `filterQRef`) honor the restored
-        // selection; the matching `setState` calls refresh the visible filter
-        // chips + search box on the next render.
-        const storedFilters = loadKanbanFilters<KanbanSelectedFilter>(projectId);
-        if (storedFilters) {
-            selectedFiltersRef.current = storedFilters.selected;
-            filterQRef.current = storedFilters.q;
-            setSelectedFilters(storedFilters.selected);
-            setFilterQ(storedFilters.q);
-        }
-        // QA-FUNC-03: restore the persisted swimlane fold modes now, and capture
-        // the persisted column fold modes for the archived-override merge below
-        // (port of `getSwimlanesModes` / `getStatusColumnModes`).
-        const storedColumnFolds = loadColumnFolds(projectId);
-        const storedSwimlaneFolds = loadSwimlaneFolds(projectId);
-        if (storedSwimlaneFolds) {
-            setFoldedSwimlane(storedSwimlaneFolds);
-        }
         try {
-            const projectResponse = await httpGet<KanbanProject>(
-                `/projects/${projectId}`,
-            );
+            // Choose the resolution endpoint. A valid positive-integer id uses the
+            // by-id path (the leading-slash form the existing suite asserts);
+            // everything else resolves from the URL slug.
+            let projectResponse: HttpResponse<KanbanProject>;
+            if (isValidProjectId(projectId)) {
+                projectResponse = await httpGet<KanbanProject>(
+                    `/projects/${projectId}`,
+                );
+            } else {
+                const slug = slugFromLocation();
+                if (!slug) {
+                    // No id and no slug → nothing resolvable yet; no network.
+                    return;
+                }
+                projectResponse = await httpGet<KanbanProject>(
+                    "projects/by_slug",
+                    { slug },
+                );
+            }
             if (!aliveRef.current) {
                 return;
             }
             const project = projectResponse.data;
+            // Publish the resolved id to the ref FIRST so the loaders invoked later
+            // in this same run read the real id, then to state so the render gate
+            // opens and the memoised WebSocket effect recomputes with the real id.
+            resolvedIdRef.current = project.id;
+            setResolvedId(project.id);
             // Module gate — mirrors loadProject's is_kanban_activated check.
             if (!project.is_kanban_activated) {
                 setPermissionDenied(true);
                 return;
+            }
+            // QA-FUNC-09: restore the persisted sidebar filters + search query
+            // BEFORE the first userstories/filters fetch so the board loads already
+            // filtered (mirrors the AngularJS filtersMixin `applyStoredFilters`,
+            // storeFiltersName "kanban-filters"). Now that the real id is known the
+            // persisted state is keyed off it. Writing the refs SYNCHRONOUSLY
+            // guarantees the initial `listUserstories` and `filtersData` requests
+            // (which read `selectedFiltersRef` / `filterQRef`) honor the restored
+            // selection; the matching `setState` calls refresh the visible filter
+            // chips + search box on the next render.
+            const storedFilters = loadKanbanFilters<KanbanSelectedFilter>(project.id);
+            if (storedFilters) {
+                selectedFiltersRef.current = storedFilters.selected;
+                filterQRef.current = storedFilters.q;
+                setSelectedFilters(storedFilters.selected);
+                setFilterQ(storedFilters.q);
+            }
+            // QA-FUNC-03: restore the persisted swimlane fold modes now, and capture
+            // the persisted column fold modes for the archived-override merge below
+            // (port of `getSwimlanesModes` / `getStatusColumnModes`).
+            const storedColumnFolds = loadColumnFolds(project.id);
+            const storedSwimlaneFolds = loadSwimlaneFolds(project.id);
+            if (storedSwimlaneFolds) {
+                setFoldedSwimlane(storedSwimlaneFolds);
             }
             project.us_statuses = sortBy(
                 (project.us_statuses as Status[] | undefined) ?? [],
@@ -1264,14 +1321,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
 
             const [usResponse, swimlaneResponse] = await Promise.all([
                 listUserstories(
-                    projectId,
+                    project.id,
                     buildUserstoriesParams(
                         zoomLevelRef.current,
                         filterQRef.current,
                         selectedFiltersRef.current,
                     ),
                 ),
-                httpGet<Swimlane[]>("/swimlanes", { project: projectId }),
+                httpGet<Swimlane[]>("/swimlanes", { project: project.id }),
             ]);
             if (!aliveRef.current) {
                 return;
@@ -1312,10 +1369,15 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     };
 
     useEffect(() => {
-        if (!Number.isFinite(projectId)) {
-            return;
+        // Fire `loadInitialData` only when there is SOMETHING to resolve — either
+        // a valid positive-integer prop id, OR a slug in the URL
+        // (`/project/:pslug/kanban`) that `loadInitialData` can look up via
+        // `GET projects/by_slug` (QA finding — blank Kanban board). When neither is
+        // present (a bare transient render) NO network / WebSocket work runs,
+        // preserving the transient-NaN contract.
+        if (isValidProjectId(projectId) || slugFromLocation() !== null) {
+            void loadInitialData();
         }
-        void loadInitialData();
         // Reload only when the (possibly transient NaN) projectId settles.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [projectId]);
@@ -1333,13 +1395,17 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // effect connects once and is not disturbed by subsequent refreshes.
     const projectReady = projectLoaded !== null;
     useEffect(() => {
-        if (!Number.isFinite(projectId) || !projectReady) {
+        // Subscribe against the RESOLVED id (the real project id, whether it came
+        // from the prop or the by-slug lookup), so the WebSocket keys match the
+        // board data even when the host attribute was empty (QA finding — blank
+        // Kanban board).
+        if (!isValidProjectId(resolvedId) || !projectReady) {
             return undefined;
         }
         const client = createEventsClient();
         client.connect();
-        const userstoriesKey = `changes.project.${projectId}.userstories`;
-        const projectsKey = `changes.project.${projectId}.projects`;
+        const userstoriesKey = `changes.project.${resolvedId}.userstories`;
+        const projectsKey = `changes.project.${resolvedId}.projects`;
         client.subscribe(userstoriesKey, () => {
             reloadRef.current();
         });
@@ -1359,7 +1425,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             client.disconnect();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [projectId, projectReady]);
+    }, [resolvedId, projectReady]);
 
     useEffect(() => {
         // F-C: mark the root alive for the duration of the mount so async
@@ -1398,7 +1464,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         // selection so it survives a reload (mirrors the AngularJS filtersMixin
         // which stored `q` as part of the applied filters). Persisting is
         // immediate; only the board reload below is debounced.
-        saveKanbanFilters(projectId, {
+        saveKanbanFilters(resolvedId, {
             q: query,
             selected: selectedFiltersRef.current,
         });
@@ -1413,22 +1479,44 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
 
     const [bulkStatusId, setBulkStatusId] = useState<number | null>(null);
 
+    // React-native create/edit/assign lightbox state (QA finding — the migrated
+    // `kanban.jade` removed the Angular `tg-lb-create-edit` host, so the previous
+    // `genericform:*` broadcasts were silent no-ops). `open` toggles the reveal
+    // class; `mode` selects create vs edit; `us` is the edit target; `statusId`
+    // seeds a CREATE with the clicked column; `focusAssignee` lands focus on the
+    // assignee control for the card "Assign to" affordance.
+    const [usLightbox, setUsLightbox] = useState<{
+        open: boolean;
+        mode: "create" | "edit";
+        us: UserStoryModel | null;
+        statusId: number | null;
+        focusAssignee: boolean;
+    }>({
+        open: false,
+        mode: "create",
+        us: null,
+        statusId: null,
+        focusAssignee: false,
+    });
+
     /**
      * F1: creation now honors the requested `type` (mirrors `addNewUs`,
      * kanban/main.coffee L266-L276).
-     *  - "standard" → dispatch `genericform:new` so the SURVIVING generic
-     *    user-story form opens (handled by `common/lightboxes.coffee` L622),
-     *    seeded with the target `statusId` (and `project`) so the new story
-     *    lands in the clicked column.
+     *  - "standard" → open the React-native create form (QA finding — the Angular
+     *    `tg-lb-create-edit` host was removed by the migration, so the old
+     *    `genericform:new` broadcast reached no receiver). Seeded with the target
+     *    `statusId` so the new story lands in the clicked column.
      *  - "bulk"     → open the React bulk lightbox (many stories from newline
      *    text via `bulk_create`).
      */
     const addNewUs = (type: "standard" | "bulk", statusId: number): void => {
         if (type === "standard") {
-            broadcastToAngular("genericform:new", {
-                objType: "us",
-                project: projectRef.current,
+            setUsLightbox({
+                open: true,
+                mode: "create",
+                us: null,
                 statusId,
+                focusAssignee: false,
             });
             return;
         }
@@ -1463,10 +1551,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 : null;
         bulkSubmittingRef.current = true;
         setBulkError(null);
+        // Use the RESOLVED project id (whether it came from the prop or the
+        // by-slug lookup) for the bulk-create + reorder writes (QA finding —
+        // blank Kanban board).
+        const id = resolvedIdRef.current;
         // QA-FUNC-05: pass the SELECTED swimlane (defaulting to the project
         // default_swimlane on a swimlane board) instead of the previously
         // hardcoded `null`, so bulk-created stories land in the chosen swimlane.
-        void bulkCreate(projectId, statusId, subjects, swimlaneId)
+        void bulkCreate(id, statusId, subjects, swimlaneId)
             .then((response) => {
                 if (position !== "top" || beforeFirstId === null) {
                     return undefined;
@@ -1478,7 +1570,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 // Reorder the freshly-created stories to the TOP of the column,
                 // ahead of the previously-first story (mirrors moveUsToTop).
                 return bulkUpdateKanbanOrder(
-                    projectId,
+                    id,
                     statusId,
                     swimlaneId,
                     null,
@@ -1510,47 +1602,138 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     };
 
     /**
-     * F3: open the SURVIVING generic edit form for a single story (mirrors
-     * `editUs`, kanban/main.coffee). The row model is looked up from the board
-     * state and handed to the AngularJS lightbox via `genericform:edit`
-     * (handled by `common/lightboxes.coffee` L638).
+     * F3: open the React-native edit form for a single story (mirrors `editUs`,
+     * kanban/main.coffee). The row model is looked up from the board state and
+     * seeded into the lightbox. QA finding — the previous `genericform:edit`
+     * broadcast targeted the removed Angular `tg-lb-create-edit` host and was a
+     * silent no-op.
      */
     const onEditUs = (usId: number): void => {
         const view = kanban.state.usMap[usId];
         if (!view) {
             return;
         }
-        const project = projectRef.current;
-        broadcastToAngular("genericform:edit", {
-            objType: "us",
-            obj: view.model,
-            statusList: (project?.us_statuses as Status[] | undefined) ?? [],
-            attachments: [],
+        setUsLightbox({
+            open: true,
+            mode: "edit",
+            us: view.model,
+            statusId: null,
+            focusAssignee: false,
         });
     };
 
     /**
      * F3: the card's "Assign to" affordance. The AngularJS quick-assign picker
      * was bound to the now-deleted controller (`changeUsAssignedUsers` via
-     * `lightboxFactory`) and has no surviving broadcast bridge, so — consistent
-     * with the Backlog root, which routes every story-field edit through the
-     * generic form — assignment opens the same generic edit form, focused on the
-     * assignee field. `focusField` is an inert hint for the AngularJS side
-     * (unknown payload keys are ignored by `genericform` `getSchema`).
+     * `lightboxFactory`) and has no surviving bridge, so — consistent with the
+     * Backlog root, which routes every story-field edit through the generic form
+     * — assignment opens the same React edit form, focused on the assignee field.
      */
     const onAssignUs = (usId: number): void => {
         const view = kanban.state.usMap[usId];
         if (!view) {
             return;
         }
-        const project = projectRef.current;
-        broadcastToAngular("genericform:edit", {
-            objType: "us",
-            obj: view.model,
-            statusList: (project?.us_statuses as Status[] | undefined) ?? [],
-            attachments: [],
-            focusField: "assigned_to",
+        setUsLightbox({
+            open: true,
+            mode: "edit",
+            us: view.model,
+            statusId: null,
+            focusAssignee: true,
         });
+    };
+
+    /**
+     * [#2] Persist a NEW single story from {@link UserStoryEditLightbox}. Ports
+     * the generic-form `mode == 'new'` branch onto the AAP-enumerated endpoints:
+     * `bulk_create` carries subject + status (+ the swimlane on a swimlane board,
+     * defaulting to the project `default_swimlane`), and — because that endpoint
+     * does NOT accept points/assignee — a follow-up `PATCH userstories/{id}`
+     * persists those when set. When the user chose "on top", the created ids are
+     * ordered ahead of the column's current first story via
+     * `bulk_update_kanban_order` (mirrors `moveUsToTop`). Then the board is
+     * re-read. Rejects on failure so the lightbox keeps itself open and surfaces
+     * the error.
+     */
+    const onCreateUs = async (fields: UserStoryCreateFields): Promise<void> => {
+        const id = resolvedIdRef.current;
+        // A swimlane board seeds the project default swimlane (the single-story
+        // form has no swimlane selector; the column header spans swimlanes).
+        const swimlaneId =
+            kanban.state.swimlanesList.length > 0
+                ? projectRef.current?.default_swimlane ?? null
+                : null;
+        // Capture the target column's current first story BEFORE creating so a
+        // "top" placement can be ordered ahead of it (mirrors moveUsToTop).
+        const beforeFirstId =
+            fields.position === "top"
+                ? firstUsInColumn(kanban.state, fields.statusId, swimlaneId)
+                : null;
+        const response = await bulkCreate(
+            id,
+            fields.statusId,
+            fields.subject,
+            swimlaneId,
+        );
+        const created = (response.data ?? []) as Array<{ id: number; version?: number }>;
+        const first = created[0];
+        const hasPoints = Object.keys(fields.points).length > 0;
+        if (first && (hasPoints || fields.assignedTo !== null)) {
+            // bulk_create cannot carry points/assignee — patch them in a follow-up.
+            await httpPatch(`/userstories/${first.id}`, {
+                points: fields.points,
+                assigned_to: fields.assignedTo,
+                version: first.version,
+            });
+        }
+        if (fields.position === "top" && beforeFirstId !== null) {
+            const createdIds = created.map((us) => us.id);
+            if (createdIds.length > 0) {
+                await bulkUpdateKanbanOrder(
+                    id,
+                    fields.statusId,
+                    swimlaneId,
+                    null,
+                    beforeFirstId,
+                    createdIds,
+                );
+            }
+        }
+        if (!aliveRef.current) {
+            return;
+        }
+        await reloadUserstories();
+    };
+
+    /**
+     * [#2] Persist EDITS to an existing story from {@link UserStoryEditLightbox}.
+     * Ports the generic-form `mode == 'edit'` branch: `PATCH userstories/{id}`
+     * with the changed fields + `version` for optimistic concurrency, then re-read
+     * the board. A 409 version conflict reloads to pick up fresh versions; the
+     * error is rethrown so the lightbox keeps itself open and surfaces the failure.
+     */
+    const onSaveUsEdit = async (
+        target: UserStoryModel,
+        changes: UserStoryEditChanges,
+    ): Promise<void> => {
+        try {
+            await httpPatch(`/userstories/${target.id}`, {
+                subject: changes.subject,
+                status: changes.status,
+                points: changes.points,
+                assigned_to: changes.assigned_to,
+                version: (target as { version?: number }).version,
+            });
+            if (!aliveRef.current) {
+                return;
+            }
+            await reloadUserstories();
+        } catch (err) {
+            if (err instanceof HttpError && err.status === 409) {
+                await reloadUserstories();
+            }
+            throw err;
+        }
     };
 
     /**
@@ -1580,7 +1763,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         setSelectedFilters(next);
         // QA-FUNC-09: persist the updated filter selection (with the current
         // search query) so it survives a reload (port of `storeFilters`).
-        saveKanbanFilters(projectId, { q: filterQRef.current, selected: next });
+        saveKanbanFilters(resolvedId, { q: filterQRef.current, selected: next });
         void reloadUserstories();
         void loadFilters(next);
     };
@@ -1595,7 +1778,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         setSelectedFilters(next);
         // QA-FUNC-09: persist the reduced filter selection (port of
         // `storeFilters`).
-        saveKanbanFilters(projectId, { q: filterQRef.current, selected: next });
+        saveKanbanFilters(resolvedId, { q: filterQRef.current, selected: next });
         void reloadUserstories();
         void loadFilters(next);
     };
@@ -1606,7 +1789,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         setFolds(next);
         // QA-FUNC-03: persist the column fold modes so the squish/unfold state
         // survives a reload (port of `storeStatusColumnModes`).
-        saveColumnFolds(projectId, next);
+        saveColumnFolds(resolvedId, next);
         setUnfold(nextFolded ? null : status.id);
     };
 
@@ -1618,7 +1801,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         setFoldedSwimlane(next);
         // QA-FUNC-03: persist the swimlane fold modes (port of
         // `storeSwimlanesModes`).
-        saveSwimlaneFolds(projectId, next);
+        saveSwimlaneFolds(resolvedId, next);
     };
 
     const handleToggleFold = (usId: number): void => {
@@ -1733,9 +1916,10 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         setMovedUs(resolved.draggedIds);
         window.setTimeout(() => setMovedUs([]), MOVED_HIGHLIGHT_MS);
 
-        // Persist to the frozen REST contract.
+        // Persist to the frozen REST contract, keyed off the RESOLVED project id
+        // (whether it came from the prop or the by-slug lookup).
         return bulkUpdateKanbanOrder(
-            projectId,
+            resolvedIdRef.current,
             statusId,
             apiSwimlane,
             neighbors.previous,
@@ -1777,6 +1961,23 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         !project.archived_code &&
         Array.isArray(project.my_permissions) &&
         project.my_permissions.indexOf("add_us") !== -1;
+
+    // [#2] Assignable users for the create/edit lightbox's assignee control,
+    // derived from the already-loaded `userstories-filters` "assigned_users"
+    // category (id = user id, name = display name). This reuses the AAP-enumerated
+    // filters endpoint rather than introducing a new members request. The
+    // synthetic "Unassigned" entry (id === null / "null") is dropped — the
+    // lightbox offers its own "Not assigned" option.
+    const assignableUsers: AssignableUser[] = (() => {
+        const category = filters.find((c) => c.dataType === "assigned_users");
+        if (!category) {
+            return [];
+        }
+        return category.content
+            .filter((option) => option.id !== null && String(option.id) !== "null")
+            .map((option) => ({ id: Number(option.id), name: option.name }))
+            .filter((user) => Number.isInteger(user.id));
+    })();
 
     return (
         <section className={"main kanban" + (swimlaneMode ? " swimlane" : "")}>
@@ -1920,6 +2121,32 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         setBulkError(null);
                     }}
                     error={bulkError}
+                />
+            ) : null}
+
+            {/*
+              * [#2] React-native single-story create/edit/assign form. Mounted
+              * only while open — matching the sibling `BulkLightbox` mount pattern
+              * above (so a closed form never leaves a hidden subject field in the
+              * DOM nor an `autoFocus` that could steal focus on board load). The
+              * `open` class still drives the SCSS reveal. Persistence is delegated
+              * to `onCreateUs` / `onSaveUsEdit`, which talk only to the frozen
+              * `/api/v1/` endpoints (`bulk_create` + `PATCH`).
+              */}
+            {usLightbox.open && project ? (
+                <UserStoryEditLightbox
+                    open={usLightbox.open}
+                    mode={usLightbox.mode}
+                    project={project}
+                    us={usLightbox.us}
+                    initialStatusId={usLightbox.statusId}
+                    focusAssignee={usLightbox.focusAssignee}
+                    assignableUsers={assignableUsers}
+                    onCreate={onCreateUs}
+                    onEdit={onSaveUsEdit}
+                    onClose={() =>
+                        setUsLightbox((prev) => ({ ...prev, open: false }))
+                    }
                 />
             ) : null}
         </section>
