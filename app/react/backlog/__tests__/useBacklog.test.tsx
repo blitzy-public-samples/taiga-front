@@ -376,7 +376,15 @@ function lastUserstoriesParams(): Record<string, unknown> {
 
 beforeEach(() => {
   jest.useFakeTimers();
-  jest.setSystemTime(new Date('2021-06-15T00:00:00Z'));
+  // Pin "now" to LOCAL midnight 2021-06-15 (month is 0-indexed -> 5). Do NOT use
+  // an ISO string with a trailing "Z": production `useBacklog.openSprintForm`
+  // seeds the create-form date via `moment().format('YYYY-MM-DD')` in LOCAL time
+  // (parity with lightboxes.coffee:152-170). A UTC-midnight instant resolves to
+  // the PRIOR local calendar day in every UTC-negative timezone (e.g. Americas),
+  // which made the "seeds from today" assertion below fail there. Local midnight
+  // formats as 2021-06-15 in ALL timezones and stays well inside Sprint B's
+  // 2021-06-01..2021-06-30 window, so `findCurrentSprint` is unaffected.
+  jest.setSystemTime(new Date(2021, 5, 15));
 
   // Events enabled by default (socket branch runs). Overridden to null in the
   // "events disabled" test.

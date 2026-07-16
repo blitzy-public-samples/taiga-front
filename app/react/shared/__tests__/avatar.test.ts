@@ -31,12 +31,54 @@ import {
 const w = window as unknown as { taigaConfig?: unknown; _version?: string };
 let prevConfig: unknown;
 let prevVersion: string | undefined;
-let prevLocation: Location;
+
+/*
+ * jsdom-safe `window.location` override (AngularJS 1.5.10 -> React 18 migration
+ * test infra).
+ *
+ * Under `jest-environment-jsdom@29`, `window.location` is installed as a special
+ * accessor and only the FIRST `Object.defineProperty(window, 'location', ...)`
+ * within a worker actually takes effect — every LATER redefinition is a silent
+ * no-op. The earlier version of this suite redefined `window.location` on every
+ * `setLocation()` call AND unconditionally in `afterEach`; because the
+ * `murmurhash3_32_gc` `describe` runs first, that first `afterEach` consumed the
+ * single effective redefinition (pinning the pristine `http://localhost/`).
+ * Every subsequent `setLocation()` was therefore a no-op: `location.host` stayed
+ * `localhost`, `getAvatar` always took the LOCAL branch, and the two
+ * off-localhost gravatar assertions failed while `avatar.ts`'s gravatar.com
+ * branch was never exercised — a deterministic `npm test` failure plus an
+ * untested production path.
+ *
+ * Fix: redefine `window.location` EXACTLY ONCE here, via a getter backed by a
+ * single mutable holder object, then MUTATE that holder in `setLocation()` /
+ * `beforeEach` (NEVER call `defineProperty` again). The getter stays live for
+ * the whole file, so every test observes the value it set and the suite is
+ * fully order-independent.
+ */
+const DEFAULT_PROTOCOL = 'http:';
+const DEFAULT_HOST = 'localhost';
+/** The single object the `window.location` getter returns for the whole file. */
+const locationHolder: { protocol: string; host: string } = {
+  protocol: DEFAULT_PROTOCOL,
+  host: DEFAULT_HOST,
+};
+
+// Redefine ONCE (see the note above). Subsequent tests MUTATE `locationHolder`.
+Object.defineProperty(window, 'location', {
+  configurable: true,
+  get(): Location {
+    return locationHolder as unknown as Location;
+  },
+});
 
 beforeEach(() => {
   prevConfig = w.taigaConfig;
   prevVersion = w._version;
-  prevLocation = window.location;
+  // Reset the SAME holder back to jsdom's pristine `http://localhost/` defaults
+  // by MUTATION (not redefinition — see the note above), so each test starts
+  // from the localhost baseline regardless of run order.
+  locationHolder.protocol = DEFAULT_PROTOCOL;
+  locationHolder.host = DEFAULT_HOST;
   // Deterministic defaults for most cases: a fixed version and a "/" baseHref.
   w._version = 'v-123';
   w.taigaConfig = { baseHref: '/' };
@@ -45,15 +87,14 @@ beforeEach(() => {
 afterEach(() => {
   w.taigaConfig = prevConfig;
   w._version = prevVersion;
-  Object.defineProperty(window, 'location', { configurable: true, value: prevLocation });
 });
 
 /** Override window.location.host/protocol for the non-localhost branch. */
 function setLocation(protocol: string, host: string): void {
-  Object.defineProperty(window, 'location', {
-    configurable: true,
-    value: { protocol, host } as unknown as Location,
-  });
+  // MUTATE the same holder the getter returns; do NOT call `defineProperty`
+  // again (jsdom@29 would silently ignore it — see the note above).
+  locationHolder.protocol = protocol;
+  locationHolder.host = host;
 }
 
 /* ------------------------------------------------------------------------------------------

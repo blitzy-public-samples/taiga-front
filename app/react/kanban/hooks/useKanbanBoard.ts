@@ -79,7 +79,7 @@ import {
 
 // Shared adapters (globals-only interop layer over the frozen /api/v1/ + WS).
 import httpClient from '../../shared/api/httpClient';
-import userstories, { type BulkOrderItem } from '../../shared/api/userstories';
+import userstories from '../../shared/api/userstories';
 import { createEventsClient, routingKeys } from '../../shared/events/eventsClient';
 // `config`/`session` are read indirectly by httpClient/eventsClient (Bearer
 // token, X-Session-Id, Accept-Language, API/events URLs), so they are NOT
@@ -779,16 +779,17 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       applyState(() => next);
 
       // Fire the frozen endpoint via the typed adapter. `bulk_userstories` is a
-      // number[] at runtime (the move payload); the adapter types the last param
-      // `BulkOrderItem[]`, so we cast ONCE here WITHOUT changing the runtime
-      // value.
+      // `number[]` at runtime (the move payload) AND the adapter now types its
+      // last param `number[]` — matching the frozen contract
+      // (kanban/main.coffee:610 `usList.map((it) => it.id)`). So
+      // `payload.bulkUserstories` is passed straight through with NO cast.
       await userstories.bulkUpdateKanbanOrder(
         pid,
         newStatusId,
         apiNewSwimlaneId,
         payload.afterUserstoryId,
         payload.beforeUserstoryId,
-        payload.bulkUserstories as unknown as BulkOrderItem[],
+        payload.bulkUserstories,
       );
 
       // .then tail (main.coffee:627-632): WIP recompute is AUTOMATIC on

@@ -52,13 +52,22 @@ import httpClient from './httpClient';
 // ---------------------------------------------------------------------------
 
 /**
- * A single per-story ordering entry sent inside the `bulk_userstories` /
- * `bulk_stories` arrays of the bulk-ordering endpoints.
+ * A single per-story ordering entry sent inside the `bulk_stories` ARRAY of
+ * `POST /userstories/bulk_update_milestone` ONLY.
  *
- * The AngularJS board/backlog build these as `{ us_id, order, ... }` objects
- * (the server keys the reorder off `us_id` and `order`). The index signature
- * tolerates any additional per-item fields a caller may include without
- * loosening the two required, typed keys.
+ * The AngularJS toolbar "move to sprint" flow builds these as `{ us_id, order }`
+ * objects (backlog/main.coffee:794-799); the server keys the milestone reorder
+ * off `us_id` and `order`. The index signature tolerates any additional
+ * per-item fields a caller may include without loosening the two required,
+ * typed keys.
+ *
+ * IMPORTANT (frozen-contract fidelity): this shape does NOT apply to the two
+ * bulk-ORDER endpoints. `bulk_update_kanban_order` and
+ * `bulk_update_backlog_order` send `bulk_userstories` as a bare `number[]` of
+ * user-story ids (kanban/main.coffee:610 `usList.map((it) => it.id)`;
+ * backlog/main.coffee:535 `_.map(usList, (it) -> it.id)`) — see
+ * `../dnd/types.ts` `BulkUserstoryIds`. Those payloads are typed `number[]`
+ * below; do NOT model them as `BulkOrderItem[]`.
  */
 export interface BulkOrderItem {
   /** The user-story id being (re)ordered. */
@@ -95,7 +104,11 @@ export interface BulkCreatePayload {
  */
 export interface BulkUpdateBacklogOrderPayload {
   project_id: number;
-  bulk_userstories: BulkOrderItem[];
+  /**
+   * A bare array of user-story IDS (`number[]`), NOT `{ us_id, order }` objects.
+   * Frozen contract: backlog/main.coffee:535 `_.map(usList, (it) -> it.id)`.
+   */
+  bulk_userstories: number[];
   milestone_id?: number;
   after_userstory_id?: number;
   before_userstory_id?: number;
@@ -123,7 +136,11 @@ export interface BulkUpdateMilestonePayload {
 export interface BulkUpdateKanbanOrderPayload {
   project_id: number;
   status_id: number;
-  bulk_userstories: BulkOrderItem[];
+  /**
+   * A bare array of user-story IDS (`number[]`), NOT `{ us_id, order }` objects.
+   * Frozen contract: kanban/main.coffee:610 `usList.map((it) => it.id)`.
+   */
+  bulk_userstories: number[];
   after_userstory_id?: number;
   before_userstory_id?: number;
   swimlane_id?: number;
@@ -184,14 +201,14 @@ export function bulkCreate(
  * @param afterUserstoryId  - Story to insert AFTER, or `null`/`0` to omit.
  * @param beforeUserstoryId - Story to insert BEFORE (used only when `after` is
  *                            falsy), or `null`/`0` to omit.
- * @param bulkUserstories   - Per-story ordering entries (-> `bulk_userstories`).
+ * @param bulkUserstories   - Bare array of moved user-story IDS (-> `bulk_userstories`, a `number[]`).
  */
 export function bulkUpdateBacklogOrder(
   projectId: number,
   milestoneId: number | null,
   afterUserstoryId: number | null,
   beforeUserstoryId: number | null,
-  bulkUserstories: BulkOrderItem[],
+  bulkUserstories: number[],
 ) {
   const params: BulkUpdateBacklogOrderPayload = {
     project_id: projectId,
@@ -265,7 +282,7 @@ export function bulkUpdateMilestone(
  * @param afterUserstoryId  - Story to insert AFTER, or `null`/`0` to omit.
  * @param beforeUserstoryId - Story to insert BEFORE (used only when `after` is
  *                            falsy), or `null`/`0` to omit.
- * @param bulkUserstories   - Per-story ordering entries (-> `bulk_userstories`).
+ * @param bulkUserstories   - Bare array of moved user-story IDS (-> `bulk_userstories`, a `number[]`).
  */
 export function bulkUpdateKanbanOrder(
   projectId: number,
@@ -273,7 +290,7 @@ export function bulkUpdateKanbanOrder(
   swimlaneId: number | null,
   afterUserstoryId: number | null,
   beforeUserstoryId: number | null,
-  bulkUserstories: BulkOrderItem[],
+  bulkUserstories: number[],
 ) {
   const params: BulkUpdateKanbanOrderPayload = {
     project_id: projectId,

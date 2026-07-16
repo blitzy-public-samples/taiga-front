@@ -610,13 +610,13 @@ function readItemEl(
  * the moved-id set, applies the optimistic update via `onMove`, then calls
  * `bulkUpdateKanbanOrder` with `swimlane === -1` mapped to `null`.
  *
- * TYPE RECONCILIATION (AAP 0.5.3): the real `../api/userstories` adapter types its
- * bulk parameter as `BulkOrderItem[]` (`{ us_id, order }`), whereas the frozen
- * wire payload — and therefore the `KanbanOrderApi` structural type — is a bare
- * `number[]` (`BulkUserstoryIds`). The legacy client sends IDS ONLY (see fidelity
- * point #2 in the header), so the RUNTIME value stays `number[]`; we reconcile only
- * the STATIC type here, once, via a single `as unknown as` cast at the default. The
- * payload is never altered.
+ * ADAPTER TYPE (AAP 0.5.3): the real `../api/userstories` adapter types its bulk
+ * ORDER parameter as a bare `number[]` — matching the frozen wire payload and
+ * the `KanbanOrderApi` structural type (`BulkUserstoryIds`). The legacy client
+ * sends IDS ONLY (see fidelity point #2 in the header), so BOTH the runtime
+ * value and the static type are `number[]`. The `as unknown as` cast at the
+ * default merely adapts the concrete multi-method `userstories` aggregate onto
+ * this minimal single-method interface; the payload is never altered.
  *
  * Destination geometry is read via whichever path `../kanban` wires:
  *   - DOM path  — when the over droppable exposes a `columnEl` HTMLElement:
@@ -741,9 +741,12 @@ export function createKanbanDragEndHandler(
  * promise chain; the chain continues past a rejected drop (a failed request does not
  * wedge the queue). Callers `await` the returned promise for the specific drop.
  *
- * TYPE RECONCILIATION (AAP 0.5.3): identical to the Kanban factory — the runtime
- * `bulk_userstories` payload stays `number[]`; only the static adapter type is
- * reconciled here via a single `as unknown as` cast at the default.
+ * ADAPTER TYPE (AAP 0.5.3): as in the Kanban factory, the adapter's
+ * `bulk_userstories` parameter and the runtime value are BOTH `number[]`. The
+ * `as unknown as` cast at the default adapts the concrete `userstories`
+ * aggregate onto the minimal `BacklogOrderApi` interface used here (whose
+ * optional, never-called `bulkUpdateMilestone` models its ids array
+ * differently); the payload is never altered.
  *
  * `bulkUpdateMilestone` is deliberately NOT called here — the drag flow uses
  * `bulkUpdateBacklogOrder` exactly as the source does (backlog/main.coffee:544-556);

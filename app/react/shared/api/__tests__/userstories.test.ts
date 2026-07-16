@@ -68,11 +68,24 @@ const patchMock = (): jest.Mock => httpClient.patch as unknown as jest.Mock;
 /** A sentinel resolved value used to prove the adapter returns the client's promise. */
 const RESULT = { ok: true } as const;
 
-/** Two representative per-story ordering entries. */
+/**
+ * Milestone ordering entries (`{ us_id, order }[]`) — the `bulk_stories` shape
+ * of `bulk_update_milestone` ONLY (backlog/main.coffee:794-799).
+ */
 const ITEMS: BulkOrderItem[] = [
   { us_id: 1, order: 0 },
   { us_id: 2, order: 1 },
 ];
+
+/**
+ * The bulk-ORDER payload for the two order endpoints is a bare array of
+ * user-story IDS (`number[]`), NOT `{ us_id, order }` objects
+ * (kanban/main.coffee:610 `usList.map((it) => it.id)`; backlog/main.coffee:535
+ * `_.map(usList, (it) -> it.id)`). Kept DISTINCT from `ITEMS` so these specs
+ * lock the frozen `number[]` contract for `bulk_update_kanban_order` and
+ * `bulk_update_backlog_order`.
+ */
+const IDS: number[] = [1, 2];
 
 beforeEach(() => {
   // `clearMocks: true` (jest.config.js) resets call data before each test; we
@@ -112,14 +125,14 @@ describe('userstories.bulkCreate (userstories.coffee:64-74)', () => {
 
 describe('userstories.bulkUpdateBacklogOrder (userstories.coffee:92-105)', () => {
   it('sends only the base params when milestone/after/before are all falsy', async () => {
-    await bulkUpdateBacklogOrder(7, null, null, null, ITEMS);
+    await bulkUpdateBacklogOrder(7, null, null, null, IDS);
 
     const [path, body] = postMock().mock.calls[0] as [
       string,
       BulkUpdateBacklogOrderPayload,
     ];
     expect(path).toBe('userstories/bulk_update_backlog_order');
-    expect(body).toEqual({ project_id: 7, bulk_userstories: ITEMS });
+    expect(body).toEqual({ project_id: 7, bulk_userstories: IDS });
     // None of the optional keys leak in.
     expect('milestone_id' in body).toBe(false);
     expect('after_userstory_id' in body).toBe(false);
@@ -127,7 +140,7 @@ describe('userstories.bulkUpdateBacklogOrder (userstories.coffee:92-105)', () =>
   });
 
   it('adds milestone_id when truthy, independently of the after/before branch', async () => {
-    await bulkUpdateBacklogOrder(7, 42, null, 9, ITEMS);
+    await bulkUpdateBacklogOrder(7, 42, null, 9, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
@@ -140,7 +153,7 @@ describe('userstories.bulkUpdateBacklogOrder (userstories.coffee:92-105)', () =>
   });
 
   it('prefers after_userstory_id over before_userstory_id (after wins)', async () => {
-    await bulkUpdateBacklogOrder(7, null, 11, 22, ITEMS);
+    await bulkUpdateBacklogOrder(7, null, 11, 22, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
@@ -152,7 +165,7 @@ describe('userstories.bulkUpdateBacklogOrder (userstories.coffee:92-105)', () =>
   });
 
   it('falls back to before_userstory_id when after is falsy', async () => {
-    await bulkUpdateBacklogOrder(7, null, null, 22, ITEMS);
+    await bulkUpdateBacklogOrder(7, null, null, 22, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
@@ -180,21 +193,21 @@ describe('userstories.bulkUpdateMilestone (userstories.coffee:107-110)', () => {
 
 describe('userstories.bulkUpdateKanbanOrder (userstories.coffee:112-129)', () => {
   it('sends only the base params when swimlane/after/before are all falsy', async () => {
-    await bulkUpdateKanbanOrder(7, 3, null, null, null, ITEMS);
+    await bulkUpdateKanbanOrder(7, 3, null, null, null, IDS);
 
     const [path, body] = postMock().mock.calls[0] as [
       string,
       BulkUpdateKanbanOrderPayload,
     ];
     expect(path).toBe('userstories/bulk_update_kanban_order');
-    expect(body).toEqual({ project_id: 7, status_id: 3, bulk_userstories: ITEMS });
+    expect(body).toEqual({ project_id: 7, status_id: 3, bulk_userstories: IDS });
     expect('after_userstory_id' in body).toBe(false);
     expect('before_userstory_id' in body).toBe(false);
     expect('swimlane_id' in body).toBe(false);
   });
 
   it('prefers after over before, then appends swimlane_id AFTER the branch', async () => {
-    await bulkUpdateKanbanOrder(7, 3, 5, 11, 22, ITEMS);
+    await bulkUpdateKanbanOrder(7, 3, 5, 11, 22, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
@@ -207,7 +220,7 @@ describe('userstories.bulkUpdateKanbanOrder (userstories.coffee:112-129)', () =>
   });
 
   it('falls back to before when after is falsy and still appends swimlane_id', async () => {
-    await bulkUpdateKanbanOrder(7, 3, 5, null, 22, ITEMS);
+    await bulkUpdateKanbanOrder(7, 3, 5, null, 22, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
@@ -219,7 +232,7 @@ describe('userstories.bulkUpdateKanbanOrder (userstories.coffee:112-129)', () =>
   });
 
   it('omits swimlane_id when it is falsy even if after/before are set', async () => {
-    await bulkUpdateKanbanOrder(7, 3, null, 11, null, ITEMS);
+    await bulkUpdateKanbanOrder(7, 3, null, 11, null, IDS);
 
     const [, body] = postMock().mock.calls[0] as [
       string,
