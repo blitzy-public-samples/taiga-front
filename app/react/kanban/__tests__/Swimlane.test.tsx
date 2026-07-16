@@ -333,7 +333,7 @@ describe('Swimlane — auto-open while dragging', () => {
     jest.useRealTimers();
   });
 
-  it('folded + active drag: hover marks pending-to-open, then after 1000ms toggles + clears pending', () => {
+  it('folded + active drag: hover marks pending-to-open, holds through 999ms, then toggles + clears pending exactly at 1000ms', () => {
     mockActive = { id: 'drag' };
     const onToggleSwimlane = jest.fn();
     render(<Swimlane {...makeProps({ folded: true, onToggleSwimlane })} />);
@@ -343,10 +343,20 @@ describe('Swimlane — auto-open while dragging', () => {
     expect(btn).toHaveClass('pending-to-open');
     expect(onToggleSwimlane).not.toHaveBeenCalled();
 
+    // One tick BEFORE the AUTO_OPEN_DELAY_MS (1000ms) deadline: the countdown is
+    // still pending and NOTHING has fired yet -- pins the exact boundary the
+    // legacy `$timeout(..., 1000)` (main.coffee KanbanSwimlaneDirective) used.
     act(() => {
-      jest.advanceTimersByTime(1000);
+      jest.advanceTimersByTime(999);
     });
+    expect(onToggleSwimlane).not.toHaveBeenCalled();
+    expect(btn).toHaveClass('pending-to-open');
 
+    // Crossing the 1000ms deadline (the final +1ms): auto-open fires EXACTLY
+    // once with the swimlane id and the `pending-to-open` class is removed.
+    act(() => {
+      jest.advanceTimersByTime(1);
+    });
     expect(onToggleSwimlane).toHaveBeenCalledTimes(1);
     expect(onToggleSwimlane).toHaveBeenCalledWith(10);
     expect(btn).not.toHaveClass('pending-to-open');
