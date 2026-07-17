@@ -7,12 +7,68 @@
 
 doctype html
 
-//- AngularJS -> React migration (coexistence). The AngularJS backlog controller
-//- (tgBacklog directive) body has been replaced by the <tg-react-backlog> Web
-//- Component, which mounts the React BacklogApp root (registered by react.js via
-//- customElements.define('tg-react-backlog', ...)). React owns everything inside
-//- the tag; AngularJS keeps routing/chrome outside it. Route
-//- /project/:pslug/backlog [app/coffee/app.coffee:226] and templateUrl
-//- "backlog/backlog.html" are unchanged; the element reads :pslug from the route.
+//- ---------------------------------------------------------------------------
+//- AngularJS 1.5.10 -> React 18 coexistence route cutover (Blitzy AAP 0.2.1 /
+//- 0.4.1). The Backlog / sprint-planning screen previously rendered by the
+//- AngularJS backlog controller (the tgBacklog directive plus the backlog-table
+//- and sprints partials and the create/edit + bulk-create + sprint add/edit
+//- lightboxes) is now rendered in place by the <tg-react-backlog> custom element.
+//- React 18 owns everything INSIDE that tag: connectedCallback mounts a React
+//- root and renders the backlog (summary/burndown, backlog table with sidebar
+//- filters and search, the sprint sidebar, and the lightboxes), reproducing the
+//- same DOM structure and CSS class names so the existing SCSS styles the React
+//- output unchanged.
+//-
+//- HOW THE ELEMENT IS LIVE: <tg-react-backlog> is registered (customElements.define)
+//- by the react.js bundle, which app-loader/app-loader.coffee loads BETWEEN
+//- elements.js and app.js -- i.e. before angular.bootstrap(document, ['taiga']).
+//- Because the element is already defined when AngularJS $compile first
+//- encounters this template, AngularJS treats it as an ordinary custom element
+//- and passes its internals through inertly: React owns everything INSIDE the
+//- tag while AngularJS owns the navigation chrome OUTSIDE it. This re-applies the
+//- coexistence pattern the repository already ships for its Angular-Elements
+//- bundle (tg-main / tg-navigation-bar / tg-live-announcement in app/index.jade)
+//- and mirrors the committed kanban.jade route cutover exactly.
+//-
+//- CHROME OUTSIDE THE BOUNDARY: the project archived-warning banner and the left
+//- tg-project-menu sidebar are self-contained AngularJS components (driven by the
+//- shared project service and the route's `section` property, not by the former
+//- controller), so they remain here as siblings. React's createRoot wipes the
+//- host element's children, so the menu must be a sibling of -- not a child of --
+//- the custom element. The `.wrapper` flex row (display:flex; height:100%, see
+//- app/styles/core/base.scss) lays the project menu beside the backlog exactly as
+//- before, and ng-init sets the `section` scope variable the menu reads to
+//- highlight the active screen.
+//-
+//- NO project-slug ATTRIBUTE is passed on purpose: TgReactBacklog resolves the
+//- slug as getAttribute('project-slug') ?? getProjectSlug(), so it only falls
+//- back to the reliable URL (/project/:pslug/backlog) when the attribute is
+//- ABSENT; an AngularJS-interpolated {{project.slug}} would be an empty string at
+//- mount time and would suppress that fallback.
+//-
+//- The inline flex style reproduces the `.main { flex: 1; min-width: 0 }` rule on
+//- the host tag so the React backlog occupies the exact same width the AngularJS
+//- main.main.scrum did, beside the fixed-width project menu -- keeping the layout
+//- pixel-identical without editing any stylesheet. BacklogApp itself renders the
+//- backlog shell (summary/burndown, backlog table, sprint sidebar) and its own
+//- create/edit + bulk + sprint add/edit lightboxes.
+//-
+//- SCOPE NOTE: only the ROUTE-LEVEL rendering is superseded here. The AngularJS
+//- taigaBacklog module registration is deliberately RETAINED elsewhere; those
+//- legacy controllers/directives simply become unreachable dead code on this
+//- route. Route /project/:pslug/backlog [app/coffee/app.coffee:226] and
+//- templateUrl "backlog/backlog.html" are unchanged; the element reads :pslug
+//- from the route.
+//- ---------------------------------------------------------------------------
+
+//- AngularJS chrome -- stays OUTSIDE the React boundary.
 tg-project-archived-warning
-tg-react-backlog
+
+div.wrapper(ng-init="section='backlog'")
+    //- AngularJS navigation sidebar -- chrome, OUTSIDE the React boundary.
+    tg-project-menu
+
+    //- React Backlog host. The inline flex style makes the host occupy the exact
+    //- width the former main.main.scrum did (flex:1; min-width:0), beside the
+    //- fixed-width project menu. No project-slug attribute is passed (see above).
+    tg-react-backlog(style="flex: 1 1 0%; min-width: 0;")
