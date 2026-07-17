@@ -530,6 +530,22 @@ describe('card-title', () => {
     const anchor = container.querySelector('.card-title a') as HTMLElement;
     expect(anchor.getAttribute('title')).toBe('#42 Implement widget');
   });
+
+  // KB-1: the title links to the AngularJS US detail route (not an inert '#').
+  it('KB-1: renders a real US-detail href /project/:slug/us/:ref on the title anchor', () => {
+    const { container } = renderCard({ project: makeProject({ slug: 'proj' }) });
+    const anchor = container.querySelector('.card-title a') as HTMLAnchorElement;
+    expect(anchor).toBeInTheDocument();
+    expect(anchor.getAttribute('href')).toBe('/project/proj/us/42');
+  });
+
+  // KB-1 defensive: without a resolvable slug the anchor falls back to '#'
+  // (never a malformed `/project//us/...`).
+  it('KB-1: falls back to href="#" when the project slug is unavailable', () => {
+    const { container } = renderCard({ project: makeProject() });
+    const anchor = container.querySelector('.card-title a') as HTMLAnchorElement;
+    expect(anchor.getAttribute('href')).toBe('#');
+  });
 });
 
 /* ========================================================================== *

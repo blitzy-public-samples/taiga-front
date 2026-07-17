@@ -74,6 +74,13 @@ const DndContextMock = DndContext as unknown as jest.Mock;
 interface CapturedProps {
   sensors: unknown;
   autoScroll: unknown;
+  // KB-8: the accessibility bundle overriding @dnd-kit's misleading keyboard-drag
+  // screen-reader text (only a PointerSensor is wired). `draggable` should be an
+  // empty string and every announcement handler should return `undefined`.
+  accessibility?: {
+    screenReaderInstructions?: { draggable: string };
+    announcements?: Record<string, (arg: unknown) => string | undefined>;
+  };
   onDragStart: (event: DragStartEvent) => void;
   onDragOver: (event: DragOverEvent) => void;
   // The provider's `handleDragEnd` is declared `async`, so the captured prop is
@@ -164,6 +171,32 @@ describe('DndProvider — mount + prop forwarding', () => {
   it('forwards the BACKLOG auto-scroll options (by reference) in backlog mode', () => {
     renderProvider({ mode: 'backlog' });
     expect(lastProps().autoScroll).toBe(getAutoScrollOptions('backlog'));
+  });
+
+  // KB-8 — the board wires ONLY a pointer sensor (no KeyboardSensor), so the
+  // default @dnd-kit screen-reader text that advertises Space/arrow-key dragging
+  // is misleading. The provider passes an accessibility bundle that blanks it out
+  // (parity with the silent legacy `dragula` drakes).
+  it('overrides screenReaderInstructions.draggable with an EMPTY string (KB-8)', () => {
+    renderProvider();
+    const { accessibility } = lastProps();
+    expect(accessibility).toBeDefined();
+    expect(accessibility?.screenReaderInstructions).toBeDefined();
+    expect(accessibility?.screenReaderInstructions?.draggable).toBe('');
+  });
+
+  it('provides silent (undefined-returning) announcement handlers (KB-8)', () => {
+    renderProvider();
+    const announcements = lastProps().accessibility?.announcements;
+    expect(announcements).toBeDefined();
+    // Every handler present must return undefined => no live-region text, exactly
+    // as the legacy dragula implementation (which announced nothing).
+    const fakeArg = { active: { id: 1 }, over: null } as unknown;
+    for (const key of ['onDragStart', 'onDragOver', 'onDragEnd', 'onDragCancel']) {
+      const handler = announcements?.[key];
+      expect(typeof handler).toBe('function');
+      expect(handler?.(fakeArg)).toBeUndefined();
+    }
   });
 });
 

@@ -78,7 +78,7 @@
  * (via the {@link useSortableCard} / {@link useSortableRow} hooks).
  */
 
-import { useSortable } from '@dnd-kit/sortable';
+import { useSortable, arrayMove } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type {
   DragEndEvent,
@@ -225,6 +225,54 @@ export function computeAdjacentIdsFromOrder(
 }
 
 /**
+ * Compute the FINAL ordered id list that results from dropping `activeId` OVER
+ * `overId`, given the destination container's CURRENT order (`currentOrder`).
+ *
+ * WHY THIS EXISTS (the same-column reorder defect):
+ * At `dragEnd` the DOM/model has NOT been reordered yet — React applies the move
+ * in the injected `onMove` AFTER the handler computes its result. Consequently
+ * the `currentOrder` read from `over.data.current.sortable.items` still lists the
+ * dragged card in its ORIGINAL slot. Feeding that stale order straight into
+ * {@link computeAdjacentIdsFromOrder} makes it read the moved card's ORIGINAL
+ * neighbors, so a same-column reorder persisted the card's OLD neighbor instead
+ * of the DROP TARGET. Simulating the drop here — producing the order the list
+ * WILL have once the move is applied — lets adjacency reflect the drop target.
+ *
+ *   - SAME container (`activeId` already present): relocate it with `arrayMove`
+ *     from its current index to the OVER card's index — the idiomatic
+ *     `@dnd-kit/sortable` reorder (equivalent to the library's own
+ *     `arrayMove(items, activeIndex, overIndex)` used in `onDragEnd`).
+ *   - CROSS container (`activeId` absent): splice-insert it at the OVER card's
+ *     index (pushing the over card and its followers down by one).
+ *
+ * When `overId` cannot be located in `currentOrder` (e.g. dropped on the
+ * container itself rather than a sibling card), the card moves to the END,
+ * matching a drop past the last item.
+ */
+export function computeFinalOrder(
+  currentOrder: UsId[],
+  activeId: UsId,
+  overId: UsId,
+): UsId[] {
+  const oldIndex = currentOrder.indexOf(activeId);
+  const overIndex = currentOrder.indexOf(overId);
+
+  if (oldIndex !== -1) {
+    // Same container: relocate WITHIN the list. A missing over id (dropped on
+    // the column body) means "to the end".
+    const targetIndex = overIndex === -1 ? currentOrder.length - 1 : overIndex;
+    return arrayMove(currentOrder, oldIndex, targetIndex);
+  }
+
+  // Cross container: insert the moved id at the over card's slot (append when
+  // the over id is not part of this container).
+  const result = [...currentOrder];
+  const insertAt = overIndex === -1 ? result.length : overIndex;
+  result.splice(insertAt, 0, activeId);
+  return result;
+}
+
+/**
  * Read the destination Kanban column's status + swimlane from its DOM dataset.
  *
  * Reproduces `newStatus = Number(parentEl.dataset.status)` and
@@ -234,11 +282,15 @@ export function computeAdjacentIdsFromOrder(
  */
 export function readKanbanColumnTarget(columnEl: HTMLElement): {
   newStatus: number;
-  newSwimlane: number;
+  newSwimlane: number | null;
 } {
   return {
     newStatus: Number(columnEl.dataset.status),
-    newSwimlane: Number(columnEl.dataset.swimlane),
+    // A column in a NON-swimlane project carries no `data-swimlane`; that MUST
+    // read as `null` (the "no swimlane" state), NOT `NaN`/`0`, so the no-op
+    // guard can compare it against the equally-`null` source swimlane. The `-1`
+    // sentinel and real numeric ids pass through unchanged (KB-6).
+    newSwimlane: toNumberOrNull(columnEl.dataset.swimlane),
   };
 }
 
@@ -247,15 +299,18 @@ export function readKanbanColumnTarget(columnEl: HTMLElement): {
  * `../kanban` droppable attaches to its `@dnd-kit` node (the data-model path,
  * used when no `columnEl` is wired). Mirrors {@link readKanbanColumnTarget} but
  * sources `statusId` / `swimlaneId` from `over.data.current` rather than the DOM
- * dataset. Non-numeric / missing values coerce to `NaN`, surfacing a wiring bug
- * loudly rather than silently sending `0`.
+ * dataset. A missing `statusId` still coerces to `NaN` (a card ALWAYS carries a
+ * status, so its absence is a wiring bug surfaced loudly). A missing / null
+ * `swimlaneId`, by contrast, is the legitimate "no swimlane" state of a
+ * NON-swimlane project and MUST read as `null` (not `NaN`/`0`) so the no-op
+ * guard can compare it against the equally-`null` source swimlane (KB-6).
  */
 export function readColumnTargetFromData(
   data: Record<string, unknown> | null | undefined,
-): { newStatus: number; newSwimlane: number } {
+): { newStatus: number; newSwimlane: number | null } {
   return {
     newStatus: Number(data?.['statusId']),
-    newSwimlane: Number(data?.['swimlaneId']),
+    newSwimlane: toNumberOrNull(data?.['swimlaneId']),
   };
 }
 
@@ -265,9 +320,14 @@ export function readColumnTargetFromData(
  *
  * Reproduces `apiNewSwimlaneId = null if newSwimlaneId == -1` from
  * `KanbanController.moveUs` (kanban/main.coffee:604-606) — the single point where
- * the board's `-1` sentinel is translated to the wire `null`.
+ * the board's `-1` sentinel is translated to the wire `null`. An already-`null`
+ * swimlane (a NON-swimlane project's "no swimlane" state) passes through as
+ * `null` unchanged (KB-6).
  */
-export function toApiSwimlane(newSwimlane: number): number | null {
+export function toApiSwimlane(newSwimlane: number | null): number | null {
+  if (newSwimlane === null) {
+    return null;
+  }
   return newSwimlane === -1 ? null : newSwimlane;
 }
 
@@ -639,8 +699,11 @@ function readItemEl(
  * Destination geometry is read via whichever path `../kanban` wires:
  *   - DOM path  — when the over droppable exposes a `columnEl` HTMLElement:
  *     {@link readKanbanColumnTarget} + {@link computeAdjacentIds} + {@link indexAmong};
- *   - data path — otherwise, from `over.data.current`:
- *     {@link readColumnTargetFromData} + {@link computeAdjacentIdsFromOrder}.
+ *   - data path — otherwise, `over` is a sibling card and geometry is read from
+ *     `over.data.current`: {@link readColumnTargetFromData} for the destination
+ *     column, then {@link computeFinalOrder} (simulate the drop over `over.id`)
+ *     feeding {@link computeAdjacentIdsFromOrder} so neighbors reflect the drop
+ *     target rather than the moved card's original slot.
  *
  * The source container (`statusId`/`swimlaneId`) and `oldIndex` are read from the
  * active item's `data.current` (attached at drag start by `../kanban`). When they
@@ -667,7 +730,7 @@ export function createKanbanDragEndHandler(
     const overData = over.data.current ?? undefined;
 
     let newStatus: number;
-    let newSwimlane: number;
+    let newSwimlane: number | null;
     let adjacent: AdjacentIds;
     let index: number;
 
@@ -683,22 +746,39 @@ export function createKanbanDragEndHandler(
         : { previousId: null, nextId: null };
       index = cardEl ? indexAmong(cardEl, columnEl, 'tg-card') : -1;
     } else {
-      // DATA PATH (preferred for @dnd-kit): read status/swimlane + final order.
+      // DATA PATH (preferred for @dnd-kit): `over` is a sibling CARD. Read the
+      // destination column's status/swimlane from the over card's data, then
+      // compute the FINAL ordered id list by SIMULATING the drop. The order read
+      // from `over.data.current.sortable.items` is the CURRENT order — the moved
+      // card is still in its ORIGINAL slot at dragEnd (React applies the move in
+      // `onMove`, after this handler). Simulating the drop (KB-7) makes adjacency
+      // reflect the DROP TARGET (`over.id`) instead of the moved card's stale
+      // original neighbors, which previously persisted the wrong neighbor on a
+      // same-column reorder.
       const target = readColumnTargetFromData(overData);
       newStatus = target.newStatus;
       newSwimlane = target.newSwimlane;
-      const orderedIds = readOrderedIds(overData);
-      adjacent = computeAdjacentIdsFromOrder(orderedIds, activeId);
-      index = orderedIds.indexOf(activeId);
+      const currentOrder = readOrderedIds(overData);
+      const overId = Number(over.id);
+      const finalOrder = computeFinalOrder(currentOrder, activeId, overId);
+      adjacent = computeAdjacentIdsFromOrder(finalOrder, activeId);
+      index = finalOrder.indexOf(activeId);
     }
 
     // Source container + original index, attached at drag start by ../kanban.
     const sourceStatus = toNumberOrNull(activeData?.['statusId']);
     const sourceSwimlane = toNumberOrNull(activeData?.['swimlaneId']);
     const oldIndex = toNumberOrNull(activeData?.['oldIndex']);
+    // KB-6: a NON-swimlane project has NO swimlane, so BOTH the source and
+    // destination swimlanes are `null`. The comparison must therefore treat
+    // `null === null` as "same swimlane" — the previous `sourceSwimlane !== null`
+    // clause wrongly excluded the null case, so a drop-in-place on a
+    // swimlane-less board was never recognized as a no-op and fired a redundant
+    // `bulk_update_kanban_order` write. We keep requiring a KNOWN source status
+    // (a card always has one); the swimlanes are compared directly, so the
+    // sentinel (`-1`), a real id, and `null` all compare correctly.
     const sameContainer =
       sourceStatus !== null &&
-      sourceSwimlane !== null &&
       newStatus === sourceStatus &&
       newSwimlane === sourceSwimlane;
 

@@ -110,6 +110,11 @@ function makeEvent(
   activeId: number,
   activeData: Record<string, unknown> | undefined,
   overData: Record<string, unknown> | null | undefined,
+  // The id of the `over` droppable — at runtime the sibling card under the
+  // pointer. The Kanban DATA-path handler reads `Number(over.id)` to simulate
+  // the drop over that card. Defaults to a non-numeric sentinel (coerces to NaN)
+  // so tests that don't target a specific card are unaffected.
+  overId: number | string = 'over-droppable',
 ): DragEndEventLike {
   const active = {
     id: activeId,
@@ -119,7 +124,7 @@ function makeEvent(
   const over =
     overData === null
       ? null
-      : { id: 'over-droppable', rect: {}, data: { current: overData }, disabled: false };
+      : { id: overId, rect: {}, data: { current: overData }, disabled: false };
   return {
     activatorEvent: new Event('pointerup'),
     active,
@@ -662,12 +667,15 @@ describe('createKanbanDragEndHandler (deterministic, injected mock api)', () => 
       getSelectedIds: () => [],
     });
 
-    // DATA PATH: moved id 20 lands at index 1 of [10, 20, 30] in the default
-    // (swimlane -1) row of status 2; source was status 1 so it is a cross-column move.
+    // DATA PATH (cross-column): moved id 20 comes from status 1 and is dropped
+    // OVER card 30 in status 2's default (swimlane -1) row, whose current order
+    // is [10, 30]. Simulating the drop splices 20 at 30's index -> FINAL order
+    // [10, 20, 30], so 20 lands at index 1 with previous = 10 (after-precedence).
     const event = makeEvent(
       20,
       { statusId: 1, swimlaneId: -1, oldIndex: 0 },
-      { statusId: 2, swimlaneId: -1, orderedIds: [10, 20, 30] },
+      { statusId: 2, swimlaneId: -1, orderedIds: [10, 30] },
+      30,
     );
 
     await handler(event);

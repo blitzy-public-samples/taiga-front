@@ -40,6 +40,7 @@ jest.mock('../httpClient', () => ({
   default: {
     post: jest.fn(),
     patch: jest.fn(),
+    delete: jest.fn(),
   },
 }));
 
@@ -50,6 +51,8 @@ import {
   bulkUpdateMilestone,
   bulkUpdateKanbanOrder,
   editStatus,
+  createUserStory,
+  deleteUserStory,
   userstories,
 } from '../userstories';
 import type {
@@ -58,12 +61,15 @@ import type {
   BulkUpdateBacklogOrderPayload,
   BulkUpdateMilestonePayload,
   BulkUpdateKanbanOrderPayload,
+  CreatePayload,
 } from '../userstories';
 
 /** The mocked `httpClient.post`, typed for call inspection. */
 const postMock = (): jest.Mock => httpClient.post as unknown as jest.Mock;
 /** The mocked `httpClient.patch`, typed for call inspection. */
 const patchMock = (): jest.Mock => httpClient.patch as unknown as jest.Mock;
+/** The mocked `httpClient.delete`, typed for call inspection. */
+const deleteMock = (): jest.Mock => httpClient.delete as unknown as jest.Mock;
 
 /** A sentinel resolved value used to prove the adapter returns the client's promise. */
 const RESULT = { ok: true } as const;
@@ -92,6 +98,7 @@ beforeEach(() => {
   // (re)install the resolved value here so delegation/return-passthrough holds.
   postMock().mockResolvedValue(RESULT);
   patchMock().mockResolvedValue(RESULT);
+  deleteMock().mockResolvedValue(null);
 });
 
 describe('userstories.bulkCreate (userstories.coffee:64-74)', () => {
@@ -271,12 +278,57 @@ describe('userstories.editStatus (userstories.coffee:141-147)', () => {
   });
 });
 
+describe('userstories.createUserStory (KB-5, POST /userstories)', () => {
+  it('POSTs to userstories with model FK keys { project, subject, status }', async () => {
+    const result = await createUserStory(7, 3, 'A new story');
+
+    expect(postMock()).toHaveBeenCalledTimes(1);
+    const [path, body] = postMock().mock.calls[0] as [string, CreatePayload];
+    // Relative path (no leading slash; httpClient joins it onto the API base).
+    expect(path).toBe('userstories');
+    // Model FK field names (NOT the *_id bulk keys); ref/kanban_order are
+    // server-assigned and never sent.
+    expect(body).toEqual({ project: 7, subject: 'A new story', status: 3 });
+    expect('project_id' in body).toBe(false);
+    expect('status_id' in body).toBe(false);
+    expect('ref' in body).toBe(false);
+    // Returns the client's promise (the created story).
+    expect(result).toBe(RESULT);
+    // Must not touch patch/delete.
+    expect(patchMock()).not.toHaveBeenCalled();
+    expect(deleteMock()).not.toHaveBeenCalled();
+  });
+});
+
+describe('userstories.deleteUserStory (KB-4, DELETE /userstories/{id})', () => {
+  it('DELETEs userstories/{usId} and returns the client promise', async () => {
+    const result = await deleteUserStory(42);
+
+    expect(deleteMock()).toHaveBeenCalledTimes(1);
+    const [path] = deleteMock().mock.calls[0] as [string];
+    expect(path).toBe('userstories/42');
+    // 204 No Content -> httpClient resolves null; the adapter passes it through.
+    expect(result).toBeNull();
+    // Must not touch post/patch.
+    expect(postMock()).not.toHaveBeenCalled();
+    expect(patchMock()).not.toHaveBeenCalled();
+  });
+
+  it('propagates a rejection (non-2xx) so the caller can keep the card + surface the error', async () => {
+    const err = new Error('403');
+    deleteMock().mockRejectedValueOnce(err);
+    await expect(deleteUserStory(42)).rejects.toBe(err);
+  });
+});
+
 describe('userstories aggregate export', () => {
-  it('exposes all five adapters on the default/named aggregate object', () => {
+  it('exposes all seven adapters on the default/named aggregate object', () => {
     expect(userstories.bulkCreate).toBe(bulkCreate);
     expect(userstories.bulkUpdateBacklogOrder).toBe(bulkUpdateBacklogOrder);
     expect(userstories.bulkUpdateMilestone).toBe(bulkUpdateMilestone);
     expect(userstories.bulkUpdateKanbanOrder).toBe(bulkUpdateKanbanOrder);
     expect(userstories.editStatus).toBe(editStatus);
+    expect(userstories.createUserStory).toBe(createUserStory);
+    expect(userstories.deleteUserStory).toBe(deleteUserStory);
   });
 });

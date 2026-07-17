@@ -122,6 +122,23 @@ jest.mock('../components/Board', () => {
           className: 'mock-add-standard',
           onClick: () => props.onAddNewUs && props.onAddNewUs('standard', 1),
         }),
+        // Card action callbacks (KB-2 edit / KB-3 assign / KB-4 delete) exposed
+        // so the container-level handlers can be exercised with a fixed us id 11.
+        react.createElement('button', {
+          type: 'button',
+          className: 'mock-card-edit',
+          onClick: () => props.onCardEdit && props.onCardEdit(11),
+        }),
+        react.createElement('button', {
+          type: 'button',
+          className: 'mock-card-assign',
+          onClick: () => props.onCardAssignedTo && props.onCardAssignedTo(11),
+        }),
+        react.createElement('button', {
+          type: 'button',
+          className: 'mock-card-delete',
+          onClick: () => props.onCardDelete && props.onCardDelete(11),
+        }),
       ),
   };
 });
@@ -234,7 +251,10 @@ const mockCreateKanbanDragEndHandler = createKanbanDragEndHandler as unknown as 
 function makeHookResult(overrides: Partial<UseKanbanBoardResult> = {}): UseKanbanBoardResult {
   const base = {
     // --- board state + projections ---
-    state: {},
+    // `userstoriesRaw` present (empty by default) so the real `getUsModel`
+    // (`state.userstoriesRaw.find`) never throws; nav tests override it with a
+    // resolvable story.
+    state: { userstoriesRaw: [] },
     usByStatus: { '1': [11, 12], '2': [13] },
     usMap: {},
     usByStatusSwimlanes: {},
@@ -265,8 +285,9 @@ function makeHookResult(overrides: Partial<UseKanbanBoardResult> = {}): UseKanba
     moveUsToTop: jest.fn(() => Promise.resolve()),
     addUs: jest.fn(),
     addUsBulk: jest.fn(() => Promise.resolve()),
+    addUsStandard: jest.fn(() => Promise.resolve()),
     editUs: jest.fn(),
-    deleteUs: jest.fn(),
+    deleteUs: jest.fn(() => Promise.resolve()),
     toggleFold: jest.fn(),
     toggleSwimlane: jest.fn(),
     hideStatus: jest.fn(),
@@ -369,6 +390,19 @@ describe('KanbanApp - Phase C: shell rendering', () => {
     expect(dndProps).toBeDefined();
     expect(dndProps.mode).toBe('kanban');
     expect(typeof dndProps.onDragEnd).toBe('function');
+  });
+
+  // KB-9 (a11y): the header search field must carry an `id` AND `name` so the
+  // browser stops logging "A form field element should have an id or name
+  // attribute". The accessible name is supplied by `aria-label` (no visible
+  // <label>, matching the legacy `tg-input-search` DOM for visual parity).
+  it('gives the header search input an id, name, and aria-label (KB-9)', () => {
+    const { container } = renderApp();
+    const search = container.querySelector('input[type="search"]') as HTMLInputElement | null;
+    expect(search).toBeInTheDocument();
+    expect(search?.getAttribute('id')).toBe('kanban-filter-search');
+    expect(search?.getAttribute('name')).toBe('kanban-filter-search');
+    expect(search?.getAttribute('aria-label')).toBeTruthy();
   });
 });
 
@@ -652,6 +686,158 @@ describe('KanbanApp - error-state rendering', () => {
 
     expect(container.querySelector('.load-error')).toBeInTheDocument();
     expect(container.querySelector('.write-error')).toBeInTheDocument();
+  });
+});
+
+/* ================================================================== *
+ * Group A -- single-story card operations (KB-1..KB-5)
+ * ------------------------------------------------------------------
+ * KB-5: the standard "+" opens a FUNCTIONAL subject input that POSTs via the
+ *       hook's addUsStandard (the container never calls the raw endpoint).
+ * KB-2/KB-3: the card Edit / Assign actions NAVIGATE to the AngularJS US detail
+ *       route via window.location (URL interop, AAP 0.4.2) - no inert shell.
+ * KB-4: the card Delete action opens a confirm; confirming fires the pessimistic
+ *       hook deleteUs (the server DELETE + remove-on-success live in the hook).
+ * ================================================================== */
+
+describe('KanbanApp - Group A: single-story card operations', () => {
+  // A resolvable board state so the real `getUsModel(state, 11)` returns a story
+  // whose ref (42) drives the detail-route navigation. Only `userstoriesRaw`
+  // matters here; cast to the state type (the container reads nothing else off it
+  // in these flows).
+  const stateWithUs11 = {
+    userstoriesRaw: [
+      {
+        id: 11,
+        ref: 42,
+        status: 1,
+        swimlane: null,
+        kanban_order: 1,
+        assigned_to: null,
+        assigned_users: [],
+      },
+    ],
+  } as unknown as UseKanbanBoardResult['state'];
+  const emptyState = { userstoriesRaw: [] } as unknown as UseKanbanBoardResult['state'];
+
+  // Swap window.location for one with a spy `assign`, restoring it afterwards.
+  function withLocationAssign(run: (assign: jest.Mock) => void): void {
+    const assign = jest.fn();
+    const original = window.location;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...original, assign },
+    });
+    try {
+      run(assign);
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: original });
+    }
+  }
+
+  // ---- KB-5: functional single-story create ----
+  it('KB-5: submitting the create subject calls addUsStandard(statusId, subject) once and closes', async () => {
+    const { container, hookResult } = renderApp();
+
+    fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
+    // A real subject input is rendered (not an inert shell).
+    const input = container.querySelector('.create-us-subject') as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: '  New story  ' } });
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+    });
+
+    expect(hookResult.addUsStandard).toHaveBeenCalledTimes(1);
+    // statusId 1 from the Board stub's onAddNewUs('standard', 1); subject trimmed.
+    // The container delegates to the hook (which owns the frozen POST); it never
+    // builds the request itself.
+    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'New story');
+    // The lightbox closes after a successful create.
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+  });
+
+  it('KB-5: an empty create subject does NOT call addUsStandard and closes the shell', () => {
+    const { container, hookResult } = renderApp();
+
+    fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
+    const input = container.querySelector('.create-us-subject') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '   ' } });
+    fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+
+    expect(hookResult.addUsStandard).not.toHaveBeenCalled();
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+  });
+
+  // ---- KB-2: edit navigates to the US detail route ----
+  it('KB-2: card Edit navigates to /project/:slug/us/:ref instead of an inert shell', () => {
+    withLocationAssign((assign) => {
+      const { container } = renderApp({}, { state: stateWithUs11 });
+
+      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+
+      expect(assign).toHaveBeenCalledTimes(1);
+      expect(assign).toHaveBeenCalledWith('/project/proj/us/42');
+      // No edit shell lightbox is opened.
+      expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+    });
+  });
+
+  // ---- KB-3: assign navigates to the US detail route ----
+  it('KB-3: card Assign navigates to /project/:slug/us/:ref instead of an inert shell', () => {
+    withLocationAssign((assign) => {
+      const { container } = renderApp({}, { state: stateWithUs11 });
+
+      fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+
+      expect(assign).toHaveBeenCalledTimes(1);
+      expect(assign).toHaveBeenCalledWith('/project/proj/us/42');
+      expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+    });
+  });
+
+  it('KB-2/KB-3: navigation is a no-op when the story id cannot be resolved', () => {
+    withLocationAssign((assign) => {
+      // Empty userstoriesRaw -> getUsModel returns undefined -> no navigation.
+      const { container } = renderApp({}, { state: emptyState });
+
+      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+
+      expect(assign).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---- KB-4: delete confirm fires the pessimistic hook deleteUs ----
+  it('KB-4: card Delete opens a confirm; confirming calls the hook deleteUs with the story', async () => {
+    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
+
+    // Delete opens the confirm dialog (no server call yet).
+    fireEvent.click(container.querySelector('.mock-card-delete') as HTMLElement);
+    expect(container.querySelector('.lightbox-create-edit')).toBeInTheDocument();
+    expect(hookResult.deleteUs).not.toHaveBeenCalled();
+
+    // Confirm -> pessimistic delete via the hook, then the dialog closes.
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-delete') as HTMLElement);
+    });
+
+    expect(hookResult.deleteUs).toHaveBeenCalledTimes(1);
+    expect((hookResult.deleteUs as jest.Mock).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ id: 11 }),
+    );
+    // The confirm dialog closes on confirm.
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+  });
+
+  it('KB-4: cancelling the delete confirm does NOT call deleteUs', () => {
+    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
+
+    fireEvent.click(container.querySelector('.mock-card-delete') as HTMLElement);
+    fireEvent.click(container.querySelector('.lightbox-create-edit .btn-cancel') as HTMLElement);
+
+    expect(hookResult.deleteUs).not.toHaveBeenCalled();
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 });
 

@@ -528,6 +528,17 @@ const Card = ({
   const ref = model.ref;
   const isBlocked = Boolean(model.is_blocked);
   const blockedNote = model.blocked_note ?? '';
+
+  // KB-1: the card title links to the AngularJS user-story DETAIL route
+  // `/project/:pslug/us/:usref` [app/coffee/app.coffee:254], reproducing the
+  // legacy `tg-nav="project-userstories-detail"` anchor (base/navurls.coffee).
+  // Rendering a REAL same-origin href (instead of the inert `href="#"`) lets the
+  // AngularJS html5Mode router intercept the click for client-side navigation -
+  // pure URL interop, no cross-framework bridge (AAP 0.4.2). `project.slug` is a
+  // string on the loaded project; `ref` is the server-assigned story ref.
+  const projectSlug = String((project as Record<string, unknown>).slug ?? '');
+  const usDetailHref =
+    ref != null && projectSlug ? `/project/${projectSlug}/us/${ref}` : '#';
   const isIocaine = Boolean(model.is_iocaine);
   const totalPoints = model.total_points;
   const dueDate = model.due_date;
@@ -681,7 +692,7 @@ const Card = ({
           {/* 4. card-title (card-title.jade) */}
           <h2 className="card-title">
             <a
-              href="#"
+              href={usDetailHref}
               title={zoomLevel === 0 ? `#${ref ?? ''} ${subject}` : undefined}
             >
               {visible('ref') ? <span className="card-ref">{`#${ref ?? ''}`}</span> : null}

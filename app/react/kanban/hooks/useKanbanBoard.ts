@@ -354,8 +354,19 @@ export interface UseKanbanBoardResult {
     swimlaneId?: number | null,
     position?: 'top' | 'bottom',
   ) => Promise<void>;
+  /**
+   * Standard single-story create (KB-5): POST /userstories with the subject in
+   * the given column, then add the created story to the board. Resolves once the
+   * board reflects the new story; surfaces a `writeError` on failure.
+   */
+  addUsStandard: (statusId: number, subject: string, position?: 'top' | 'bottom') => Promise<void>;
   editUs: (us: UserStory) => void;
-  deleteUs: (us: UserStory) => void;
+  /**
+   * Delete a single story (KB-4). Performs the frozen `DELETE /userstories/{id}`
+   * FIRST and removes the story from the board ONLY on success (pessimistic), so
+   * a failed delete leaves the card in place and surfaces a `writeError`.
+   */
+  deleteUs: (us: UserStory) => Promise<void>;
   toggleFold: (statusId: number) => void;
   toggleSwimlane: (swimlaneId: number) => void;
   hideStatus: (statusId: number) => void;
@@ -953,6 +964,37 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
   );
 
   /**
+   * `addUsStandard` (KB-5) - the standard single-story create path. POSTs a
+   * single `subject` to `POST /userstories` via the typed adapter, then adds the
+   * returned story (with its server-assigned id/ref/kanban_order) to the board.
+   * The user stays on the board (no reload, no navigation). Mirrors `addUsBulk`
+   * for the single-create case, reproducing the AngularJS generic-form
+   * `usform:new:success` STATE effect (main.coffee:187-206) that added the
+   * created story to the board without a full reload.
+   *
+   * F-WRITE parity: a failed create is caught, surfaced via the `writeError`
+   * channel (the same "changes were not saved" surface the failed-move path
+   * uses), and never escapes as an uncaught rejection — callers invoke this
+   * fire-and-forget.
+   */
+  const addUsStandard = useCallback(
+    async (statusId: number, subject: string, position: 'top' | 'bottom' = 'bottom'): Promise<void> => {
+      const pid = projectIdRef.current;
+      if (pid == null) {
+        return;
+      }
+      try {
+        setWriteError(null);
+        const created = await userstories.createUserStory(pid, statusId, subject);
+        addUs(created as UserStory, position);
+      } catch (err) {
+        setWriteError(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+    [addUs],
+  );
+
+  /**
    * `editUs` - reproduces the `usform:edit:success` STATE effect (main.coffee:
    * 208-221). When the status changed, bump `kanban_order` to (last card's
    * order + 1) so the story lands at the END of the new status column, then
@@ -985,14 +1027,37 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
   );
 
   /**
-   * `deleteUs` - reproduces the `kanban:us:deleted` handler (main.coffee:
-   * 223-224): remove the story from board state. The full delete flow (confirm
-   * dialog + server `DELETE /userstories/:id`, main.coffee:297-314) is a
-   * card-action owned by KanbanApp; this dispatcher reproduces only the
-   * board-state removal that the event triggers.
+   * `deleteUs` (KB-4) - the FULL single-story delete flow. Reproduces the
+   * AngularJS confirm-then-delete path (main.coffee:297-314): `repo.remove(us)`
+   * -> `DELETE /userstories/{id}` FIRST, then on the server's `204 No Content`
+   * the `kanban:us:deleted` event removes the story from board state
+   * (main.coffee:223-224).
+   *
+   * This is PESSIMISTIC on purpose: the previous implementation removed the card
+   * from the board WITHOUT ever calling the server (the QA "phantom delete" -
+   * the story reappeared on reload and, worse, its stale id could corrupt a
+   * later `bulk_update_kanban_order` payload). We now:
+   *   - fire exactly ONE `DELETE /userstories/{id}` write,
+   *   - remove from the board ONLY after the delete SUCCEEDS,
+   *   - on failure, keep the card in place and surface `writeError` (the same
+   *     "changes were not saved" surface the failed-move path uses),
+   *   - never re-throw (callers invoke this fire-and-forget), so a rejected
+   *     delete does not become an uncaught promise rejection.
    */
   const deleteUs = useCallback(
-    (us: UserStory): void => {
+    async (us: UserStory): Promise<void> => {
+      try {
+        setWriteError(null);
+        await userstories.deleteUserStory(us.id);
+      } catch (err) {
+        // Server delete failed (4xx/5xx/offline): leave the story on the board
+        // and surface the error. Do NOT remove it (that was the phantom-delete
+        // bug) and do NOT re-throw.
+        setWriteError(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      // Delete succeeded on the server -> now mirror the `kanban:us:deleted`
+      // board reaction.
       applyState((prev) => remove(prev, us));
     },
     [applyState],
@@ -1211,6 +1276,7 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     moveUsToTop,
     addUs,
     addUsBulk,
+    addUsStandard,
     editUs,
     deleteUs,
     toggleFold,

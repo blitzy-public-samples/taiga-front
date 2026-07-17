@@ -66,6 +66,8 @@ import {
   type DragOverEvent,
   type DragEndEvent,
   type DragCancelEvent,
+  type Announcements,
+  type ScreenReaderInstructions,
 } from '@dnd-kit/core';
 
 import { useDndSensors } from './sensors';
@@ -125,6 +127,44 @@ export interface DndProviderProps {
   /** The sortable content (columns/cards or the backlog table/rows). */
   children: React.ReactNode;
 }
+
+/**
+ * Accessibility bundle passed to `<DndContext accessibility={...}>` for
+ * screen-reader parity (KB-8).
+ *
+ * `@dnd-kit` ships a DEFAULT `screenReaderInstructions.draggable` that every
+ * draggable advertises through its `aria-describedby`
+ * ("To pick up a draggable item, press the space bar. While dragging, use the
+ * arrow keys to move the item…"), plus DEFAULT `announcements` phrased around
+ * that same keyboard-move model. This board wires ONLY a pointer sensor
+ * (see `./sensors` — `useDndSensors()` returns a single `PointerSensor`); there
+ * is NO `KeyboardSensor`, so keyboard drag-and-drop is deliberately NOT
+ * implemented. That matches the legacy `dragula` drakes, which offered no
+ * keyboard DnD and emitted no screen-reader text at all.
+ *
+ * Advertising an unimplemented keyboard affordance misleads assistive-technology
+ * users (a user is told to press Space/arrows, but nothing happens). We therefore
+ * override the accessibility content with empty / parity-accurate values:
+ *   - `screenReaderInstructions.draggable: ''` — each card's `aria-describedby`
+ *     no longer promises keyboard dragging.
+ *   - `announcements.*` all return `undefined` — no live-region messages, exactly
+ *     as the silent `dragula` implementation behaved.
+ *
+ * This changes NO visible DOM and NO drag behavior — it only removes misleading
+ * screen-reader text, restoring behavioral parity with the AngularJS screen.
+ */
+const DND_ACCESSIBILITY: {
+  screenReaderInstructions: ScreenReaderInstructions;
+  announcements: Announcements;
+} = {
+  screenReaderInstructions: { draggable: '' },
+  announcements: {
+    onDragStart: () => undefined,
+    onDragOver: () => undefined,
+    onDragEnd: () => undefined,
+    onDragCancel: () => undefined,
+  },
+};
 
 /**
  * `<DndContext>` wrapper that drives sensors, auto-scroll, the drag-lifecycle
@@ -288,6 +328,7 @@ export const DndProvider: React.FC<DndProviderProps> = ({
     <DndContext
       sensors={sensors}
       autoScroll={autoScroll}
+      accessibility={DND_ACCESSIBILITY}
       onDragStart={handleDragStart}
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}

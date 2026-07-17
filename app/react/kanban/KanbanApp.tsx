@@ -129,6 +129,9 @@ const I18N: Record<string, string> = {
   'COMMON.CLOSE': 'Close',
   'COMMON.DELETE': 'Delete',
   'US.BULK_PLACEHOLDER': 'One user story per line',
+  // Single-story create subject placeholder (KB-5); matches COMMON.FIELDS.SUBJECT
+  // ("Subject") from the legacy locale.
+  'US.SUBJECT_PLACEHOLDER': 'Subject',
   'COMMON.PERMISSION_DENIED': 'You do not have permission to view this board.',
   // Generic error strings reused from the legacy notification service
   // (`app/locales/taiga/locale-en.json` -> NOTIFICATION.*) so the failed-load
@@ -369,17 +372,24 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   /* ----------------------------------------------------------------------- *
    * Lightbox coordination state (main.coffee:266-315)
    * ----------------------------------------------------------------------- */
-  // The create/edit lightbox host reproduces `.lightbox-create-edit`; in
-  // coexistence the deep user-story form is provided by the AngularJS generic
-  // form, so this host is a faithful shell that still drives the
-  // `isLightboxOpened` gate. `intent` distinguishes the create / edit / assign /
-  // delete flows the card popover triggers.
+  // The create/delete lightbox host reproduces `.lightbox-create-edit`. Two
+  // intents remain in React ownership:
+  //   - `create`: a FUNCTIONAL single-story create (KB-5) - a subject input that
+  //     POSTs `/userstories` and adds the story to the board (user stays here).
+  //   - `delete`: the confirm dialog before the pessimistic `DELETE /userstories`
+  //     (KB-4).
+  // The former `edit`/`assign` intents were inert shells; per the coexistence
+  // boundary (AAP 0.4.2) those card actions now NAVIGATE to the AngularJS
+  // user-story detail route instead (see `navigateToUsDetail`), so they no
+  // longer open this host.
   const [createEditLightbox, setCreateEditLightbox] = useState<{
     open: boolean;
-    intent: 'create' | 'edit' | 'assign' | 'delete';
+    intent: 'create' | 'delete';
     statusId: number | null;
     usId: number | null;
   }>({ open: false, intent: 'create', statusId: null, usId: null });
+  // Subject text for the functional single-story create (KB-5).
+  const [createSubject, setCreateSubject] = useState<string>('');
   // The bulk lightbox host reproduces `.lightbox-generic-bulk`; it is fully
   // functional -- a textarea that posts through the clean bulk-create endpoint.
   const [bulkLightbox, setBulkLightbox] = useState<{ open: boolean; statusId: number | null }>({
@@ -441,6 +451,7 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     moveUs,
     moveUsToTop,
     addUsBulk,
+    addUsStandard,
     deleteUs,
     toggleFold,
     toggleSwimlane,
@@ -601,14 +612,16 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   }, []);
 
   // `addNewUs(type, statusId)` (main.coffee:266): 'bulk' opens the functional
-  // bulk textarea; 'standard' opens the create lightbox shell. Both raise the
-  // lightbox gate so a concurrent `projects`-change event defers its reload.
+  // bulk textarea; 'standard' opens the functional single-story create input
+  // (KB-5). Both raise the lightbox gate so a concurrent `projects`-change event
+  // defers its reload.
   const addNewUs = useCallback(
     (mode: 'standard' | 'bulk', statusId: number) => {
       if (mode === 'bulk') {
         setBulkText('');
         setBulkLightbox({ open: true, statusId });
       } else {
+        setCreateSubject('');
         setCreateEditLightbox({ open: true, intent: 'create', statusId, usId: null });
       }
       setLightboxOpen(true);
@@ -616,24 +629,34 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     [setLightboxOpen],
   );
 
-  // `editUs(id)` (main.coffee:278) -- open the edit lightbox shell + raise gate.
-  const handleEditUs = useCallback(
+  // KB-2/KB-3: single-story edit and assignment are NOT reproduced as in-React
+  // lightboxes. Per the coexistence boundary (AAP 0.4.2 - interop is globals +
+  // URL + REST only, NEVER the AngularJS injector/$rootScope), the card Edit and
+  // Assign actions (and the avatar quick-assign) NAVIGATE to the AngularJS
+  // user-story DETAIL route `/project/:pslug/us/:usref`
+  // [app/coffee/app.coffee:254], whose page exposes the full edit + assignment
+  // surface. This is sanctioned URL interop (a plain same-origin browser
+  // navigation via the `window.location` global), NOT a cross-framework bridge,
+  // and it replaces the previously-inert edit/assign shells.
+  const navigateToUsDetail = useCallback(
     (id: number) => {
-      setCreateEditLightbox({ open: true, intent: 'edit', statusId: null, usId: id });
-      setLightboxOpen(true);
+      const us = getUsModel(state, id);
+      const ref = us == null ? null : Number(us.ref);
+      if (ref == null || Number.isNaN(ref)) {
+        return;
+      }
+      window.location.assign(`/project/${projectSlug}/us/${ref}`);
     },
-    [setLightboxOpen],
+    [state, projectSlug],
   );
 
-  // `changeUsAssignedUsers(id)` (main.coffee:339) -- open the assign lightbox
-  // shell (assignment is a facet of edit) + raise gate.
-  const handleAssignedTo = useCallback(
-    (id: number) => {
-      setCreateEditLightbox({ open: true, intent: 'assign', statusId: null, usId: id });
-      setLightboxOpen(true);
-    },
-    [setLightboxOpen],
-  );
+  // `editUs(id)` (main.coffee:278) -> navigate to the US detail page (KB-2).
+  const handleEditUs = navigateToUsDetail;
+
+  // `changeUsAssignedUsers(id)` (main.coffee:339) + avatar quick-assign ->
+  // navigate to the US detail page, whose assignment control replaces the legacy
+  // assign lightbox (KB-3).
+  const handleAssignedTo = navigateToUsDetail;
 
   // `deleteUs(id)` (main.coffee:297) -- open the confirm shell + raise gate. The
   // actual removal happens on confirm (see `confirmDelete`).
@@ -679,19 +702,19 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     setLightboxOpen(false);
   }, [setLightboxOpen]);
 
-  // Confirm delete -> board-state removal via the hook, then close. The server
-  // DELETE + confirm dialog was a global AngularJS lightbox (outside the two
-  // hosts this screen owns, with no delete endpoint in scope); the hook's
-  // `deleteUs` reproduces the board reaction (`kanban:us:deleted`).
+  // Confirm delete (KB-4). Resolve the raw model, close the confirm dialog
+  // immediately (parity: the confirm lightbox dismisses on click), then fire the
+  // PESSIMISTIC delete fire-and-forget: the hook's `deleteUs` performs the frozen
+  // `DELETE /userstories/{id}` and removes the card from the board ONLY on the
+  // server's `204 No Content` (surfacing `writeError` on failure). This replaces
+  // the previous phantom delete, which removed the card WITHOUT any server call.
   const confirmDelete = useCallback(() => {
     const id = createEditLightbox.usId;
-    if (id != null) {
-      const us = getUsModel(state, id);
-      if (us) {
-        deleteUs(us);
-      }
-    }
+    const us = id != null ? getUsModel(state, id) : undefined;
     closeCreateEdit();
+    if (us) {
+      void deleteUs(us);
+    }
   }, [createEditLightbox.usId, state, deleteUs, closeCreateEdit]);
 
   const submitBulk = useCallback(() => {
@@ -707,6 +730,21 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
       closeBulk();
     });
   }, [bulkLightbox.statusId, bulkText, addUsBulk, closeBulk]);
+
+  // Submit the functional single-story create (KB-5). `addUsStandard` POSTs
+  // `/userstories` and adds the created story (with its server id/ref) to the
+  // board; the user stays on the board. An empty subject just closes the shell.
+  const submitStandard = useCallback(() => {
+    const statusId = createEditLightbox.statusId;
+    const subject = createSubject.trim();
+    if (statusId == null || subject.length === 0) {
+      closeCreateEdit();
+      return;
+    }
+    void addUsStandard(statusId, subject).then(() => {
+      closeCreateEdit();
+    });
+  }, [createEditLightbox.statusId, createSubject, addUsStandard, closeCreateEdit]);
 
   /* ----------------------------------------------------------------------- *
    * Drag-and-drop (provide context; mechanics live in ../shared/dnd)
@@ -784,13 +822,9 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   const hasSwimlanes = swimlanesList.length > 0;
   const projectName = project ? String((project as Record<string, unknown>).name ?? '') : '';
   const createEditTitle =
-    createEditLightbox.intent === 'edit'
-      ? t('LIGHTBOX.CREATE_EDIT_US.EDIT')
-      : createEditLightbox.intent === 'assign'
-        ? t('LIGHTBOX.ASSIGNED_USERS.TITLE')
-        : createEditLightbox.intent === 'delete'
-          ? t('COMMON.CONFIRM.TITLE')
-          : t('LIGHTBOX.CREATE_EDIT_US.NEW');
+    createEditLightbox.intent === 'delete'
+      ? t('COMMON.CONFIRM.TITLE')
+      : t('LIGHTBOX.CREATE_EDIT_US.NEW');
 
   /* ----------------------------------------------------------------------- *
    * Render -- reproduce the kanban.jade shell DOM exactly (zero visual change).
@@ -823,8 +857,19 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
               </button>
               {/* tg-input-search reproduced inline (inert host wrapper + inner DOM). */}
               <TgInputSearch>
+                {/*
+                 * KB-9 (a11y): give the search field an `id`/`name` (and an
+                 * `aria-label` for the accessible name) so the browser no longer
+                 * logs "A form field element should have an id or name attribute".
+                 * These attributes are INVISIBLE — no visible `<label>` is added,
+                 * matching the legacy `tg-input-search` DOM (which carried none) so
+                 * the reproduced markup and existing SCSS render byte-identically.
+                 */}
                 <input
                   type="search"
+                  id="kanban-filter-search"
+                  name="kanban-filter-search"
+                  aria-label={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
                   placeholder={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
                   value={filterQ}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => changeQ(event.target.value)}
@@ -909,12 +954,32 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             </div>
           ) : (
             <div className="lightbox-body">
-              {/* Coexistence shell: the detailed user-story form is provided by
-                  the AngularJS generic-form lightbox outside the React boundary. */}
-              <p className="help-text">{t('LIGHTBOX.CREATE_EDIT_US.NEW')}</p>
+              {/* Functional single-story create (KB-5): a subject input that
+                  POSTs `/userstories` into the clicked column and adds the story
+                  to the board. Enter submits; the user stays on the board. */}
+              <input
+                type="text"
+                className="create-us-subject"
+                name="create-us-subject"
+                id="create-us-subject"
+                aria-label={t('LIGHTBOX.CREATE_EDIT_US.NEW')}
+                placeholder={t('US.SUBJECT_PLACEHOLDER')}
+                value={createSubject}
+                autoFocus
+                onChange={(event: ChangeEvent<HTMLInputElement>) => setCreateSubject(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    submitStandard();
+                  }
+                }}
+              />
               <div className="lightbox-actions">
                 <button type="button" className="btn-cancel" onClick={closeCreateEdit}>
-                  {t('COMMON.CLOSE')}
+                  {t('COMMON.CANCEL')}
+                </button>
+                <button type="button" className="btn-save" onClick={submitStandard}>
+                  {t('COMMON.SAVE')}
                 </button>
               </div>
             </div>

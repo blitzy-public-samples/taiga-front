@@ -386,11 +386,20 @@ const FilterBar = (props: FilterBarProps) => {
               saveCustomFilter();
             }}
           >
+            {/*
+             * KB-9 (a11y): add an `id`/`name` (alongside the existing
+             * `aria-label`) so the browser no longer logs "A form field element
+             * should have an id or name attribute". No visible `<label>` is added
+             * — the accessible name is supplied by `aria-label`, matching the
+             * legacy filter markup so visual parity is preserved.
+             */}
             <input
               className={
                 'add-filter-input e2e-filter-name-input' +
                 (lengthZeroError || repeatedFilterError ? ' checksley-error' : '')
               }
+              id="kanban-add-filter-name"
+              name="kanban-add-filter-name"
               aria-label={t('COMMON.FILTERS.PLACEHOLDER_FILTER_NAME')}
               type="text"
               placeholder={t('COMMON.FILTERS.PLACEHOLDER_FILTER_NAME')}

@@ -91,12 +91,17 @@ jest.mock('../../shared/api/userstories', () => {
   const bulkUpdateMilestone = jest.fn();
   const bulkUpdateKanbanOrder = jest.fn();
   const editStatus = jest.fn();
+  // KB-5 single-story create + KB-4 single-story delete adapters.
+  const createUserStory = jest.fn();
+  const deleteUserStory = jest.fn();
   const aggregate = {
     bulkCreate,
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
     bulkUpdateKanbanOrder,
     editStatus,
+    createUserStory,
+    deleteUserStory,
   };
   return { __esModule: true, ...aggregate, default: aggregate };
 });
@@ -147,6 +152,8 @@ import { redirectToLogin } from '../../shared/session';
 const getMock = httpClient.get as unknown as jest.Mock;
 const bulkKanbanMock = userstories.bulkUpdateKanbanOrder as unknown as jest.Mock;
 const bulkCreateMock = userstories.bulkCreate as unknown as jest.Mock;
+const createUsMock = userstories.createUserStory as unknown as jest.Mock;
+const deleteUsMock = userstories.deleteUserStory as unknown as jest.Mock;
 const createEventsClientMock = createEventsClient as unknown as jest.Mock;
 const redirectToLoginMock = redirectToLogin as unknown as jest.Mock;
 
@@ -318,6 +325,17 @@ describe('useKanbanBoard', () => {
     installDefaultGet();
     bulkKanbanMock.mockResolvedValue({});
     bulkCreateMock.mockResolvedValue([]); // [] -> addUs(add, []) is a clean no-op
+    // KB-4 delete resolves to null (204 No Content); KB-5 create resolves to a
+    // minimal created story so addUs can add it. Individual tests override.
+    deleteUsMock.mockResolvedValue(null);
+    createUsMock.mockResolvedValue({
+      id: 500,
+      status: 1,
+      swimlane: null,
+      kanban_order: 10,
+      assigned_to: null,
+      assigned_users: [],
+    });
     (userstories.editStatus as unknown as jest.Mock).mockResolvedValue({});
     (userstories.bulkUpdateBacklogOrder as unknown as jest.Mock).mockResolvedValue({});
     (userstories.bulkUpdateMilestone as unknown as jest.Mock).mockResolvedValue({});
@@ -910,7 +928,10 @@ describe('useKanbanBoard', () => {
           assigned_to: null,
           assigned_users: [],
         });
-        view.result.current.deleteUs({
+        // `deleteUs` is now PESSIMISTIC (KB-4): it awaits DELETE /userstories/{id}
+        // and removes from the board only on success. Await it so the removal has
+        // completed before the assertion.
+        await view.result.current.deleteUs({
           id: 12,
           status: 1,
           swimlane: null,
@@ -924,6 +945,91 @@ describe('useKanbanBoard', () => {
       expect(view.result.current.usMap[99]).toBeDefined();
       expect(view.result.current.usMap[12]).toBeUndefined();
       expect(view.result.current.project).not.toBeNull();
+    });
+
+    // KB-4: deleteUs fires exactly one DELETE /userstories/{id} and removes the
+    // story from the board ONLY on the server's 204.
+    it('deleteUs calls deleteUserStory(id) and removes the story on success', async () => {
+      const view = await loadHook();
+      expect(view.result.current.usMap[12]).toBeDefined();
+
+      await act(async () => {
+        await view.result.current.deleteUs({
+          id: 12,
+          status: 1,
+          swimlane: null,
+          kanban_order: 2,
+          assigned_to: null,
+          assigned_users: [],
+        });
+      });
+
+      expect(deleteUsMock).toHaveBeenCalledTimes(1);
+      expect(deleteUsMock).toHaveBeenCalledWith(12);
+      expect(view.result.current.usMap[12]).toBeUndefined();
+      expect(view.result.current.writeError ?? null).toBeNull();
+    });
+
+    // KB-4: a FAILED delete keeps the card on the board and surfaces writeError
+    // (no phantom delete).
+    it('deleteUs keeps the story and surfaces writeError when the server delete fails', async () => {
+      const view = await loadHook();
+      expect(view.result.current.usMap[12]).toBeDefined();
+      const err = new Error('boom');
+      deleteUsMock.mockRejectedValueOnce(err);
+
+      await act(async () => {
+        await view.result.current.deleteUs({
+          id: 12,
+          status: 1,
+          swimlane: null,
+          kanban_order: 2,
+          assigned_to: null,
+          assigned_users: [],
+        });
+      });
+
+      expect(deleteUsMock).toHaveBeenCalledTimes(1);
+      // Card stays on the board.
+      expect(view.result.current.usMap[12]).toBeDefined();
+      expect(view.result.current.writeError).toBe(err);
+    });
+
+    // KB-5: addUsStandard posts to createUserStory(projectId, statusId, subject)
+    // and adds the created story to the board.
+    it('addUsStandard posts to createUserStory and adds the created story', async () => {
+      const view = await loadHook();
+      createUsMock.mockResolvedValueOnce({
+        id: 777,
+        status: 1,
+        swimlane: null,
+        kanban_order: 99,
+        assigned_to: null,
+        assigned_users: [],
+      });
+
+      await act(async () => {
+        await view.result.current.addUsStandard(1, 'A brand new story');
+      });
+
+      expect(createUsMock).toHaveBeenCalledTimes(1);
+      expect(createUsMock).toHaveBeenCalledWith(7, 1, 'A brand new story');
+      expect(view.result.current.usMap[777]).toBeDefined();
+      expect(view.result.current.writeError ?? null).toBeNull();
+    });
+
+    // KB-5: a FAILED create surfaces writeError and adds nothing.
+    it('addUsStandard surfaces writeError when the create fails', async () => {
+      const view = await loadHook();
+      const err = new Error('create failed');
+      createUsMock.mockRejectedValueOnce(err);
+
+      await act(async () => {
+        await view.result.current.addUsStandard(1, 'Doomed story');
+      });
+
+      expect(createUsMock).toHaveBeenCalledTimes(1);
+      expect(view.result.current.writeError).toBe(err);
     });
   });
 

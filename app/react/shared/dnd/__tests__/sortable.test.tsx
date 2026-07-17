@@ -30,7 +30,11 @@ import type { DragEndEvent } from '@dnd-kit/core';
 
 // Mock `useSortable` so the hook wrappers can be tested with a controlled drag
 // state (transform / transition / isDragging) — no DndContext or real drag needed.
+// The rest of the module is kept REAL via `requireActual` so pure helpers such as
+// `arrayMove` (used by `computeFinalOrder`) resolve normally — they have no React
+// or DOM dependency and are safe to run under jsdom.
 jest.mock('@dnd-kit/sortable', () => ({
+  ...jest.requireActual('@dnd-kit/sortable'),
   useSortable: jest.fn(),
 }));
 import { useSortable } from '@dnd-kit/sortable';
@@ -54,6 +58,7 @@ import {
   matchesItem,
   computeAdjacentIds,
   computeAdjacentIdsFromOrder,
+  computeFinalOrder,
   readKanbanColumnTarget,
   readColumnTargetFromData,
   toApiSwimlane,
@@ -121,6 +126,12 @@ function makeEvent(
   // present but its `data.current` is empty (exercises the defensive
   // optional-chaining / `?? undefined` short-circuit arms in the handlers).
   overData: Record<string, unknown> | null | undefined,
+  // The id of the `over` droppable. At runtime a sibling card is the drop
+  // target, so this is its numeric user-story id — the DATA-path handler reads
+  // `Number(over.id)` to simulate the drop over that card. Defaults to a
+  // non-numeric sentinel (coerces to NaN, i.e. "no specific target card") so
+  // DOM-path and defensive tests that don't set it are unaffected.
+  overId: number | string = 'over-droppable',
 ): DragEndEvent {
   const active = {
     id: activeId,
@@ -131,7 +142,7 @@ function makeEvent(
     overData === null
       ? null
       : {
-          id: 'over-droppable',
+          id: overId,
           rect: {},
           data: { current: overData },
           disabled: false,
@@ -282,6 +293,59 @@ describe('computeAdjacentIdsFromOrder (data-model after-precedence)', () => {
   });
 });
 
+describe('computeFinalOrder (simulate the drop to derive the FINAL order — KB-7)', () => {
+  // SAME container: the active id is already present and is relocated with
+  // `arrayMove` from its current index to the over card's index.
+  it('same container, move DOWN over a lower card -> arrayMove to that slot', () => {
+    // 20 dropped over 40: 20 lands where 40 was; 40 shifts up one.
+    expect(computeFinalOrder([10, 20, 30, 40], 20, 40)).toEqual([10, 30, 40, 20]);
+  });
+
+  it('same container, move UP over a higher card -> arrayMove to that slot', () => {
+    // 40 dropped over 10: 40 lands at the top; the rest shift down one.
+    expect(computeFinalOrder([10, 20, 30, 40], 40, 10)).toEqual([40, 10, 20, 30]);
+  });
+
+  it('same container, dropped over ITSELF -> order unchanged (feeds the no-op guard)', () => {
+    // The drop-in-place case: over.id === active.id. The final order equals the
+    // current order, so `finalOrder.indexOf(activeId) === oldIndex` and the
+    // handler's no-op guard can fire (no redundant write).
+    expect(computeFinalOrder([10, 20, 30], 20, 20)).toEqual([10, 20, 30]);
+  });
+
+  it('same container, over id NOT found (dropped on the column body) -> moved to the END', () => {
+    expect(computeFinalOrder([10, 20, 30], 10, 999)).toEqual([20, 30, 10]);
+  });
+
+  // CROSS container: the active id is absent and is spliced in at the over slot.
+  it('cross container, insert BEFORE the over card at its index', () => {
+    // 20 comes from another column and is dropped over 30 (index 1) -> lands at 1.
+    expect(computeFinalOrder([10, 30], 20, 30)).toEqual([10, 20, 30]);
+  });
+
+  it('cross container, over id NOT found -> appended to the end', () => {
+    expect(computeFinalOrder([10, 30], 20, 999)).toEqual([10, 30, 20]);
+  });
+
+  it('cross container, empty destination -> becomes the sole element', () => {
+    expect(computeFinalOrder([], 20, 999)).toEqual([20]);
+  });
+
+  it('KB-7 regression: a same-column reorder yields the DROP TARGET as the neighbor', () => {
+    // Reproduces the reported defect shape: id 30 is dragged DOWN over id 143 in
+    // a column whose current order still lists 30 next to its ORIGINAL neighbor
+    // 32. The FINAL order must place 143 immediately before 30 so adjacency sends
+    // after=143 (the drop target), never the stale original neighbor 32.
+    const current = [30, 32, 100, 143, 200];
+    const final = computeFinalOrder(current, 30, 143);
+    expect(final).toEqual([32, 100, 143, 30, 200]);
+    expect(computeAdjacentIdsFromOrder(final, 30)).toEqual({
+      previousId: 143,
+      nextId: null,
+    });
+  });
+});
+
 describe('readKanbanColumnTarget', () => {
   it('reads Number(dataset.status/.swimlane) from the column element', () => {
     const col = el('div', ['taskboard-column'], { status: '3', swimlane: '2' });
@@ -291,6 +355,14 @@ describe('readKanbanColumnTarget', () => {
   it('reads the -1 swimlane sentinel unchanged', () => {
     const col = el('div', ['taskboard-column'], { status: '5', swimlane: '-1' });
     expect(readKanbanColumnTarget(col)).toEqual({ newStatus: 5, newSwimlane: -1 });
+  });
+
+  it('reads a MISSING data-swimlane (non-swimlane project column) as null (KB-6)', () => {
+    // A non-swimlane project's column carries no `data-swimlane`; that must read
+    // as null (the "no swimlane" state), not NaN, so the no-op guard can match it
+    // against the equally-null source swimlane.
+    const col = el('div', ['taskboard-column'], { status: '5' });
+    expect(readKanbanColumnTarget(col)).toEqual({ newStatus: 5, newSwimlane: null });
   });
 });
 
@@ -302,10 +374,20 @@ describe('readColumnTargetFromData', () => {
     });
   });
 
-  it('coerces missing/null data to NaN (surfaces a wiring bug loudly)', () => {
+  it('coerces a missing status to NaN (surfaces a wiring bug loudly) but a missing swimlane to null (the no-swimlane state)', () => {
+    // A card ALWAYS carries a status, so a missing statusId is a wiring bug and
+    // stays a loud NaN. A missing swimlaneId is the legitimate "no swimlane"
+    // state of a non-swimlane project and MUST read as null (KB-6).
     const target = readColumnTargetFromData(null);
     expect(Number.isNaN(target.newStatus)).toBe(true);
-    expect(Number.isNaN(target.newSwimlane)).toBe(true);
+    expect(target.newSwimlane).toBeNull();
+  });
+
+  it('reads an explicit null swimlaneId as null (KB-6 non-swimlane project)', () => {
+    expect(readColumnTargetFromData({ statusId: 4, swimlaneId: null })).toEqual({
+      newStatus: 4,
+      newSwimlane: null,
+    });
   });
 });
 
@@ -320,6 +402,10 @@ describe('toApiSwimlane', () => {
 
   it('passes a positive id through unchanged', () => {
     expect(toApiSwimlane(5)).toBe(5);
+  });
+
+  it('passes null through as null (KB-6 non-swimlane project)', () => {
+    expect(toApiSwimlane(null)).toBeNull();
   });
 });
 
@@ -504,12 +590,16 @@ describe('createKanbanDragEndHandler', () => {
 
   it('data path: after-precedence PREVIOUS + exact endpoint args', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
-    // moved id 7 lands between 11 and 8 -> previous = 11, next = null
+    // Same-column reorder: current order [7, 11, 8], drag 7 DOWN over 11. The
+    // FINAL order is [11, 7, 8], so 7 lands between 11 and 8 -> previous = 11
+    // (after-precedence), next = null. This is the KB-7 shape: neighbors come
+    // from the DROP TARGET, not 7's original neighbor.
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 5 },
-        { statusId: 3, swimlaneId: 2, orderedIds: [11, 7, 8] },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, orderedIds: [7, 11, 8] },
+        11,
       ),
     );
 
@@ -526,11 +616,14 @@ describe('createKanbanDragEndHandler', () => {
 
   it('data path: after-precedence NEXT when dropped at the top', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
+    // Same-column reorder: current order [8, 7, 9], drag 7 UP over 8. The FINAL
+    // order is [7, 8, 9], so 7 lands at the TOP -> previous = null, next = 8.
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 2, orderedIds: [7, 8, 9] },
+        { statusId: 3, swimlaneId: 2, oldIndex: 1 },
+        { statusId: 3, swimlaneId: 2, orderedIds: [8, 7, 9] },
+        8,
       ),
     );
 
@@ -542,11 +635,14 @@ describe('createKanbanDragEndHandler', () => {
 
   it('maps swimlane -1 to null in the API call', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
+    // Same-column reorder in the -1 (unclassified) swimlane: current [7, 11],
+    // drag 7 over 11 -> FINAL [11, 7], previous = 11.
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: -1, oldIndex: 0 },
-        { statusId: 3, swimlaneId: -1, orderedIds: [11, 7] },
+        { statusId: 3, swimlaneId: -1, oldIndex: 0 },
+        { statusId: 3, swimlaneId: -1, orderedIds: [7, 11] },
+        11,
       ),
     );
 
@@ -562,8 +658,9 @@ describe('createKanbanDragEndHandler', () => {
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 0, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 0, orderedIds: [11, 7] },
+        { statusId: 3, swimlaneId: 0, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 0, orderedIds: [7, 11] },
+        11,
       ),
     );
     const bulk = bulkUpdateKanbanOrder.mock.calls[0][5];
@@ -582,8 +679,9 @@ describe('createKanbanDragEndHandler', () => {
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 2, orderedIds: [11, 7, 8, 9] },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, orderedIds: [7, 11, 8, 9] },
+        11,
       ),
     );
     expect(bulkUpdateKanbanOrder).toHaveBeenCalledWith(100, 3, 2, 11, null, [7, 8, 9]);
@@ -591,11 +689,14 @@ describe('createKanbanDragEndHandler', () => {
 
   it('NO-OP GUARD: same container + unchanged index -> neither onMove nor api', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
+    // Drop-in-place: 7 dropped over ITSELF in [11, 7, 8]. The FINAL order is
+    // unchanged, so index (1) === oldIndex (1) in the same container -> no-op.
     await handler(
       makeEvent(
         7,
         { statusId: 3, swimlaneId: 2, oldIndex: 1 },
         { statusId: 3, swimlaneId: 2, orderedIds: [11, 7, 8] },
+        7,
       ),
     );
     expect(onMove).not.toHaveBeenCalled();
@@ -614,8 +715,9 @@ describe('createKanbanDragEndHandler', () => {
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 2, orderedIds: [11, 7] },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, orderedIds: [7, 11] },
+        11,
       ),
     );
     expect(onMove.mock.invocationCallOrder[0]).toBeLessThan(
@@ -652,11 +754,15 @@ describe('createKanbanDragEndHandler', () => {
 
   it('reads orderedIds from @dnd-kit sortable.items fallback', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
+    // No explicit `orderedIds`; the current order is taken from @dnd-kit's
+    // auto-attached `sortable.items` ([7, 11, 8]). Drag 7 over 11 -> FINAL
+    // [11, 7, 8], previous = 11.
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 2, sortable: { items: [11, 7, 8] } },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, sortable: { items: [7, 11, 8] } },
+        11,
       ),
     );
     expect(bulkUpdateKanbanOrder).toHaveBeenCalledWith(100, 3, 2, 11, null, [7]);
@@ -675,9 +781,11 @@ describe('createKanbanDragEndHandler', () => {
   it('processes conservatively when the source data is absent (no oldIndex to guard on)', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
     // active.data.current is undefined -> sourceStatus/swimlane/oldIndex all null,
-    // so the no-op guard cannot fire and the move is processed (harmless reorder).
+    // so the no-op guard cannot fire and the move is processed (harmless reorder)
+    // EVEN when 7 is dropped over itself in [11, 7] (FINAL order unchanged,
+    // previous = 11).
     await handler(
-      makeEvent(7, undefined, { statusId: 3, swimlaneId: 2, orderedIds: [11, 7] }),
+      makeEvent(7, undefined, { statusId: 3, swimlaneId: 2, orderedIds: [11, 7] }, 7),
     );
     expect(onMove).toHaveBeenCalledWith(
       expect.objectContaining({ newStatus: 3, afterUserstoryId: 11 }),
@@ -685,8 +793,11 @@ describe('createKanbanDragEndHandler', () => {
     expect(bulkUpdateKanbanOrder).toHaveBeenCalledWith(100, 3, 2, 11, null, [7]);
   });
 
-  it('data path with no orderedIds/sortable -> empty order (adjacency null, index -1)', async () => {
+  it('data path into an empty destination -> card becomes the sole element (adjacency null, index 0)', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
+    // No orderedIds and no sortable.items -> the destination order is empty, so
+    // the cross-container insert makes 7 the SOLE element: FINAL [7], index 0,
+    // no neighbors. (Reproduces dropping into an empty column.)
     await handler(
       makeEvent(
         7,
@@ -698,7 +809,7 @@ describe('createKanbanDragEndHandler', () => {
       movedIds: [7],
       newStatus: 3,
       newSwimlane: 2,
-      index: -1,
+      index: 0,
       afterUserstoryId: null,
       beforeUserstoryId: null,
     });
@@ -727,8 +838,9 @@ describe('createKanbanDragEndHandler', () => {
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
-        { statusId: 3, swimlaneId: 2, orderedIds: [11, 7] },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, orderedIds: [7, 11] },
+        11,
       ),
     );
     expect(userstories.bulkUpdateKanbanOrder).toHaveBeenCalledWith(
@@ -748,9 +860,11 @@ describe('createKanbanDragEndHandler', () => {
     await handler(
       makeEvent(
         7,
-        { statusId: 1, swimlaneId: 2, oldIndex: 0 },
+        { statusId: 3, swimlaneId: 2, oldIndex: 0 },
         // columnEl is not an HTMLElement -> readElement returns null -> data path.
-        { columnEl: 'not-an-element', statusId: 3, swimlaneId: 2, orderedIds: [11, 7] },
+        // Current order [7, 11], drag 7 over 11 -> FINAL [11, 7], previous = 11.
+        { columnEl: 'not-an-element', statusId: 3, swimlaneId: 2, orderedIds: [7, 11] },
+        11,
       ),
     );
     expect(bulkUpdateKanbanOrder).toHaveBeenCalledWith(100, 3, 2, 11, null, [7]);
@@ -770,13 +884,15 @@ describe('createKanbanDragEndHandler', () => {
 
   it('treats a non-numeric oldIndex as unknown (guard cannot fire)', async () => {
     const handler = createKanbanDragEndHandler({ projectId: 100, onMove, api });
-    // Same container + index 0, but oldIndex is non-numeric -> NaN -> null, so the
-    // no-op guard cannot fire and the move is processed.
+    // Same container, 7 dropped over itself in [7, 8] (FINAL order unchanged,
+    // index 0, next = 8), but oldIndex is non-numeric -> NaN -> null, so the
+    // no-op guard cannot fire and the move is processed anyway.
     await handler(
       makeEvent(
         7,
         { statusId: 3, swimlaneId: 2, oldIndex: 'x' },
         { statusId: 3, swimlaneId: 2, orderedIds: [7, 8] },
+        7,
       ),
     );
     expect(onMove).toHaveBeenCalled();

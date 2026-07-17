@@ -334,6 +334,72 @@ export function editStatus(statusId: number, wipLimit: number | null) {
   });
 }
 
+/**
+ * Body of `POST /userstories` (the STANDARD single-story create). Reproduces the
+ * model-create payload the AngularJS generic form posts through `repo.create`
+ * (the `$tgResources.userstories.create` -> `POST /userstories` path registered
+ * at `resources.coffee:107`). The Django endpoint is backed by the model
+ * `UserStoryValidator` (`userstories/validators.py:48`, `model = UserStory`),
+ * so the wire keys are the MODEL FK/field names — `project`, `subject`,
+ * `status` — NOT the `*_id` suffixed keys used by the bulk validators. `ref`
+ * and `kanban_order` are server-assigned (`read_only_fields`), so they are
+ * never sent.
+ */
+export interface CreatePayload {
+  /** Target project id (model FK `project`). */
+  project: number;
+  /** The new story subject line (single line, no newline splitting). */
+  subject: string;
+  /**
+   * Target user-story status id (model FK `status`). Sent so the story lands in
+   * the column the "+" was clicked in; the server defaults it to the project's
+   * default US status only when omitted.
+   */
+  status: number;
+}
+
+/**
+ * Create a SINGLE user story, used by the Kanban column "+" (standard, non-bulk)
+ * create flow (KB-5).
+ *
+ * This is the frozen `POST /userstories` model-create endpoint the AngularJS
+ * client already uses via `repo.create("userstories", data)`; adding a typed
+ * adapter is contract-preserving (no new/changed backend contract). The created
+ * user-story object is returned (parsed JSON body) so the caller can add it to
+ * the board with its server-assigned `id`/`ref`/`kanban_order`.
+ *
+ * @param projectId - Target project id (-> `project`).
+ * @param statusId  - Target status id the story is created in (-> `status`).
+ * @param subject   - The new story subject (-> `subject`).
+ */
+export function createUserStory(projectId: number, statusId: number, subject: string) {
+  const data: CreatePayload = {
+    project: projectId,
+    subject,
+    status: statusId,
+  };
+
+  return httpClient.post('userstories', data);
+}
+
+/**
+ * Delete a SINGLE user story by id, used by the Kanban card "Delete" action
+ * (KB-4).
+ *
+ * Reproduces the AngularJS delete flow's server call `repo.remove(us)` ->
+ * `DELETE /userstories/{id}` (the `$tgResources.userstories` collection
+ * registered at `resources.coffee:107`; legacy `kanban/main.coffee:297-314`
+ * confirm-then-remove). The endpoint answers `204 No Content`, so `httpClient`
+ * resolves to `null`; the promise REJECTS (via `httpClient`'s error path) on any
+ * non-2xx, letting the caller keep the card on the board and surface the error.
+ * Adding a typed adapter is contract-preserving (existing frozen endpoint).
+ *
+ * @param usId - Id of the user story to delete (path segment).
+ */
+export function deleteUserStory(usId: number) {
+  return httpClient.delete(`userstories/${usId}`);
+}
+
 // ---------------------------------------------------------------------------
 // Export surface
 //
@@ -350,6 +416,8 @@ export const userstories = {
   bulkUpdateMilestone,
   bulkUpdateKanbanOrder,
   editStatus,
+  createUserStory,
+  deleteUserStory,
 };
 
 export default userstories;

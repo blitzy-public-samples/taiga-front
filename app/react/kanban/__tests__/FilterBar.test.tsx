@@ -466,6 +466,18 @@ describe('FilterBar — custom filter save flow (Phase G)', () => {
     expect(input.classList.contains('checksley-error')).toBe(false);
   });
 
+  // KB-9 (a11y): the filter-name field must carry an `id` AND `name` so the
+  // browser stops logging "A form field element should have an id or name
+  // attribute". The accessible name stays on `aria-label` (no visible <label>,
+  // preserving legacy visual parity).
+  it('gives the filter-name input an id, name, and aria-label (KB-9)', () => {
+    const { container } = renderBar();
+    const { input } = openForm(container);
+    expect(input.getAttribute('id')).toBe('kanban-add-filter-name');
+    expect(input.getAttribute('name')).toBe('kanban-add-filter-name');
+    expect(input.getAttribute('aria-label')).toBeTruthy();
+  });
+
   it('rejects an empty name with the length-zero error and does not save', () => {
     const { container, spies } = renderBar();
 
