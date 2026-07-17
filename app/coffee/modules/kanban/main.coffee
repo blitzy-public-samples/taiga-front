@@ -6,24 +6,27 @@
 # Copyright (c) 2021-present Kaleidos INC
 ###
 
-# QA finding [O]: use the one-arg RETRIEVE form, NOT the two-arg create form.
+# Empty-module stub for the migrated Kanban screen.
 #
-# The `taigaKanban` module is CREATED once by the aggregator
-# `app/coffee/modules/kanban.coffee` (gulp concat position 6). The Angular
-# Taskboard then registers services onto it via the retrieve form
-# (`taskboard/taskboard-tasks.coffee` L157 `tgTaskboardTasks`,
-# `taskboard/taskboard-issues.coffee` L81 `tgTaskboardIssues`; concat position 9),
-# and `admin/lightboxes.coffee` (position 17) also retrieves it.
+# The Kanban board UI is now implemented in React (app/react/kanban/**, mounted
+# via the <tg-react-kanban> custom element). All former KanbanController and
+# tgKanban* directive logic has been removed from this file; only the AngularJS
+# module reference required by `angular.module("taiga", modules)`
+# [app/coffee/app.coffee L1106, "taigaKanban" L1065] remains.
 #
-# This migrated stub is concatenated LAST among these (position 10). Using the
-# two-arg create form `angular.module("taigaKanban", [])` here RE-CREATES and
-# EMPTIES the module, wiping the Taskboard's already-registered services and
-# producing `[$injector:unpr] Unknown provider: tgTaskboardTasksProvider` — a
-# regression in the out-of-scope Angular Taskboard.
+# The `taigaKanban` module object itself is created (with its empty dependency
+# list) by the module aggregator `app/coffee/modules/kanban.coffee`
+# (`angular.module("taigaKanban", [])`). This is the same two-file arrangement
+# the upstream project has always used: the aggregator creates the module and
+# each feature file retrieves it with the one-argument accessor form. The
+# original `kanban/main.coffee` opened with `module = angular.module("taigaKanban")`
+# for exactly this reason, and this stub preserves that retrieval form.
 #
-# The AAP's literal §0.4.1/§0.7.2 wording ("reduce to angular.module(\"taigaKanban\", [])")
-# is superseded here by the AAP's controlling principle §0.2.2/§0.7.1 ("leave
-# everything else unchanged" — the Taskboard MUST keep working). Retrieving the
-# already-created module preserves `angular.module("taiga", modules)` resolution
-# WITHOUT destroying the Taskboard's DI registrations.
+# The retrieval (one-argument) form is also what keeps the still-AngularJS
+# Taskboard working: `taskboard/taskboard-tasks.coffee` and
+# `taskboard/taskboard-issues.coffee` register the `tgTaskboardTasks` /
+# `tgTaskboardIssues` services onto `taigaKanban`, and `admin/lightboxes.coffee`
+# retrieves it. Those files are concatenated ahead of this one, so re-creating
+# the module here (the two-argument form) would empty it and drop those already
+# registered services (`[$injector:unpr] Unknown provider: tgTaskboardTasksProvider`).
 angular.module("taigaKanban")

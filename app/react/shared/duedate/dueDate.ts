@@ -21,6 +21,11 @@ import moment from "moment";
  *
  * This module is pure TypeScript: it performs no DOM or network I/O and imports
  * no React, so it is unit-testable in isolation (with an injectable `now`).
+ *
+ * [M-08] Extracted from `app/react/kanban/dueDate.ts` to this shared location so
+ * BOTH the Kanban card and the two Backlog row variants (`BacklogTable`,
+ * `Sprint`) reproduce the identical severity color / formatted-date / tooltip
+ * behavior from a single tested source.
  */
 
 /** A single due-date appearance rule (color + status name + threshold). */

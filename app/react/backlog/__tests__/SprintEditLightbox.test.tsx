@@ -208,6 +208,21 @@ describe("SprintEditLightbox — open state reveal [#3]", () => {
         expect(root).not.toBeNull();
         expect(root).toHaveClass("open");
     });
+
+    // [M-09] Modal-dialog accessibility via the shared useDialogA11y primitive.
+    it("exposes role=dialog + aria-modal with aria-labelledby wired to the title", () => {
+        const { container } = renderLightbox({ open: true });
+        const dialog = container.querySelector(
+            ".lightbox.lightbox-sprint-add-edit",
+        ) as HTMLElement;
+        expect(dialog).toHaveAttribute("role", "dialog");
+        expect(dialog).toHaveAttribute("aria-modal", "true");
+        const labelledby = dialog.getAttribute("aria-labelledby");
+        expect(labelledby).toBeTruthy();
+        const title = container.querySelector("h2.title") as HTMLElement;
+        expect(title.id).toBe(labelledby);
+        expect((title.textContent ?? "").trim().length).toBeGreaterThan(0);
+    });
 });
 
 /* -------------------------------------------------------------------------- */

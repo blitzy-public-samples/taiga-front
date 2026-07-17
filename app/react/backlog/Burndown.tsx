@@ -37,6 +37,7 @@ import type { KeyboardEvent, ReactNode } from "react";
 
 import type { BurndownPoint, Project, ProjectStats } from "./types";
 import { t } from "../shared/i18n/translate";
+import { projectAdminModulesUrl } from "../shared/nav/urls";
 
 /**
  * Render a summary-stats label from the shared catalog ([i18n]) that embeds a
@@ -48,9 +49,20 @@ import { t } from "../shared/i18n/translate";
 function renderMultilineLabel(key: string, fallback: string): ReactNode {
     const rendered = t(key, fallback);
     const parts = rendered.split(/<br\s*\/?>/i);
-    return parts.flatMap((part, index) =>
-        index === 0 ? [part] : [<br key={`br-${index}`} />, part],
-    );
+    // [N-06] Build the interleaved [text, <br/>, text, ...] output with a plain
+    // `reduce` instead of `Array.prototype.flatMap`. `flatMap` is ES2019, but the
+    // esbuild bundle targets es2017 (gulpfile.js) and esbuild does NOT down-level
+    // /polyfill runtime prototype methods — a `flatMap` call would therefore be
+    // emitted verbatim and throw on an es2017 runtime that lacks it. `reduce` is
+    // ES5 and safe on every supported target while producing identical markup.
+    return parts.reduce<ReactNode[]>((acc, part, index) => {
+        if (index === 0) {
+            acc.push(part);
+        } else {
+            acc.push(<br key={`br-${index}`} />, part);
+        }
+        return acc;
+    }, []);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -562,7 +574,7 @@ function BurndownChart({ milestones }: { milestones: readonly BurndownPoint[] })
             viewBox={`0 0 ${CHART_VIEWBOX_WIDTH} ${CHART_VIEWBOX_HEIGHT}`}
             preserveAspectRatio="xMidYMid meet"
             role="img"
-            aria-label="Burndown chart"
+            aria-label={t("BACKLOG.CHART.ARIA_LABEL", "Burndown chart")}
             style={{ width: "100%", height: "auto", display: "block" }}
         >
             {/* Gridlines + zero baseline (Flot grid.color / borderColor #D8DEE9). */}
@@ -813,7 +825,11 @@ export function Burndown(props: BurndownProps): JSX.Element {
                                 "To have a nice graph that helps you follow the evolution of the project you have to set up the points and sprints through the",
                             )}{" "}
                             <a
-                                href=""
+                                href={
+                                    project
+                                        ? projectAdminModulesUrl(project.slug)
+                                        : undefined
+                                }
                                 title={t(
                                     "BACKLOG.CUSTOMIZE_GRAPH_TITLE",
                                     "Set up the points and sprints through the Admin",

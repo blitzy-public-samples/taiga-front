@@ -450,17 +450,38 @@ describe("BulkUserStoriesLightbox", () => {
             expect(container.querySelector('[class*="swimlane"]')).toBeNull();
         });
 
-        it("preserves the crossed radio markup verbatim (#top-backlog value=bottom / #bottom-backlog value=top)", () => {
+        it("preserves the crossed radio markup verbatim (top-backlog value=bottom / bottom-backlog value=top)", () => {
             const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
 
-            const top = container.querySelector("#top-backlog") as HTMLInputElement | null;
-            const bottom = container.querySelector("#bottom-backlog") as HTMLInputElement | null;
+            // [N-02] The ids now carry an instance-unique `useId()` prefix, so match
+            // on the stable suffix rather than the bare legacy id.
+            const top = container.querySelector(
+                'input[id$="-top-backlog"]',
+            ) as HTMLInputElement | null;
+            const bottom = container.querySelector(
+                'input[id$="-bottom-backlog"]',
+            ) as HTMLInputElement | null;
             expect(top).not.toBeNull();
             expect(bottom).not.toBeNull();
-            // The source template intentionally CROSSES id/value: #top-backlog carries
-            // value="bottom" and #bottom-backlog carries value="top". Reproduced verbatim.
+            // The source template intentionally CROSSES id/value: the `-top-backlog`
+            // radio carries value="bottom" and the `-bottom-backlog` radio carries
+            // value="top". Reproduced verbatim.
             expect(top!.getAttribute("value")).toBe("bottom");
             expect(bottom!.getAttribute("value")).toBe("top");
+        });
+    });
+
+    describe("modal accessibility (M-09)", () => {
+        it("exposes role=dialog + aria-modal with aria-labelledby wired to the title", () => {
+            const { container } = render(<BulkUserStoriesLightbox {...makeProps()} />);
+            const dialog = container.querySelector(".lightbox") as HTMLElement;
+            expect(dialog).toHaveAttribute("role", "dialog");
+            expect(dialog).toHaveAttribute("aria-modal", "true");
+            const labelledby = dialog.getAttribute("aria-labelledby");
+            expect(labelledby).toBeTruthy();
+            const title = container.querySelector("h2.title") as HTMLElement;
+            expect(title.id).toBe(labelledby);
+            expect((title.textContent ?? "").trim().length).toBeGreaterThan(0);
         });
     });
 });

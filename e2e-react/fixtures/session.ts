@@ -109,7 +109,16 @@ async function login(page: Page, baseURL: string | undefined): Promise<void> {
     await page.fill('input[name="password"]', '123123');
 
     // 8. Submit the login form.
-    await page.click('.submit-button');
+    //    [C-08] The prior selector `.submit-button` DOES NOT EXIST in this
+    //    version of the AngularJS login form and blocked every authenticated
+    //    test. The authoritative markup is
+    //    app/partials/includes/modules/login-form.jade:
+    //        form.login-form > fieldset.end > button(type="submit"
+    //            translate="LOGIN_COMMON.ACTION_SIGN_IN")
+    //    so the login form's submit is `form.login-form button[type="submit"]`.
+    //    (The login form is the still-AngularJS, not-migrated screen, so this
+    //    selector is stable post-migration.)
+    await page.click('form.login-form button[type="submit"]');
 
     // 9. Wait (<=10s) until the app redirects back to the client root. The
     //    robust equivalent of the legacy `url === host` check is a pathname of

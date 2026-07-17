@@ -33,17 +33,49 @@
  * wrapper around each icon, which several SCSS rules target directly.
  */
 
-import { createElement, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RefObject } from "react";
+import { createElement, Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 
 import type { Id, Project, ProjectStats, UserStory, UserStoryActions } from "./types";
 import { emojify } from "../shared/emoji/emojify";
 import { t } from "../shared/i18n/translate";
+import { projectUserStoryUrl } from "../shared/nav/urls";
+import { Icon } from "../shared/ui/Icon";
+import { dueDateColor, dueDateTitle } from "../shared/duedate/dueDate";
+import type { DueDateAppearance } from "../shared/duedate/dueDate";
 
 /* -------------------------------------------------------------------------- */
 /* Local helpers                                                              */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * [M-21] Visually-hidden style for the native selection checkbox.
+ *
+ * The out-of-scope `app/styles/core/forms.scss` rule
+ * `.custom-checkbox input { display: none; }` removes the real control from the
+ * accessibility tree AND the keyboard tab order, leaving only an empty
+ * `<label>` that a keyboard/screen-reader user cannot operate. Rather than edit
+ * that shared stylesheet, we VISUALLY HIDE the native checkbox with an inline
+ * style (which wins over the class rule) using the standard clip technique: it
+ * stays in the a11y tree and tab order (so it is focusable and Space toggles
+ * it) while occupying no visible space. `display: "block"` explicitly overrides
+ * the `display: none` from the stylesheet; the label's `::after` still draws the
+ * visual checkmark via the `input:not(:checked) + label::after` sibling rule,
+ * which is unaffected by the input's positioning.
+ */
+const VISUALLY_HIDDEN_CHECKBOX: CSSProperties = {
+    position: "absolute",
+    width: "1px",
+    height: "1px",
+    padding: 0,
+    margin: "-1px",
+    overflow: "hidden",
+    clip: "rect(0, 0, 0, 0)",
+    whiteSpace: "nowrap",
+    border: 0,
+    display: "block",
+};
 
 /**
  * Reproduces the AngularJS `tgSvg` directive output verbatim: an inline
@@ -130,6 +162,112 @@ function usePopover(): PopoverController {
     }, []);
 
     return { open, setOpen, toggle, ref };
+}
+
+/**
+ * The shape returned by {@link useMenuA11y}.
+ */
+interface MenuA11yController {
+    /** Ref for the `<ul role="menu">` list element. */
+    menuRef: RefObject<HTMLUListElement>;
+    /** `onKeyDown` handler to spread onto the `<ul role="menu">`. */
+    onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => void;
+}
+
+/**
+ * [M-21] Completes the ARIA menu pattern for a popover that advertises
+ * `aria-haspopup="menu"`. Layered ON TOP of {@link usePopover} (which owns
+ * open/close, click-outside, and document-level Escape), it adds the
+ * keyboard/focus behavior a real menu requires:
+ *
+ *  - focus moves to the first `[role="menuitem"]` when the menu opens (post-
+ *    paint, so the item exists and is focusable);
+ *  - ArrowDown / ArrowUp move a roving focus between items (wrapping), and
+ *    Home / End jump to the first / last item;
+ *  - Escape closes the menu AND returns focus to the trigger (the plain
+ *    document-level Escape in `usePopover` only closes it);
+ *  - Tab dismisses the menu, letting focus proceed naturally.
+ *
+ * The item lookup is a live `querySelectorAll` so it transparently supports
+ * grouped menus (e.g. the points popover's role→points grouping), where the
+ * menuitems are nested inside `role="group"` sub-lists.
+ */
+function useMenuA11y(
+    open: boolean,
+    close: () => void,
+    triggerRef: RefObject<HTMLElement>,
+): MenuA11yController {
+    const menuRef = useRef<HTMLUListElement>(null);
+
+    useEffect(() => {
+        if (!open) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => {
+            const items = menuRef.current?.querySelectorAll<HTMLElement>(
+                '[role="menuitem"]',
+            );
+            items?.[0]?.focus();
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, [open]);
+
+    const onKeyDown = useCallback(
+        (event: ReactKeyboardEvent<HTMLElement>): void => {
+            const items = Array.from(
+                menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [],
+            );
+            if (items.length === 0) {
+                return;
+            }
+            const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+            switch (event.key) {
+                case "ArrowDown": {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const next = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length;
+                    items[next].focus();
+                    break;
+                }
+                case "ArrowUp": {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const prev = currentIndex <= 0 ? items.length - 1 : currentIndex - 1;
+                    items[prev].focus();
+                    break;
+                }
+                case "Home": {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    items[0].focus();
+                    break;
+                }
+                case "End": {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    items[items.length - 1].focus();
+                    break;
+                }
+                case "Escape": {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    close();
+                    triggerRef.current?.focus();
+                    break;
+                }
+                case "Tab": {
+                    // Tab dismisses the menu; focus proceeds naturally.
+                    close();
+                    break;
+                }
+                default:
+                    break;
+            }
+        },
+        [close, triggerRef],
+    );
+
+    return { menuRef, onKeyDown };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -587,6 +725,30 @@ function BacklogStoryRow({
     const pointsPopover = usePopover();
     const optionsPopover = usePopover();
 
+    // [M-21] Trigger refs so Escape can return focus to the control that opened
+    // each menu, and the ARIA-menu keyboard controllers for the three popovers
+    // that advertise `aria-haspopup="menu"`. `rowMenuIds` gives this row's menus
+    // instance-unique ids for the triggers' `aria-controls`.
+    const rowMenuIds = useId();
+    const statusTriggerRef = useRef<HTMLAnchorElement>(null);
+    const pointsTriggerRef = useRef<HTMLAnchorElement>(null);
+    const optionsTriggerRef = useRef<HTMLButtonElement>(null);
+    const statusMenu = useMenuA11y(
+        statusPopover.open,
+        () => statusPopover.setOpen(false),
+        statusTriggerRef,
+    );
+    const pointsMenu = useMenuA11y(
+        pointsPopover.open,
+        () => pointsPopover.setOpen(false),
+        pointsTriggerRef,
+    );
+    const optionsMenu = useMenuA11y(
+        optionsPopover.open,
+        () => optionsPopover.setOpen(false),
+        optionsTriggerRef,
+    );
+
     // Status name/color (mirror usStatusById[us.status]).
     const status = project.us_statuses.find((candidate) => candidate.id === us.status);
     const statusName = status ? status.name : "";
@@ -604,6 +766,13 @@ function BacklogStoryRow({
 
     // Computable roles for the points popover (mirror _.filter(roles, "computable")).
     const computableRoles = project.roles.filter((role) => role.computable);
+
+    // [M-08] Project-level due-date threshold configuration (`us_duedates`),
+    // falling back to the service defaults when the project doesn't define one
+    // (mirrors `DueDateService.getStatus`, which reads `project["us_duedates"]`).
+    const dueDateConfig = Array.isArray(project.us_duedates)
+        ? (project.us_duedates as DueDateAppearance[])
+        : undefined;
 
     const rowClassName =
         "row us-item-row" +
@@ -640,10 +809,24 @@ function BacklogStoryRow({
                 {canModifyUs && (
                     <div className="input">
                         <div className="custom-checkbox">
+                            {/* [M-21] The native checkbox is the real, keyboard-
+                                operable control: visually hidden (not `display:none`)
+                                so it stays focusable and in the a11y tree, and given
+                                an explicit accessible name. The `<label>` keeps its
+                                `htmlFor` link (so a pointer click on the visual box
+                                still toggles selection and its `::after` draws the
+                                check state) but no longer carries `tabIndex` — the
+                                input, not the empty label, is now the focus target. */}
                             <input
                                 type="checkbox"
                                 id={`us-check-${us.ref}`}
                                 checked={selected}
+                                style={VISUALLY_HIDDEN_CHECKBOX}
+                                aria-label={t(
+                                    "US.SELECT",
+                                    "Select user story #{{ref}} {{subject}}",
+                                    { ref: us.ref, subject: subjectText },
+                                )}
                                 onChange={(event) =>
                                     onToggleSelection(
                                         us.ref,
@@ -652,14 +835,18 @@ function BacklogStoryRow({
                                     )
                                 }
                             />
-                            <label htmlFor={`us-check-${us.ref}`} tabIndex={0} />
+                            <label htmlFor={`us-check-${us.ref}`} aria-hidden="true" />
                         </div>
                     </div>
                 )}
             </div>
 
             <div className="user-stories user-story-main-data">
-                <a className="user-story-link" href={`#/project/${project.slug}/us/${us.ref}`}>
+                {/* [M-07] baseHref-aware HTML5 route (NOT a `#`-fragment): the
+                    legacy `tg-nav="project-userstories-detail"` resolved to a
+                    real navigation under HTML5 mode. `projectUserStoryUrl`
+                    reproduces the exact `$navUrls` template + baseHref prefix. */}
+                <a className="user-story-link" href={projectUserStoryUrl(project.slug, us.ref)}>
                     <span className="user-story-number">#{us.ref}</span>
                     {/* XSS-safe: `subjectText` is the emojified subject as a PLAIN
                         string (shortcodes → unicode chars), rendered as React
@@ -669,9 +856,24 @@ function BacklogStoryRow({
                     <span className="user-story-name">{subjectText}</span>
                 </a>
                 {us.due_date && (
-                    // Placeholder for the shared tg-due-date widget (out of scope);
-                    // the `.due-date` class is preserved for SCSS fidelity.
-                    <span className="due-date" />
+                    // [M-08] Due-date parity — reproduces the legacy
+                    // `tg-due-date.due-date` (icon-only variant, `due-date-icon.jade`):
+                    // an `icon-clock` whose fill is the severity color and whose
+                    // tooltip is the formatted date + status name. `.due-date`
+                    // (wrapper) and `.due-date-icon` (icon) class names match the
+                    // compiled SCSS (backlog-table.scss L369-375) so it themes
+                    // unchanged. Color/title come from the shared due-date helpers
+                    // (extracted from the working Kanban card).
+                    <span className="due-date">
+                        <Icon
+                            name="icon-clock"
+                            wrapperClass="due-date-icon"
+                            fill={dueDateColor(us.due_date, dueDateConfig) ?? undefined}
+                            title={t("COMMON.CARD.DUE_DATE", "Due date: {{date}}", {
+                                date: dueDateTitle(us.due_date, dueDateConfig),
+                            })}
+                        />
+                    </span>
                 )}
                 {showTags &&
                     us.tags &&
@@ -699,6 +901,7 @@ function BacklogStoryRow({
             {/* STATUS cell + popover (tg-us-status) */}
             <div className="status" ref={statusPopover.ref}>
                 <a
+                    ref={statusTriggerRef}
                     className="us-status"
                     href=""
                     title={statusName}
@@ -710,6 +913,7 @@ function BacklogStoryRow({
                     role="button"
                     aria-haspopup="menu"
                     aria-expanded={statusPopover.open}
+                    aria-controls={statusPopover.open ? `${rowMenuIds}-status` : undefined}
                     aria-disabled={!canModifyUs}
                     onClick={(event) => {
                         event.preventDefault();
@@ -736,12 +940,22 @@ function BacklogStoryRow({
                     // [S] reveal: inline `display:block` mirrors the AngularJS
                     // jQuery `fadeIn()` (the `.popover` mixin's base is `display:none`
                     // with no class-based reveal in the compiled CSS).
-                    <ul className="popover pop-status" style={{ display: "block" }}>
+                    <ul
+                        className="popover pop-status"
+                        style={{ display: "block" }}
+                        id={`${rowMenuIds}-status`}
+                        ref={statusMenu.menuRef}
+                        role="menu"
+                        aria-label={statusName || t("COMMON.FIELDS.STATUS", "Status")}
+                        onKeyDown={statusMenu.onKeyDown}
+                    >
                         {project.us_statuses.map((usStatus) => (
-                            <li key={usStatus.id}>
+                            <li key={usStatus.id} role="none">
                                 <a
                                     className="popover-status"
                                     href=""
+                                    role="menuitem"
+                                    tabIndex={-1}
                                     data-status-id={usStatus.id}
                                     onClick={(event) => {
                                         event.preventDefault();
@@ -760,12 +974,14 @@ function BacklogStoryRow({
             {/* POINTS cell + popover (tg-backlog-us-points) */}
             <div className="points" ref={pointsPopover.ref}>
                 <a
+                    ref={pointsTriggerRef}
                     className="us-points"
                     href=""
                     // [R] Same as us-status: this is a popover trigger, not a link.
                     role="button"
                     aria-haspopup="menu"
                     aria-expanded={pointsPopover.open}
+                    aria-controls={pointsPopover.open ? `${rowMenuIds}-points` : undefined}
                     aria-disabled={!canModifyUs}
                     aria-label={t("US.POINTS_LABEL", "Points: {{points}}", { points: pointsDisplay })}
                     onClick={(event) => {
@@ -787,15 +1003,37 @@ function BacklogStoryRow({
                 </a>
                 {pointsPopover.open && (
                     // [S] reveal: inline `display:block` mirrors AngularJS `fadeIn()`.
-                    <ul className="popover pop-points" style={{ display: "block" }}>
+                    <ul
+                        className="popover pop-points"
+                        style={{ display: "block" }}
+                        id={`${rowMenuIds}-points`}
+                        ref={pointsMenu.menuRef}
+                        role="menu"
+                        aria-label={t("COMMON.FIELDS.POINTS", "Points")}
+                        onKeyDown={pointsMenu.onKeyDown}
+                    >
                         {computableRoles.map((role) => (
-                            <li key={role.id}>
-                                <span className="item-text">{role.name}</span>
-                                <ul>
+                            // [M-21] Each role is a `role="group"` of point choices,
+                            // labelled by its (visible) name span, so the grouped
+                            // menuitems keep their per-role heading while the menu's
+                            // roving focus (useMenuA11y) traverses every point option.
+                            <li key={role.id} role="none">
+                                <span
+                                    className="item-text"
+                                    id={`${rowMenuIds}-points-role-${role.id}`}
+                                >
+                                    {role.name}
+                                </span>
+                                <ul
+                                    role="group"
+                                    aria-labelledby={`${rowMenuIds}-points-role-${role.id}`}
+                                >
                                     {project.points.map((point) => (
-                                        <li key={point.id}>
+                                        <li key={point.id} role="none">
                                             <a
                                                 href=""
+                                                role="menuitem"
+                                                tabIndex={-1}
                                                 onClick={(event) => {
                                                     event.preventDefault();
                                                     actions.onChangePoints(us, role.id, point.id);
@@ -818,6 +1056,7 @@ function BacklogStoryRow({
                 <div className="us-option" ref={optionsPopover.ref}>
                     <button
                         type="button"
+                        ref={optionsTriggerRef}
                         className={
                             "us-option-popup-button js-popup-button" + (isFirst ? " first" : "")
                         }
@@ -827,6 +1066,7 @@ function BacklogStoryRow({
                         aria-label={t("US.OPTIONS_LABEL", "User story options")}
                         aria-haspopup="menu"
                         aria-expanded={optionsPopover.open}
+                        aria-controls={optionsPopover.open ? `${rowMenuIds}-options` : undefined}
                         onClick={optionsPopover.toggle}
                     >
                         <Svg icon="icon-more-vertical" />
@@ -836,13 +1076,24 @@ function BacklogStoryRow({
                         // (`.us-option-popup.first .move-to-top { display: none }`);
                         // we ALSO omit the action entirely for the first story.
                         <ul
+                            id={`${rowMenuIds}-options`}
+                            ref={optionsMenu.menuRef}
+                            // [Q][M-21] The trigger claims `aria-haspopup="menu"`, so the
+                            // popup must expose a real menu: `role="menu"` + `role="menuitem"`
+                            // children, focus-on-open, roving arrow keys, Escape/Tab close
+                            // (all via the shared `useMenuA11y` controller).
+                            role="menu"
+                            aria-label={t("US.OPTIONS_LABEL", "User story options")}
+                            onKeyDown={optionsMenu.onKeyDown}
                             className={"popover us-option-popup" + (isFirst ? " first" : "")}
                             // [S] reveal: inline `display:block` mirrors AngularJS `fadeIn()`.
                             style={{ display: "block" }}
                         >
-                            <li>
+                            <li role="none">
                                 <button
                                     type="button"
+                                    role="menuitem"
+                                    tabIndex={-1}
                                     className="e2e-edit edit-story"
                                     onClick={() => {
                                         actions.onEditUserStory(us);
@@ -854,9 +1105,11 @@ function BacklogStoryRow({
                                 </button>
                             </li>
                             {canDeleteUs && (
-                                <li>
+                                <li role="none">
                                     <button
                                         type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
                                         className="e2e-delete"
                                         onClick={() => {
                                             actions.onDeleteUserStory(us);
@@ -869,9 +1122,11 @@ function BacklogStoryRow({
                                 </li>
                             )}
                             {!isFirst && (
-                                <li>
+                                <li role="none">
                                     <button
                                         type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
                                         className="e2e-edit move-to-top"
                                         onClick={() => {
                                             actions.onMoveToTop(us);

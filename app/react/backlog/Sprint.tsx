@@ -39,13 +39,23 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import type { Sprint, Project, UserStory, Epic } from "./types";
 import { emojify } from "../shared/emoji/emojify";
 import { t } from "../shared/i18n/translate";
+import { projectUserStoryUrl, projectTaskboardUrl } from "../shared/nav/urls";
+import { Icon } from "../shared/ui/Icon";
+import { dueDateColor, dueDateTitle } from "../shared/duedate/dueDate";
+import type { DueDateAppearance } from "../shared/duedate/dueDate";
 
 /**
  * Concrete moment format for sprint start/finish dates. Equals the i18n value
  * of `BACKLOG.SPRINTS.DATE` ("DD MMM YYYY"), which the legacy
  * `tgBacklogSprintHeader` fed straight into `moment(...).format(...)`.
  */
-const SPRINT_DATE_FMT = "DD MMM YYYY"; // i18n BACKLOG.SPRINTS.DATE
+// The sprint date format is a localizable moment token string
+// (BACKLOG.SPRINTS.DATE). It is resolved through the shared runtime translator
+// [M-06] at render time inside the `useMemo` below — never memoized at module
+// load, since the React bundle is evaluated before `angular.bootstrap`, so the
+// live `$translate` catalog only becomes reachable once the component renders.
+const SPRINT_DATE_FMT_KEY = "BACKLOG.SPRINTS.DATE";
+const SPRINT_DATE_FMT_FALLBACK = "DD MMM YYYY";
 
 /**
  * Format a numeric point value the way the AngularJS `| number` filter did:
@@ -83,6 +93,13 @@ interface SprintStoryRowProps {
     canModifyUs: boolean;
     /** Mirror of SprintProps.dragEnabled — gates the drag affordance. */
     dragEnabled: boolean;
+    /**
+     * [M-08] Project-level due-date threshold config (`project.us_duedates`).
+     * `undefined` ⇒ the shared helper's default thresholds. Threaded from the
+     * parent `Sprint` (which owns the `project`) so the sprint row reproduces
+     * the same severity color / tooltip as the backlog row and the card.
+     */
+    dueDateConfig: DueDateAppearance[] | undefined;
 }
 
 /**
@@ -92,7 +109,7 @@ interface SprintStoryRowProps {
  *
  * Ports the `div.row.milestone-us-item-row` markup from sprint.jade.
  */
-function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintStoryRowProps): JSX.Element {
+function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled, dueDateConfig }: SprintStoryRowProps): JSX.Element {
     // Register the row as a draggable node. Called unconditionally (Rules of Hooks);
     // the drag affordance itself is applied only when `dragEnabled` (below).
     const { attributes, listeners, setNodeRef } = useDraggable({ id: us.id });
@@ -153,7 +170,11 @@ function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintSto
             <div className="column-us">
                 <a
                     className={usNameClassName}
-                    href={`#/project/${projectSlug}/us/${us.ref}`}
+                    // [M-07] baseHref-aware HTML5 route (NOT a `#`-fragment):
+                    // the legacy `tg-nav="project-userstories-detail"` navigated
+                    // for real under HTML5 mode. `projectUserStoryUrl`
+                    // reproduces the `$navUrls` template + baseHref prefix.
+                    href={projectUserStoryUrl(projectSlug, us.ref)}
                 >
                     <span className="us-ref-text">#{us.ref}</span>
                     {/*
@@ -179,8 +200,24 @@ function SprintStoryRow({ us, projectSlug, canModifyUs, dragEnabled }: SprintSto
                         ))}
                     </div>
                 ) : null}
-                {/* tg-due-date — minimal parity marker (the full popover is out of scope). */}
-                {us.due_date ? <span className="due-date" /> : null}
+                {/* [M-08] Due-date parity — reproduces the legacy
+                    `tg-due-date.due-date` (icon-only variant, `due-date-icon.jade`):
+                    an `icon-clock` whose fill is the severity color and whose
+                    tooltip is the formatted date + status name. `.due-date`
+                    (wrapper) and `.due-date-icon` (icon) class names match the
+                    compiled SCSS (sprints.scss L243-254) so it themes unchanged. */}
+                {us.due_date ? (
+                    <span className="due-date">
+                        <Icon
+                            name="icon-clock"
+                            wrapperClass="due-date-icon"
+                            fill={dueDateColor(us.due_date, dueDateConfig) ?? undefined}
+                            title={t("COMMON.CARD.DUE_DATE", "Due date: {{date}}", {
+                                date: dueDateTitle(us.due_date, dueDateConfig),
+                            })}
+                        />
+                    </span>
+                ) : null}
             </div>
             {us.total_points != null ? (
                 <div className={pointsColumnClassName}>
@@ -220,11 +257,16 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
         // isVisible gates the taskboard links (header name link + bottom button).
         const isVisible = project.my_permissions.includes("view_milestones");
 
-        // AngularJS hash route, navUrls key "project-taskboard".
-        const taskboardUrl = `#/project/${project.slug}/taskboard/${sprint.slug}`;
+        // [M-07] baseHref-aware HTML5 route (navUrls key "project-taskboard"),
+        // NOT a `#`-fragment: the legacy `tgBacklogSprintHeader` resolved this
+        // via `$navUrls.resolve` and HTML5-mode routing performed a real
+        // navigation. `projectTaskboardUrl` reproduces the exact template +
+        // baseHref prefix.
+        const taskboardUrl = projectTaskboardUrl(project.slug, sprint.slug);
 
-        const start = moment(sprint.estimated_start).format(SPRINT_DATE_FMT);
-        const finish = moment(sprint.estimated_finish).format(SPRINT_DATE_FMT);
+        const sprintDateFmt = t(SPRINT_DATE_FMT_KEY, SPRINT_DATE_FMT_FALLBACK);
+        const start = moment(sprint.estimated_start).format(sprintDateFmt);
+        const finish = moment(sprint.estimated_finish).format(sprintDateFmt);
         const estimatedDateRange = `${start} - ${finish}`;
 
         const closedPoints = sprint.closed_points || 0;
@@ -247,6 +289,18 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
             isFull,
         };
     }, [project, sprint]);
+
+    // [M-08] Project-level due-date threshold configuration (`us_duedates`),
+    // falling back to the shared helper's defaults when the project doesn't
+    // define one (mirrors `DueDateService.getStatus`). Memoized so each
+    // `SprintStoryRow` receives a stable reference.
+    const dueDateConfig = useMemo<DueDateAppearance[] | undefined>(
+        () =>
+            Array.isArray(project.us_duedates)
+                ? (project.us_duedates as DueDateAppearance[])
+                : undefined,
+        [project],
+    );
 
     const hasStories = sprint.user_stories.length > 0;
 
@@ -370,6 +424,7 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                             projectSlug={project.slug}
                             canModifyUs={view.canModifyUs}
                             dragEnabled={dragEnabled}
+                            dueDateConfig={dueDateConfig}
                         />
                     ))
                 )}

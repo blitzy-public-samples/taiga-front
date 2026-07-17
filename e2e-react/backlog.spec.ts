@@ -29,27 +29,35 @@
  *
  * ARCHITECTURE THE RETARGETING RESPECTS (verified from app/react source)
  * ----------------------------------------------------------------------
- *   - The migrated backlog shell (partials/backlog/backlog.jade) hosts ONLY the
- *     React root <tg-react-backlog>. The rich single-user-story create/edit
- *     "generic form" lightbox is a shared COMMON AngularJS surface (out of scope
- *     per AAP §0.2.2) that is NOT hosted in the migrated shell. The React screen
- *     therefore DELEGATES single-US "standard create" and "edit" back to
- *     AngularJS via `broadcastToAngular` — a `$rootScope.$broadcast` of
- *     `genericform:new` / `genericform:edit` (BacklogApp.tsx L1266, L1373). The
- *     migrated screen's REAL, in-scope responsibility is to fire that bridge with
- *     the correct payload, which these tests verify with a hard `$broadcast` spy.
- *   - The ONLY in-React create surface is the BULK user-story lightbox
- *     (`.lightbox-generic-bulk`, BulkUserStoriesLightbox.tsx). "bulk create" and
- *     the XSS-safety assertion drive that real React surface end to end.
- *   - Single-US DELETE and sprint DELETE use a native `window.confirm`
- *     (BacklogApp.tsx L1277, SprintEditLightbox.tsx L302) — NOT a `.lightbox-
- *     generic-ask` dialog. Deletes are therefore confirmed through a Playwright
- *     `page.on('dialog', …)` handler (QA Issue 3: the old code masked the missing
- *     confirm dialog with a `.catch(() => {})`; that mask is gone).
- *   - Attachments are intentionally OUT OF SCOPE: the React screens emit no
- *     attachment DOM (AAP §0.1.1 functional surface omits attachments), so the
- *     legacy attachment cases are a documented drop, not a hidden skip (QA
- *     Issue 3).
+ * [C-07] The earlier revision of this section was built on an OBSOLETE premise —
+ * that single-US create/edit is DELEGATED back to AngularJS via a
+ * `$rootScope.$broadcast("genericform:new" / "genericform:edit")` bridge, that
+ * deletes use a native `window.confirm`, and that attachments emit no DOM. The
+ * M-10 migration replaced all three: the React Backlog now owns a REAL single-US
+ * create/edit lightbox and themed confirm/attachment surfaces. The corrected
+ * architecture these tests drive is:
+ *   - The migrated backlog shell (partials/backlog/backlog.jade) hosts the React
+ *     root <tg-react-backlog>, which renders its OWN single-user-story create/edit
+ *     lightbox (app/react/backlog/UserStoryEditLightbox.tsx, a mirror of the
+ *     kanban lightbox: `.lightbox.lightbox-generic-form.lightbox-create-edit`).
+ *     "standard create" (the `.new-us` "+" button → addNewUs("standard")) and
+ *     "edit" (each row's options-popup Edit item) open that real form; submitting
+ *     persists DIRECTLY (onCreateUserStory → POST /userstories/bulk_create + an
+ *     optional follow-up PATCH; onSaveUserStoryEdit → PATCH /userstories/{id}).
+ *     The `genericform:*` bridge no longer exists.
+ *   - The BULK user-story lightbox (`.lightbox-generic-bulk`,
+ *     BulkUserStoriesLightbox.tsx) is a SEPARATE affordance (`.new-us` icon
+ *     button → addNewUs("bulk")); "bulk create US" and the XSS-safety assertion
+ *     drive it end to end.
+ *   - Single-US DELETE and sprint DELETE use the THEMED React ConfirmDialog
+ *     (shared/dialog/ConfirmDialog.tsx, [N-03]: role="dialog" + aria-modal +
+ *     `.js-confirm`/`.js-cancel`) — NOT a native `window.confirm`. Deletes are
+ *     therefore confirmed by clicking the dialog's confirm control, and the
+ *     matching persist (`DELETE /userstories/{id}` or `DELETE /milestones/{id}`)
+ *     is hard-asserted.
+ *   - Attachments ARE in scope: the real lightbox exposes a native
+ *     `input[type="file"]` (ports lb-create-edit's `.add-attach`) whose selection
+ *     uploads via `POST /userstories/attachments` after the story is created.
  *
  * DETERMINISM (QA Issue 7 fix)
  * ----------------------------
@@ -157,9 +165,10 @@ const POP_ROLE = '.popover.pop-role';
 const POP_ROLE_ITEM = 'a.role';
 
 /* --- new-us controls ---------------------------------------------- *
- * `.new-us button.btn-small` (index 0) fires the AngularJS `genericform:new`
- * bridge (single-US standard create — out-of-scope rich form). `.btn-icon`
- * (index 1) opens the React bulk lightbox. */
+ * [C-07] `.new-us button.btn-small` (index 0 → addNewUs("standard")) opens the
+ * REAL React single-US create lightbox (backlog/UserStoryEditLightbox.tsx).
+ * `.btn-icon` (index 1 → addNewUs("bulk")) opens the React bulk lightbox. Both
+ * are gated by the `add_us` permission (`{canAddUs && …}`). */
 const NEW_US_STANDARD = `${BOARD} .new-us button.btn-small`;
 const NEW_US_BULK = `${BOARD} .new-us button.btn-icon`;
 
@@ -169,6 +178,26 @@ const NEW_US_BULK = `${BOARD} .new-us button.btn-icon`;
 const LB_BULK = '.lightbox-generic-bulk';
 const LB_BULK_SUBMIT = 'button.js-submit-button';
 const LB_BULK_CLOSE = 'button.close';
+
+// [C-07] The REAL single-US create/edit lightbox (backlog/UserStoryEditLightbox.tsx,
+// a mirror of the kanban lightbox). Reproduces the Jade
+// `div.lightbox.lightbox-generic-form.lightbox-create-edit`; `.open` reveals it.
+// Fields carry the same `name=` attributes as the legacy generic form so payload
+// parity is directly observable. This REPLACES the removed genericform:* bridge.
+const LB_EDIT = '.lightbox-create-edit'; // the create/edit lightbox root
+const LB_EDIT_SUBJECT = 'input[name="subject"]'; // subject field
+const LB_EDIT_DESCRIPTION = 'textarea[name="description"]'; // description field
+const LB_EDIT_DUE_DATE = 'input[name="due_date"]'; // due-date field
+const LB_EDIT_SUBMIT = '.js-submit-button'; // Create/Save submit button
+const LB_EDIT_REQUIRED = '.checksley-required'; // inline required-field error
+
+// [C-07] Themed React ConfirmDialog (shared/dialog/ConfirmDialog.tsx, [N-03]) —
+// used for BOTH single-US delete (BacklogApp) and sprint delete
+// (SprintEditLightbox); it REPLACES the native window.confirm the earlier suite
+// accepted via page.on('dialog'). role="dialog" + aria-modal.
+const CONFIRM_DIALOG = '[role="dialog"]';
+const CONFIRM_OK = '.js-confirm';
+const CONFIRM_CANCEL = '.js-cancel';
 
 /* --- sprint add / edit / lightbox --------------------------------- *
  * Add-sprint trigger is `.sprint-header a.btn-link` (empty-state fallback is
@@ -295,61 +324,99 @@ async function openBacklog(page: Page, projectSlug: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * AngularJS bridge spy (verifies the delegated single-US create/edit)
+ * [C-07] Real single-US create/edit lightbox helpers
  * ------------------------------------------------------------------ *
- * `broadcastToAngular` (BacklogApp.tsx) hands single-US "standard create" and
- * "edit" to the surviving AngularJS generic-form lightbox via
- * `angular.element(document).injector().get('$rootScope').$broadcast(name,
- * payload)`. Since that lightbox is out of scope for the migrated shell, we
- * verify the migrated screen's real responsibility — that it fires the correct
- * bridge event with the correct payload — by wrapping `$rootScope.$broadcast`
- * with a recorder installed into the page.
+ * The React Backlog renders ONE create/edit lightbox at the board root
+ * (app/react/backlog/UserStoryEditLightbox.tsx — a mirror of the kanban
+ * lightbox), opened by `addNewUs("standard")` (the `.new-us` "+" button) and by
+ * each row's options-popup Edit item (`button.e2e-edit.edit-story`). These
+ * helpers drive its real fields and REPLACE the removed
+ * `$rootScope.$broadcast("genericform:*")` bridge the earlier suite spied on:
+ * BacklogApp now persists directly (onCreateUserStory / onSaveUserStoryEdit)
+ * against the frozen `/userstories` endpoints.
  */
-interface BridgeCall {
-    name: string;
-    objType?: string;
+
+/** The board-level create/edit lightbox, visible only when it carries `.open`. */
+function editLightbox(page: Page): Locator {
+    return page.locator(`${LB_EDIT}.open`).first();
 }
 
-/** Install (idempotently) a recorder over `$rootScope.$broadcast`. */
-async function installBridgeSpy(page: Page): Promise<void> {
-    await page.evaluate(() => {
-        const w = window as unknown as {
-            __bridgeCalls?: Array<{ name: string; objType?: string }>;
-            __bridgeSpyInstalled?: boolean;
-            angular?: {
-                element: (d: Document) => {
-                    injector: () => {
-                        get: (s: string) => {
-                            $broadcast: (n: string, p: unknown) => unknown;
-                        };
-                    };
-                };
-            };
-        };
-        w.__bridgeCalls = w.__bridgeCalls || [];
-        if (w.__bridgeSpyInstalled) {
-            return;
-        }
-        if (!w.angular) {
-            return; // AngularJS shell not present (should not happen at runtime)
-        }
-        const rs = w.angular.element(document).injector().get('$rootScope');
-        const orig = rs.$broadcast.bind(rs);
-        rs.$broadcast = (name: string, payload: unknown): unknown => {
-            const p = (payload || {}) as { objType?: string };
-            w.__bridgeCalls!.push({ name, objType: p.objType });
-            return orig(name, payload);
-        };
-        w.__bridgeSpyInstalled = true;
-    });
+/** Open a backlog row's options popup and return the visible menu. */
+async function openRowOptions(page: Page, row: Locator): Promise<Locator> {
+    await row.locator(US_OPTION_BTN).first().click();
+    const popup = page.locator(US_OPTION_POPUP).first();
+    await popup.waitFor({ state: 'visible', timeout: 10_000 });
+    return popup;
 }
 
-/** Read back the recorded bridge broadcasts. */
-async function bridgeBroadcasts(page: Page): Promise<BridgeCall[]> {
-    return page.evaluate(() => {
-        const w = window as unknown as { __bridgeCalls?: BridgeCall[] };
-        return w.__bridgeCalls || [];
-    });
+/**
+ * Open the REAL single-US create lightbox from the backlog header "+"
+ * (`.new-us button.btn-small`) and wait for it to reveal.
+ *
+ * @param page The authenticated Playwright page.
+ * @returns The visible create lightbox locator.
+ */
+async function openCreateLightbox(page: Page): Promise<Locator> {
+    await page.locator(NEW_US_STANDARD).first().click();
+    const lb = editLightbox(page);
+    await expect(lb).toBeVisible({ timeout: 10_000 });
+    return lb;
+}
+
+/**
+ * Open the REAL edit lightbox for a backlog row through its options popup
+ * (`button.e2e-edit.edit-story`), seeded with that story.
+ *
+ * @param page The authenticated Playwright page.
+ * @param row  A single backlog-row locator.
+ * @returns The visible edit lightbox locator.
+ */
+async function openEditLightbox(page: Page, row: Locator): Promise<Locator> {
+    const popup = await openRowOptions(page, row);
+    await popup.locator(OPT_EDIT).first().click();
+    const lb = editLightbox(page);
+    await expect(lb).toBeVisible({ timeout: 10_000 });
+    return lb;
+}
+
+/**
+ * Submit the create/edit lightbox and wait for it to close (lose `.open`), which
+ * only happens once the persist request resolves successfully.
+ *
+ * @param page The authenticated Playwright page.
+ * @param lb   The open lightbox locator.
+ */
+async function submitLightbox(page: Page, lb: Locator): Promise<void> {
+    await lb.locator(LB_EDIT_SUBMIT).first().click();
+    await expect(lb).toBeHidden({ timeout: 20_000 });
+}
+
+/**
+ * Await the single-US create persist (`POST /userstories/bulk_create`, which the
+ * generic-form CREATE branch uses for subject+status). Start BEFORE the submit,
+ * `await` after.
+ *
+ * @param page The authenticated Playwright page.
+ */
+function waitCreatePersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /\/userstories\/bulk_create/.test(r.url()) && r.request().method() === 'POST',
+        { timeout: 20_000 },
+    );
+}
+
+/**
+ * Await the single-US edit persist (`PATCH /userstories/{id}`). Start BEFORE the
+ * submit, `await` after; returns the matched response so the method can be
+ * asserted.
+ *
+ * @param page The authenticated Playwright page.
+ */
+function waitEditPersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /\/userstories\/\d+(\?|$)/.test(r.url()) && r.request().method() === 'PATCH',
+        { timeout: 20_000 },
+    );
 }
 
 /* ------------------------------------------------------------------ *
@@ -559,30 +626,107 @@ test.describe('backlog', () => {
     });
 
     /* -------------------------------------------------------------- *
-     * create US
+     * create US (the REAL single-US lightbox)
      * -------------------------------------------------------------- *
-     * The rich single-user-story create form is a shared AngularJS generic-form
-     * lightbox (out of scope, AAP §0.2.2) that the migrated shell does not host.
-     * The migrated screen's real responsibility is to DELEGATE the standard
-     * create back to AngularJS via the `genericform:new` bridge — asserted here
-     * with a hard $broadcast spy. (The real in-React create surface is the bulk
-     * lightbox, exercised by "bulk create US" below.)
+     * [C-07] "standard create" opens the REAL React create/edit lightbox
+     * (backlog/UserStoryEditLightbox.tsx) from the `.new-us` "+" button — NOT the
+     * removed genericform:new bridge, and NOT the bulk lightbox (a separate
+     * affordance covered by "bulk create US"). Cases:
+     *   1. happy path       — subject only → one bulk_create POST → US appears;
+     *   2. full-form parity — subject + description + due date → bulk_create then
+     *                         a follow-up PATCH persists the rich fields;
+     *   3. negative path    — empty subject → inline required error, NO persist,
+     *                         lightbox stays open;
+     *   4. attachment       — a file selected in the real `input[type="file"]`
+     *                         uploads via POST /userstories/attachments on submit.
      */
     test.describe('create US', () => {
-        test('standard create fires the genericform:new bridge', async ({ page }) => {
-            await installBridgeSpy(page);
+        test('standard create through the real lightbox', async ({ page }) => {
+            const before = await userStories(page).count();
+
+            const lb = await openCreateLightbox(page);
             await capture(page, 'create-us');
 
-            await page.locator(NEW_US_STANDARD).first().click();
+            const subject = `standard create${Date.now()}`;
+            await lb.locator(LB_EDIT_SUBJECT).fill(subject);
 
-            await expect
-                .poll(async () =>
-                    (await bridgeBroadcasts(page)).some(
-                        (b) => b.name === 'genericform:new' && b.objType === 'us',
-                    ),
-                    { timeout: 10_000 },
-                )
-                .toBe(true);
+            const persisted = waitCreatePersist(page);
+            await submitLightbox(page, lb);
+            await persisted;
+
+            await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20_000 });
+        });
+
+        test('create with description and due date persists the full form', async ({ page }) => {
+            const before = await userStories(page).count();
+
+            const lb = await openCreateLightbox(page);
+            await lb.locator(LB_EDIT_SUBJECT).fill(`full form${Date.now()}`);
+            await lb.locator(LB_EDIT_DESCRIPTION).fill('created via the real react lightbox');
+
+            const dueDate = lb.locator(LB_EDIT_DUE_DATE);
+            if (await dueDate.count()) {
+                await dueDate.fill('2025-12-31');
+            }
+
+            // subject+status ship in bulk_create; the rich fields follow in a PATCH.
+            const created = waitCreatePersist(page);
+            const patched = waitEditPersist(page);
+            await submitLightbox(page, lb);
+            await created;
+            await patched;
+
+            await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20_000 });
+        });
+
+        test('empty subject shows the required error and does not persist', async ({ page }) => {
+            const before = await userStories(page).count();
+
+            const lb = await openCreateLightbox(page);
+            await lb.locator(LB_EDIT_SUBJECT).fill('');
+
+            // Guard: NO create request may leave the browser for an invalid form.
+            let persistFired = false;
+            page.on('request', (r) => {
+                if (/\/userstories\/bulk_create/.test(r.url()) && r.method() === 'POST') {
+                    persistFired = true;
+                }
+            });
+
+            await lb.locator(LB_EDIT_SUBMIT).first().click();
+
+            await expect(lb.locator(LB_EDIT_REQUIRED)).toBeVisible({ timeout: 5_000 });
+            await expect(lb).toBeVisible();
+            expect(persistFired).toBe(false);
+            await expect(userStories(page)).toHaveCount(before);
+        });
+
+        test('create a user story with an attachment', async ({ page }) => {
+            const before = await userStories(page).count();
+
+            const lb = await openCreateLightbox(page);
+            await lb.locator(LB_EDIT_SUBJECT).fill(`attach${Date.now()}`);
+
+            // Attach a small in-memory file via the real <input type="file">.
+            await lb.locator('input[type="file"]').setInputFiles({
+                name: 'note.txt',
+                mimeType: 'text/plain',
+                buffer: Buffer.from('parity attachment'),
+            });
+            await expect(lb.locator('.attachments-num')).toHaveText('1');
+
+            const created = waitCreatePersist(page);
+            const uploaded = page.waitForResponse(
+                (r) =>
+                    /\/userstories\/attachments/.test(r.url()) &&
+                    r.request().method() === 'POST',
+                { timeout: 20_000 },
+            );
+            await submitLightbox(page, lb);
+            await created;
+            await uploaded;
+
+            await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20_000 });
         });
     });
 
@@ -600,30 +744,33 @@ test.describe('backlog', () => {
     });
 
     /* -------------------------------------------------------------- *
-     * edit US
+     * edit US (the REAL single-US lightbox)
      * -------------------------------------------------------------- *
-     * Edit is delegated to the AngularJS generic-form lightbox via the
-     * `genericform:edit` bridge (BacklogApp.tsx L1266). We open the row's
-     * options popup, click Edit, and assert the correct bridge event fires.
+     * [C-07] The row options-popup Edit item (`button.e2e-edit.edit-story`)
+     * opens the REAL edit lightbox seeded with the story — NOT the removed
+     * genericform:edit bridge. Editing the subject and submitting must issue a
+     * single `PATCH /userstories/{id}` and reflect the new subject in the table.
      */
     test.describe('edit US', () => {
-        test('edit affordance fires the genericform:edit bridge', async ({ page }) => {
-            await installBridgeSpy(page);
-
+        test('edit a user story subject through the real lightbox', async ({ page }) => {
             const row = userStories(page).first();
-            await row.locator(US_OPTION_BTN).first().click();
-            const popup = page.locator(US_OPTION_POPUP).first();
-            await popup.waitFor({ state: 'visible', timeout: 10_000 });
-            await popup.locator(OPT_EDIT).first().click();
 
-            await expect
-                .poll(async () =>
-                    (await bridgeBroadcasts(page)).some(
-                        (b) => b.name === 'genericform:edit' && b.objType === 'us',
-                    ),
-                    { timeout: 10_000 },
-                )
-                .toBe(true);
+            const lb = await openEditLightbox(page, row);
+            await expect(lb.locator(LB_EDIT_SUBJECT)).toBeVisible();
+            await capture(page, 'edit-us');
+
+            const edited = `edited${Date.now()}`;
+            await lb.locator(LB_EDIT_SUBJECT).fill(edited);
+
+            const persisted = waitEditPersist(page);
+            await submitLightbox(page, lb);
+            const response = await persisted;
+            expect(response.request().method()).toBe('PATCH');
+
+            // The edited (unique) subject is now rendered on exactly one row.
+            await expect(
+                userStories(page).locator('.user-story-name', { hasText: edited }),
+            ).toHaveCount(1, { timeout: 20_000 });
         });
     });
 
@@ -658,19 +805,52 @@ test.describe('backlog', () => {
             .not.toBe(original);
     });
 
-    test('delete US', async ({ page }) => {
-        const before = await userStories(page).count();
+    /*
+     * [C-07] `delete US` — the row options-popup Delete item (`button.e2e-delete`)
+     * opens the THEMED ConfirmDialog ([N-03]), NOT a native window.confirm.
+     * Cancelling leaves the row; confirming issues `DELETE /userstories/{id}` and
+     * removes it.
+     */
+    test.describe('delete US', () => {
+        test('cancel keeps the story', async ({ page }) => {
+            const before = await userStories(page).count();
 
-        // Single-US delete uses a native window.confirm (NOT a lightbox); accept it.
-        page.once('dialog', (dialog) => dialog.accept());
+            const popup = await openRowOptions(page, userStories(page).first());
+            await popup.locator(OPT_DELETE).first().click();
 
-        const row = userStories(page).first();
-        await row.locator(US_OPTION_BTN).first().click();
-        const popup = page.locator(US_OPTION_POPUP).first();
-        await popup.waitFor({ state: 'visible', timeout: 10_000 });
-        await popup.locator(OPT_DELETE).first().click();
+            const dialog = page
+                .locator(CONFIRM_DIALOG)
+                .filter({ has: page.locator(CONFIRM_OK) });
+            await expect(dialog).toBeVisible({ timeout: 10_000 });
+            await dialog.locator(CONFIRM_CANCEL).click();
+            await expect(dialog).toBeHidden({ timeout: 10_000 });
 
-        await expect(userStories(page)).toHaveCount(before - 1, { timeout: 20_000 });
+            await expect(userStories(page)).toHaveCount(before);
+        });
+
+        test('confirm deletes the story', async ({ page }) => {
+            const before = await userStories(page).count();
+
+            const popup = await openRowOptions(page, userStories(page).first());
+            await popup.locator(OPT_DELETE).first().click();
+
+            const dialog = page
+                .locator(CONFIRM_DIALOG)
+                .filter({ has: page.locator(CONFIRM_OK) });
+            await expect(dialog).toBeVisible({ timeout: 10_000 });
+            await capture(page, 'delete-us');
+
+            const deleted = page.waitForResponse(
+                (r) =>
+                    /\/userstories\/\d+(\?|$)/.test(r.url()) &&
+                    r.request().method() === 'DELETE',
+                { timeout: 20_000 },
+            );
+            await dialog.locator(CONFIRM_OK).click();
+            await deleted;
+
+            await expect(userStories(page)).toHaveCount(before - 1, { timeout: 20_000 });
+        });
     });
 
     /* -------------------------------------------------------------- *
@@ -693,6 +873,73 @@ test.describe('backlog', () => {
         await expect
             .poll(async () => await tableRowRef(rows.nth(0)), { timeout: 20_000 })
             .toBe(draggedRef);
+    });
+
+    /*
+     * [C-07] rollback — when the backlog-order persist FAILS, the optimistic
+     * reorder is rolled back (BacklogApp L1985: `applyMovedUserstories(prev)`)
+     * and the rows return to their original order. Force a 500 on
+     * `bulk_update_backlog_order` via route interception (deterministic, no
+     * backend dependency).
+     */
+    test('failed order persist rolls the reorder back', async ({ page }) => {
+        const rows = userStories(page);
+        const originalFirstRef = await tableRowRef(rows.nth(0));
+        const dragRow = rows.nth(4);
+        const draggedRef = await tableRowRef(dragRow);
+
+        await page.route(/bulk_update_backlog_order/, (route) =>
+            route.fulfill({ status: 500, contentType: 'application/json', body: '{}' }),
+        );
+
+        await dndDrag(page, dragRow.locator(TABLE_DRAG_HANDLE), rows.nth(0));
+
+        // The optimistic move is reverted: row 0 is the ORIGINAL first row again,
+        // not the dragged row.
+        await expect
+            .poll(async () => await tableRowRef(rows.nth(0)), { timeout: 15_000 })
+            .toBe(originalFirstRef);
+        expect(await tableRowRef(rows.nth(0))).not.toBe(draggedRef);
+
+        await page.unroute(/bulk_update_backlog_order/);
+    });
+
+    /*
+     * [C-07] permission gating — the "+" create controls (`.new-us` buttons) are
+     * gated on the `add_us` permission (`{canAddUs && …}`). Strip `add_us` from
+     * the project payload via route interception, reload, and assert both the
+     * standard and bulk create affordances are absent.
+     */
+    test('create affordances are hidden without add_us permission', async ({ page }) => {
+        const projectsRe = /\/api\/v1\/projects(\/|\?|$)/;
+        const stripAddUs = (p: Record<string, unknown>): Record<string, unknown> => {
+            if (Array.isArray(p.my_permissions)) {
+                p.my_permissions = (p.my_permissions as string[]).filter((x) => x !== 'add_us');
+            }
+            return p;
+        };
+
+        await page.route(projectsRe, async (route) => {
+            const response = await route.fetch();
+            let json: unknown;
+            try {
+                json = await response.json();
+            } catch {
+                return route.fulfill({ response });
+            }
+            const body = Array.isArray(json)
+                ? (json as Record<string, unknown>[]).map(stripAddUs)
+                : stripAddUs(json as Record<string, unknown>);
+            return route.fulfill({ response, json: body });
+        });
+
+        // Reload so the board re-reads the permission-stripped project payload.
+        await openBacklog(page, 'project-3');
+
+        await expect(page.locator(NEW_US_STANDARD)).toHaveCount(0, { timeout: 15_000 });
+        await expect(page.locator(NEW_US_BULK)).toHaveCount(0, { timeout: 15_000 });
+
+        await page.unroute(projectsRe);
     });
 
     test('reorder multiple us', async ({ page }) => {
@@ -861,6 +1108,11 @@ test.describe('backlog', () => {
                 .toContain(name);
         });
 
+        // [C-07] Sprint delete uses the THEMED ConfirmDialog nested over the
+        // sprint lightbox (SprintEditLightbox → ConfirmDialog, [N-03]), NOT a
+        // native window.confirm. Both are role="dialog", so target the confirm
+        // control (`.js-confirm`) directly — it is unique to the ConfirmDialog —
+        // and hard-assert the `DELETE /milestones/{id}` persist.
         test('delete', async ({ page }) => {
             await page.locator(EDIT_SPRINT).nth(0).click();
             const lb = await waitSprintLightbox(page);
@@ -868,9 +1120,19 @@ test.describe('backlog', () => {
             // Record the name BEFORE deleting.
             const name = (await lb.locator(SPRINT_NAME_INPUT).first().inputValue()).trim();
 
-            // Sprint delete uses a native window.confirm; accept it.
-            page.once('dialog', (dialog) => dialog.accept());
             await lb.locator(SPRINT_DELETE).first().click();
+
+            const confirmBtn = page.locator(CONFIRM_OK);
+            await expect(confirmBtn).toBeVisible({ timeout: 10_000 });
+
+            const deleted = page.waitForResponse(
+                (r) =>
+                    /\/milestones\/\d+(\?|$)/.test(r.url()) &&
+                    r.request().method() === 'DELETE',
+                { timeout: 20_000 },
+            );
+            await confirmBtn.click();
+            await deleted;
             await waitSprintLightboxClose(page);
 
             await expect

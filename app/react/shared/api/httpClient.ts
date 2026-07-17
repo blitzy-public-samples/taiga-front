@@ -54,7 +54,10 @@ export interface RequestOptions {
     params?: QueryParams;
     /** Extra request headers (e.g. `x-disable-pagination`). Default headers win on conflict. */
     headers?: Record<string, string>;
-    /** JSON request body; serialized with `JSON.stringify`. */
+    /**
+     * Request body. A `FormData` value is sent as multipart (used for attachment
+     * uploads); anything else is serialized with `JSON.stringify`.
+     */
     body?: unknown;
     /** Optional abort signal. */
     signal?: AbortSignal;
@@ -234,11 +237,18 @@ export async function request<T = unknown>(
 ): Promise<HttpResponse<T>> {
     const url = buildUrl(path) + buildQueryString(options.params);
     const hasBody = options.body !== undefined && options.body !== null;
-    const headers = buildHeaders(method, hasBody, options.headers);
+    // [M-10] `FormData` bodies (attachment uploads) are sent as multipart: they
+    // are NOT JSON-stringified, and the JSON `Content-Type` header is omitted so
+    // the browser sets the correct `multipart/form-data; boundary=…` itself.
+    const isFormDataBody =
+        hasBody && typeof FormData !== "undefined" && options.body instanceof FormData;
+    const headers = buildHeaders(method, hasBody && !isFormDataBody, options.headers);
 
     const init: RequestInit = { method, headers };
     if (hasBody) {
-        init.body = JSON.stringify(options.body);
+        init.body = isFormDataBody
+            ? (options.body as FormData)
+            : JSON.stringify(options.body);
     }
     if (options.signal) {
         init.signal = options.signal;

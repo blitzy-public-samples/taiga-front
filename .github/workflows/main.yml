@@ -92,8 +92,11 @@ jobs:
     - name: npm install
       run: npm ci
 
-    - name: pass unit test
+    # [N-07] `ci:test` (package.json) already ends with `npx jest --coverage`,
+    # which enforces the ≥70% line gate via `coverageThreshold` in jest.config.js
+    # (AAP §0.5.2 mandates the coverage-gated Jest run live inside `ci:test`). A
+    # separate `npm run test:coverage` step here re-ran the entire Jest suite with
+    # coverage a second time for no added signal — removed to keep exactly one
+    # coverage-gated run.
+    - name: pass unit test (karma + jest coverage gate)
       run: npm run ci:test
-
-    - name: pass react unit tests (jest, >=70% line coverage)
-      run: npm run test:coverage

@@ -5,7 +5,7 @@
  *
  * Copyright (c) 2021-present Kaleidos INC
  */
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, waitFor } from "@testing-library/react";
 import { Card } from "../Card";
 import { retrieveUserStoryData } from "../useKanbanState";
 import type {
@@ -216,6 +216,62 @@ describe("Card assignee + actions", () => {
         fireEvent.click(container.querySelector(".card-action-edit")!);
         expect(container.querySelector(".card-actions-menu")).toBeNull();
     });
+
+    // [M-13] "Move to top" card action, ported from the legacy card-actions
+    // popover gated on `canEdit(getModifyPermisionKey()) && !isFirst`
+    // (kanban/main.coffee L1090-L1097). It fires `onClickMoveToTop(id)`.
+    it("fires onClickMoveToTop with the story id when the Move-to-top action is clicked (not first card)", () => {
+        const onClickMoveToTop = jest.fn();
+        const { container } = render(
+            <Card
+                item={view({ id: 42, subject: "Hi" })}
+                project={project}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+                isFirst={false}
+                onClickMoveToTop={onClickMoveToTop}
+            />,
+        );
+        openActionsMenu(container);
+        const moveTop = container.querySelector(".card-action-move-to-top");
+        expect(moveTop).not.toBeNull();
+        fireEvent.click(moveTop!);
+        expect(onClickMoveToTop).toHaveBeenCalledTimes(1);
+        expect(onClickMoveToTop).toHaveBeenCalledWith(42);
+    });
+
+    it("hides the Move-to-top action for the first card in its column (isFirst)", () => {
+        const { container } = render(
+            <Card
+                item={view({ id: 42, subject: "Hi" })}
+                project={project}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+                isFirst
+                onClickMoveToTop={jest.fn()}
+            />,
+        );
+        openActionsMenu(container);
+        // `project` grants modify_us, but the card is first -> no move-to-top.
+        expect(container.querySelector(".card-action-edit")).not.toBeNull();
+        expect(container.querySelector(".card-action-move-to-top")).toBeNull();
+    });
+
+    it("hides the Move-to-top action when the project lacks modify permission", () => {
+        // view_us only: no modify_us -> the ⋮ trigger does not even render.
+        const { container } = render(
+            <Card
+                item={view({ id: 42, subject: "Hi" })}
+                project={projectReadOnly}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+                isFirst={false}
+                onClickMoveToTop={jest.fn()}
+            />,
+        );
+        expect(container.querySelector(".card-actions")).toBeNull();
+        expect(container.querySelector(".card-action-move-to-top")).toBeNull();
+    });
 });
 
 describe("Card rich render at max zoom", () => {
@@ -278,6 +334,26 @@ describe("Card rich render at max zoom", () => {
         expect(onToggleFold).toHaveBeenCalledWith(200);
     });
 
+    it("[M-21] the unfold affordance is keyboard-operable (Enter/Space) and named", () => {
+        const onToggleFold = jest.fn();
+        const { container } = render(
+            <Card item={richView()} project={project} zoom={ZOOM[3]} zoomLevel={3}
+                onToggleFold={onToggleFold} />,
+        );
+        const unfold = container.querySelector(".card-unfold") as HTMLElement;
+        expect(unfold).not.toBeNull();
+        // Accessible name for assistive tech (the legacy control had none).
+        expect((unfold.getAttribute("aria-label") ?? "").length).toBeGreaterThan(0);
+        // Keyboard activation: Enter toggles the fold…
+        fireEvent.keyDown(unfold, { key: "Enter" });
+        expect(onToggleFold).toHaveBeenCalledTimes(1);
+        expect(onToggleFold).toHaveBeenLastCalledWith(200);
+        // …and Space toggles it too.
+        fireEvent.keyDown(unfold, { key: " " });
+        expect(onToggleFold).toHaveBeenCalledTimes(2);
+        expect(onToggleFold).toHaveBeenLastCalledWith(200);
+    });
+
     it("fires edit/assign/delete with the story id from the actions menu at max zoom", () => {
         const onClickEdit = jest.fn();
         const onClickAssignedTo = jest.fn();
@@ -303,6 +379,55 @@ describe("Card rich render at max zoom", () => {
         fireEvent.click(del.container.querySelector(".card-actions .js-popup-button")!);
         fireEvent.click(del.container.querySelector(".card-action-delete")!);
         expect(onClickDelete).toHaveBeenCalledWith(200);
+    });
+
+    it("[M-21] the actions popup implements a complete ARIA menu (roles, controls, roving focus, Escape)", async () => {
+        const { container } = render(
+            <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} />,
+        );
+        const trigger = container.querySelector(
+            ".card-actions .js-popup-button",
+        ) as HTMLButtonElement;
+        // Trigger advertises a menu popup.
+        expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+        expect(trigger.getAttribute("aria-expanded")).toBe("false");
+
+        fireEvent.click(trigger);
+
+        const menu = container.querySelector(".card-actions-menu") as HTMLElement;
+        expect(menu).not.toBeNull();
+        // Menu semantics + wiring.
+        expect(menu.getAttribute("role")).toBe("menu");
+        expect(trigger.getAttribute("aria-expanded")).toBe("true");
+        expect(trigger.getAttribute("aria-controls")).toBe(menu.id);
+        expect(menu.id.length).toBeGreaterThan(0);
+
+        const items = Array.from(
+            menu.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+        );
+        // edit + assign + delete + move-to-top (richView is not the first card here).
+        expect(items.length).toBeGreaterThanOrEqual(3);
+
+        // Focus lands on the first item once the popup is rendered (post-paint).
+        await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+        // ArrowDown / ArrowUp move a roving focus between items.
+        fireEvent.keyDown(menu, { key: "ArrowDown" });
+        expect(document.activeElement).toBe(items[1]);
+        fireEvent.keyDown(menu, { key: "ArrowUp" });
+        expect(document.activeElement).toBe(items[0]);
+
+        // Home / End jump to the extremes.
+        fireEvent.keyDown(menu, { key: "End" });
+        expect(document.activeElement).toBe(items[items.length - 1]);
+        fireEvent.keyDown(menu, { key: "Home" });
+        expect(document.activeElement).toBe(items[0]);
+
+        // Escape closes the menu and returns focus to the trigger.
+        fireEvent.keyDown(menu, { key: "Escape" });
+        expect(container.querySelector(".card-actions-menu")).toBeNull();
+        expect(trigger.getAttribute("aria-expanded")).toBe("false");
+        expect(document.activeElement).toBe(trigger);
     });
 
     it("uses a custom resolveAvatar when provided", () => {
@@ -490,5 +615,108 @@ describe("Card multi-select ctrl/meta-click (QA-FUNC-01)", () => {
         );
         const el = container.querySelector("[data-id]")!;
         expect(() => fireEvent.click(el, { ctrlKey: true })).not.toThrow();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// [N-04] baseHref-aware epic/task navigation destinations.
+// The initial migration emitted no-op `card-epic` anchors and a literal
+// `href="#"` task link; both now resolve to the exact surviving AngularJS
+// routes (`project-epics-detail` / `project-tasks-detail`).
+// ---------------------------------------------------------------------------
+describe("Card [N-04] epic/task link destinations", () => {
+    const projectWithSlug: KanbanProject = {
+        id: 7,
+        my_permissions: ["modify_us"],
+        slug: "proj",
+    };
+
+    it("expanded (zoom>0) epic link targets /project/:slug/epic/:ref", () => {
+        const { container } = render(
+            <Card
+                item={view({
+                    id: 1,
+                    ref: 5,
+                    epics: [{ id: 9, ref: 3, color: "#f00", subject: "Epic" }],
+                })}
+                project={projectWithSlug}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+            />,
+        );
+        const link = container.querySelector(
+            ".card-epics .card-epic",
+        ) as HTMLAnchorElement;
+        expect(link).not.toBeNull();
+        expect(link.getAttribute("href")).toBe("/project/proj/epic/3");
+    });
+
+    it("compact (zoom 0) epic link targets the same epic detail URL", () => {
+        const { container } = render(
+            <Card
+                item={view({
+                    id: 1,
+                    ref: 5,
+                    epics: [{ id: 9, ref: 3, color: "#f00", subject: "Epic" }],
+                })}
+                project={projectWithSlug}
+                zoom={ZOOM[0]}
+                zoomLevel={0}
+            />,
+        );
+        const link = container.querySelector(
+            ".card-compact-epics .card-epic",
+        ) as HTMLAnchorElement;
+        expect(link).not.toBeNull();
+        expect(link.getAttribute("href")).toBe("/project/proj/epic/3");
+    });
+
+    it("task link targets /project/:slug/task/:ref (no more href=#)", () => {
+        const { container } = render(
+            <Card
+                item={view({
+                    id: 1,
+                    ref: 5,
+                    tasks: [
+                        {
+                            id: 8,
+                            ref: 4,
+                            subject: "Task",
+                            is_closed: false,
+                            is_blocked: false,
+                        },
+                    ],
+                })}
+                project={projectWithSlug}
+                zoom={ZOOM[3]}
+                zoomLevel={3}
+            />,
+        );
+        const link = container.querySelector(
+            ".card-tasks .card-task a",
+        ) as HTMLAnchorElement;
+        expect(link).not.toBeNull();
+        expect(link.getAttribute("href")).toBe("/project/proj/task/4");
+    });
+
+    it("omits the href entirely when the project slug is unavailable", () => {
+        const { container } = render(
+            <Card
+                item={view({
+                    id: 1,
+                    ref: 5,
+                    epics: [{ id: 9, ref: 3, color: "#f00", subject: "Epic" }],
+                })}
+                project={project}
+                zoom={ZOOM[2]}
+                zoomLevel={2}
+            />,
+        );
+        const link = container.querySelector(
+            ".card-epics .card-epic",
+        ) as HTMLAnchorElement;
+        expect(link).not.toBeNull();
+        // No `href=""`/`"#"` placeholder that would reload/scroll the page.
+        expect(link.hasAttribute("href")).toBe(false);
     });
 });

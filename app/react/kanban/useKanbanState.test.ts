@@ -22,14 +22,14 @@ import {
     reduceToggleFold,
     retrieveUserStoryData,
     useKanbanState,
-} from "../useKanbanState";
+} from "./useKanbanState";
 import type {
     KanbanProject,
     Status,
     Swimlane,
     UsersById,
     UserStoryModel,
-} from "../useKanbanState";
+} from "./useKanbanState";
 
 const statuses: Status[] = [
     { id: 1, name: "New", color: "#f00", order: 1, is_archived: false, wip_limit: null },

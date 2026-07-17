@@ -191,6 +191,22 @@ describe("shared/api/httpClient", () => {
             expect(init.body).toBeUndefined();
         });
 
+        it("[M-10] sends a FormData body as multipart (no JSON.stringify, no JSON Content-Type)", async () => {
+            const form = new FormData();
+            form.append("project", "7");
+            form.append("object_id", "42");
+            await request("POST", "userstories/attachments", { body: form });
+            const { init } = callArgs();
+            // The FormData instance is passed through verbatim (not stringified).
+            expect(init.body).toBe(form);
+            expect(typeof init.body).not.toBe("string");
+            // No JSON Content-Type: the browser sets the multipart boundary itself.
+            expect(sentHeaders()["Content-Type"]).toBeUndefined();
+            // Auth/session headers are still applied.
+            expect(sentHeaders()["Authorization"]).toBe(`Bearer ${TOKEN}`);
+            expect(sentHeaders()["X-Session-Id"]).toBe(SESSION_ID);
+        });
+
         it("transmits a DELETE body when one is supplied", async () => {
             await request("DELETE", "userstories/1", { body: { reason: "obsolete" } });
             const { init } = callArgs();

@@ -224,6 +224,16 @@ export interface DndProviderProps {
      * persistence; consumers should treat a `null` resolved defensively.
      */
     onPersistError?: (error: unknown, resolved: ResolvedDrop | null) => void;
+    /**
+     * [M-12] Notifies the consumer when a drag STARTS (`true`) and ENDS/CANCELS
+     * (`false`). The legacy Kanban detected "a drag is in progress" by probing
+     * for dragula's `tg-card.gu-mirror` element (kanban/main.coffee L1172); with
+     * `@dnd-kit` there is no such DOM mirror to probe, so the provider — the one
+     * component that owns the drag lifecycle — surfaces the active flag instead.
+     * `KanbanBoard` uses it to drive the folded-swimlane hover auto-open, which
+     * must only trigger WHILE a card is being dragged.
+     */
+    onDragActiveChange?: (active: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +446,7 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         collisionDetection,
         keyboardCoordinateGetter,
         onPersistError,
+        onDragActiveChange,
     } = props;
 
     // Hooks are intentionally called UNCONDITIONALLY, before the permission gate
@@ -478,13 +489,20 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         }),
     );
 
-    const handleDragStart = useCallback((event: DragStartEvent): void => {
-        setActiveId(Number(event.active.id));
-    }, []);
+    const handleDragStart = useCallback(
+        (event: DragStartEvent): void => {
+            setActiveId(Number(event.active.id));
+            // [M-12] A card drag has begun — enable folded-swimlane hover-open.
+            onDragActiveChange?.(true);
+        },
+        [onDragActiveChange],
+    );
 
     const handleDragCancel = useCallback((): void => {
         setActiveId(null);
-    }, []);
+        // [M-12] Drag cancelled — disable hover-open.
+        onDragActiveChange?.(false);
+    }, [onDragActiveChange]);
 
     const handleDragEnd = useCallback(
         (event: DragEndEvent): void => {
@@ -499,6 +517,8 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
 
             // Clear the overlay id immediately.
             setActiveId(null);
+            // [M-12] The drag has ended — disable folded-swimlane hover-open.
+            onDragActiveChange?.(false);
 
             // Resolve the drop UP-FRONT so the resolved payload is available to the
             // failure-recovery contract below. The consuming screen needs the exact
@@ -538,7 +558,7 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
                 handleFailure(error);
             }
         },
-        [resolveDrop, persist, onPersistError],
+        [resolveDrop, persist, onPersistError, onDragActiveChange],
     );
 
     // Permission gate: inert pass-through when DnD is disabled (no DndContext,

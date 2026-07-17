@@ -17,7 +17,7 @@ var gulp = require("gulp"),
     rename = require("gulp-rename"),
     gulpif = require("gulp-if"),
     replace = require("gulp-replace"),
-    sass = require('gulp-sass')(require('sass'));
+    sass = require('gulp-sass')(require('node-sass'));
     minifyCSS = require("gulp-clean-css"),
     stylelint = require('gulp-stylelint');
     cache = require("gulp-cache"),
@@ -619,7 +619,14 @@ gulp.task("esbuild", function() {
         jsx: "automatic",
         define: { "process.env.NODE_ENV": isDeploy ? '"production"' : '"development"' },
         minify: isDeploy,
-        sourcemap: true,
+        // [N-08] Emit a source map ONLY for non-deploy (dev/watch) builds. A
+        // `deploy` build must NOT ship a public source map: an inline/adjacent
+        // map embeds `sourcesContent` for the entire app/react/** tree (~326
+        // files, ~2 MiB of original TypeScript) and would be served verbatim by
+        // nginx, exposing the full un-minified source. Tie it to the same
+        // `isDeploy` switch that already governs `minify` and the NODE_ENV
+        // define so dev builds stay debuggable while production ships none.
+        sourcemap: !isDeploy,
         logLevel: "info"
     });
 });

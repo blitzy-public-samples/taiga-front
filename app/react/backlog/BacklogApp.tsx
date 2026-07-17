@@ -87,10 +87,13 @@ import type {
 import { httpGet, httpPatch, httpDelete, HttpError } from "../shared/api/httpClient";
 import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import * as userstoriesApi from "../shared/api/userstories";
+import * as attachmentsApi from "../shared/api/attachments";
+import type { UserStoryAttachment } from "../shared/api/attachments";
 import * as milestonesApi from "../shared/api/milestones";
 import * as userStorageApi from "../shared/api/userStorage";
 import type { StoredCustomFilters } from "../shared/api/userStorage";
 import { createEventsClient } from "../shared/events/websocket";
+import { generateHash } from "../shared/util/hash";
 import {
     DndProvider,
     isDragEnabled,
@@ -229,12 +232,18 @@ const VALID_QUERY_PARAMS: ReadonlySet<string> = new Set<string>([
 const SEARCH_DEBOUNCE_MS = 250;
 
 /**
- * Legacy localStorage key for the burndown-collapsed flag. The AngularJS key
- * came from `generateHash(["is-burndown-grpahs-collapsed"])`; the misspelling
- * "grpahs" is preserved verbatim for parity (the exact hashing is approximated
- * with a stable, project-agnostic key here).
+ * Legacy localStorage key for the burndown-collapsed flag (N-01). Reproduced
+ * EXACTLY: the AngularJS backlog stored it under
+ * `generateHash(["is-burndown-grpahs-collapsed"])` (backlog/main.coffee L1182),
+ * where `generateHash` is the sha1-of-JSON-components helper ported byte-for-byte
+ * in {@link generateHash}. The misspelling "grpahs" is preserved verbatim — it is
+ * part of the hashed input, so any deviation would compute a different key and
+ * silently orphan every existing user's saved setting. The former approximation
+ * (the raw string `"is-burndown-grpahs-collapsed"`) is migrated on read below.
  */
-const BURNDOWN_COLLAPSED_KEY = "is-burndown-grpahs-collapsed";
+const BURNDOWN_COLLAPSED_KEY = generateHash(["is-burndown-grpahs-collapsed"]);
+/** The pre-N-01 approximated (un-hashed) key, migrated on read for continuity. */
+const BURNDOWN_COLLAPSED_LEGACY_APPROX_KEY = "is-burndown-grpahs-collapsed";
 
 /**
  * `storeCustomFiltersName` for the backlog (backlog/main.coffee L50). Used to
@@ -262,8 +271,24 @@ function getBaseHref(): string {
     return cfg?.baseHref ?? "";
 }
 
-/** Per-project localStorage key for the show-tags preference. */
+/**
+ * Per-project localStorage key for the show-tags preference (N-01). Reproduced
+ * EXACTLY from the AngularJS resource (`userstories.coffee` storeShowTags /
+ * getShowTags, L169-176): with `hashShowTags = 'backlog-tags'` the namespace is
+ * `"{projectId}:backlog-tags"` and the key is
+ * `generateHash([projectId, "{projectId}:backlog-tags"])`. Using the exact key
+ * means the React Backlog reads the SAME value existing AngularJS users already
+ * saved, instead of the previous approximation (`showTags-{projectId}`) that
+ * silently started from scratch. The projectId is hashed as a number (matching
+ * `@scope.projectId`), so `JSON.stringify` yields the bare integer.
+ */
+const SHOW_TAGS_NAMESPACE_SUFFIX = "backlog-tags";
 function showTagsKey(projectId: number): string {
+    const ns = `${projectId}:${SHOW_TAGS_NAMESPACE_SUFFIX}`;
+    return generateHash([projectId, ns]);
+}
+/** The pre-N-01 approximated show-tags key, migrated on read for continuity. */
+function showTagsLegacyApproxKey(projectId: number): string {
     return `showTags-${projectId}`;
 }
 
@@ -717,6 +742,34 @@ function writeStoredBoolean(key: string, value: boolean): void {
         window.localStorage.setItem(key, String(value));
     } catch {
         /* best-effort: ignore storage failures (private mode, quota, jsdom) */
+    }
+}
+
+/**
+ * Read a boolean preference under its EXACT legacy hashed key (N-01), migrating
+ * a value written under an earlier approximated key if the hashed key is empty.
+ *
+ * Primary path: the hashed key is the one the AngularJS client used, so an
+ * existing user's saved value is read directly. Migration path: if the hashed
+ * key has no value but the pre-N-01 approximated key does, copy it forward
+ * (write under the hashed key, best-effort) and honor it — so the brief window
+ * in which the approximation was used never loses a user's setting. Absent both,
+ * returns `false` (same default as `readStoredBoolean`).
+ */
+function readStoredBooleanMigrating(exactKey: string, approxKey: string): boolean {
+    try {
+        const exact = window.localStorage.getItem(exactKey);
+        if (exact !== null) {
+            return exact === "true";
+        }
+        const approx = window.localStorage.getItem(approxKey);
+        if (approx !== null) {
+            window.localStorage.setItem(exactKey, approx);
+            return approx === "true";
+        }
+        return false;
+    } catch {
+        return false;
     }
 }
 
@@ -1196,7 +1249,10 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         isValidProjectId(projectId) ? projectId : NaN,
     );
     const [burndownCollapsed, setBurndownCollapsed] = useState<boolean>(() =>
-        readStoredBoolean(BURNDOWN_COLLAPSED_KEY),
+        readStoredBooleanMigrating(
+            BURNDOWN_COLLAPSED_KEY,
+            BURNDOWN_COLLAPSED_LEGACY_APPROX_KEY,
+        ),
     );
     const [closedSprintsVisible, setClosedSprintsVisible] = useState<boolean>(false);
     const [sprintLightbox, setSprintLightbox] = useState<SprintLightboxState>({
@@ -1226,6 +1282,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     // Refs that mirror the latest render values so the memoised async callbacks
     // never read a stale closure (the controller relied on a live `@scope`).
     const aliveRef = useRef<boolean>(true);
+    // M-04: per-project generation. `loadProject` bumps it whenever it (re)resolves
+    // the project — a new prop id on a same-instance transition, or a `.projects`
+    // refresh. Every dependent loader (stats/sprints/userstories/filters) captures
+    // the generation at its start and commits ONLY if it is still current, so a
+    // late completion cannot publish data for a project that has since changed.
+    // This closes the gap the boolean `aliveRef` alone could not (the root stays
+    // "alive" across a same-instance project transition).
+    const loadGenRef = useRef<number>(0);
+    // M-04: per-query generation for the paginated userstories load, so a slow
+    // response for an older filter/search/page cannot overwrite the list produced
+    // by a newer query (latest-wins), independent of the project generation.
+    const userstoriesGenRef = useRef<number>(0);
     const stateRef = useRef(state);
     stateRef.current = state;
     const projectRef = useRef<Project | null>(project);
@@ -1316,6 +1384,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         // never keeps the board wedged on a stale connection-error screen.
         setConnectionError(false);
 
+        // M-04: open a NEW generation for this project resolution. Any load already
+        // in flight (from a prior project id or an overlapping refresh) is now
+        // stale and drops its result below.
+        const myGen = ++loadGenRef.current;
+
         try {
             // Choose the resolution endpoint. Only a valid positive-integer id
             // uses the by-id path (called with a single arg, exactly as before);
@@ -1331,7 +1404,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 }
                 res = await httpGet<Project>("projects/by_slug", { slug });
             }
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return false;
             }
             // Publish the resolved id to the ref FIRST so the loaders invoked
@@ -1347,7 +1420,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             }
             return true;
         } catch (err) {
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return false;
             }
             // Respect blocked / archived responses (403 / 451) as permission-denied.
@@ -1370,9 +1443,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (!isValidProjectId(id)) {
             return;
         }
+        // M-04: bind this load to the project generation active at its start.
+        const myGen = loadGenRef.current;
         try {
             const res = await httpGet<ProjectStats>(`projects/${id}/stats`);
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             setStats(res.data);
@@ -1391,9 +1466,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (!isValidProjectId(id)) {
             return;
         }
+        // M-04: bind to the project generation active at start.
+        const myGen = loadGenRef.current;
         try {
             const result = await milestonesApi.list(id, { closed: false });
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             const open = Number.isNaN(result.open) ? result.milestones.length : result.open;
@@ -1410,9 +1487,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (!isValidProjectId(id)) {
             return;
         }
+        // M-04: bind to the project generation active at start.
+        const myGen = loadGenRef.current;
         try {
             const result = await milestonesApi.list(id, { closed: true });
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             const closed = Number.isNaN(result.closed) ? result.milestones.length : result.closed;
@@ -1441,6 +1520,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             const selected = opts.selected !== undefined ? opts.selected : s.selectedFilters;
             const requestPage = opts.reset ? 1 : pageRef.current;
 
+            // M-04: bind to the current project generation AND claim a new query
+            // generation. The commit below must be BOTH the newest query and still
+            // for the current project, so a stale filter/search/page response never
+            // overwrites a newer one and a cross-project response never lands.
+            const projGen = loadGenRef.current;
+            const usGen = ++userstoriesGenRef.current;
+
             setLoadingUserstories(true);
 
             const params: QueryParams = {
@@ -1456,7 +1542,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
             try {
                 const res = await httpGet<UserStory[]>("userstories", params);
-                if (!aliveRef.current) {
+                if (
+                    !aliveRef.current ||
+                    projGen !== loadGenRef.current ||
+                    usGen !== userstoriesGenRef.current
+                ) {
                     return;
                 }
 
@@ -1479,7 +1569,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
                 pageRef.current = hasNextPage ? requestPage + 1 : requestPage;
             } catch (err) {
-                if (!aliveRef.current) {
+                if (
+                    !aliveRef.current ||
+                    projGen !== loadGenRef.current ||
+                    usGen !== userstoriesGenRef.current
+                ) {
                     return;
                 }
                 setLoadingUserstories(false);
@@ -1505,13 +1599,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             // freshly-computed counts reflect it (state update is async).
             const selected =
                 overrideSelected !== undefined ? overrideSelected : s.selectedFilters;
+            // M-04: bind to the project generation active at start.
+            const myGen = loadGenRef.current;
             try {
                 const res = await userstoriesApi.filtersData({
                     project: id,
                     milestone: "null",
                     ...pickSelectedFilterParams(selected),
                 });
-                if (!aliveRef.current) {
+                if (!aliveRef.current || myGen !== loadGenRef.current) {
                     return;
                 }
                 const categories = buildFilterCategories(res.data);
@@ -1534,9 +1630,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (!isValidProjectId(id)) {
             return;
         }
+        // M-04: bind to the project generation active at start.
+        const myGen = loadGenRef.current;
         try {
             const raw = await userStorageApi.getFilters(id, BACKLOG_CUSTOM_FILTERS_SUFFIX);
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             // Update ONLY the customFilters slice. Reading stateRef.current.filters
@@ -1553,6 +1651,35 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         await Promise.all([loadProjectStats(), loadSprints(), loadUserstories({ reset: true })]);
     }, [loadProjectStats, loadSprints, loadUserstories]);
 
+    /**
+     * Refresh the authoritative project record and reconcile everything that
+     * depends on it. Invoked by the `changes.project.{id}.projects` WebSocket
+     * subscription (C-05) so that — on an already-mounted Backlog screen — a
+     * server-side change to project attributes never leaves a stale gate:
+     *   - module activation (`is_backlog_activated`),
+     *   - permissions (`my_permissions`, e.g. add_us / modify_us / delete_milestone),
+     *   - archive / block state (403 / 451 → permission-denied),
+     *   - metadata (user-story statuses, points) used by the filters and rows.
+     *
+     * `loadProject` re-runs the exact gate logic used on first load (clearing or
+     * setting `permissionDenied` / `loadError`); when the project is still
+     * viewable it reconciles the dependent data (stats, sprints, stories) and the
+     * filter categories so status/point metadata changes are reflected. The
+     * shared `aliveRef` guard prevents a late completion from committing after
+     * unmount (further hardened per-project/per-query in the async-safety pass).
+     */
+    const refreshProjectState = useCallback(async (): Promise<void> => {
+        const ok = await loadProject();
+        if (!aliveRef.current || !ok) {
+            return;
+        }
+        await loadBacklog();
+        if (!aliveRef.current) {
+            return;
+        }
+        await loadFilters();
+    }, [loadProject, loadBacklog, loadFilters]);
+
     /* ---------------------------------------------------------------------- */
     /* Phase C — WebSocket subscription (port initializeSubscription)          */
     /* ---------------------------------------------------------------------- */
@@ -1567,6 +1694,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         const id = resolvedIdRef.current;
         if (!isValidProjectId(id)) {
             return;
+        }
+        // M-04: never leak a prior socket. If a client already exists (e.g. a
+        // same-instance project transition re-ran the init), disconnect it before
+        // establishing the new subscription so events for the previous project can
+        // no longer fire. The mount effect also tears the socket down on a
+        // projectId change; this guards any re-init ordering.
+        if (eventsRef.current) {
+            eventsRef.current.disconnect();
+            eventsRef.current = null;
         }
         const client = createEventsClient();
         eventsRef.current = client;
@@ -1586,7 +1722,28 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             },
             { selfNotification: true },
         );
-    }, [loadUserstories, loadSprints, loadClosedSprints, loadProjectStats]);
+
+        // C-05 — project-attribute events. The AngularJS client keeps its
+        // permission / module / archive / metadata gates fresh on an
+        // already-open screen by reacting to `changes.project.{id}.projects`
+        // (the same routing key the Kanban root already honors). The Backlog had
+        // been omitting it, so a server-side module-deactivation, permission
+        // revocation, archive/block, or user-story-status/points edit left the
+        // mounted Backlog stale. Refresh the project record (which re-evaluates
+        // every gate) and reconcile the dependent data on any `.projects` event
+        // — the Backlog has no swimlanes, so (unlike Kanban) it does not narrow
+        // to swimlane/status match strings; any project-attribute change is
+        // relevant to at least one Backlog gate or list.
+        client.subscribe(`changes.project.${id}.projects`, () => {
+            void refreshProjectState();
+        });
+    }, [
+        loadUserstories,
+        loadSprints,
+        loadClosedSprints,
+        loadProjectStats,
+        refreshProjectState,
+    ]);
 
     /**
      * Port of `loadInitialData` (main.coffee L488): project → subscription →
@@ -1608,7 +1765,21 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         // Restore the persisted show-tags preference (port of `getShowTags`).
         // Uses the RESOLVED id (published synchronously by loadProject above).
         try {
-            const stored = window.localStorage.getItem(showTagsKey(resolvedIdRef.current));
+            const pid = resolvedIdRef.current;
+            let stored = window.localStorage.getItem(showTagsKey(pid));
+            if (stored == null) {
+                // N-01 migration: honor a value written under the pre-N-01
+                // approximated key, copying it forward under the exact key.
+                const approx = window.localStorage.getItem(showTagsLegacyApproxKey(pid));
+                if (approx != null) {
+                    try {
+                        window.localStorage.setItem(showTagsKey(pid), approx);
+                    } catch {
+                        /* best-effort */
+                    }
+                    stored = approx;
+                }
+            }
             if (stored != null) {
                 const desired = stored === "true";
                 if (stateRef.current.showTags !== desired) {
@@ -2228,16 +2399,41 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             let created = res.data as unknown as UserStory[];
             const first = created[0];
             const hasPoints = Object.keys(fields.points).length > 0;
-            if (first && (hasPoints || fields.assignedTo !== null)) {
+            // bulk_create carries only subject/status. Everything else the
+            // generic form collects is persisted in a follow-up PATCH — but only
+            // when at least one such field departs from its create default (so a
+            // bare "subject only" create still makes exactly one request).
+            const needsFollowUp =
+                hasPoints ||
+                fields.assignedTo !== null ||
+                fields.description !== "" ||
+                fields.tags.length > 0 ||
+                fields.due_date !== null ||
+                fields.is_blocked ||
+                fields.team_requirement ||
+                fields.client_requirement;
+            if (first && needsFollowUp) {
                 const patchRes = await httpPatch<UserStory>(`userstories/${first.id}`, {
                     points: fields.points,
                     assigned_to: fields.assignedTo,
+                    description: fields.description,
+                    tags: fields.tags,
+                    due_date: fields.due_date,
+                    is_blocked: fields.is_blocked,
+                    blocked_note: fields.blocked_note,
+                    team_requirement: fields.team_requirement,
+                    client_requirement: fields.client_requirement,
                     version: first.version,
                 });
                 if (!aliveRef.current) {
                     return;
                 }
                 created = [patchRes.data, ...created.slice(1)];
+            }
+            // Upload any chosen files against the freshly-created story (ports
+            // `createAttachments(data)`).
+            if (first) {
+                await createAttachments(first.id, fields.attachmentsToAdd);
             }
             await onBulkCreated(created, fields.position);
         },
@@ -2261,8 +2457,19 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     status: changes.status,
                     points: changes.points,
                     assigned_to: changes.assigned_to,
+                    description: changes.description,
+                    tags: changes.tags,
+                    due_date: changes.due_date,
+                    is_blocked: changes.is_blocked,
+                    blocked_note: changes.blocked_note,
+                    team_requirement: changes.team_requirement,
+                    client_requirement: changes.client_requirement,
                     version: target.version,
                 });
+                // Reproduce the CoffeeScript submit order: save →
+                // deleteAttachments → createAttachments.
+                await deleteAttachments(changes.attachmentsToDelete);
+                await createAttachments(target.id, changes.attachmentsToAdd);
                 if (!aliveRef.current) {
                     return;
                 }
@@ -2277,6 +2484,50 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             }
         },
         [patchUserStory, loadProjectStats, loadUserstories],
+    );
+
+    /**
+     * Upload each pending file as an attachment of user story `objectId`, against
+     * the frozen `/userstories/attachments` endpoint (ports `createAttachments`).
+     * Sequential to keep ordering deterministic.
+     */
+    const createAttachments = useCallback(
+        async (objectId: number, files: File[]): Promise<void> => {
+            for (const file of files) {
+                await attachmentsApi.uploadUserstoryAttachment(
+                    file,
+                    objectId,
+                    resolvedIdRef.current,
+                );
+            }
+        },
+        [],
+    );
+
+    /** Delete each queued attachment id (ports `deleteAttachments`). */
+    const deleteAttachments = useCallback(
+        async (ids: number[]): Promise<void> => {
+            for (const attachmentId of ids) {
+                await attachmentsApi.deleteUserstoryAttachment(attachmentId);
+            }
+        },
+        [],
+    );
+
+    /**
+     * Hydrate a story's existing attachments for the edit form. The backlog list
+     * endpoint omits the attachments array, so the lightbox calls this on open
+     * (against the frozen `/userstories/attachments` list endpoint).
+     */
+    const fetchUsAttachments = useCallback(
+        async (usId: number): Promise<UserStoryAttachment[]> => {
+            const response = await attachmentsApi.listUserstoryAttachments(
+                usId,
+                resolvedIdRef.current,
+            );
+            return response.data ?? [];
+        },
+        [],
     );
 
     /** The prop-drilled user-story action contract (memoised). */
@@ -2345,9 +2596,10 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
     /**
      * Port of `toggleShowTags` + `storeShowTags`: flip the hook flag and persist
-     * the preference under a per-project key. The exact legacy key came from
-     * `generateHash(["showTags", projectId])`; it is approximated here as
-     * `showTags-{projectId}` (documented in {@link showTagsKey}).
+     * the preference under the EXACT legacy per-project key
+     * `generateHash([projectId, "{projectId}:backlog-tags"])` (N-01, see
+     * {@link showTagsKey}), so the value round-trips with what the AngularJS
+     * backlog wrote for the same user.
      */
     const toggleShowTags = useCallback((): void => {
         const next = !stateRef.current.showTags;
@@ -3126,14 +3378,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     </div>
                 </section>
 
-                {/* `sidebar.sidebar` is a child of `main`, a SIBLING of
-                    `section.backlog`. Rendered via `createElement` because
-                    `sidebar` is not a standard element and augmenting
-                    `JSX.IntrinsicElements` would risk cross-module collisions
-                    (same rationale as the `tg-svg` host). */}
-                {createElement(
-                    "sidebar",
-                    { className: "sidebar" },
+                {/* The sprint sidebar is a child of `main`, a SIBLING of
+                    `section.backlog`. The legacy Jade emitted a non-standard
+                    `<sidebar class="sidebar">`; here it is a semantic
+                    `<aside className="sidebar">` (a valid HTML landmark that
+                    React recognizes, so no "unrecognized tag" warning), while
+                    keeping the `sidebar` CLASS so the compiled `.sidebar` SCSS
+                    (lightbox.scss, backlog layout) themes it unchanged. */}
+                <aside className="sidebar">
                     <SprintList
                         project={project}
                         openSprints={state.sprints}
@@ -3145,8 +3397,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                         onAddNewSprint={addNewSprint}
                         onEditSprint={onEditSprint}
                         onToggleClosedSprints={handleToggleClosedSprints}
-                    />,
-                )}
+                    />
+                </aside>
             </DndProvider>
 
             {/* [ERR-1] non-blocking user notifications (failed inline change /
@@ -3171,6 +3423,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 assignableUsers={assignableUsers}
                 onCreate={onCreateUserStory}
                 onEdit={onSaveUserStoryEdit}
+                fetchAttachments={fetchUsAttachments}
                 onClose={() => setUsLightbox((s) => ({ ...s, open: false }))}
             />
             <SprintEditLightbox

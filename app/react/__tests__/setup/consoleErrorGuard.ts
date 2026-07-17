@@ -7,25 +7,15 @@
  */
 
 /**
- * F-A — Global `console.error` guard (jest `setupFilesAfterEnv`).
+ * Global `console.error` guard (jest `setupFilesAfterEnv`).
  *
- * The React Backlog root hosts its sprint sidebar inside a lowercase custom
- * element via `createElement("sidebar", …)` (BacklogApp.tsx). React does not
- * recognize `<sidebar>` as an intrinsic element and emits a one-off
- * `console.error`:
- *
- *   "Warning: The tag <sidebar> is unrecognized in this browser. If you meant
- *    to render a React component, start its name with an uppercase letter."
- *
- * That warning is benign (the element is intentional and class-driven CSS
- * themes it exactly like the Jade output), but before this guard it leaked
- * un-asserted on every happy-path Backlog render — noise that could hide a
- * genuinely new console error.
- *
- * This guard makes console hygiene explicit for EVERY spec:
- *   - the single benign `<sidebar>` unrecognized-tag warning is suppressed;
- *   - EVERY other `console.error` is still forwarded (so it stays visible) AND
- *     recorded, and the test FAILS in `afterEach` if any such error leaked.
+ * Every React unit spec is held to strict console hygiene: ANY `console.error`
+ * that leaks during a test — an unrecognized-tag warning, an act() warning, a
+ * PropTypes failure, an unhandled render error — fails that test in
+ * `afterEach`. There is no allowlist: the React roots emit only valid,
+ * React-recognized markup (the sprint sidebar and the lightbox side panels are
+ * semantic `<aside className="sidebar">` landmarks, not the legacy non-standard
+ * `<sidebar>` element), so no benign warning needs to be tolerated.
  *
  * It is installed via raw assignment (not `jest.spyOn`) so it composes cleanly
  * with specs that install their OWN `console.error` spy for a deliberate error
@@ -41,15 +31,6 @@
 
 type ConsoleErrorFn = (...args: unknown[]) => void;
 
-/** True when the call is React's benign "<sidebar> is unrecognized" warning. */
-function isBenignSidebarWarning(args: readonly unknown[]): boolean {
-    const format = typeof args[0] === "string" ? (args[0] as string) : "";
-    return (
-        /is unrecognized in this browser/.test(format) &&
-        args.some((a) => a === "sidebar")
-    );
-}
-
 let originalConsoleError: ConsoleErrorFn;
 let leaked: unknown[][];
 
@@ -58,10 +39,6 @@ beforeEach(() => {
     leaked = [];
 
     console.error = ((...args: unknown[]): void => {
-        if (isBenignSidebarWarning(args)) {
-            // Intentional, benign — swallow it.
-            return;
-        }
         // Record for the afterEach assertion, and still forward so the error
         // remains visible in the test output.
         leaked.push(args);
@@ -85,9 +62,8 @@ afterEach(() => {
         const captured = leaked;
         leaked = [];
         throw new Error(
-            `Unexpected console.error during test (${captured.length}). Only the ` +
-                `benign React "<sidebar> is unrecognized" warning is allowed; ` +
-                `assert or fix the following:\n${rendered}`,
+            `Unexpected console.error during test (${captured.length}). No ` +
+                `console.error is allowed; assert or fix the following:\n${rendered}`,
         );
     }
 });

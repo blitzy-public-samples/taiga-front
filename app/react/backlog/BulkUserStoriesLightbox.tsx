@@ -41,12 +41,13 @@
  * backlog, so `swimlane_id` is ALWAYS sent as `null`.
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, useId } from "react";
 import type { FormEvent } from "react";
 
 import type { Project, UsStatus, Id, UserStory } from "./types";
 import { bulkCreate } from "../shared/api/userstories";
 import { t } from "../shared/i18n/translate";
+import { useDialogA11y } from "../shared/dialog/useDialogA11y";
 
 /* -------------------------------------------------------------------------- */
 /* i18n literals — English values pinned from app/locales/taiga/locale-en.json. */
@@ -160,22 +161,24 @@ export function BulkUserStoriesLightbox(
         }
     }, [open, defaultStatusId]);
 
-    // Escape closes the lightbox (equivalent to the ✕ close button) — but never
-    // while a submit is in flight, mirroring the shared ConfirmDialog behavior so
-    // the whole board's modal chrome dismisses consistently via the keyboard.
-    useEffect(() => {
-        if (!open) {
-            return undefined;
-        }
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !submitting) {
-                event.preventDefault();
-                onClose();
-            }
-        };
-        document.addEventListener("keydown", onKeyDown);
-        return () => document.removeEventListener("keydown", onKeyDown);
-    }, [open, submitting, onClose]);
+    // [M-09] Complete modal-dialog accessibility (role/aria-modal, focus
+    // entry+trap+return, background inert, nested-Escape policy) via the shared
+    // primitive. Escape closes the lightbox (equivalent to the ✕ close button)
+    // but never while a submit is in flight (`closeOnEscape: !submitting`).
+    // Initial focus lands on the bulk textarea. Replaces the former bespoke
+    // Escape-only handler.
+    const titleId = useId();
+    // [N-02] Instance-unique prefix for the crossed `top-backlog`/`bottom-backlog`
+    // radio ids the legacy Jade hard-coded, which collided with the other backlog
+    // lightboxes mounted (hidden) at the same time. `useId()` yields a stable
+    // per-instance prefix.
+    const fieldIds = useId();
+    const { dialogRef, dialogProps } = useDialogA11y({
+        open,
+        onClose,
+        closeOnEscape: !submitting,
+        initialFocusRef: textareaRef,
+    });
 
     // Ports getCurrentStatus(): the status whose id matches the selected statusId.
     const currentStatus = useMemo<UsStatus | undefined>(
@@ -255,6 +258,9 @@ export function BulkUserStoriesLightbox(
         // the `open` class instead (element stays in the DOM either way, mirroring
         // `lightboxService.open/close`).
         <div
+            ref={dialogRef}
+            {...dialogProps}
+            aria-labelledby={titleId}
             className={"lightbox lightbox-generic-bulk" + (open ? " open" : "")}
         >
             {/* tg-lightbox-close */}
@@ -268,7 +274,9 @@ export function BulkUserStoriesLightbox(
             </button>
 
             <form onSubmit={handleSubmit} noValidate>
-                <h2 className="title">{t("COMMON.NEW_BULK", TITLE_NEW_BULK)}</h2>
+                <h2 className="title" id={titleId}>
+                    {t("COMMON.NEW_BULK", TITLE_NEW_BULK)}
+                </h2>
 
                 {/* Status selector — jade `fieldset(ng-if="project.us_statuses")` */}
                 {project.us_statuses ? (
@@ -325,7 +333,7 @@ export function BulkUserStoriesLightbox(
                         */}
                         <label className="custom-radio">
                             <input
-                                id="top-backlog"
+                                id={`${fieldIds}-top-backlog`}
                                 type="radio"
                                 name="us_position"
                                 value="bottom"
@@ -340,7 +348,7 @@ export function BulkUserStoriesLightbox(
 
                         <label className="custom-radio">
                             <input
-                                id="bottom-backlog"
+                                id={`${fieldIds}-bottom-backlog`}
                                 type="radio"
                                 name="us_position"
                                 value="top"

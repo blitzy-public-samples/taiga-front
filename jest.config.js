@@ -28,8 +28,10 @@ module.exports = {
     },
 
     // @testing-library/jest-dom v6 auto-registers matchers when required.
-    // consoleErrorGuard (F-A) suppresses ONLY the benign React "<sidebar> is
-    // unrecognized" warning and fails any test that leaks another console.error.
+    // consoleErrorGuard enforces strict console hygiene with NO allowlist: any
+    // console.error a test leaks fails that test (the React roots emit only valid
+    // React-recognized markup — the sidebars are semantic <aside> landmarks — so
+    // nothing benign needs tolerating).
     setupFilesAfterEnv: [
         "@testing-library/jest-dom",
         "<rootDir>/app/react/__tests__/setup/consoleErrorGuard.ts"

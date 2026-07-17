@@ -873,6 +873,38 @@ describe("KanbanApp — WebSocket", () => {
         );
     });
 
+    it("[M-11] coalesces a burst of userstories events into a single leading reload", async () => {
+        const { usCb } = await loadAndGetCallbacks();
+        const before = mockListUserstories.mock.calls.length;
+        // Fire five events back-to-back within one tick, as an event storm would.
+        await act(async () => {
+            usCb({});
+            usCb({});
+            usCb({});
+            usCb({});
+            usCb({});
+        });
+        // The leading edge issues exactly ONE reload; the remaining four are
+        // coalesced (the trailing refresh is deferred by EVENTS_DEBOUNCE_MS and
+        // does not fire within this synchronous window). Pre-fix, all five would
+        // have triggered overlapping full-board refetches.
+        expect(mockListUserstories.mock.calls.length).toBe(before + 1);
+    });
+
+    it("[M-03] surfaces the shared error toast when a socket-triggered reload fails", async () => {
+        const { usCb } = await loadAndGetCallbacks();
+        // The board fetch (Promise.all) rejects on the userstories leg.
+        mockListUserstories.mockRejectedValueOnce(new Error("reload boom"));
+        await act(async () => {
+            usCb({});
+        });
+        await waitFor(() =>
+            expect(
+                document.querySelector(".kanban-notification-error"),
+            ).not.toBeNull(),
+        );
+    });
+
     it("performs a full refresh on a matching projects event", async () => {
         const { projCb } = await loadAndGetCallbacks();
         const before = mockHttpGet.mock.calls.filter((c) =>
@@ -1341,9 +1373,155 @@ describe("KanbanApp — drag persist", () => {
         expect(mockCaptured.boardProps?.movedUs).toEqual([1]);
     });
 
+    it("[M-05] rolls the board back to the pre-move snapshot and notifies when persistence fails", async () => {
+        await renderLoaded();
+        const neighbors: DropNeighbors = { previous: 2, next: null };
+        // The exact immer-frozen board handed to the child BEFORE the drag; a
+        // successful rollback restores this precise reference.
+        const stateBefore = mockCaptured.boardProps!.state;
+        // Make the single bulk_update_kanban_order POST reject.
+        mockHttpPost.mockRejectedValueOnce(new Error("persist failed"));
+        await act(async () => {
+            await mockCaptured.boardProps?.persist(resolvedFor("100::-1"), neighbors);
+        });
+        // Board restored to the exact pre-move snapshot (reference equality).
+        expect(mockCaptured.boardProps?.state).toBe(stateBefore);
+        // Transient move highlight cleared on rollback.
+        expect(mockCaptured.boardProps?.movedUs).toEqual([]);
+        // Shared error toast surfaced (mirrors `$tgConfirm.notify("error")`).
+        expect(document.querySelector(".kanban-notification-error")).not.toBeNull();
+    });
+
+    it("[M-05] a failed persist does not reject (no unhandled rejection)", async () => {
+        await renderLoaded();
+        const neighbors: DropNeighbors = { previous: 2, next: null };
+        mockHttpPost.mockRejectedValueOnce(new Error("persist failed"));
+        // The drag handler fires-and-forgets persist; it must resolve, not reject.
+        await act(async () => {
+            await expect(
+                mockCaptured.boardProps?.persist(resolvedFor("100::-1"), neighbors),
+            ).resolves.toBeUndefined();
+        });
+    });
+
     it("exposes a resolveDrop that delegates to resolveKanbanDrop (null over -> null)", async () => {
         await renderLoaded();
         expect(mockCaptured.boardProps?.resolveDrop(dragEnd(1, null))).toBeNull();
+    });
+});
+
+/* ========================================================================== */
+/* Component — move to top (M-13)                                             */
+/* ========================================================================== */
+
+// The default board holds ordered cards [1, 2] in status 100 (no swimlane).
+// `handleMoveToTop` ports `moveUsToTop` -> `moveUs(null, [us], status, swimlane,
+// 0, null, firstUsId)` via the same bulk_update_kanban_order contract as a drag.
+describe("KanbanApp — move to top (M-13)", () => {
+    it("moves a non-first card to the top with the exact bulk-order payload and highlights it", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickMoveToTop?.(2);
+        });
+        const call = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/bulk_update_kanban_order",
+        );
+        expect(call).toBeDefined();
+        // Ported moveUs(null, [2], 100, null, firstId=1): placed BEFORE the
+        // current first card (id 1), no swimlane_id for the -1 sentinel.
+        expect(call?.[1]).toEqual({
+            project_id: PROJECT_ID,
+            status_id: 100,
+            bulk_userstories: [2],
+            before_userstory_id: 1,
+        });
+        // The moved card is highlighted for the transient window.
+        expect(mockCaptured.boardProps?.movedUs).toEqual([2]);
+    });
+
+    it("is a no-op for a card already at the top of its column (first-card gating)", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickMoveToTop?.(1);
+        });
+        // Card 1 is already first -> NO bulk-order request is issued.
+        const call = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/bulk_update_kanban_order",
+        );
+        expect(call).toBeUndefined();
+        expect(mockCaptured.boardProps?.movedUs).toEqual([]);
+    });
+
+    it("is a no-op for an unknown card id", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickMoveToTop?.(999999);
+        });
+        const call = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/bulk_update_kanban_order",
+        );
+        expect(call).toBeUndefined();
+    });
+
+    it("rolls the board back to the pre-move snapshot and notifies when the move fails", async () => {
+        await renderLoaded();
+        // The exact immer-frozen board BEFORE the move; rollback restores it.
+        const stateBefore = mockCaptured.boardProps!.state;
+        // Make the single bulk_update_kanban_order POST reject.
+        mockHttpPost.mockRejectedValueOnce(new Error("move failed"));
+        await act(async () => {
+            mockCaptured.boardProps?.onClickMoveToTop?.(2);
+        });
+        // The failure path re-renders once the rejection is handled.
+        await waitFor(() =>
+            expect(
+                document.querySelector(".kanban-notification-error"),
+            ).not.toBeNull(),
+        );
+        // Board restored to the exact pre-move snapshot (reference equality).
+        expect(mockCaptured.boardProps?.state).toBe(stateBefore);
+        // Transient highlight cleared on rollback.
+        expect(mockCaptured.boardProps?.movedUs).toEqual([]);
+    });
+});
+
+/* ========================================================================== */
+/* Component — folded-swimlane drag hover auto-open (M-12)                    */
+/* ========================================================================== */
+
+// The Swimlane owns the ~1s hover timer (covered by Swimlane.test.tsx); this
+// suite proves the APP wires the callback the real root previously omitted:
+// `onRequestOpenSwimlane` must be supplied and must OPEN + persist a folded
+// swimlane (port of `mouseoverSwimlane` -> `ctrl.toggleSwimlane`).
+describe("KanbanApp — swimlane hover auto-open (M-12)", () => {
+    it("supplies onRequestOpenSwimlane to the board", async () => {
+        await renderLoaded();
+        expect(typeof mockCaptured.boardProps?.onRequestOpenSwimlane).toBe(
+            "function",
+        );
+    });
+
+    it("opens a folded swimlane when the board requests it (unfold + persist)", async () => {
+        await renderLoaded();
+        // Fold swimlane 50 first (manual toggle), then request-open it.
+        await act(async () => {
+            mockCaptured.boardProps?.onToggleSwimlane?.(50);
+        });
+        expect(mockCaptured.boardProps?.foldedSwimlane?.[50]).toBe(true);
+
+        await act(async () => {
+            mockCaptured.boardProps?.onRequestOpenSwimlane?.(50);
+        });
+        expect(mockCaptured.boardProps?.foldedSwimlane?.[50]).toBe(false);
+    });
+
+    it("never re-folds an already-open swimlane (open-only, no-op)", async () => {
+        await renderLoaded();
+        // Swimlane 50 starts open (foldedSwimlane empty) -> request-open is a no-op.
+        await act(async () => {
+            mockCaptured.boardProps?.onRequestOpenSwimlane?.(50);
+        });
+        expect(!!mockCaptured.boardProps?.foldedSwimlane?.[50]).toBe(false);
     });
 });
 
@@ -1405,35 +1583,60 @@ describe("KanbanApp — board callbacks", () => {
         expect(mockCaptured.boardProps).not.toBeNull();
     });
 
-    it("deletes a user story after confirmation and reloads", async () => {
-        const confirmSpy = jest
-            .spyOn(window, "confirm")
-            .mockReturnValue(true);
+    // [N-03] Delete now opens the THEMED, localized ConfirmDialog
+    // (.lightbox-generic-delete) — the port of `$tgConfirm.askOnDelete(...)` —
+    // instead of the browser-native `window.confirm`. `onClickDelete` OPENS the
+    // dialog; the DELETE only runs after its confirm (.js-confirm) button.
+    it("opens the themed confirm dialog and deletes + reloads on confirm", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickDelete?.(1);
+        });
+        const dialog = document.querySelector(
+            ".lightbox-generic-delete.open",
+        ) as HTMLElement | null;
+        expect(dialog).not.toBeNull();
+        // No DELETE fires until the user confirms.
+        expect(mockHttpDelete).not.toHaveBeenCalled();
+
+        await act(async () => {
+            fireEvent.click(dialog!.querySelector(".js-confirm") as HTMLElement);
+            await Promise.resolve();
         });
         expect(mockHttpDelete).toHaveBeenCalledWith("/userstories/1");
-        confirmSpy.mockRestore();
+        // The dialog closes after a successful delete.
+        await waitFor(() =>
+            expect(
+                document.querySelector(".lightbox-generic-delete.open"),
+            ).toBeNull(),
+        );
     });
 
-    it("does not delete when the confirmation is declined", async () => {
-        const confirmSpy = jest
-            .spyOn(window, "confirm")
-            .mockReturnValue(false);
+    it("does not delete when the confirm dialog is cancelled", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickDelete?.(1);
         });
+        const dialog = document.querySelector(
+            ".lightbox-generic-delete.open",
+        ) as HTMLElement | null;
+        expect(dialog).not.toBeNull();
+
+        await act(async () => {
+            fireEvent.click(dialog!.querySelector(".js-cancel") as HTMLElement);
+            await Promise.resolve();
+        });
         expect(mockHttpDelete).not.toHaveBeenCalled();
-        confirmSpy.mockRestore();
+        // Cancel closes the dialog.
+        expect(
+            document.querySelector(".lightbox-generic-delete.open"),
+        ).toBeNull();
     });
 
     // QA-FUNC-14: a failed DELETE must surface an error notification and SKIP the
     // reload (so the still-present card remains), mirroring the AngularJS
     // `confirm.notify("error")` branch. Previously there was no `.catch()`.
     it("shows an error notification and does NOT reload when delete fails", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
         mockHttpDelete.mockRejectedValueOnce(new Error("boom"));
         await renderLoaded();
         // Baseline: listUserstories calls so far (initial load).
@@ -1441,12 +1644,20 @@ describe("KanbanApp — board callbacks", () => {
         await act(async () => {
             mockCaptured.boardProps?.onClickDelete?.(1);
         });
+        const dialog = document.querySelector(
+            ".lightbox-generic-delete.open",
+        ) as HTMLElement | null;
+        expect(dialog).not.toBeNull();
+
+        await act(async () => {
+            fireEvent.click(dialog!.querySelector(".js-confirm") as HTMLElement);
+            await Promise.resolve();
+        });
         expect(mockHttpDelete).toHaveBeenCalledWith("/userstories/1");
         // Error banner shown...
         expect(document.querySelector(".kanban-notification-error")).not.toBeNull();
         // ...and NO extra reload was triggered by the failed delete.
         expect(mockListUserstories.mock.calls.length).toBe(callsBefore);
-        confirmSpy.mockRestore();
     });
 
     it("reports isArchivedHidden=false for an unknown user story", async () => {
@@ -1612,6 +1823,150 @@ describe("KanbanApp — edit & assignee callbacks (F3)", () => {
             });
         }).not.toThrow();
         expect(document.querySelector(".lightbox-create-edit.open")).not.toBeNull();
+    });
+});
+
+/* ========================================================================== */
+/* M-10 — user-story form persistence: extended PATCH + attachment side-effects */
+/* ========================================================================== */
+
+describe("KanbanApp — user-story form persistence (M-10)", () => {
+    it("create persists the secondary fields via a follow-up PATCH and uploads chosen files", async () => {
+        mockBulkCreate.mockImplementation(() =>
+            Promise.resolve(mkRes([{ id: 555, version: 1 }])),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("standard", 100);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        fireEvent.change(lb.querySelector('input[name="subject"]') as HTMLInputElement, {
+            target: { value: "Rich US" },
+        });
+        fireEvent.change(lb.querySelector("textarea.description") as HTMLTextAreaElement, {
+            target: { value: "the description" },
+        });
+        fireEvent.click(lb.querySelector(".btn-icon.team-requirement") as HTMLElement);
+        const file = new File(["data"], "attach.png", { type: "image/png" });
+        fireEvent.change(lb.querySelector('input[type="file"]') as HTMLInputElement, {
+            target: { files: [file] },
+        });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+        });
+
+        // bulk_create carries only subject/status/swimlane.
+        expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 100, "Rich US", null);
+        // The follow-up PATCH carries the extended generic-form field set.
+        await waitFor(() =>
+            expect(mockHttpPatch).toHaveBeenCalledWith(
+                "/userstories/555",
+                expect.objectContaining({
+                    description: "the description",
+                    team_requirement: true,
+                    tags: [],
+                    version: 1,
+                }),
+            ),
+        );
+        // The chosen file is uploaded as an attachment of the CREATED story via a
+        // multipart POST to the frozen `/userstories/attachments` endpoint.
+        await waitFor(() =>
+            expect(mockHttpPost).toHaveBeenCalledWith(
+                "/userstories/attachments",
+                expect.any(FormData),
+            ),
+        );
+        const attachCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/attachments",
+        ) as unknown[] | undefined;
+        const fd = attachCall?.[1] as FormData;
+        expect(fd.get("object_id")).toBe("555");
+        expect(fd.get("project")).toBe(String(PROJECT_ID));
+        expect((fd.get("attached_file") as File).name).toBe("attach.png");
+    });
+
+    it("a subject-only create makes NO follow-up PATCH and uploads nothing", async () => {
+        mockBulkCreate.mockImplementation(() =>
+            Promise.resolve(mkRes([{ id: 556, version: 1 }])),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("standard", 100);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        fireEvent.change(lb.querySelector('input[name="subject"]') as HTMLInputElement, {
+            target: { value: "Just a subject" },
+        });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+        });
+        await waitFor(() =>
+            expect(document.querySelector(".lightbox-create-edit.open")).toBeNull(),
+        );
+        expect(mockHttpPatch).not.toHaveBeenCalled();
+        expect(
+            mockHttpPost.mock.calls.some((c) => c[0] === "/userstories/attachments"),
+        ).toBe(false);
+    });
+
+    it("edit persists the extended field set, deletes removed attachments, and uploads new ones", async () => {
+        currentUserstories = [
+            makeUs({
+                id: 1,
+                status: 100,
+                kanban_order: 0,
+                version: 9,
+                attachments: [{ id: 55, name: "old.pdf" }],
+                total_attachments: 1,
+            } as Partial<UserStoryModel>),
+        ];
+        mockListUserstories.mockImplementation(() =>
+            Promise.resolve(mkRes(currentUserstories)),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onClickEdit?.(1);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        // The existing attachment is shown (seeded from the model — no GET).
+        expect(lb.querySelectorAll(".single-attachment").length).toBe(1);
+        // Delete the existing attachment (queues id 55).
+        fireEvent.click(lb.querySelector(".attachment-delete") as HTMLElement);
+        // Add a new file.
+        const file = new File(["data"], "fresh.png", { type: "image/png" });
+        fireEvent.change(lb.querySelector('input[type="file"]') as HTMLInputElement, {
+            target: { files: [file] },
+        });
+        fireEvent.change(lb.querySelector("textarea.description") as HTMLTextAreaElement, {
+            target: { value: "updated body" },
+        });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+        });
+
+        // The edit PATCH carries the extended field set + optimistic version.
+        await waitFor(() =>
+            expect(mockHttpPatch).toHaveBeenCalledWith(
+                "/userstories/1",
+                expect.objectContaining({
+                    description: "updated body",
+                    version: 9,
+                }),
+            ),
+        );
+        // The removed attachment is deleted through the frozen endpoint.
+        await waitFor(() =>
+            expect(mockHttpDelete).toHaveBeenCalledWith("/userstories/attachments/55"),
+        );
+        // The new file is uploaded against the same story.
+        const attachCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/attachments",
+        ) as unknown[] | undefined;
+        expect(attachCall).toBeTruthy();
+        const fd = attachCall?.[1] as FormData;
+        expect(fd.get("object_id")).toBe("1");
+        expect((fd.get("attached_file") as File).name).toBe("fresh.png");
     });
 });
 

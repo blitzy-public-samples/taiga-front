@@ -166,6 +166,22 @@ function root(container: HTMLElement): HTMLElement {
 }
 
 /* -------------------------------------------------------------------------- */
+/* [M-09] Modal-dialog accessibility (via the shared useDialogA11y primitive)  */
+/* -------------------------------------------------------------------------- */
+
+test("[M-09] exposes role=dialog + aria-modal with aria-labelledby wired to the title", () => {
+    const { container } = renderLightbox({ open: true });
+    const dialog = root(container);
+    expect(dialog).toHaveAttribute("role", "dialog");
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    const labelledby = dialog.getAttribute("aria-labelledby");
+    expect(labelledby).toBeTruthy();
+    const title = container.querySelector("h2.title") as HTMLElement;
+    expect(title.id).toBe(labelledby);
+    expect((title.textContent ?? "").trim().length).toBeGreaterThan(0);
+});
+
+/* -------------------------------------------------------------------------- */
 /* Reveal contract (#3)                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -196,7 +212,9 @@ test("create mode seeds a blank form with defaults and the creation-position sec
     expect(container.querySelector(".status-text")?.textContent).toBe("New");
     // Creation-position radios ARE present in create mode; default = "at the bottom".
     expect(container.querySelector("section.creation-position")).not.toBeNull();
-    const bottomRadio = container.querySelector("#top-backlog") as HTMLInputElement;
+    const bottomRadio = container.querySelector(
+        'input[name="us_position"][value="bottom"]',
+    ) as HTMLInputElement;
     expect(bottomRadio.checked).toBe(true);
 });
 
@@ -273,17 +291,29 @@ test("create submit hands onCreate the collected fields and closes on success", 
         target: { value: "103" },
     });
     // Position -> "on top".
-    fireEvent.click(container.querySelector("#bottom-backlog") as HTMLInputElement);
+    fireEvent.click(
+        container.querySelector('input[name="us_position"][value="top"]') as HTMLInputElement,
+    );
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+    // M-10 — the create payload now carries the full generic-form field surface;
+    // the secondary fields are at their untouched create defaults here.
     expect(onCreate).toHaveBeenCalledWith({
         subject: "Brand new", // trimmed
         statusId: 100, // default
         points: { "11": 103 },
         assignedTo: 43,
         position: "top",
+        description: "",
+        tags: [],
+        due_date: null,
+        is_blocked: false,
+        blocked_note: "",
+        team_requirement: false,
+        client_requirement: false,
+        attachmentsToAdd: [],
     });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
 });
@@ -303,11 +333,22 @@ test("edit submit hands onEdit the target + changes and closes on success", asyn
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
     await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    // M-10 — the edit payload now carries the full generic-form field surface;
+    // the secondary fields round-trip from the (default) story values here.
     expect(onEdit).toHaveBeenCalledWith(us, {
         subject: "Renamed story",
         status: 101,
         points: { "11": 102 },
         assigned_to: 42,
+        description: "",
+        tags: [],
+        due_date: null,
+        is_blocked: false,
+        blocked_note: "",
+        team_requirement: false,
+        client_requirement: false,
+        attachmentsToDelete: [],
+        attachmentsToAdd: [],
     });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
 });
@@ -417,4 +458,169 @@ test("Escape does nothing while the lightbox is closed", () => {
     const { onClose } = renderLightbox({ mode: "create", open: false });
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
+});
+
+/* -------------------------------------------------------------------------- */
+/* M-10 — secondary generic-form fields (description / tags / due date /       */
+/* requirement / blocking / attachments)                                       */
+/* -------------------------------------------------------------------------- */
+
+test("[M-10] edit seeds all secondary fields from the story", () => {
+    const us = makeUs({
+        description: "Some details",
+        tags: [
+            ["backend", "#ff0000"],
+            ["urgent", null],
+        ],
+        due_date: "2025-01-15",
+        is_blocked: true,
+        blocked_note: "waiting on API",
+        team_requirement: true,
+        client_requirement: true,
+    } as unknown as Partial<UserStory>);
+    const { container } = renderLightbox({ mode: "edit", us });
+
+    // Description.
+    expect(
+        (container.querySelector("textarea.description") as HTMLTextAreaElement).value,
+    ).toBe("Some details");
+    // Tags — two chips, values shown, first carries its background color.
+    const chips = container.querySelectorAll(".tags-container .tag");
+    expect(chips.length).toBe(2);
+    expect(chips[0].querySelector("span")?.textContent).toBe("backend");
+    expect((chips[0] as HTMLElement).style.backgroundColor).toBe("rgb(255, 0, 0)");
+    // Due date.
+    expect(
+        (container.querySelector('input[name="due_date"]') as HTMLInputElement).value,
+    ).toBe("2025-01-15");
+    // Blocking — blocked-note visible (no `hidden`) and seeded.
+    const blockedNote = container.querySelector(".blocked-note") as HTMLElement;
+    expect(blockedNote).not.toHaveClass("hidden");
+    expect(
+        (blockedNote.querySelector('input[name="blocked_note"]') as HTMLInputElement)
+            .value,
+    ).toBe("waiting on API");
+    // Requirement toggles active.
+    expect(container.querySelector(".btn-icon.team-requirement")).toHaveClass("active");
+    expect(container.querySelector(".btn-icon.client-requirement")).toHaveClass(
+        "active",
+    );
+    // is-blocked button reflects blocked (item-unblock, not item-block).
+    expect(container.querySelector(".btn-icon.is-blocked")).toHaveClass("item-unblock");
+});
+
+test("[M-10] blocked-note is hidden until is-blocked is toggled on", () => {
+    const { container } = renderLightbox({ mode: "create" });
+    const blockedNote = () => container.querySelector(".blocked-note") as HTMLElement;
+    // create default: not blocked -> hidden, button shows item-block.
+    expect(blockedNote()).toHaveClass("hidden");
+    expect(container.querySelector(".btn-icon.is-blocked")).toHaveClass("item-block");
+    fireEvent.click(container.querySelector(".btn-icon.is-blocked") as HTMLElement);
+    expect(blockedNote()).not.toHaveClass("hidden");
+    expect(container.querySelector(".btn-icon.is-blocked")).toHaveClass("item-unblock");
+});
+
+test("[M-10] adding a tag via Enter and deleting a chip", () => {
+    const { container } = renderLightbox({ mode: "create" });
+    const input = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "NewTag" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // Normalized to lower-case; chip rendered; input cleared.
+    let chips = container.querySelectorAll(".tags-container .tag");
+    expect(chips.length).toBe(1);
+    expect(chips[0].querySelector("span")?.textContent).toBe("newtag");
+    expect(input.value).toBe("");
+    // Delete the chip.
+    fireEvent.click(chips[0].querySelector(".e2e-delete-tag") as HTMLElement);
+    chips = container.querySelectorAll(".tags-container .tag");
+    expect(chips.length).toBe(0);
+});
+
+test("[M-10] a duplicate tag is not added twice", () => {
+    const { container } = renderLightbox({ mode: "create" });
+    const input = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "dup" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.change(input, { target: { value: "DUP" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(container.querySelectorAll(".tags-container .tag").length).toBe(1);
+});
+
+test("[M-10] the add-tag input is absent without the add_us permission", () => {
+    const { container } = renderLightbox({
+        mode: "create",
+        project: makeProject({ my_permissions: ["view_us", "modify_us"] }),
+    });
+    expect(container.querySelector(".add-tag-input")).toBeNull();
+});
+
+test("[M-10] create payload carries edited secondary fields", async () => {
+    const { container, onCreate } = renderLightbox({ mode: "create" });
+    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
+        target: { value: "Rich US" },
+    });
+    fireEvent.change(container.querySelector("textarea.description") as HTMLTextAreaElement, {
+        target: { value: "desc text" },
+    });
+    fireEvent.change(container.querySelector('input[name="due_date"]') as HTMLInputElement, {
+        target: { value: "2025-03-01" },
+    });
+    fireEvent.click(container.querySelector(".btn-icon.team-requirement") as HTMLElement);
+    fireEvent.click(container.querySelector(".btn-icon.is-blocked") as HTMLElement);
+    fireEvent.change(container.querySelector('input[name="blocked_note"]') as HTMLInputElement, {
+        target: { value: "blocked reason" },
+    });
+    const tagInput = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    fireEvent.change(tagInput, { target: { value: "alpha" } });
+    fireEvent.keyDown(tagInput, { key: "Enter" });
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+    expect(onCreate.mock.calls[0][0]).toMatchObject({
+        subject: "Rich US",
+        description: "desc text",
+        due_date: "2025-03-01",
+        team_requirement: true,
+        client_requirement: false,
+        is_blocked: true,
+        blocked_note: "blocked reason",
+        tags: [["alpha", null]],
+    });
+});
+
+test("[M-10] attachments: adding files lists them and edit deletion queues the id", async () => {
+    // Edit story with one existing attachment (id 55) seeded from the model.
+    const us = makeUs({
+        attachments: [{ id: 55, name: "spec.pdf" }],
+        total_attachments: 1,
+    } as Partial<UserStory>);
+    const { container, onEdit } = renderLightbox({ mode: "edit", us });
+
+    // Existing attachment shown.
+    let rows = container.querySelectorAll(".single-attachment");
+    expect(rows.length).toBe(1);
+    expect(rows[0].querySelector(".attachment-name span")?.textContent).toBe("spec.pdf");
+
+    // Add a new file via the file input.
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(["data"], "diagram.png", { type: "image/png" });
+    fireEvent.change(fileInput, { target: { files: [file] } });
+    rows = container.querySelectorAll(".single-attachment");
+    expect(rows.length).toBe(2);
+
+    // Delete the EXISTING attachment (queues id 55).
+    const existingRow = Array.from(rows).find(
+        (r) => r.querySelector(".attachment-name span")?.textContent === "spec.pdf",
+    ) as HTMLElement;
+    fireEvent.click(existingRow.querySelector(".attachment-delete") as HTMLElement);
+
+    // Submit and assert the edit payload carries the add + delete intents.
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+    await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    const changes = onEdit.mock.calls[0][1] as {
+        attachmentsToAdd: File[];
+        attachmentsToDelete: number[];
+    };
+    expect(changes.attachmentsToDelete).toEqual([55]);
+    expect(changes.attachmentsToAdd.map((f) => f.name)).toEqual(["diagram.png"]);
 });

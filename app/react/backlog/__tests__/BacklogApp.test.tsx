@@ -30,6 +30,7 @@
  */
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { generateHash } from "../../shared/util/hash";
 import type { ReactNode } from "react";
 import type { DragEndEvent } from "@dnd-kit/core";
 
@@ -278,6 +279,13 @@ const mockIsDragEnabled = isDragEnabled as unknown as jest.Mock;
 /* -------------------------------------------------------------------------- */
 
 const PROJECT_ID = 5;
+
+// N-01 — the EXACT legacy hashed localStorage keys the AngularJS backlog used,
+// computed via the same ported `generateHash` helper. Tests assert against these
+// so a regression to an approximated key (which would orphan real user settings)
+// is caught.
+const SHOW_TAGS_KEY = generateHash([PROJECT_ID, `${PROJECT_ID}:backlog-tags`]);
+const BURNDOWN_COLLAPSED_KEY_EXACT = generateHash(["is-burndown-grpahs-collapsed"]);
 
 function makeProject(overrides: Partial<Project> = {}): Project {
     return {
@@ -713,6 +721,67 @@ test("loads project/stats/sprints/userstories and renders the backlog shell", as
         expect.any(Function),
         { selfNotification: true },
     );
+    // C-05 — the Backlog now ALSO subscribes to project-attribute events so its
+    // permission / module / archive / metadata gates never go stale.
+    expect(mockEventsClient.subscribe).toHaveBeenCalledWith(
+        `changes.project.${PROJECT_ID}.projects`,
+        expect.any(Function),
+    );
+});
+
+test("C-05: a .projects event refreshes the project record and reconciles dependent state", async () => {
+    await renderApp();
+
+    // Locate the handler registered for the `.projects` routing key.
+    const projectsCall = mockEventsClient.subscribe.mock.calls.find(
+        (c) => c[0] === `changes.project.${PROJECT_ID}.projects`,
+    );
+    expect(projectsCall).toBeDefined();
+    const projectsHandler = projectsCall?.[1] as (data?: unknown) => void;
+
+    // Baseline: how many times the project was fetched during initial load.
+    const projectGetsBefore = countGet((p) => p === `projects/${PROJECT_ID}`);
+    const milestoneCallsBefore = mockListMilestones.mock.calls.length;
+
+    // Fire a project-attribute change (e.g. a permission/module/status edit).
+    await act(async () => {
+        projectsHandler({ matches: "projects.userstorystatus" });
+    });
+
+    // The authoritative project record is re-fetched (re-evaluating every gate),
+    // and dependent data (sprints/stories/stats) is reconciled.
+    expect(countGet((p) => p === `projects/${PROJECT_ID}`)).toBeGreaterThan(
+        projectGetsBefore,
+    );
+    expect(mockListMilestones.mock.calls.length).toBeGreaterThan(
+        milestoneCallsBefore,
+    );
+});
+
+test("C-05: a .projects event that revokes module activation gates the screen", async () => {
+    const { container } = await renderApp();
+
+    const projectsCall = mockEventsClient.subscribe.mock.calls.find(
+        (c) => c[0] === `changes.project.${PROJECT_ID}.projects`,
+    );
+    const projectsHandler = projectsCall?.[1] as (data?: unknown) => void;
+
+    // Before the event the board is live (no permission-denied gate).
+    expect(container.querySelector(".permission-denied")).toBeNull();
+
+    // A server-side change deactivates the Backlog module; the next project
+    // fetch reflects it.
+    currentProject = makeProject({ is_backlog_activated: false });
+
+    await act(async () => {
+        projectsHandler({ matches: "projects.project" });
+    });
+
+    // The permission-denied gate now renders live (module activation went stale
+    // before C-05; the `.projects` subscription refreshes it in place).
+    await waitFor(() =>
+        expect(container.querySelector(".permission-denied")).not.toBeNull(),
+    );
 });
 
 test("renders the header controls: add, bulk, filters button, search, move-to-latest, forecasting", async () => {
@@ -1103,12 +1172,22 @@ test("onCreate (no points/assignee) POSTs bulk_create with subject+status and re
             points: {},
             assignedTo: null,
             position: "bottom",
+            // M-10 generic-form secondary fields, all at their create defaults so
+            // this "subject only" create still departs from none of them.
+            description: "",
+            tags: [],
+            due_date: null,
+            is_blocked: false,
+            blocked_note: "",
+            team_requirement: false,
+            client_requirement: false,
+            attachmentsToAdd: [],
         });
     });
 
     // subject + status carried by bulk_create; swimlane is null on the backlog.
     expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "Fresh", null);
-    // No points/assignee => no follow-up PATCH.
+    // No points/assignee and every secondary field at default => no follow-up PATCH.
     expect(mockHttpPatch).not.toHaveBeenCalled();
     // Backlog re-read (onBulkCreated).
     await waitFor(() =>
@@ -1129,16 +1208,32 @@ test("onCreate with points/assignee issues a follow-up PATCH on the new story", 
             points: { "1": 11 },
             assignedTo: 42,
             position: "bottom",
+            description: "",
+            tags: [],
+            due_date: null,
+            is_blocked: false,
+            blocked_note: "",
+            team_requirement: false,
+            client_requirement: false,
+            attachmentsToAdd: [],
         });
     });
 
     expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "WithMeta", null);
-    // Follow-up PATCH persists points + assignee against the created story's id,
-    // carrying the created story's version for optimistic concurrency.
+    // Follow-up PATCH persists points + assignee (plus the full generic-form
+    // field set, at defaults here) against the created story's id, carrying the
+    // created story's version for optimistic concurrency.
     await waitFor(() =>
         expect(mockHttpPatch).toHaveBeenCalledWith("userstories/2001", {
             points: { "1": 11 },
             assigned_to: 42,
+            description: "",
+            tags: [],
+            due_date: null,
+            is_blocked: false,
+            blocked_note: "",
+            team_requirement: false,
+            client_requirement: false,
             version: 4,
         }),
     );
@@ -1157,6 +1252,14 @@ test("onCreate with position 'top' reorders the new story to the top", async () 
             points: {},
             assignedTo: null,
             position: "top",
+            description: "",
+            tags: [],
+            due_date: null,
+            is_blocked: false,
+            blocked_note: "",
+            team_requirement: false,
+            client_requirement: false,
+            attachmentsToAdd: [],
         });
     });
 
@@ -1182,6 +1285,15 @@ test("onEdit PATCHes userstories/{id} with the changed fields + version and relo
             status: 101,
             points: { "1": 11 },
             assigned_to: 42,
+            description: "",
+            tags: [],
+            due_date: null,
+            is_blocked: false,
+            blocked_note: "",
+            team_requirement: false,
+            client_requirement: false,
+            attachmentsToDelete: [],
+            attachmentsToAdd: [],
         });
     });
 
@@ -1190,6 +1302,13 @@ test("onEdit PATCHes userstories/{id} with the changed fields + version and relo
         status: 101,
         points: { "1": 11 },
         assigned_to: 42,
+        description: "",
+        tags: [],
+        due_date: null,
+        is_blocked: false,
+        blocked_note: "",
+        team_requirement: false,
+        client_requirement: false,
         version: 7,
     });
     await waitFor(() =>
@@ -1219,6 +1338,15 @@ test("onEdit reloads the backlog and rethrows on a 409 version conflict", async 
                 status: 101,
                 points: {},
                 assigned_to: null,
+                description: "",
+                tags: [],
+                due_date: null,
+                is_blocked: false,
+                blocked_note: "",
+                team_requirement: false,
+                client_requirement: false,
+                attachmentsToDelete: [],
+                attachmentsToAdd: [],
             })
             .then(() => undefined)
             .catch((err: unknown) => err);
@@ -1229,6 +1357,148 @@ test("onEdit reloads the backlog and rethrows on a 409 version conflict", async 
     await waitFor(() =>
         expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
     );
+});
+
+/* ========================================================================== */
+/* [M-10] Generic-form secondary fields: extended PATCH + attachment side-     */
+/* effects. These prove the persistence contract the mocked lightbox delegates */
+/* to BacklogApp (the DOM behaviour of the form itself lives in the sibling    */
+/* UserStoryEditLightbox spec). The `attachments` API is deliberately NOT      */
+/* mocked, so it runs for real over the mocked httpClient — letting us assert  */
+/* the exact multipart FormData and DELETE endpoint the legacy form used.      */
+/* ========================================================================== */
+
+describe("BacklogApp — user-story form persistence (M-10)", () => {
+    test("onCreate persists the secondary fields via a follow-up PATCH and uploads chosen files", async () => {
+        await renderApp();
+        mockBulkCreate.mockImplementationOnce(() =>
+            Promise.resolve(mkRes([makeUs({ id: 2000, subject: "Rich US", version: 1 })])),
+        );
+        const file = new File(["data"], "attach.png", { type: "image/png" });
+
+        await act(async () => {
+            await mockCaptured.userStoryEditProps?.onCreate({
+                subject: "Rich US",
+                statusId: 1,
+                points: {},
+                assignedTo: null,
+                position: "bottom",
+                description: "the description",
+                tags: [],
+                due_date: null,
+                is_blocked: false,
+                blocked_note: "",
+                team_requirement: true,
+                client_requirement: false,
+                attachmentsToAdd: [file],
+            });
+        });
+
+        // The follow-up PATCH carries the extended generic-form field set,
+        // targeting the freshly-created story with its version.
+        await waitFor(() =>
+            expect(mockHttpPatch).toHaveBeenCalledWith(
+                "userstories/2000",
+                expect.objectContaining({
+                    description: "the description",
+                    team_requirement: true,
+                    tags: [],
+                    version: 1,
+                }),
+            ),
+        );
+        // The chosen file is uploaded as an attachment of the CREATED story via a
+        // multipart POST to the frozen `/userstories/attachments` endpoint.
+        const attachCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/attachments",
+        ) as unknown[] | undefined;
+        expect(attachCall).toBeTruthy();
+        const fd = attachCall?.[1] as FormData;
+        expect(fd.get("object_id")).toBe("2000");
+        expect(fd.get("project")).toBe(String(PROJECT_ID));
+        expect((fd.get("attached_file") as File).name).toBe("attach.png");
+    });
+
+    test("a subject-only create makes NO follow-up PATCH and uploads nothing", async () => {
+        await renderApp();
+        mockBulkCreate.mockImplementationOnce(() =>
+            Promise.resolve(mkRes([makeUs({ id: 2100, subject: "Bare", version: 1 })])),
+        );
+
+        await act(async () => {
+            await mockCaptured.userStoryEditProps?.onCreate({
+                subject: "Bare",
+                statusId: 1,
+                points: {},
+                assignedTo: null,
+                position: "bottom",
+                description: "",
+                tags: [],
+                due_date: null,
+                is_blocked: false,
+                blocked_note: "",
+                team_requirement: false,
+                client_requirement: false,
+                attachmentsToAdd: [],
+            });
+        });
+
+        // Every secondary field is at its create default => no follow-up PATCH.
+        expect(mockHttpPatch).not.toHaveBeenCalled();
+        // No files queued => nothing is uploaded.
+        expect(
+            mockHttpPost.mock.calls.some((c) => c[0] === "/userstories/attachments"),
+        ).toBe(false);
+    });
+
+    test("onEdit persists the extended field set, deletes removed attachments, and uploads new ones", async () => {
+        await renderApp();
+        const file = new File(["data"], "fresh.png", { type: "image/png" });
+
+        await act(async () => {
+            await mockCaptured.userStoryEditProps?.onEdit(
+                makeUs({ id: 1000, version: 9 }),
+                {
+                    subject: "Edited",
+                    status: 101,
+                    points: {},
+                    assigned_to: null,
+                    description: "updated body",
+                    tags: [],
+                    due_date: null,
+                    is_blocked: false,
+                    blocked_note: "",
+                    team_requirement: false,
+                    client_requirement: false,
+                    attachmentsToDelete: [55],
+                    attachmentsToAdd: [file],
+                },
+            );
+        });
+
+        // The edit PATCH carries the extended field set + optimistic version.
+        await waitFor(() =>
+            expect(mockHttpPatch).toHaveBeenCalledWith(
+                "userstories/1000",
+                expect.objectContaining({
+                    description: "updated body",
+                    version: 9,
+                }),
+            ),
+        );
+        // The removed attachment is deleted through the frozen endpoint.
+        await waitFor(() =>
+            expect(mockHttpDelete).toHaveBeenCalledWith("/userstories/attachments/55"),
+        );
+        // The new file is uploaded against the same story.
+        const attachCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories/attachments",
+        ) as unknown[] | undefined;
+        expect(attachCall).toBeTruthy();
+        const fd = attachCall?.[1] as FormData;
+        expect(fd.get("object_id")).toBe("1000");
+        expect((fd.get("attached_file") as File).name).toBe("fresh.png");
+    });
 });
 
 /* ========================================================================== */
@@ -1481,12 +1751,12 @@ test("show-tags toggle flips the checkbox and persists the preference", async ()
             (container.querySelector("#show-tags-input") as HTMLInputElement).checked,
         ).toBe(false),
     );
-    expect(window.localStorage.getItem(`showTags-${PROJECT_ID}`)).toBe("false");
+    expect(window.localStorage.getItem(SHOW_TAGS_KEY)).toBe("false");
 });
 
 test("restores the persisted show-tags preference on load", async () => {
     // Persisted OFF while the hook default is ON -> the load path must flip it.
-    window.localStorage.setItem(`showTags-${PROJECT_ID}`, "false");
+    window.localStorage.setItem(SHOW_TAGS_KEY, "false");
     const { container } = await renderApp();
 
     await waitFor(() =>
@@ -1494,6 +1764,27 @@ test("restores the persisted show-tags preference on load", async () => {
             (container.querySelector("#show-tags-input") as HTMLInputElement).checked,
         ).toBe(false),
     );
+});
+
+test("[N-01] migrates a show-tags value from the pre-hash approximated key", async () => {
+    // A value saved by the pre-N-01 build under the approximated key
+    // (`showTags-${projectId}`) must still be honored, and copied forward
+    // under the exact legacy hashed key so it round-trips thereafter.
+    const approxKey = `showTags-${PROJECT_ID}`;
+    window.localStorage.setItem(approxKey, "false");
+    // The exact hashed key is intentionally absent to force the migration path.
+    expect(window.localStorage.getItem(SHOW_TAGS_KEY)).toBeNull();
+
+    const { container } = await renderApp();
+
+    // The persisted OFF preference is honored despite living under the old key.
+    await waitFor(() =>
+        expect(
+            (container.querySelector("#show-tags-input") as HTMLInputElement).checked,
+        ).toBe(false),
+    );
+    // ...and the value has been copied forward under the exact hashed key.
+    expect(window.localStorage.getItem(SHOW_TAGS_KEY)).toBe("false");
 });
 
 test("velocity/forecasting toggle reveals the add-sprint affordance", async () => {
@@ -1529,9 +1820,24 @@ test("burndown collapse toggle persists under the legacy key", async () => {
     });
 
     await waitFor(() =>
-        expect(window.localStorage.getItem("is-burndown-grpahs-collapsed")).toBe("true"),
+        expect(window.localStorage.getItem(BURNDOWN_COLLAPSED_KEY_EXACT)).toBe("true"),
     );
     expect(mockCaptured.burndownProps?.collapsed).toBe(true);
+});
+
+test("[N-01] migrates a burndown-collapsed value from the pre-hash approximated key", async () => {
+    // The pre-N-01 build persisted this preference under the raw hash-input
+    // string (`is-burndown-grpahs-collapsed`) rather than its sha1 hash. That
+    // value must still be honored on load and copied forward under the exact key.
+    window.localStorage.setItem("is-burndown-grpahs-collapsed", "true");
+    expect(window.localStorage.getItem(BURNDOWN_COLLAPSED_KEY_EXACT)).toBeNull();
+
+    await renderApp();
+
+    // The collapsed preference is honored via the migration path...
+    await waitFor(() => expect(mockCaptured.burndownProps?.collapsed).toBe(true));
+    // ...and copied forward under the exact legacy hashed key.
+    expect(window.localStorage.getItem(BURNDOWN_COLLAPSED_KEY_EXACT)).toBe("true");
 });
 
 test("revealing closed sprints lazily loads them once", async () => {
@@ -2612,6 +2918,68 @@ test("onLoadMore requests the next page (reset:false) via the userstories endpoi
     await waitFor(() =>
         expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
     );
+});
+
+test("[M-04] a stale userstories response never overwrites a newer query (latest-wins)", async () => {
+    // Enable pagination so onLoadMore issues real follow-up userstories loads.
+    currentUsHeaders = {
+        "x-pagination-next": "1",
+        "Taiga-Info-Backlog-Total-Userstories": "3",
+    };
+    await renderApp();
+
+    // Replace the userstories route with two CONTROLLABLE responses so their
+    // completion order can be inverted relative to their request order.
+    const resolvers: Array<() => void> = [];
+    let usCall = 0;
+    mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+        const path = String(args[0]);
+        if (path.includes("/stats")) return Promise.resolve(mkRes(currentStats));
+        if (path === `projects/${PROJECT_ID}`) return Promise.resolve(mkRes(currentProject));
+        if (path === "projects/by_slug") return Promise.resolve(mkRes(currentProject));
+        if (path === "userstories") {
+            usCall += 1;
+            const which = usCall;
+            return new Promise((resolve) => {
+                resolvers.push(() =>
+                    resolve(
+                        mkRes(
+                            which === 1
+                                ? [makeUs({ id: 111, ref: 11, subject: "STALE", backlog_order: 3 })]
+                                : [makeUs({ id: 222, ref: 22, subject: "FRESH", backlog_order: 2 })],
+                            {},
+                        ),
+                    ),
+                );
+            });
+        }
+        return Promise.resolve(mkRes({}));
+    });
+
+    // Fire two overlapping follow-up loads (request order: #1 then #2).
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onLoadMore();
+        mockCaptured.backlogTableProps?.onLoadMore();
+        await Promise.resolve();
+    });
+    expect(resolvers.length).toBe(2);
+
+    // Complete them OUT OF ORDER: the newer request (#2, FRESH) resolves first…
+    await act(async () => {
+        resolvers[1]();
+        await Promise.resolve();
+    });
+    // …then the older request (#1, STALE) resolves last.
+    await act(async () => {
+        resolvers[0]();
+        await Promise.resolve();
+    });
+
+    // The board committed only the FRESH query; the superseded STALE response
+    // was dropped by the per-query generation guard.
+    const ids = (mockCaptured.backlogTableProps?.userstories ?? []).map((u) => u.id);
+    expect(ids).toContain(222);
+    expect(ids).not.toContain(111);
 });
 
 /* ========================================================================== */

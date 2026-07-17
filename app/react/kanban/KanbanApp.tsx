@@ -7,7 +7,9 @@
  */
 
 import { createElement, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import sortBy from "lodash/sortBy";
+import debounce from "lodash/debounce";
 import {
     httpDelete,
     httpGet,
@@ -22,6 +24,12 @@ import {
     listUserstories,
 } from "../shared/api/userstories";
 import { createEventsClient } from "../shared/events/websocket";
+import {
+    uploadUserstoryAttachment,
+    deleteUserstoryAttachment,
+    listUserstoryAttachments,
+} from "../shared/api/attachments";
+import type { UserStoryAttachment } from "../shared/api/attachments";
 import type {
     DropNeighbors,
     NormalizedDragEnd,
@@ -29,6 +37,8 @@ import type {
 } from "../shared/dnd/DndProvider";
 import { KanbanBoard } from "./KanbanBoard";
 import { Icon } from "../shared/ui/Icon";
+import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
+import { t } from "../shared/i18n/translate";
 import { buildContainerKey } from "./KanbanColumn";
 import { UserStoryEditLightbox } from "./UserStoryEditLightbox";
 import type {
@@ -116,77 +126,51 @@ const MAX_ZOOM_LEVEL = 3;
 const DEFAULT_ZOOM_LEVEL = 1;
 const MOVED_HIGHLIGHT_MS = 1000;
 const SEARCH_DEBOUNCE_MS = 200;
+// M-11: coalesce WebSocket event bursts so a rapid stream of `.userstories` /
+// `.projects` notifications does not trigger overlapping full-board refetches.
+// The AngularJS baseline wrapped BOTH subscription handlers in
+// `taiga.debounceLeading(randomInt(700, 1000), fn)` (kanban/main.coffee L246-255),
+// where `debounceLeading` is `_.debounce(fn, wait, {leading:false, trailing:true})`.
+// We reproduce the coalescing with a fixed wait at the upper bound of the legacy
+// random range (the randomness was only an anti-thundering-herd jitter across
+// clients, not user-visible behavior) and, per the review's "leading-edge"
+// directive, fire on the leading edge so the first event of a burst still
+// refreshes immediately while the remainder are coalesced into a single trailing
+// refresh. Latest-request protection is provided by the reload generation guard.
+const EVENTS_DEBOUNCE_MS = 1000;
 
-// Section title (KANBAN.SECTION_NAME) rendered in the board header — the SCREEN
-// name, not the project name (the project name is owned by the surrounding
-// AngularJS `tg-project-menu`). Ported from `mainTitle.jade` (header > h1 > span).
-const SECTION_NAME = "Kanban";
-
-// Board-zoom control labels (ZOOM.TITLE + ZOOM.ZOOM-1..4), ported from
-// `board-zoom.jade` / `board-zoom.scss`. Index === zoom level (0-3).
-const ZOOM_TITLE = "Zoom:";
-const ZOOM_LABELS: ReadonlyArray<string> = [
-    "Compact",
-    "Default",
-    "Detailed",
-    "Expanded",
-];
-
-// Search affordance (COMMON.FILTERS.INPUT_PLACEHOLDER), ported from the
-// `tgInputSearch` component. `aria-label` is added for accessibility (QA-A11Y-01)
-// without altering the visual placeholder text.
-const SEARCH_PLACEHOLDER = "subject or reference";
-const SEARCH_ARIA_LABEL = "Search by subject or reference";
+// Non-visible input identifiers for the search affordance. All USER-VISIBLE
+// board-header copy (KANBAN.SECTION_NAME section title; ZOOM.TITLE + ZOOM.ZOOM-1..4
+// zoom labels ported from `board-zoom.jade`; COMMON.FILTERS.INPUT_PLACEHOLDER
+// search placeholder + its aria-label) is localized [M-06] through the shared
+// runtime translator at RENDER time — defined as locals inside `KanbanApp`
+// (see below) rather than at module load, because the React bundle is evaluated
+// by `loadJS(react-app.js)` BEFORE `angular.bootstrap`, so the live `$translate`
+// service is only reachable once a component actually renders inside the mounted
+// custom element. Freezing them at module load would pin the English fallback
+// for every locale, defeating the localization this finding restores.
 const SEARCH_INPUT_ID = "kanban-search-input";
 const SEARCH_INPUT_NAME = "kanban-search";
 
 // Error-notification copy — ported from the AngularJS `$tgConfirm.notify("error")`
-// path (common/confirm.coffee: NOTIFICATION_MSG.error -> NOTIFICATION.WARNING /
-// NOTIFICATION.WARNING_TEXT, and NOTIFICATION.CLOSE for the dismiss control).
-// The React roots cannot call the Angular `$tgConfirm` service, so the same copy
-// is surfaced through an in-board, className-driven banner (no injected <style>).
-const NOTIFY_ERROR_TITLE = "Oops, something went wrong...";
-const NOTIFY_ERROR_MESSAGE = "Your changes were not saved!";
-const NOTIFY_CLOSE_LABEL = "Close notification";
-
-// Permission-denied copy (QA-FUNC-10) — ported verbatim from the AngularJS
-// permission-denied page (`app/partials/error/permission-denied.jade`) and the
-// locale strings it references: ERROR.PERMISSION_DENIED / ERROR.PERMISSION_DENIED_TEXT
-// (locale-en.json L1500-1501). The board renders a VISIBLE message for the
-// permission-denied / module-off / 403 / 451 states instead of a blank section,
-// mirroring the (QA-praised) `.kanban-load-error` visible-message pattern.
-const PERMISSION_DENIED_TITLE = "Permission denied";
-const PERMISSION_DENIED_TEXT =
-    "You don't have permission to access this page.";
-
-// Bulk-create lightbox copy (QA-FUNC-04) — ported verbatim from
-// `lightbox-us-bulk.jade` and the locale strings it references: COMMON.NEW_BULK,
-// LIGHTBOX.CREATE_EDIT.{SELECT_STATUS,LOCATION,CREATE_BOTTOM,CREATE_TOP,
-// SELECT_SWIMLANE,DEFAULT}, KANBAN.UNCLASSIFIED_USER_STORIES, COMMON.ONE_ITEM_LINE
-// and COMMON.SAVE. The lightbox reproduces the same DOM/class names so the
-// compiled `lightbox.scss` themes it unchanged (no injected <style>).
-const BULK_TITLE = "New bulk insert";
-const BULK_SELECT_STATUS = "Select status";
-const BULK_LOCATION = "Location";
-const BULK_CREATE_BOTTOM = "at the bottom";
-const BULK_CREATE_TOP = "on top";
-const BULK_SELECT_SWIMLANE = "Select swimlane";
-const BULK_DEFAULT_SWIMLANE = "Default";
-const BULK_UNCLASSIFIED = "Unclassified user stories";
-const BULK_PLACEHOLDER = "One item per line...";
-const BULK_SAVE = "Save";
+// path (common/confirm.coffee: NOTIFICATION.WARNING / NOTIFICATION.WARNING_TEXT,
+// and NOTIFICATION.CLOSE for the dismiss control), surfaced through an in-board,
+// className-driven banner. Localized [M-06] at render time via locals in the
+// consuming components (`KanbanNotification`, `BulkLightbox`, `KanbanApp`).
+//
+// Permission-denied copy (QA-FUNC-10, ERROR.PERMISSION_DENIED /
+// ERROR.PERMISSION_DENIED_TEXT) and the bulk-create lightbox copy (QA-FUNC-04,
+// COMMON.NEW_BULK, LIGHTBOX.CREATE_EDIT.*, KANBAN.UNCLASSIFIED_USER_STORIES,
+// COMMON.ONE_ITEM_LINE, COMMON.SAVE, ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT) are
+// likewise localized at render time via locals in `KanbanApp` / `BulkLightbox`.
 
 // Bulk-textarea validation (QA-FUNC-07) — the AngularJS lightbox wired two
 // `checksley` validators on the textarea: `data-required="true"` and
 // `data-linewidth="200"`. The latter is the custom validator registered in
 // app.coffee (L907): every line must be strictly shorter than the width, i.e.
-// `line.length < 200`. The messages are the exact COMMON.FORM_ERRORS strings.
+// `line.length < 200`. The messages are the exact COMMON.FORM_ERRORS strings,
+// resolved through the translator inside `validateBulkText` (render/runtime).
 const BULK_LINE_WIDTH = 200;
-const BULK_ERROR_REQUIRED = "This value is required.";
-const BULK_ERROR_LINEWIDTH =
-    "One or more lines is perhaps too long. Try to keep under " +
-    BULK_LINE_WIDTH +
-    " characters.";
 
 /**
  * Client-side reproduction of the two `checksley` validators bound to the bulk
@@ -199,12 +183,18 @@ const BULK_ERROR_LINEWIDTH =
  */
 export function validateBulkText(text: string): string | null {
     if (!text.trim()) {
-        return BULK_ERROR_REQUIRED;
+        return t("COMMON.FORM_ERRORS.REQUIRED", "This value is required.");
     }
     const lines = text.split(/\r\n|\r|\n/);
     const anyTooLong = lines.some((line) => line.length >= BULK_LINE_WIDTH);
     if (anyTooLong) {
-        return BULK_ERROR_LINEWIDTH;
+        // COMMON.FORM_ERRORS.LINEWIDTH uses a checksley-style `%s` placeholder
+        // (not angular-translate's `{{ }}`), so the width is substituted here
+        // after translation — for both the live catalog value and the fallback.
+        return t(
+            "COMMON.FORM_ERRORS.LINEWIDTH",
+            "One or more lines is perhaps too long. Try to keep under %s characters.",
+        ).replace("%s", String(BULK_LINE_WIDTH));
     }
     return null;
 }
@@ -676,7 +666,7 @@ function KanbanFilterPanel(props: KanbanFilterPanelProps): JSX.Element {
                             key={`${filter.dataType}:${filter.id}`}
                             className="filter-applied"
                             onClick={() => onRemoveFilter(filter)}
-                            title="Remove filter"
+                            title={t("COMMON.FILTERS.ACTION_REMOVE", "Remove filter")}
                         >
                             <span className="name">{filter.name}</span>
                         </button>
@@ -762,6 +752,10 @@ interface KanbanNotificationProps {
 }
 
 function KanbanNotification(props: KanbanNotificationProps): JSX.Element {
+    // [M-06] Localized at render time (see the module-level note on why the
+    // translator must not be invoked at module load).
+    const NOTIFY_ERROR_TITLE = t("NOTIFICATION.WARNING", "Oops, something went wrong...");
+    const NOTIFY_CLOSE_LABEL = t("NOTIFICATION.CLOSE", "Close notification");
     return (
         <div
             className="kanban-notification kanban-notification-error"
@@ -782,6 +776,54 @@ function KanbanNotification(props: KanbanNotificationProps): JSX.Element {
                 <Icon name="icon-close" />
             </button>
         </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [N-03] Delete-confirmation state + message rendering.
+//
+// The AngularJS Kanban deleted a story through `$tgConfirm.askOnDelete(...)`
+// (common/confirm.coffee L122), a THEMED, localized lightbox — never the
+// browser-native `window.confirm`. The initial React port regressed this to a
+// raw `window.confirm("Delete this user story?")` (English-only, unthemed,
+// blocking). This state object + the shared {@link ConfirmDialog} restore the
+// themed/localized behavior, mirroring the Backlog root's already-fixed flow.
+// ---------------------------------------------------------------------------
+
+interface DeleteConfirmState {
+    /** Whether the confirmation dialog is open. */
+    open: boolean;
+    /** The story pending deletion (id + subject for the message), or null. */
+    us: { id: number; subject: string } | null;
+    /** True while the DELETE request is in flight (disables the buttons). */
+    busy: boolean;
+}
+
+/**
+ * Render the localized "Are you sure you want to delete …" message with the
+ * story subject wrapped in `<strong>` — ports `US.TITLE_DELETE_MESSAGE`
+ * (locale-en.json) and the AngularJS `askOnDelete` copy. The subject is passed
+ * as a React child (auto-escaped), so no `dangerouslySetInnerHTML` is used and
+ * the migration's XSS-safe posture is preserved. When the active locale's value
+ * carries no `<strong>` wrapper the text is rendered plain (tags stripped),
+ * matching the Backlog root's identical helper.
+ */
+function renderDeleteMessage(subject: string): ReactNode {
+    const rendered = t(
+        "US.TITLE_DELETE_MESSAGE",
+        "Are you sure you want to delete <strong>\u201C{{subject}}\u201C</strong>?",
+        { subject },
+    );
+    const match = rendered.match(/^([\s\S]*?)<strong>([\s\S]*?)<\/strong>([\s\S]*)$/);
+    if (!match) {
+        return rendered.replace(/<\/?strong>/g, "");
+    }
+    return (
+        <>
+            {match[1]}
+            <strong>{match[2]}</strong>
+            {match[3]}
+        </>
     );
 }
 
@@ -852,6 +894,25 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
             : swimlanes.find((swimlane) => swimlane.id === swimlaneId) ?? null;
     const showSwimlaneSelector = swimlaneMode && swimlanes.length > 0;
     const shownError = validationError ?? error ?? null;
+
+    // [M-06] Bulk-lightbox copy localized at render time (see the module-level
+    // note on why the translator is not invoked at module load). Keys + English
+    // fallbacks are the authoritative catalog entries referenced by the legacy
+    // `lightbox-us-bulk.jade`.
+    const NOTIFY_CLOSE_LABEL = t("NOTIFICATION.CLOSE", "Close notification");
+    const BULK_TITLE = t("COMMON.NEW_BULK", "New bulk insert");
+    const BULK_SELECT_STATUS = t("LIGHTBOX.CREATE_EDIT.SELECT_STATUS", "Select status");
+    const BULK_LOCATION = t("LIGHTBOX.CREATE_EDIT.LOCATION", "Location");
+    const BULK_CREATE_BOTTOM = t("LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM", "at the bottom");
+    const BULK_CREATE_TOP = t("LIGHTBOX.CREATE_EDIT.CREATE_TOP", "on top");
+    const BULK_SELECT_SWIMLANE = t("LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE", "Select swimlane");
+    const BULK_DEFAULT_SWIMLANE = t("ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT", "Default");
+    const BULK_UNCLASSIFIED = t(
+        "KANBAN.UNCLASSIFIED_USER_STORIES",
+        "Unclassified user stories",
+    );
+    const BULK_PLACEHOLDER = t("COMMON.ONE_ITEM_LINE", "One item per line...");
+    const BULK_SAVE = t("COMMON.SAVE", "Save");
 
     const handleSubmit = (): void => {
         const message = validateBulkText(text);
@@ -1090,6 +1151,32 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const { projectId } = props;
     const kanban = useKanbanState();
 
+    // [M-06] Board-header + notification + permission-denied copy localized at
+    // RENDER time (see the module-level note on why the translator must not be
+    // invoked at module load). Keys + English fallbacks are the authoritative
+    // catalog entries used by the legacy Jade markup / locale-en.json.
+    const SECTION_NAME = t("KANBAN.SECTION_NAME", "Kanban");
+    const ZOOM_TITLE = t("ZOOM.TITLE", "Zoom:");
+    const ZOOM_LABELS: ReadonlyArray<string> = [
+        t("ZOOM.ZOOM-1", "Compact"),
+        t("ZOOM.ZOOM-2", "Default"),
+        t("ZOOM.ZOOM-3", "Detailed"),
+        t("ZOOM.ZOOM-4", "Expanded"),
+    ];
+    const SEARCH_PLACEHOLDER = t("COMMON.FILTERS.INPUT_PLACEHOLDER", "subject or reference");
+    // `aria-label` has no legacy catalog entry (added for QA-A11Y-01); it routes
+    // through the translator and resolves to the fallback until a key is added.
+    const SEARCH_ARIA_LABEL = t(
+        "KANBAN.SEARCH_ARIA_LABEL",
+        "Search by subject or reference",
+    );
+    const NOTIFY_ERROR_MESSAGE = t("NOTIFICATION.WARNING_TEXT", "Your changes were not saved!");
+    const PERMISSION_DENIED_TITLE = t("ERROR.PERMISSION_DENIED", "Permission denied");
+    const PERMISSION_DENIED_TEXT = t(
+        "ERROR.PERMISSION_DENIED_TEXT",
+        "You don't have permission to access this page.",
+    );
+
     // The EFFECTIVE project id the whole board keys off. It is the prop id when
     // that is already a valid positive integer; otherwise it stays `NaN` until
     // `loadInitialData` resolves it from the URL slug via `GET projects/by_slug`
@@ -1132,6 +1219,14 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // (QA-FUNC-06). `null` = hidden.
     const [errorNotice, setErrorNotice] = useState<string | null>(null);
     const [bulkError, setBulkError] = useState<string | null>(null);
+    // [N-03] Themed delete-confirmation dialog state (replaces window.confirm).
+    // `open` toggles the shared ConfirmDialog; `busy` disables its buttons while
+    // the DELETE is in flight; `us` carries the id + subject for the message.
+    const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>({
+        open: false,
+        us: null,
+        busy: false,
+    });
 
     // Sidebar filter state (F2). `filters` are the five category widgets built
     // from `filters_data`; `selectedFilters` are the user's active choices and
@@ -1157,6 +1252,24 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // Unmount guard: async resolvers must not `setState` after the root has been
     // unmounted (F-C). Mirrors the Backlog root's `aliveRef` pattern.
     const aliveRef = useRef<boolean>(true);
+    // M-03/M-04: monotonic generation counter for board-loading operations
+    // (`loadInitialData` + `reloadUserstories`). Each load captures the value it
+    // bumps to and commits its result ONLY if it is still the newest load; a
+    // superseded (stale) load — from an older filter/search/zoom/event OR a prior
+    // project/query transition on the same instance — is dropped. This is the
+    // "only the latest request may commit" guarantee, and it makes same-instance
+    // project transitions safe where the boolean `aliveRef` alone was not.
+    const loadGenRef = useRef<number>(0);
+    // M-03: independent latest-wins guard for the auxiliary filter metadata load,
+    // so a slow `filters_data` response cannot overwrite the categories produced
+    // by a newer selection. Kept separate from `loadGenRef` because a filter
+    // change reloads BOTH the board and the filters and the two must not cancel
+    // each other.
+    const filterGenRef = useRef<number>(0);
+    // N-05: a SINGLE handle for the moved-card highlight timer, cleared before it
+    // is replaced (rapid successive moves) and on unmount, so overlapping timers
+    // can neither fight over `movedUs` nor fire after the root is gone.
+    const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     zoomLevelRef.current = zoomLevel;
     filterQRef.current = filterQ;
     selectedFiltersRef.current = selectedFilters;
@@ -1176,24 +1289,40 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         }
         const level = levelOverride ?? zoomLevelRef.current;
         const query = queryOverride ?? filterQRef.current;
-        const [usResponse, swimlaneResponse] = await Promise.all([
-            listUserstories(
-                id,
-                buildUserstoriesParams(level, query, selectedFiltersRef.current),
-            ),
-            httpGet<Swimlane[]>("/swimlanes", { project: id }),
-        ]);
-        if (!aliveRef.current) {
-            return;
+        // M-03/M-04: claim the newest generation. Any load already in flight is
+        // now stale and will drop its result below.
+        const myGen = ++loadGenRef.current;
+        try {
+            const [usResponse, swimlaneResponse] = await Promise.all([
+                listUserstories(
+                    id,
+                    buildUserstoriesParams(level, query, selectedFiltersRef.current),
+                ),
+                httpGet<Swimlane[]>("/swimlanes", { project: id }),
+            ]);
+            // Drop the result if the root unmounted OR a newer load superseded us.
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
+                return;
+            }
+            const userstories =
+                (usResponse.data as unknown as UserStoryModel[]) ?? [];
+            kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
+            kanban.setUserstories(userstories);
+            // Multi-select group drag (QA-FUNC-01): clear the card selection whenever
+            // the board reloads, mirroring `cleanSelectedUss` (main.coffee L597) so a
+            // stale selection cannot outlive the cards it referenced.
+            setSelectedUss({});
+            setNotFound(userstories.length === 0 && !!query);
+        } catch {
+            // M-03: a reload can be fired-and-forgotten (WebSocket handler, drag
+            // persist, delete). Catch here so it never rejects unhandled, and —
+            // only if we are still the newest live load — surface the shared error
+            // toast instead of silently leaving the board stale.
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
+                return;
+            }
+            setErrorNotice(NOTIFY_ERROR_MESSAGE);
         }
-        const userstories = (usResponse.data as unknown as UserStoryModel[]) ?? [];
-        kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
-        kanban.setUserstories(userstories);
-        // Multi-select group drag (QA-FUNC-01): clear the card selection whenever
-        // the board reloads, mirroring `cleanSelectedUss` (main.coffee L597) so a
-        // stale selection cannot outlive the cards it referenced.
-        setSelectedUss({});
-        setNotFound(userstories.length === 0 && !!query);
     };
 
     /**
@@ -1211,12 +1340,16 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             return;
         }
         const selected = overrideSelected ?? selectedFiltersRef.current;
+        // M-03: latest-wins for the auxiliary filter-metadata load, independent of
+        // the board `loadGenRef`, so a slow response for an older selection cannot
+        // overwrite the categories computed for a newer one.
+        const myGen = ++filterGenRef.current;
         try {
             const response = await filtersData({
                 project: id,
                 ...pickSelectedFilterParams(selected),
             });
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== filterGenRef.current) {
                 return;
             }
             setFilters(buildKanbanFilterCategories(response.data));
@@ -1237,6 +1370,11 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         if (!isValidProjectId(projectId) && slugFromLocation() === null) {
             return;
         }
+        // M-04: claim the newest generation for this full (re)load. A prior load
+        // still in flight — e.g. from the previous project id on a same-instance
+        // transition, or an overlapping projects-event refresh — becomes stale and
+        // will not commit its project metadata, board data, or error state below.
+        const myGen = ++loadGenRef.current;
         try {
             // Choose the resolution endpoint. A valid positive-integer id uses the
             // by-id path (the leading-slash form the existing suite asserts);
@@ -1257,7 +1395,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     { slug },
                 );
             }
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             const project = projectResponse.data;
@@ -1330,7 +1468,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 ),
                 httpGet<Swimlane[]>("/swimlanes", { project: project.id }),
             ]);
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             const userstories =
@@ -1341,7 +1479,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             // Load the sidebar filter categories (auxiliary; never blocks the board).
             void loadFilters();
         } catch (err) {
-            if (!aliveRef.current) {
+            if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             // Respect blocked / archived responses (403 / 451) as permission-denied,
@@ -1367,6 +1505,31 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     refreshAllRef.current = () => {
         void loadInitialData();
     };
+
+    // M-11: leading+trailing coalescing wrappers for the two WebSocket handlers,
+    // created ONCE and reused for the socket's whole life. Each invokes the latest
+    // reload/refresh closure via its ref, so a burst of events collapses into a
+    // single leading refresh plus (at most) one trailing refresh. `.cancel()` on
+    // teardown discards any pending trailing call (timer cleanup + latest-request
+    // protection across resolvedId transitions and unmount).
+    const debouncedReloadRef = useRef<ReturnType<typeof debounce> | null>(null);
+    if (debouncedReloadRef.current === null) {
+        debouncedReloadRef.current = debounce(
+            () => reloadRef.current(),
+            EVENTS_DEBOUNCE_MS,
+            { leading: true, trailing: true },
+        );
+    }
+    const debouncedRefreshAllRef = useRef<ReturnType<typeof debounce> | null>(
+        null,
+    );
+    if (debouncedRefreshAllRef.current === null) {
+        debouncedRefreshAllRef.current = debounce(
+            () => refreshAllRef.current(),
+            EVENTS_DEBOUNCE_MS,
+            { leading: true, trailing: true },
+        );
+    }
 
     useEffect(() => {
         // Fire `loadInitialData` only when there is SOMETHING to resolve — either
@@ -1407,19 +1570,28 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const userstoriesKey = `changes.project.${resolvedId}.userstories`;
         const projectsKey = `changes.project.${resolvedId}.projects`;
         client.subscribe(userstoriesKey, () => {
-            reloadRef.current();
+            // M-11: coalesce bursts (leading fire + single trailing refresh).
+            debouncedReloadRef.current?.();
         });
         client.subscribe(projectsKey, (data) => {
+            // The matches filter runs SYNCHRONOUSLY per event (outside the
+            // debounce) so a matching event within a burst is never missed just
+            // because the leading/trailing sampled event did not match; only the
+            // resulting full refresh is coalesced.
             const matches = (data as { matches?: string }).matches;
             if (
                 matches === "projects.swimlane" ||
                 matches === "projects.swimlaneuserstorystatus" ||
                 matches === "projects.userstorystatus"
             ) {
-                refreshAllRef.current();
+                debouncedRefreshAllRef.current?.();
             }
         });
         return () => {
+            // Cancel any pending trailing refresh before tearing the socket down
+            // so it cannot fire against a stale resolvedId or after unmount.
+            debouncedReloadRef.current?.cancel();
+            debouncedRefreshAllRef.current?.cancel();
             client.unsubscribe(userstoriesKey);
             client.unsubscribe(projectsKey);
             client.disconnect();
@@ -1437,6 +1609,16 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             if (searchTimer.current !== null) {
                 clearTimeout(searchTimer.current);
             }
+            // N-05: clear the single moved-card highlight timer so it cannot fire
+            // `setMovedUs` after the root has unmounted.
+            if (highlightTimerRef.current !== null) {
+                clearTimeout(highlightTimerRef.current);
+                highlightTimerRef.current = null;
+            }
+            // M-11: cancel any pending coalesced socket refresh on unmount (the
+            // socket effect also cancels, but this guards teardown ordering).
+            debouncedReloadRef.current?.cancel();
+            debouncedRefreshAllRef.current?.cancel();
         };
     }, []);
 
@@ -1678,11 +1860,30 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const created = (response.data ?? []) as Array<{ id: number; version?: number }>;
         const first = created[0];
         const hasPoints = Object.keys(fields.points).length > 0;
-        if (first && (hasPoints || fields.assignedTo !== null)) {
-            // bulk_create cannot carry points/assignee — patch them in a follow-up.
+        // bulk_create carries only subject/status/swimlane. Everything else the
+        // generic form collects is persisted in a follow-up PATCH — but only when
+        // at least one such field departs from its create default (so a bare
+        // "subject only" create still makes exactly one request, as before).
+        const needsFollowUp =
+            hasPoints ||
+            fields.assignedTo !== null ||
+            fields.description !== "" ||
+            fields.tags.length > 0 ||
+            fields.due_date !== null ||
+            fields.is_blocked ||
+            fields.team_requirement ||
+            fields.client_requirement;
+        if (first && needsFollowUp) {
             await httpPatch(`/userstories/${first.id}`, {
                 points: fields.points,
                 assigned_to: fields.assignedTo,
+                description: fields.description,
+                tags: fields.tags,
+                due_date: fields.due_date,
+                is_blocked: fields.is_blocked,
+                blocked_note: fields.blocked_note,
+                team_requirement: fields.team_requirement,
+                client_requirement: fields.client_requirement,
                 version: first.version,
             });
         }
@@ -1698,6 +1899,11 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     createdIds,
                 );
             }
+        }
+        // Upload any chosen files against the freshly-created story (ports
+        // `createAttachments(data)`), then re-read the board.
+        if (first) {
+            await createAttachments(first.id, fields.attachmentsToAdd);
         }
         if (!aliveRef.current) {
             return;
@@ -1722,8 +1928,20 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 status: changes.status,
                 points: changes.points,
                 assigned_to: changes.assigned_to,
+                description: changes.description,
+                tags: changes.tags,
+                due_date: changes.due_date,
+                is_blocked: changes.is_blocked,
+                blocked_note: changes.blocked_note,
+                team_requirement: changes.team_requirement,
+                client_requirement: changes.client_requirement,
                 version: (target as { version?: number }).version,
             });
+            // Reproduce the CoffeeScript submit order: save → deleteAttachments →
+            // createAttachments. Deletions first so a delete+re-add of the same
+            // file name cannot race.
+            await deleteAttachments(changes.attachmentsToDelete);
+            await createAttachments(target.id, changes.attachmentsToAdd);
             if (!aliveRef.current) {
                 return;
             }
@@ -1734,6 +1952,44 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             }
             throw err;
         }
+    };
+
+    /**
+     * Upload each pending file as an attachment of user story `objectId`, against
+     * the frozen `/userstories/attachments` endpoint (ports `createAttachments`).
+     * Sequential to keep ordering deterministic and avoid a burst of parallel
+     * multipart uploads.
+     */
+    const createAttachments = async (
+        objectId: number,
+        files: File[],
+    ): Promise<void> => {
+        const projectId = resolvedIdRef.current;
+        for (const file of files) {
+            await uploadUserstoryAttachment(file, objectId, projectId);
+        }
+    };
+
+    /** Delete each queued attachment id (ports `deleteAttachments`). */
+    const deleteAttachments = async (ids: number[]): Promise<void> => {
+        for (const attachmentId of ids) {
+            await deleteUserstoryAttachment(attachmentId);
+        }
+    };
+
+    /**
+     * Hydrate a story's existing attachments for the edit form. The board list
+     * endpoint omits the attachments array, so the lightbox calls this on open
+     * (against the frozen `/userstories/attachments` list endpoint).
+     */
+    const fetchUsAttachments = async (
+        usId: number,
+    ): Promise<UserStoryAttachment[]> => {
+        const response = await listUserstoryAttachments(
+            usId,
+            resolvedIdRef.current,
+        );
+        return response.data ?? [];
     };
 
     /**
@@ -1804,35 +2060,86 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         saveSwimlaneFolds(resolvedId, next);
     };
 
+    /**
+     * [M-12] OPEN (unfold) a folded swimlane during a drag-hover, and persist
+     * the change. Wired to `KanbanBoard.onRequestOpenSwimlane`, which the
+     * `Swimlane` invokes after ~1s of hovering a FOLDED swimlane title while a
+     * card is being dragged — the port of `mouseoverSwimlane`'s
+     * `$timeout(... ctrl.toggleSwimlane(swimlaneId), 1000)` (kanban/main.coffee
+     * L1173-L1179). Unlike {@link toggleSwimlane} this ONLY opens (never folds),
+     * so a spurious repeat hover cannot re-close a swimlane the user just opened;
+     * it is a no-op when the swimlane is already open. The fold modes are
+     * persisted through the same `saveSwimlaneFolds` path as a manual toggle.
+     */
+    const openSwimlane = (swimlaneId: number): void => {
+        if (!foldedSwimlane[swimlaneId]) {
+            // Already open — nothing to do (no state churn, no persist).
+            return;
+        }
+        const next = { ...foldedSwimlane, [swimlaneId]: false };
+        setFoldedSwimlane(next);
+        saveSwimlaneFolds(resolvedId, next);
+    };
+
     const handleToggleFold = (usId: number): void => {
         kanban.toggleFold(usId);
     };
 
+    /**
+     * [N-03] The ACTUAL deletion, extracted from the old `handleDeleteUs` body so
+     * the themed {@link ConfirmDialog} can drive it. Ports the AngularJS
+     * `deleteUserStory` success/error branches (kanban/main.coffee L308-314):
+     * `DELETE /userstories/{id}` then reload on success; on failure surface the
+     * error notification and SKIP the reload so the (still-present) card stays on
+     * the board (QA-FUNC-14). Never rethrows, so the dialog always closes after.
+     */
+    const performDeleteUs = async (usId: number): Promise<void> => {
+        try {
+            await httpDelete(`/userstories/${usId}`);
+            if (!aliveRef.current) {
+                return;
+            }
+            await reloadUserstories();
+        } catch {
+            // QA-FUNC-14: mirror the AngularJS `deleteUserStory` error branch
+            // (`promise.then null, -> @confirm.notify("error")`,
+            // kanban/main.coffee L313-314). Surface an error notification and
+            // SKIP the reload so the (still-present) card stays on the board.
+            if (!aliveRef.current) {
+                return;
+            }
+            setErrorNotice(NOTIFY_ERROR_MESSAGE);
+        }
+    };
+
+    /**
+     * [N-03] Card "delete" action: open the themed confirmation dialog instead
+     * of the browser-native `window.confirm`. Ports `$tgConfirm.askOnDelete(...)`
+     * (common/confirm.coffee L122). The subject is read from the board state so
+     * the dialog message can name the story being deleted.
+     */
     const handleDeleteUs = (usId: number): void => {
-        if (
-            typeof window !== "undefined" &&
-            typeof window.confirm === "function" &&
-            !window.confirm("Delete this user story?")
-        ) {
+        const view = kanban.state.usMap[usId];
+        const subject = view?.model.subject ?? "";
+        setDeleteConfirm({ open: true, us: { id: usId, subject }, busy: false });
+    };
+
+    /** [N-03] Confirm handler for the delete dialog: run the delete, then close. */
+    const handleConfirmDelete = async (): Promise<void> => {
+        const target = deleteConfirm.us;
+        if (!target) {
             return;
         }
-        void httpDelete(`/userstories/${usId}`)
-            .then(() => {
-                if (!aliveRef.current) {
-                    return;
-                }
-                void reloadUserstories();
-            })
-            .catch(() => {
-                // QA-FUNC-14: mirror the AngularJS `deleteUserStory` error branch
-                // (`promise.then null, -> @confirm.notify("error")`,
-                // kanban/main.coffee L313-314). Surface an error notification and
-                // SKIP the reload so the (still-present) card stays on the board.
-                if (!aliveRef.current) {
-                    return;
-                }
-                setErrorNotice(NOTIFY_ERROR_MESSAGE);
-            });
+        setDeleteConfirm((s) => ({ ...s, busy: true }));
+        await performDeleteUs(target.id);
+        if (aliveRef.current) {
+            setDeleteConfirm({ open: false, us: null, busy: false });
+        }
+    };
+
+    /** [N-03] Cancel handler for the delete dialog: close without deleting. */
+    const handleCancelDelete = (): void => {
+        setDeleteConfirm({ open: false, us: null, busy: false });
     };
 
     const isArchivedHidden = (usId: number): boolean => {
@@ -1905,6 +2212,11 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const apiSwimlane =
             swimlaneId === UNCLASSIFIED_SWIMLANE_ID ? null : swimlaneId;
 
+        // M-05: snapshot the board BEFORE the optimistic mutation. `kanban.state`
+        // is an immer-frozen immutable value, so holding the reference captures
+        // the exact pre-move board to restore if persistence fails.
+        const snapshot = kanban.state;
+
         // Optimistic local reorder (immer producer).
         kanban.move(
             resolved.draggedIds,
@@ -1914,7 +2226,16 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             neighbors.next,
         );
         setMovedUs(resolved.draggedIds);
-        window.setTimeout(() => setMovedUs([]), MOVED_HIGHLIGHT_MS);
+        // N-05: a single highlight timer — clear any prior one before scheduling
+        // the replacement so rapid successive moves cannot leave competing timers
+        // racing to blank `movedUs`.
+        if (highlightTimerRef.current !== null) {
+            clearTimeout(highlightTimerRef.current);
+        }
+        highlightTimerRef.current = setTimeout(() => {
+            highlightTimerRef.current = null;
+            setMovedUs([]);
+        }, MOVED_HIGHLIGHT_MS);
 
         // Persist to the frozen REST contract, keyed off the RESOLVED project id
         // (whether it came from the prop or the by-slug lookup).
@@ -1925,7 +2246,101 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             neighbors.previous,
             neighbors.next,
             resolved.draggedIds,
-        ).then(() => undefined);
+        )
+            .then(() => undefined)
+            .catch(() => {
+                // M-05: on rejection, roll the board back to the snapshot, clear
+                // the transient highlight (and its timer), and surface the shared
+                // error toast — mirroring the AngularJS drag failure path that
+                // reverted the optimistic move and called `$tgConfirm.notify`.
+                // Resolve (do not rethrow) so the fire-and-forget drag handler
+                // never produces an unhandled rejection (aligns with M-03).
+                if (!aliveRef.current) {
+                    return;
+                }
+                kanban.restore(snapshot);
+                if (highlightTimerRef.current !== null) {
+                    clearTimeout(highlightTimerRef.current);
+                    highlightTimerRef.current = null;
+                }
+                setMovedUs([]);
+                setErrorNotice(NOTIFY_ERROR_MESSAGE);
+            });
+    };
+
+    /**
+     * [M-13] Move a card to the TOP of its column — port of the legacy
+     * `moveToTopDropdown` -> `moveUsToTop` -> `moveUs(null, [us], status,
+     * swimlane, 0, null, nextUsId)` chain (kanban/main.coffee L157-L185).
+     *
+     * The legacy code found the FIRST card currently in the column
+     * (`userstories.get(0)`) and reordered the moved card to sit before it, via
+     * the same `bulk_update_kanban_order` endpoint the drag path uses. Here the
+     * ordered container lists come from {@link buildContainerIndex}. Two guards
+     * implement the finding's "first-card / no-op gating": if the card is not on
+     * the board, or is already at index 0 of its column (so there is no distinct
+     * "first" card to move before), the action is a no-op — no optimistic
+     * mutation and no network call. Otherwise the move is applied optimistically
+     * and rolled back with the shared error toast on persistence failure,
+     * exactly like {@link persist} (M-05).
+     */
+    const handleMoveToTop = (usId: number): void => {
+        const view = kanban.state.usMap[usId];
+        if (!view) {
+            return;
+        }
+        const containerIndex = buildContainerIndex(kanban.state);
+        const location = containerIndex.containerOf[usId];
+        if (!location || location.index === 0) {
+            // Card is unknown, or already the first in its column -> no-op.
+            return;
+        }
+        const orderedIds = containerIndex.listOf[location.key] ?? [];
+        const firstId = orderedIds.length > 0 ? orderedIds[0] : null;
+        if (firstId === null || firstId === usId) {
+            return;
+        }
+        const { statusId, swimlaneId } = parseContainerKey(location.key);
+        const apiSwimlane =
+            swimlaneId === UNCLASSIFIED_SWIMLANE_ID ? null : swimlaneId;
+
+        // M-05-style snapshot for rollback (immer-frozen immutable reference).
+        const snapshot = kanban.state;
+
+        // Optimistic reorder: move `usId` to the top, i.e. BEFORE the current
+        // first card (previousCard = null, nextCard = firstId), matching
+        // `moveUs(..., 0, null, nextUsId)`.
+        kanban.move([usId], statusId, apiSwimlane, null, firstId);
+        setMovedUs([usId]);
+        if (highlightTimerRef.current !== null) {
+            clearTimeout(highlightTimerRef.current);
+        }
+        highlightTimerRef.current = setTimeout(() => {
+            highlightTimerRef.current = null;
+            setMovedUs([]);
+        }, MOVED_HIGHLIGHT_MS);
+
+        void bulkUpdateKanbanOrder(
+            resolvedIdRef.current,
+            statusId,
+            apiSwimlane,
+            null,
+            firstId,
+            [usId],
+        )
+            .then(() => undefined)
+            .catch(() => {
+                if (!aliveRef.current) {
+                    return;
+                }
+                kanban.restore(snapshot);
+                if (highlightTimerRef.current !== null) {
+                    clearTimeout(highlightTimerRef.current);
+                    highlightTimerRef.current = null;
+                }
+                setMovedUs([]);
+                setErrorNotice(NOTIFY_ERROR_MESSAGE);
+            });
     };
 
     // -----------------------------------------------------------------------
@@ -2095,10 +2510,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         onAddUs={addNewUs}
                         onFoldStatus={foldStatus}
                         onToggleSwimlane={toggleSwimlane}
+                        onRequestOpenSwimlane={openSwimlane}
                         onToggleFold={handleToggleFold}
                         onClickEdit={onEditUs}
                         onClickAssignedTo={onAssignUs}
                         onClickDelete={handleDeleteUs}
+                        onClickMoveToTop={handleMoveToTop}
                         onToggleSelect={toggleSelectedUs}
                     />
                 ) : null}
@@ -2144,11 +2561,33 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     assignableUsers={assignableUsers}
                     onCreate={onCreateUs}
                     onEdit={onSaveUsEdit}
+                    fetchAttachments={fetchUsAttachments}
                     onClose={() =>
                         setUsLightbox((prev) => ({ ...prev, open: false }))
                     }
                 />
             ) : null}
+
+            {/* [N-03] Themed delete-confirmation dialog, replacing the native
+                window.confirm. Ports `$tgConfirm.askOnDelete(...)`:
+                title US.TITLE_DELETE_ACTION, message US.TITLE_DELETE_MESSAGE. */}
+            <ConfirmDialog
+                open={deleteConfirm.open}
+                variant="delete"
+                busy={deleteConfirm.busy}
+                title={t("US.TITLE_DELETE_ACTION", "Delete user story")}
+                message={
+                    deleteConfirm.us
+                        ? renderDeleteMessage(deleteConfirm.us.subject)
+                        : null
+                }
+                confirmLabel={t("COMMON.DELETE", "Delete")}
+                cancelLabel={t("COMMON.CANCEL", "Cancel")}
+                onConfirm={() => {
+                    void handleConfirmDelete();
+                }}
+                onCancel={handleCancelDelete}
+            />
         </section>
     );
 }

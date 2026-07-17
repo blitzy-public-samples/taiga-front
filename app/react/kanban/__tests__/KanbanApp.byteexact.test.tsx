@@ -396,29 +396,47 @@ describe("KanbanApp — board callbacks", () => {
     });
 
     it("deletes a user story via onClickDelete when confirmed (DELETE /userstories/{id})", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
         await renderLoaded();
         fetchMock.mockClear();
+        // [N-03] Delete opens the themed ConfirmDialog (port of askOnDelete),
+        // not the native window.confirm. No DELETE fires until the user confirms.
         await act(async () => {
             mockBoardHolder.props!.onClickDelete?.(101);
+        });
+        const dialog = document.querySelector(
+            ".lightbox-generic-delete.open",
+        ) as HTMLElement | null;
+        expect(dialog).not.toBeNull();
+        expect(findCall("/userstories/101")).toBeFalsy();
+
+        await act(async () => {
+            fireEvent.click(dialog!.querySelector(".js-confirm") as HTMLElement);
             await Promise.resolve();
         });
         const call = findCall("/userstories/101");
         expect(call).toBeTruthy();
         expect((call![1] as RequestInit).method).toBe("DELETE");
-        confirmSpy.mockRestore();
     });
 
     it("does NOT delete when the confirm dialog is cancelled", async () => {
-        const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(false);
         await renderLoaded();
         fetchMock.mockClear();
         await act(async () => {
             mockBoardHolder.props!.onClickDelete?.(101);
+        });
+        const dialog = document.querySelector(
+            ".lightbox-generic-delete.open",
+        ) as HTMLElement | null;
+        expect(dialog).not.toBeNull();
+
+        await act(async () => {
+            fireEvent.click(dialog!.querySelector(".js-cancel") as HTMLElement);
             await Promise.resolve();
         });
         expect(findCall("/userstories/101")).toBeFalsy();
-        confirmSpy.mockRestore();
+        expect(
+            document.querySelector(".lightbox-generic-delete.open"),
+        ).toBeNull();
     });
 
     it("exposes isArchivedHidden and showPlaceholder predicates", async () => {

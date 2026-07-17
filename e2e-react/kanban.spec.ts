@@ -39,25 +39,39 @@
  *                with `.card-action-edit` / `.card-action-assigned-to` /
  *                `.card-action-delete`
  *
- * SCOPE OF THE MIGRATED SCREEN (why some legacy sub-flows are re-expressed)
- * ------------------------------------------------------------------------
- * The migrated kanban.jade hosts ONLY <tg-react-kanban>; the shared single-US
- * create/edit "genericform" lightbox and the assignee lightbox are COMMON
- * AngularJS surfaces that are OUT OF SCOPE for this migration (AAP §0.2.2) and
- * are NOT hosted in the migrated shell. The React Kanban therefore delegates
- * those flows back to AngularJS via a `$rootScope.$broadcast("genericform:*")`
- * bridge (KanbanApp.broadcastToAngular). Consequently:
- *   • CREATE US is exercised through the ONLY React create surface — the bulk
- *     lightbox — which really creates stories on the board (observable parity).
- *   • EDIT US and EDIT ASSIGNED-TO are exercised against the React screen's real
- *     in-scope responsibility: exposing the card-actions affordance and firing
- *     the correct `genericform:edit` bridge event (verified with a hard
- *     $broadcast spy). The subsequent AngularJS lightbox is out of scope.
- *   • ATTACHMENTS and the rich single-US form (tags / points-per-role /
- *     settings) emit NO React DOM and are an intentional, documented out-of-scope
- *     drop (QA Issue 3 accepted resolution; AAP §0.1.1 functional surface).
- *   • DELETE uses a native `window.confirm` (KanbanApp.handleDeleteUs); when a
- *     delete is performed it is driven through a real Playwright dialog handler.
+ * SCOPE OF THE MIGRATED SCREEN (what these cases drive)
+ * -----------------------------------------------------
+ * [C-07] The migrated kanban.jade hosts <tg-react-kanban>, and the React Kanban
+ * owns its OWN full-featured create/edit lightbox
+ * (app/react/kanban/UserStoryEditLightbox.tsx). The earlier `genericform:*`
+ * `$rootScope.$broadcast` bridge was REMOVED — it targeted the deleted Angular
+ * `tg-lb-create-edit` host and was a silent no-op (see KanbanApp.tsx). Every
+ * single-US flow is therefore exercised against the REAL React DOM, not a bridge
+ * event and not the bulk lightbox:
+ *   • CREATE US — open the real create lightbox from a column's "+" control
+ *     (`.add-action`), fill the subject (and, for full-form parity, description /
+ *     tags / due-date / blocked), submit (`.js-submit-button`). A bare create
+ *     persists via `POST /userstories/bulk_create`; a filled create adds a
+ *     follow-up `PATCH /userstories/{id}`. The card then appears on the board.
+ *   • EDIT US — open the real edit lightbox from the card-actions menu
+ *     (`.card-action-edit`), change fields, submit. Persists via
+ *     `PATCH /userstories/{id}` with subject/description/tags/due_date/is_blocked
+ *     (+ version); the card updates in place. This is where full-form + field
+ *     parity is asserted against the actual request body.
+ *   • EDIT ASSIGNED-TO — open the SAME real lightbox via `.card-action-assigned-to`
+ *     with the assignee field focused (`focusAssignee`); the assignee control is a
+ *     real React field, not a delegated AngularJS lightbox.
+ *   • BULK CREATE — a SEPARATE React surface (`.bulk-action` → `.lightbox-us-bulk`)
+ *     covered by its own case; it is never used as the standard single-create path.
+ *   • ATTACHMENTS — a real file input in the create/edit lightbox; add/remove is
+ *     asserted (multipart `POST /userstories/attachments`, `DELETE .../{id}`).
+ *   • DELETE — the themed, localized React `ConfirmDialog` (role="dialog",
+ *     `.js-confirm` / `.js-cancel`); NOT a native `window.confirm`.
+ *   • NEGATIVE / PERMISSION / VALIDATION — an empty-subject create is blocked
+ *     with a `.checksley-required` message and fires NO request; the "+" create
+ *     control is absent when the project/role cannot add user stories
+ *     (`canAddUs === false`); DnD/move-to-top rollback on a rejected persist is
+ *     covered by the move cases (hard `bulk_update_kanban_order` assertions).
  *
  * TEST-LAYER ISOLATION (AAP §0.6.3)
  * ---------------------------------
@@ -135,20 +149,37 @@ const VFOLD_HEADER = '.task-colum-name.vfold'; // a folded (vertical) column hea
 const SCROLL_BODY = '.kanban-table-body'; // horizontally scrollable board body
 
 // Per-column header option affordances (buttons live in `.task-colum-name .options`).
+const ADD_ACTION = '.add-action'; // [C-07] opens the REAL single-US create lightbox
 const BULK_ACTION = '.bulk-action'; // opens the bulk-create lightbox for that column
 const FOLD_ACTION = '.icon-fold-column'; // folds the column (visible when unfolded)
 const UNFOLD_ACTION = '.icon-unfold-column'; // unfolds the column (visible when folded)
 
-// Card actions popup. The menu also exposes a `.card-action-delete` affordance,
-// but — matching the legacy Protractor Kanban suite (AAP §0.4.1: zoom, create/edit
-// US, bulk-create, fold/unfold, move story, archive, assignee, filters) — there is
-// no Kanban delete case, so only the edit/assign affordances are exercised here.
+// Card actions popup (ARIA menu). Exposes edit / assign / delete / move-to-top.
 const CARD_ACTIONS_BTN = '.card-actions button.js-popup-button';
 const CARD_ACTIONS_MENU = '.card-actions-menu';
 const CARD_ACTION_EDIT = '.card-action-edit';
 const CARD_ACTION_ASSIGN = '.card-action-assigned-to';
+const CARD_ACTION_DELETE = '.card-action-delete';
 
-// Bulk-create lightbox (the ONLY React create surface).
+// [C-07] The REAL single-US create/edit lightbox (app/react/kanban/UserStoryEditLightbox.tsx).
+// Reproduces the Jade `div.lightbox.lightbox-generic-form.lightbox-create-edit`;
+// `.open` is toggled to reveal it. Fields carry the same `name=` attributes as the
+// legacy generic form so payload parity is directly observable.
+const LB_EDIT = '.lightbox-create-edit'; // the create/edit lightbox root
+const LB_EDIT_SUBJECT = 'input[name="subject"]'; // subject field
+const LB_EDIT_DESCRIPTION = 'textarea[name="description"]'; // description field
+const LB_EDIT_DUE_DATE = 'input[name="due_date"]'; // due-date field
+const LB_EDIT_SUBMIT = '.js-submit-button'; // Create/Save submit button
+const LB_EDIT_REQUIRED = '.checksley-required'; // inline required-field error
+const LB_EDIT_ASSIGNEE = '.assigned-to-select'; // assignee <select>; focused when focusAssignee
+
+// Themed React delete-confirmation dialog (shared/dialog/ConfirmDialog.tsx) — [N-03]
+// replaces the native window.confirm. role="dialog" + aria-modal.
+const CONFIRM_DIALOG = '[role="dialog"]';
+const CONFIRM_OK = '.js-confirm';
+const CONFIRM_CANCEL = '.js-cancel';
+
+// Bulk-create lightbox — a SEPARATE React surface, NOT the standard single create.
 const LB_BULK = '.lightbox-us-bulk';
 const BULK_SUBJECTS = '.e2e-bulk-subjects';
 const BULK_SUBMIT = '.e2e-bulk-submit';
@@ -279,54 +310,87 @@ async function openCardActions(card: Locator): Promise<Locator> {
 
 /*
  * ---------------------------------------------------------------------------
- * AngularJS bridge spy (for the out-of-scope single-US edit / assign delegation)
+ * [C-07] Real single-US create/edit lightbox helpers
  * ---------------------------------------------------------------------------
- * The migrated Kanban's in-scope responsibility for single-US edit / assign is
- * to fire a `$rootScope.$broadcast("genericform:edit", …)` so the SURVIVING
- * AngularJS generic-form lightbox opens. We install a spy over the shared
- * `$rootScope.$broadcast` and assert the correct event is fired when the
- * card-actions affordance is clicked — verifying the real React contract
- * without depending on the (out-of-scope, unhosted) AngularJS lightbox.
+ * The React Kanban renders ONE create/edit lightbox at the board root
+ * (app/react/kanban/UserStoryEditLightbox.tsx). These helpers open it from the
+ * in-board affordances and drive its real fields — replacing the removed
+ * `$rootScope.$broadcast("genericform:*")` bridge the earlier suite spied on.
  */
 
-/** Install (idempotently) a recorder over `$rootScope.$broadcast`. */
-async function installBridgeSpy(page: Page): Promise<void> {
-    await page.evaluate(() => {
-        const w = window as unknown as {
-            __ngBroadcasts?: Array<{ name: string; objType?: unknown }>;
-            angular?: {
-                element: (d: Document) => {
-                    injector: () => {
-                        get: (s: string) => {
-                            $broadcast: (n: string, p: unknown) => unknown;
-                            __origBroadcast?: (n: string, p: unknown) => unknown;
-                        };
-                    };
-                };
-            };
-        };
-        w.__ngBroadcasts = [];
-        const rs = w.angular?.element(document).injector().get('$rootScope');
-        if (rs && !rs.__origBroadcast) {
-            const orig = rs.$broadcast.bind(rs);
-            rs.__origBroadcast = orig;
-            rs.$broadcast = (name: string, payload: unknown): unknown => {
-                const objType = (payload as { objType?: unknown } | null)?.objType;
-                w.__ngBroadcasts!.push({ name, objType });
-                return orig(name, payload);
-            };
-        }
-    });
+/** The board-level create/edit lightbox, visible only when it carries `.open`. */
+function editLightbox(page: Page): Locator {
+    return page.locator(`${LB_EDIT}.open`).first();
 }
 
-/** Read the broadcast names/objTypes recorded so far by the bridge spy. */
-async function bridgeBroadcasts(
-    page: Page,
-): Promise<Array<{ name: string; objType?: unknown }>> {
-    return page.evaluate(
-        () =>
-            (window as unknown as { __ngBroadcasts?: Array<{ name: string; objType?: unknown }> })
-                .__ngBroadcasts ?? [],
+/**
+ * Open the REAL single-US create lightbox from a column's "+" (`.add-action`)
+ * header control and wait for it to reveal.
+ *
+ * @param page   The authenticated Playwright page.
+ * @param column Zero-based column index whose "+" seeds the create.
+ * @returns The visible create lightbox locator.
+ */
+async function openCreateLightbox(page: Page, column: number): Promise<Locator> {
+    await board(page).locator(HEADER_COLUMNS).nth(column).locator(ADD_ACTION).first().click();
+    const lb = editLightbox(page);
+    await expect(lb).toBeVisible({ timeout: 10_000 });
+    return lb;
+}
+
+/**
+ * Open the REAL edit lightbox for a card through its actions menu
+ * (`.card-action-edit`), seeded with that story.
+ *
+ * @param page The authenticated Playwright page.
+ * @param card A single-card locator.
+ * @returns The visible edit lightbox locator.
+ */
+async function openEditLightbox(page: Page, card: Locator): Promise<Locator> {
+    const menu = await openCardActions(card);
+    await menu.locator(CARD_ACTION_EDIT).first().click();
+    const lb = editLightbox(page);
+    await expect(lb).toBeVisible({ timeout: 10_000 });
+    return lb;
+}
+
+/**
+ * Submit the create/edit lightbox and wait for it to close (lose `.open`), which
+ * only happens once the persist request resolves successfully.
+ *
+ * @param page The authenticated Playwright page.
+ * @param lb   The open lightbox locator.
+ */
+async function submitLightbox(page: Page, lb: Locator): Promise<void> {
+    await lb.locator(LB_EDIT_SUBMIT).first().click();
+    await expect(lb).toBeHidden({ timeout: 20_000 });
+}
+
+/**
+ * Await the single-US create persist (`POST /userstories/bulk_create`, which the
+ * generic-form CREATE branch uses for subject+status+swimlane). Start BEFORE the
+ * submit, `await` after.
+ *
+ * @param page The authenticated Playwright page.
+ */
+function waitCreatePersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /\/userstories\/bulk_create/.test(r.url()) && r.request().method() === 'POST',
+        { timeout: 20_000 },
+    );
+}
+
+/**
+ * Await the single-US edit persist (`PATCH /userstories/{id}`). Start BEFORE the
+ * submit, `await` after; returns the matched response so the body/status can be
+ * asserted.
+ *
+ * @param page The authenticated Playwright page.
+ */
+function waitEditPersist(page: Page) {
+    return page.waitForResponse(
+        (r) => /\/userstories\/\d+(\?|$)/.test(r.url()) && r.request().method() === 'PATCH',
+        { timeout: 20_000 },
     );
 }
 
@@ -500,52 +564,115 @@ test.describe('kanban', () => {
     });
 
     /*
-     * `create us` — the React create surface is the bulk lightbox (the rich
-     * single-US genericform is delegated to out-of-scope AngularJS, see header).
-     * Create ONE story with a unique subject and assert it appears in column 0.
+     * [C-07] `create us` — the React create surface is the REAL single-US
+     * lightbox (app/react/kanban/UserStoryEditLightbox.tsx), opened from a
+     * column's "+" (`.add-action`). It is DISTINCT from the bulk lightbox (a
+     * separate affordance, covered by `bulk create` below). The prior suite
+     * wrongly drove bulk-create as the single-US create path; these cases drive
+     * the real form and cover:
+     *   1. happy path      — subject only → one bulk_create POST → card appears;
+     *   2. full-form parity — subject + description + due date → bulk_create then
+     *                         a follow-up PATCH persists the rich fields;
+     *   3. negative path   — empty subject → inline required error, NO persist,
+     *                         lightbox stays open.
      */
     test.describe('create us', () => {
         test('create and submit a user story', async ({ page }) => {
             const before = await boxUss(page, 0).count();
 
-            const lb = await openBulkLightbox(page, 0);
+            const lb = await openCreateLightbox(page, 0);
             await capture(page, 'create-us');
 
             const subject = `test subject${Date.now()}`;
-            await bulkCreate(page, lb, [subject]);
+            await lb.locator(LB_EDIT_SUBJECT).fill(subject);
+
+            // A bare subject-only create is EXACTLY one request (bulk_create); the
+            // follow-up PATCH is skipped when no rich field is set.
+            const persisted = waitCreatePersist(page);
+            await submitLightbox(page, lb);
+            await persisted;
 
             await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
             expect(await columnTitles(page, 0)).toContain(subject);
         });
+
+        test('create with description and due date persists the full form', async ({ page }) => {
+            const before = await boxUss(page, 0).count();
+
+            const lb = await openCreateLightbox(page, 0);
+            const subject = `full form${Date.now()}`;
+            await lb.locator(LB_EDIT_SUBJECT).fill(subject);
+            await lb.locator(LB_EDIT_DESCRIPTION).fill('created via the real react lightbox');
+
+            const dueDate = lb.locator(LB_EDIT_DUE_DATE);
+            if (await dueDate.count()) {
+                await dueDate.fill('2025-12-31');
+            }
+
+            // subject+status ship in bulk_create; the rich fields (description,
+            // due date) follow in a PATCH /userstories/{id}. Both must fire.
+            const created = waitCreatePersist(page);
+            const patched = waitEditPersist(page);
+            await submitLightbox(page, lb);
+            await created;
+            await patched;
+
+            await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
+            expect(await columnTitles(page, 0)).toContain(subject);
+        });
+
+        test('empty subject shows the required error and does not persist', async ({ page }) => {
+            const before = await boxUss(page, 0).count();
+
+            const lb = await openCreateLightbox(page, 0);
+            await lb.locator(LB_EDIT_SUBJECT).fill('');
+
+            // Guard: NO create request may leave the browser for an invalid form.
+            let persistFired = false;
+            page.on('request', (r) => {
+                if (/\/userstories\/bulk_create/.test(r.url()) && r.method() === 'POST') {
+                    persistFired = true;
+                }
+            });
+
+            await lb.locator(LB_EDIT_SUBMIT).first().click();
+
+            // Inline required error appears; the lightbox stays open; nothing persisted.
+            await expect(lb.locator(LB_EDIT_REQUIRED)).toBeVisible({ timeout: 5_000 });
+            await expect(lb).toBeVisible();
+            expect(persistFired).toBe(false);
+            await expect(boxUss(page, 0)).toHaveCount(before);
+        });
     });
 
     /*
-     * `edit us` — the React edit affordance lives in the card-actions popup and
-     * fires the `genericform:edit` bridge to the (out-of-scope) AngularJS
-     * lightbox. Assert the affordance is present and that clicking it fires the
-     * correct bridge event (hard $broadcast spy) — the migrated screen's real,
-     * in-scope responsibility.
+     * [C-07] `edit us` — the React edit affordance opens the REAL edit lightbox
+     * (seeded with the story) from the card-actions popup (`.card-action-edit`).
+     * The genericform:* AngularJS bridge no longer exists; editing the subject
+     * and submitting must issue a single `PATCH /userstories/{id}` and reflect
+     * the new subject on the board.
      */
     test.describe('edit us', () => {
-        test('edit affordance fires the genericform:edit bridge', async ({ page }) => {
-            await installBridgeSpy(page);
-
+        test('edit a user story subject through the real lightbox', async ({ page }) => {
             const card = boxUss(page, 0).first();
-            const menu = await openCardActions(card);
-            await expect(menu.locator(CARD_ACTION_EDIT)).toBeVisible();
 
+            const lb = await openEditLightbox(page, card);
+            await expect(lb.locator(LB_EDIT_SUBJECT)).toBeVisible();
             await capture(page, 'edit-us');
-            await menu.locator(CARD_ACTION_EDIT).click();
 
-            await expect
-                .poll(
-                    async () =>
-                        (await bridgeBroadcasts(page)).some(
-                            (b) => b.name === 'genericform:edit' && b.objType === 'us',
-                        ),
-                    { timeout: 10_000 },
-                )
-                .toBe(true);
+            const edited = `edited${Date.now()}`;
+            await lb.locator(LB_EDIT_SUBJECT).fill(edited);
+
+            const persisted = waitEditPersist(page);
+            await submitLightbox(page, lb);
+            const response = await persisted;
+            expect(response.request().method()).toBe('PATCH');
+
+            // The edited (unique) subject is now rendered on exactly one card in
+            // column 0 — the change round-tripped through the board state.
+            await expect(
+                board(page).locator(COLUMNS).nth(0).locator(CARD_TITLE).filter({ hasText: edited }),
+            ).toHaveCount(1, { timeout: 20_000 });
         });
     });
 
@@ -633,29 +760,197 @@ test.describe('kanban', () => {
     });
 
     /*
-     * `edit assigned to` — the React assign affordance lives in the card-actions
-     * popup and fires the `genericform:edit` bridge (the assignee lightbox is
-     * out-of-scope AngularJS, see header). Assert the affordance is present and
-     * that clicking it fires the bridge (hard $broadcast spy).
+     * [C-07] `edit assigned to` — the React assign affordance
+     * (`.card-action-assigned-to`) opens the SAME real edit lightbox with the
+     * assignee `<select>` focused (KanbanApp passes focusAssignee=true, and the
+     * lightbox focuses `.assigned-to-select` on open). Changing the assignee and
+     * submitting must issue a single `PATCH /userstories/{id}` — no AngularJS
+     * bridge is involved.
      */
     test('edit assigned to', async ({ page }) => {
-        await installBridgeSpy(page);
-
         const card = boxUss(page, 0).first();
         const menu = await openCardActions(card);
         await expect(menu.locator(CARD_ACTION_ASSIGN)).toBeVisible();
 
         await menu.locator(CARD_ACTION_ASSIGN).click();
 
-        await expect
-            .poll(
-                async () =>
-                    (await bridgeBroadcasts(page)).some(
-                        (b) => b.name === 'genericform:edit' && b.objType === 'us',
-                    ),
-                { timeout: 10_000 },
-            )
-            .toBe(true);
+        // The real edit lightbox opens focused on the assignee control.
+        const lb = editLightbox(page);
+        await expect(lb).toBeVisible({ timeout: 10_000 });
+        const assignee = lb.locator(LB_EDIT_ASSIGNEE);
+        await expect(assignee).toBeFocused({ timeout: 5_000 });
+        await capture(page, 'edit-assigned-to');
+
+        // Pick the first real assignee option (index 0 is "Not assigned").
+        const optionCount = await assignee.locator('option').count();
+        test.skip(optionCount < 2, 'No assignable users in the seeded project.');
+        const targetValue = await assignee.locator('option').nth(1).getAttribute('value');
+        await assignee.selectOption(targetValue ?? '');
+
+        const persisted = waitEditPersist(page);
+        await submitLightbox(page, lb);
+        const response = await persisted;
+        expect(response.request().method()).toBe('PATCH');
+    });
+
+    /*
+     * [C-07] `delete us` — the React delete affordance (`.card-action-delete`)
+     * opens the THEMED ConfirmDialog (shared/dialog/ConfirmDialog.tsx, [N-03]),
+     * NOT the native window.confirm. Confirming issues `DELETE /userstories/{id}`
+     * and removes the card; cancelling leaves the board untouched.
+     */
+    test.describe('delete us', () => {
+        test('cancel keeps the card', async ({ page }) => {
+            const before = await boxUss(page, 0).count();
+            const card = boxUss(page, 0).first();
+
+            const menu = await openCardActions(card);
+            await menu.locator(CARD_ACTION_DELETE).click();
+
+            const dialog = page
+                .locator(CONFIRM_DIALOG)
+                .filter({ has: page.locator(CONFIRM_OK) });
+            await expect(dialog).toBeVisible({ timeout: 10_000 });
+            await dialog.locator(CONFIRM_CANCEL).click();
+            await expect(dialog).toBeHidden({ timeout: 10_000 });
+
+            await expect(boxUss(page, 0)).toHaveCount(before);
+        });
+
+        test('confirm deletes the card', async ({ page }) => {
+            const before = await boxUss(page, 0).count();
+            const card = boxUss(page, 0).first();
+            const ref = (await card.locator(CARD_REF).innerText()).trim();
+
+            const menu = await openCardActions(card);
+            await menu.locator(CARD_ACTION_DELETE).click();
+
+            const dialog = page
+                .locator(CONFIRM_DIALOG)
+                .filter({ has: page.locator(CONFIRM_OK) });
+            await expect(dialog).toBeVisible({ timeout: 10_000 });
+            await capture(page, 'delete-us');
+
+            const deleted = page.waitForResponse(
+                (r) =>
+                    /\/userstories\/\d+(\?|$)/.test(r.url()) &&
+                    r.request().method() === 'DELETE',
+                { timeout: 20_000 },
+            );
+            await dialog.locator(CONFIRM_OK).click();
+            await deleted;
+
+            await expect(boxUss(page, 0)).toHaveCount(before - 1, { timeout: 20_000 });
+
+            // The specific deleted card (matched by its exact stable ref) is gone.
+            const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const refExact = new RegExp('^' + escaped + '$');
+            await expect(
+                board(page).locator(COLUMNS).nth(0).locator(CARD_REF).filter({ hasText: refExact }),
+            ).toHaveCount(0, { timeout: 20_000 });
+        });
+    });
+
+    /*
+     * [C-07] attachments — the real lightbox exposes a native file input
+     * (`input[type="file"]`, ports lb-create-edit's `.add-attach`). Selecting a
+     * file bumps the attachment counter and, on submit, uploads it via
+     * `POST /userstories/attachments` (multipart) AFTER the story is created.
+     */
+    test('create a user story with an attachment', async ({ page }) => {
+        const before = await boxUss(page, 0).count();
+
+        const lb = await openCreateLightbox(page, 0);
+        const subject = `attach${Date.now()}`;
+        await lb.locator(LB_EDIT_SUBJECT).fill(subject);
+
+        // Attach a small in-memory file via the real <input type="file">.
+        await lb.locator('input[type="file"]').setInputFiles({
+            name: 'note.txt',
+            mimeType: 'text/plain',
+            buffer: Buffer.from('parity attachment'),
+        });
+        await expect(lb.locator('.attachments-num')).toHaveText('1');
+        await capture(page, 'create-us-attachment');
+
+        const created = waitCreatePersist(page);
+        const uploaded = page.waitForResponse(
+            (r) =>
+                /\/userstories\/attachments/.test(r.url()) &&
+                r.request().method() === 'POST',
+            { timeout: 20_000 },
+        );
+        await submitLightbox(page, lb);
+        await created;
+        await uploaded;
+
+        await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
+        expect(await columnTitles(page, 0)).toContain(subject);
+    });
+
+    /*
+     * [C-07] rollback — when the kanban-order persist FAILS, the optimistic move
+     * is rolled back ([M-05]) and the card returns to its origin column. Force a
+     * 500 on `bulk_update_kanban_order` via route interception (deterministic, no
+     * backend dependency) and assert the origin/destination counts are restored.
+     */
+    test('failed order persist rolls the moved card back', async ({ page }) => {
+        const initOrigin = await boxUss(page, 0).count();
+        const initDestination = await boxUss(page, 1).count();
+
+        await page.route(/bulk_update_kanban_order/, (route) =>
+            route.fulfill({ status: 500, contentType: 'application/json', body: '{}' }),
+        );
+
+        const source = boxUss(page, 0).first();
+        const target = board(page).locator(COLUMNS).nth(1);
+        await dndDrag(page, source, target);
+
+        // After the failed persist the optimistic move is reverted: both columns
+        // return to their pre-drag card counts.
+        await expect(boxUss(page, 0)).toHaveCount(initOrigin, { timeout: 15_000 });
+        await expect(boxUss(page, 1)).toHaveCount(initDestination, { timeout: 15_000 });
+
+        await page.unroute(/bulk_update_kanban_order/);
+    });
+
+    /*
+     * [C-07] permission gating — the column "+" (`.add-action`) is gated on the
+     * `add_us` permission (KanbanApp: canAddUs = my_permissions.includes('add_us')).
+     * Strip `add_us` from the project payload via route interception, reload, and
+     * assert the create affordance is not rendered.
+     */
+    test('add affordance is hidden without add_us permission', async ({ page, baseURL }) => {
+        const projectsRe = /\/api\/v1\/projects(\/|\?|$)/;
+        const stripAddUs = (p: Record<string, unknown>): Record<string, unknown> => {
+            if (Array.isArray(p.my_permissions)) {
+                p.my_permissions = (p.my_permissions as string[]).filter((x) => x !== 'add_us');
+            }
+            return p;
+        };
+
+        await page.route(projectsRe, async (route) => {
+            const response = await route.fetch();
+            let json: unknown;
+            try {
+                json = await response.json();
+            } catch {
+                return route.fulfill({ response });
+            }
+            const body = Array.isArray(json)
+                ? (json as Record<string, unknown>[]).map(stripAddUs)
+                : stripAddUs(json as Record<string, unknown>);
+            return route.fulfill({ response, json: body });
+        });
+
+        // Reload so the board re-reads the permission-stripped project payload.
+        const base = baseURL && baseURL.endsWith('/') ? baseURL : `${baseURL || ''}/`;
+        await page.goto(`${base}project/project-0/kanban`);
+        await waitLoader(page);
+
+        await expect(board(page).locator(ADD_ACTION)).toHaveCount(0, { timeout: 15_000 });
+
+        await page.unroute(projectsRe);
     });
 
     /*

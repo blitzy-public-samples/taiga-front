@@ -141,8 +141,11 @@ export function SprintList(props: SprintListProps): JSX.Element {
                             onAddNewSprint();
                         }}
                     >
-                        {/* literal "Add" in sprints.jade (no BACKLOG.SPRINTS.ADD key) */}
-                        <span>Add</span>
+                        {/* [M-06] The legacy sprints.jade uses a literal `span Add`
+                            with no dedicated BACKLOG.SPRINTS.ADD key; route it through
+                            the shared generic COMMON.ADD ("Add") entry so it localizes
+                            with the rest of the client. */}
+                        <span>{t("COMMON.ADD", "Add")}</span>
                         {/* tg-svg icon-add (decorative) */}
                         <svg className="icon icon-add" aria-hidden="true" focusable="false">
                             <use xlinkHref="#icon-add" href="#icon-add" />

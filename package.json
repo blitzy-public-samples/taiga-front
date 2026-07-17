@@ -98,7 +98,7 @@
     "merge-stream": "^1.0.0",
     "minimist": "^1.1.1",
     "mocha": "^2.2.4",
-    "sass": "1.77.8",
+    "node-sass": "8.0.0",
     "photoswipe": "^4.1.0",
     "pre-commit": "^1.0.5",
     "readable-stream": "~2.1.2",
@@ -156,5 +156,8 @@
     "react-dom": "18.2.0",
     "showdown": "^1.4.3",
     "taiga-html-editor": "https://github.com/taigaio/taiga-html-editor#stable"
+  },
+  "overrides": {
+    "node-releases": "2.0.23"
   }
 }

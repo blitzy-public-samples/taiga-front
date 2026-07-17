@@ -11,6 +11,7 @@ import type { ReactNode } from "react";
 import type { KanbanProject, Swimlane as SwimlaneModel } from "./useKanbanState";
 import { UNCLASSIFIED_SWIMLANE_ID } from "./useKanbanState";
 import { Icon } from "../shared/ui/Icon";
+import { t } from "../shared/i18n/translate";
 
 /**
  * Kanban swimlane row.
@@ -23,9 +24,18 @@ import { Icon } from "../shared/ui/Icon";
  * for the swimlane are supplied as `children`.
  */
 
-const UNCLASSIFIED_TOOLTIP =
-    "User stories that have not been assigned to a swimlane yet.";
-const DEFAULT_SWIMLANE_LABEL = "Default";
+// Labels routed through the shared runtime translator [M-06] at RENDER time
+// (never memoized at module load — the React bundle evaluates before
+// `angular.bootstrap`, so `$translate` is only reachable once a component
+// renders). Keys + English fallbacks are the authoritative catalog entries used
+// by the legacy Jade markup (kanban-table.jade): the unclassified-swimlane help
+// tooltip (`KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP`) and the default-swimlane
+// marker (`ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT`).
+const UNCLASSIFIED_TOOLTIP_KEY = "KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP";
+const UNCLASSIFIED_TOOLTIP_FALLBACK =
+    "The user stories that are not part of any swimlane are here.";
+const DEFAULT_SWIMLANE_KEY = "ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT";
+const DEFAULT_SWIMLANE_FALLBACK = "Default";
 const AUTO_OPEN_DELAY_MS = 1000;
 
 export interface SwimlaneProps {
@@ -107,13 +117,15 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                 {isUnclassified && (
                     <div className="unclassified-us-info">
                         <Icon name="icon-help-circle" />
-                        <div className="tooltip pop-help">{UNCLASSIFIED_TOOLTIP}</div>
+                        <div className="tooltip pop-help">
+                            {t(UNCLASSIFIED_TOOLTIP_KEY, UNCLASSIFIED_TOOLTIP_FALLBACK)}
+                        </div>
                     </div>
                 )}
                 {isDefault && (
                     <div className="default-swimlane">
                         <Icon name="icon-star" wrapperClass="default-swimlane-icon" />
-                        <span className="default-text">{DEFAULT_SWIMLANE_LABEL}</span>
+                        <span className="default-text">{t(DEFAULT_SWIMLANE_KEY, DEFAULT_SWIMLANE_FALLBACK)}</span>
                     </div>
                 )}
             </button>

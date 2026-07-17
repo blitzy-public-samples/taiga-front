@@ -248,4 +248,85 @@ describe("Sprint", () => {
       expect(edit).toHaveAttribute("aria-label", "Edit Sprint");
     });
   });
+
+  /* ---------------------------------------------------------------------- */
+  /* [M-07] baseHref-aware HTML5 navigation (no `#`-fragment)               */
+  /* ---------------------------------------------------------------------- */
+
+  describe("[M-07] HTML5 navigation", () => {
+    it("links each user story to the baseHref-aware HTML5 us route (not a #-fragment)", () => {
+      const sprint = makeSprint({ id: 1, user_stories: [makeUs({ id: 5, ref: 42 })] });
+      const { container } = renderSprint({ sprint, project: makeProject({ slug: "myproj" }) });
+      const link = container.querySelector("a.us-name") as HTMLAnchorElement | null;
+      expect(link).not.toBeNull();
+      expect(link!.getAttribute("href")).toBe("/project/myproj/us/42");
+      // must NOT be a hash-fragment link
+      expect(link!.getAttribute("href")).not.toMatch(/^#/);
+    });
+
+    it("links the sprint header name and the bottom taskboard button to the HTML5 taskboard route", () => {
+      const sprint = makeSprint({ id: 7, slug: "sprint-7", user_stories: [makeUs({ id: 1, ref: 1 })] });
+      const { container } = renderSprint({ sprint, project: makeProject({ slug: "myproj" }) });
+      const links = Array.from(container.querySelectorAll("a")).filter(
+        (a) => a.getAttribute("href") === "/project/myproj/taskboard/sprint-7",
+      );
+      // header name link + bottom "go to taskboard" button both resolve here
+      expect(links.length).toBe(2);
+      links.forEach((a) => expect(a.getAttribute("href")).not.toMatch(/^#/));
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /* [M-08] Due-date icon / severity color / formatted-date tooltip        */
+  /* ---------------------------------------------------------------------- */
+
+  describe("[M-08] due-date parity", () => {
+    it("renders no due-date marker when the story has no due date", () => {
+      const sprint = makeSprint({ id: 1, user_stories: [makeUs({ id: 1, ref: 1, due_date: null })] });
+      const { container } = renderSprint({ sprint });
+      expect(container.querySelector(".due-date")).toBeNull();
+    });
+
+    it("renders the due-date clock icon with severity fill and a formatted tooltip", () => {
+      // 2000-01-01 is far in the past -> "past due" (red #E44057) with the
+      // default thresholds.
+      const sprint = makeSprint({ id: 1, user_stories: [makeUs({ id: 1, ref: 1, due_date: "2000-01-01" })] });
+      const { container } = renderSprint({ sprint });
+
+      const wrapper = container.querySelector(".due-date");
+      expect(wrapper).not.toBeNull();
+
+      const icon = wrapper!.querySelector("svg.icon.icon-clock") as SVGElement | null;
+      expect(icon).not.toBeNull();
+      // severity color applied as the svg fill (past due -> red #E44057).
+      // jsdom preserves the hex string exactly as set on the inline style.
+      expect((icon as unknown as HTMLElement).style.fill).toBe("#E44057");
+
+      // the icon wrapper carries the themed `.due-date-icon` class
+      expect(wrapper!.querySelector(".due-date-icon")).not.toBeNull();
+
+      // tooltip = COMMON.CARD.DUE_DATE interpolated with the formatted date +
+      // status name ("01 Jan 2000 (past due)")
+      const title = icon!.querySelector("use > title");
+      expect(title).not.toBeNull();
+      expect(title!.textContent).toBe("Due date: 01 Jan 2000 (past due)");
+    });
+
+    it("uses the project's us_duedates thresholds when provided", () => {
+      // A single all-green threshold forces "normal due" regardless of date.
+      const sprint = makeSprint({ id: 1, user_stories: [makeUs({ id: 1, ref: 1, due_date: "2000-01-01" })] });
+      const project = makeProject({
+        slug: "proj",
+        us_duedates: [
+          { color: "#00FF00", name: "custom green", days_to_due: null, by_default: true },
+        ],
+      });
+      const { container } = renderSprint({ sprint, project });
+      const icon = container.querySelector(".due-date svg.icon.icon-clock") as SVGElement | null;
+      expect(icon).not.toBeNull();
+      expect((icon as unknown as HTMLElement).style.fill).toBe("#00FF00");
+      const title = icon!.querySelector("use > title");
+      expect(title!.textContent).toBe("Due date: 01 Jan 2000 (custom green)");
+    });
+  });
 });

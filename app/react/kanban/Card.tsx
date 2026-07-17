@@ -6,16 +6,19 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { useState } from "react";
-import type { MouseEvent } from "react";
+import { useState, useRef, useEffect, useId } from "react";
+import type { MouseEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Icon } from "../shared/ui/Icon";
+import { t } from "../shared/i18n/translate";
+import { projectEpicUrl, projectTaskUrl } from "../shared/nav/urls";
 import { isDragEnabled } from "../shared/dnd/DndProvider";
-import { dueDateColor, dueDateTitle } from "./dueDate";
-import type { DueDateAppearance } from "./dueDate";
+import { dueDateColor, dueDateTitle } from "../shared/duedate/dueDate";
+import type { DueDateAppearance } from "../shared/duedate/dueDate";
 import type {
     BaseUser,
+    EpicRef,
     KanbanProject,
     TaskModel,
     UsView,
@@ -34,9 +37,22 @@ import type {
  */
 
 const DEFAULT_TAG_COLOR = "#A9AABC";
-const NOT_ASSIGNED_LABEL = "Not assigned";
 const UNCLASSIFIED_SWIMLANE_ID = -1;
-const IS_IOCAINE_LABEL = "Is iocaine";
+
+// Card labels/titles routed through the shared runtime translator [M-06] at
+// RENDER time (never memoized at module load, since the React bundle evaluates
+// before `angular.bootstrap`). Keys + English fallbacks mirror the authoritative
+// catalog entries used by the legacy card templates
+// (app/modules/components/card/card-templates/*.jade and the `tgCardActions`
+// menu in app/coffee/modules/kanban/main.coffee): the not-assigned avatar label
+// (`COMMON.ASSIGNED_TO.NOT_ASSIGNED`) and the iocaine marker
+// (`TASK.FIELDS.IS_IOCAINE`). `COMMON.CARD.ACTIONS` has no legacy catalog entry
+// (the AngularJS popup button carried only an icon), so it resolves to its
+// fallback while still routing through the translator.
+const NOT_ASSIGNED_KEY = "COMMON.ASSIGNED_TO.NOT_ASSIGNED";
+const NOT_ASSIGNED_FALLBACK = "Not assigned";
+const IS_IOCAINE_KEY = "TASK.FIELDS.IS_IOCAINE";
+const IS_IOCAINE_FALLBACK = "Is iocaine";
 
 /**
  * Fallback avatar URL used when a user has no photo, or when a user story has no
@@ -70,6 +86,20 @@ export interface CardProps {
     onClickEdit?: (id: number) => void;
     onClickDelete?: (id: number) => void;
     onClickAssignedTo?: (id: number) => void;
+    /**
+     * [M-13] Move the card to the top of its column. Ports the legacy
+     * `onClickMoveToTop($scope.vm.item)` card action (kanban/main.coffee
+     * L1090-L1097). The parent (`KanbanColumn`) supplies the handler and sets
+     * {@link isFirst} so the menu item is hidden for a card already at the top.
+     */
+    onClickMoveToTop?: (id: number) => void;
+    /**
+     * [M-13] Whether this card is the first in its column (the AngularJS
+     * `is-first="$first"` binding, kanban-table.jade L161,L236). The legacy
+     * card gated the "move to top" action on `canEdit(...) && !isFirst`, so the
+     * action is hidden for the top card (no-op gating).
+     */
+    isFirst?: boolean;
     /** ctrl/meta-click multi-select toggle (QA-FUNC-01). */
     onToggleSelect?: (id: number) => void;
     /** Resolve an avatar URL for a user (defaults to the user's photo). */
@@ -96,12 +126,102 @@ export function Card(props: CardProps): JSX.Element {
         onClickEdit,
         onClickDelete,
         onClickAssignedTo,
+        onClickMoveToTop,
+        isFirst = false,
         onToggleSelect,
         resolveAvatar,
     } = props;
 
     const model = item.model;
     const [actionsOpen, setActionsOpen] = useState(false);
+
+    // [M-21] Complete ARIA menu pattern for the card actions popup. The trigger
+    // advertises `aria-haspopup="menu"` + `aria-controls`, the popup is a
+    // `role="menu"` with `role="menuitem"` children, and keyboard users get the
+    // expected behavior: focus lands on the first item when the menu opens, the
+    // arrow keys (plus Home/End) move a roving focus between items, Escape closes
+    // the menu and returns focus to the trigger, and Tab dismisses it.
+    const actionsButtonRef = useRef<HTMLButtonElement>(null);
+    const actionsMenuRef = useRef<HTMLDivElement>(null);
+    const actionsMenuId = useId();
+
+    // Move focus onto the first menu item once the popup is rendered (post-paint).
+    useEffect(() => {
+        if (!actionsOpen) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => {
+            const items = actionsMenuRef.current?.querySelectorAll<HTMLElement>(
+                '[role="menuitem"]',
+            );
+            items?.[0]?.focus();
+        }, 0);
+        return () => window.clearTimeout(timer);
+    }, [actionsOpen]);
+
+    /** Close the menu; optionally return focus to the trigger (keyboard dismiss). */
+    const closeActionsMenu = (returnFocus: boolean): void => {
+        setActionsOpen(false);
+        if (returnFocus) {
+            actionsButtonRef.current?.focus();
+        }
+    };
+
+    /** Roving-focus + dismiss keyboard handling for the actions menu. */
+    const handleActionsMenuKeyDown = (
+        event: ReactKeyboardEvent<HTMLDivElement>,
+    ): void => {
+        const items = Array.from(
+            actionsMenuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ??
+                [],
+        );
+        if (items.length === 0) {
+            return;
+        }
+        const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+        switch (event.key) {
+            case "ArrowDown": {
+                event.preventDefault();
+                event.stopPropagation();
+                const next = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length;
+                items[next].focus();
+                break;
+            }
+            case "ArrowUp": {
+                event.preventDefault();
+                event.stopPropagation();
+                const prev =
+                    currentIndex <= 0 ? items.length - 1 : currentIndex - 1;
+                items[prev].focus();
+                break;
+            }
+            case "Home": {
+                event.preventDefault();
+                event.stopPropagation();
+                items[0].focus();
+                break;
+            }
+            case "End": {
+                event.preventDefault();
+                event.stopPropagation();
+                items[items.length - 1].focus();
+                break;
+            }
+            case "Escape": {
+                event.preventDefault();
+                event.stopPropagation();
+                closeActionsMenu(true);
+                break;
+            }
+            case "Tab": {
+                // Tab dismisses the menu; focus proceeds naturally (no preventDefault).
+                closeActionsMenu(false);
+                break;
+            }
+            default:
+                break;
+        }
+    };
 
     const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
         useSortable({ id: item.id });
@@ -180,6 +300,21 @@ export function Card(props: CardProps): JSX.Element {
             ? `/project/${project.slug}/us/${model.ref}`
             : "";
 
+    // [N-04] baseHref-aware destinations for the card epic/task links (legacy
+    // `tg-nav="project-epics-detail:…"` / `project-tasks-detail:…` — see
+    // card-templates/card-epics.jade, card-tasks.jade). The epic and its tasks
+    // belong to the board's project, so its slug supplies `:project`. When the
+    // slug or ref is unavailable the href is omitted (no `href=""`/`"#"`
+    // placeholder that would reload the page).
+    const epicHref = (epic: EpicRef): string | undefined =>
+        project.slug != null && epic.ref != null
+            ? projectEpicUrl(project.slug, epic.ref)
+            : undefined;
+    const taskHref = (task: TaskModel): string | undefined =>
+        project.slug != null && task.ref != null
+            ? projectTaskUrl(project.slug, task.ref)
+            : undefined;
+
     const avatarSrc = (user: BaseUser): string => {
         const resolved = resolveAvatar
             ? resolveAvatar(user)
@@ -257,12 +392,14 @@ export function Card(props: CardProps): JSX.Element {
                     <div className="card-actions">
                         <button
                             type="button"
+                            ref={actionsButtonRef}
                             className={
                                 "js-popup-button" + (actionsOpen ? " popover-open" : "")
                             }
-                            aria-label="Actions"
-                            aria-haspopup="true"
+                            aria-label={t("COMMON.CARD.ACTIONS", "Actions")}
+                            aria-haspopup="menu"
                             aria-expanded={actionsOpen}
+                            aria-controls={actionsOpen ? actionsMenuId : undefined}
                             onClick={(event) => {
                                 event.stopPropagation();
                                 setActionsOpen((open) => !open);
@@ -271,10 +408,19 @@ export function Card(props: CardProps): JSX.Element {
                             <Icon name="icon-more-vertical" />
                         </button>
                         {actionsOpen && (
-                            <div className="card-actions-menu">
+                            <div
+                                className="card-actions-menu"
+                                id={actionsMenuId}
+                                ref={actionsMenuRef}
+                                role="menu"
+                                aria-label={t("COMMON.CARD.ACTIONS", "Actions")}
+                                onKeyDown={handleActionsMenuKeyDown}
+                            >
                                 {canModify && (
                                     <button
                                         type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
                                         className="card-action-edit"
                                         onClick={(event) => {
                                             event.stopPropagation();
@@ -282,12 +428,14 @@ export function Card(props: CardProps): JSX.Element {
                                             onClickEdit?.(item.id);
                                         }}
                                     >
-                                        Edit
+                                        {t("COMMON.CARD.EDIT", "Edit card")}
                                     </button>
                                 )}
                                 {canModify && (
                                     <button
                                         type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
                                         className="card-action-assigned-to"
                                         onClick={(event) => {
                                             event.stopPropagation();
@@ -295,12 +443,14 @@ export function Card(props: CardProps): JSX.Element {
                                             onClickAssignedTo?.(item.id);
                                         }}
                                     >
-                                        Assign to
+                                        {t("COMMON.CARD.ASSIGN_TO", "Assign To")}
                                     </button>
                                 )}
                                 {canDelete && (
                                     <button
                                         type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
                                         className="card-action-delete"
                                         onClick={(event) => {
                                             event.stopPropagation();
@@ -308,7 +458,29 @@ export function Card(props: CardProps): JSX.Element {
                                             onClickDelete?.(item.id);
                                         }}
                                     >
-                                        Delete
+                                        {t("COMMON.CARD.DELETE", "Delete card")}
+                                    </button>
+                                )}
+                                {/* [M-13] "Move to top" — ports the legacy card
+                                    action gated on `canEdit(...) && !isFirst`
+                                    (kanban/main.coffee L1090-L1097). Localized
+                                    label (COMMON.CARD.MOVE_TO_TOP) + the
+                                    `icon-move-to-top` glyph, hidden for the card
+                                    already at the top of its column. */}
+                                {canModify && !isFirst && (
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        tabIndex={-1}
+                                        className="card-action-move-to-top"
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            setActionsOpen(false);
+                                            onClickMoveToTop?.(item.id);
+                                        }}
+                                    >
+                                        <Icon name="icon-move-to-top" />
+                                        {t("COMMON.CARD.MOVE_TO_TOP", "Move to top")}
                                     </button>
                                 )}
                             </div>
@@ -322,7 +494,11 @@ export function Card(props: CardProps): JSX.Element {
                         {(model.epics ?? []).length > 0 && (
                             <div className="card-epics">
                                 {(model.epics ?? []).map((epic) => (
-                                    <a key={epic.id} className="card-epic">
+                                    <a
+                                        key={epic.id}
+                                        className="card-epic"
+                                        href={epicHref(epic)}
+                                    >
                                         <span
                                             className="epic-color"
                                             style={{ backgroundColor: epic.color }}
@@ -352,7 +528,11 @@ export function Card(props: CardProps): JSX.Element {
                         <div className="card-compact-epics">
                             <div className="card-epics">
                                 {(model.epics ?? []).map((epic) => (
-                                    <a key={epic.id} className="card-epic">
+                                    <a
+                                        key={epic.id}
+                                        className="card-epic"
+                                        href={epicHref(epic)}
+                                    >
                                         <span
                                             className="epic-color"
                                             style={{ backgroundColor: epic.color }}
@@ -377,12 +557,12 @@ export function Card(props: CardProps): JSX.Element {
                                 <div className="card-user-avatar card-not-assigned">
                                     <img
                                         src={unnamedAvatarUrl()}
-                                        title={NOT_ASSIGNED_LABEL}
-                                        alt={NOT_ASSIGNED_LABEL}
+                                        title={t(NOT_ASSIGNED_KEY, NOT_ASSIGNED_FALLBACK)}
+                                        alt={t(NOT_ASSIGNED_KEY, NOT_ASSIGNED_FALLBACK)}
                                     />
                                     {visible("assigned_to_extended") && (
                                         <span className="card-not-assigned-title">
-                                            {NOT_ASSIGNED_LABEL}
+                                            {t(NOT_ASSIGNED_KEY, NOT_ASSIGNED_FALLBACK)}
                                         </span>
                                     )}
                                 </div>
@@ -398,7 +578,14 @@ export function Card(props: CardProps): JSX.Element {
                                             />
                                         )}
                                         {index === 2 && item.assigned_users.length > 3 && (
-                                            <span className="extra-assigned">
+                                            <span
+                                                className="extra-assigned"
+                                                title={t(
+                                                    "COMMON.CARD.EXTRA_ASSIGNED_USERS",
+                                                    "{{total}} more assigned users",
+                                                    { total: item.assigned_users.length - 2 },
+                                                )}
+                                            >
                                                 {`${item.assigned_users.length - 2}+`}
                                             </span>
                                         )}
@@ -417,13 +604,17 @@ export function Card(props: CardProps): JSX.Element {
                                     {model.total_points ? (
                                         <span
                                             className="card-estimation"
-                                            title="Estimation"
+                                            title={t("COMMON.CARD.ESTIMATION", "Estimation")}
                                             data-id={model.id}
                                         >
-                                            {`${model.total_points} pts`}
+                                            {t("COMMON.CARD.PTS", "{{pts}} pts", {
+                                                pts: model.total_points,
+                                            })}
                                         </span>
                                     ) : (
-                                        <span className="card-estimation">N/E</span>
+                                        <span className="card-estimation">
+                                            {t("COMMON.CARD.NO_PTS", "N/E")}
+                                        </span>
                                     )}
                                 </span>
                                 {model.due_date && (
@@ -437,16 +628,28 @@ export function Card(props: CardProps): JSX.Element {
                                                 dueDateColor(model.due_date, dueDateConfig) ??
                                                 undefined
                                             }
-                                            title={`Due date: ${dueDateTitle(
-                                                model.due_date,
-                                                dueDateConfig,
-                                            )}`}
+                                            title={t(
+                                                "COMMON.CARD.DUE_DATE",
+                                                "Due date: {{date}}",
+                                                {
+                                                    date: dueDateTitle(
+                                                        model.due_date,
+                                                        dueDateConfig,
+                                                    ),
+                                                },
+                                            )}
                                         />
                                     </div>
                                 )}
                                 {model.is_iocaine && (
-                                    <div className="card-iocaine" title={IS_IOCAINE_LABEL}>
-                                        <Icon name="icon-iocaine" title={IS_IOCAINE_LABEL} />
+                                    <div
+                                        className="card-iocaine"
+                                        title={t(IS_IOCAINE_KEY, IS_IOCAINE_FALLBACK)}
+                                    >
+                                        <Icon
+                                            name="icon-iocaine"
+                                            title={t(IS_IOCAINE_KEY, IS_IOCAINE_FALLBACK)}
+                                        />
                                     </div>
                                 )}
                                 {model.is_blocked && (
@@ -457,19 +660,28 @@ export function Card(props: CardProps): JSX.Element {
                             </div>
                             <div className="card-statistics">
                                 {!!model.total_attachments && (
-                                    <div className="statistic card-attachments" title="Attachments">
+                                    <div
+                                        className="statistic card-attachments"
+                                        title={t("ATTACHMENT.SECTION_NAME", "Attachments")}
+                                    >
                                         <Icon name="icon-paperclip" />
                                         <span>{model.total_attachments}</span>
                                     </div>
                                 )}
                                 {(model.watchers ?? []).length > 0 && (
-                                    <div className="statistic card-watchers" title="Watchers">
+                                    <div
+                                        className="statistic card-watchers"
+                                        title={t("COMMON.WATCHERS.WATCHERS", "Watchers")}
+                                    >
                                         <Icon name="icon-eye" />
                                         <span>{(model.watchers ?? []).length}</span>
                                     </div>
                                 )}
                                 {!!model.total_comments && (
-                                    <div className="statistic card-comments" title="Comments">
+                                    <div
+                                        className="statistic card-comments"
+                                        title={t("COMMENTS.TITLE", "Comments")}
+                                    >
                                         <Icon name="icon-message-square" />
                                         <span>{model.total_comments}</span>
                                     </div>
@@ -482,7 +694,14 @@ export function Card(props: CardProps): JSX.Element {
                                                 ? " completed"
                                                 : "")
                                         }
-                                        title="Tasks"
+                                        title={t(
+                                            "COMMON.CARD.TASKS",
+                                            "{{completed}} tasks of {{total}} completed",
+                                            {
+                                                completed: getClosedTasks().length,
+                                                total: tasks.length,
+                                            },
+                                        )}
                                     >
                                         {`${getClosedTasks().length} / ${tasks.length}`}
                                     </div>
@@ -499,7 +718,7 @@ export function Card(props: CardProps): JSX.Element {
                             {tasks.map((task) => (
                                 <li className="card-task" key={task.id ?? task.ref}>
                                     <a
-                                        href="#"
+                                        href={taskHref(task)}
                                         className={
                                             (task.is_closed ? "closed-task" : "") +
                                             (task.is_blocked ? " blocked-task" : "")
@@ -516,13 +735,39 @@ export function Card(props: CardProps): JSX.Element {
 
                 {/* card-unfold */}
                 {showUnfold && (
+                    // [M-21] Keyboard-operable fold toggle. The element is kept as a
+                    // `div role="button"` (NOT a native <button>) so the exact
+                    // `.card-unfold` SCSS — which styles a div — themes it unchanged,
+                    // but it now (a) carries an accessible NAME and (b) responds to
+                    // Enter/Space, matching the native button activation keys, so it
+                    // is no longer a mouse-only control. The Ctrl/Meta guard (which
+                    // suppressed the toggle for modified clicks) is preserved on both
+                    // the pointer and keyboard paths.
                     <div
                         className="card-unfold ng-animate-disabled"
                         role="button"
                         tabIndex={0}
+                        aria-label={t(
+                            "KANBAN.CARD.TOGGLE_FOLD",
+                            "Expand or collapse user story #{{ref}} {{subject}}",
+                            { ref: model.ref ?? "", subject: model.subject ?? "" },
+                        )}
                         onClick={(event) => {
                             if (!event.ctrlKey && !event.metaKey) {
                                 onToggleFold?.(item.id);
+                            }
+                        }}
+                        onKeyDown={(event) => {
+                            if (
+                                event.key === "Enter" ||
+                                event.key === " " ||
+                                event.key === "Spacebar"
+                            ) {
+                                // Prevent the page from scrolling on Space.
+                                event.preventDefault();
+                                if (!event.ctrlKey && !event.metaKey) {
+                                    onToggleFold?.(item.id);
+                                }
                             }
                         }}
                     >

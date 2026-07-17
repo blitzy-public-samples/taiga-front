@@ -13,6 +13,9 @@ import {
     getDueDateStatus,
     type DueDateAppearance,
 } from "../dueDate";
+// (moved from app/react/kanban/__tests__/ to shared/duedate/__tests__/ as part
+// of the [M-08] extraction; the relative import to the sibling module is
+// unchanged.)
 
 /**
  * Deterministic tests for the due-date appearance logic ported from

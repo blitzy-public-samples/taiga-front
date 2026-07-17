@@ -606,6 +606,14 @@ export interface UseKanbanState {
     ) => void;
     toggleFold: (usId: number) => void;
     addArchivedStatus: (statusId: number) => void;
+    /**
+     * Replace the entire board with a previously captured snapshot. Used for
+     * optimistic-move rollback (M-05): a drag applies `move` immediately, and if
+     * the bulk-order persistence rejects, the caller restores the pre-move
+     * snapshot it captured from {@link state}. The snapshot is an immer-frozen
+     * immutable value, so restoring it is a pure reference swap.
+     */
+    restore: (snapshot: KanbanState) => void;
 }
 
 export function useKanbanState(): UseKanbanState {
@@ -645,6 +653,10 @@ export function useKanbanState(): UseKanbanState {
         setState((prev) => reduceAddArchivedStatus(prev, statusId));
     }, []);
 
+    const restore = useCallback((snapshot: KanbanState) => {
+        setState(() => snapshot);
+    }, []);
+
     return {
         state,
         init,
@@ -652,5 +664,6 @@ export function useKanbanState(): UseKanbanState {
         move,
         toggleFold,
         addArchivedStatus,
+        restore,
     };
 }

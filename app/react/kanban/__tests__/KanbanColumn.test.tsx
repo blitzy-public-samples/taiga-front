@@ -146,6 +146,8 @@ describe("KanbanColumn DOM", () => {
         const col = container.querySelector(".kanban-uses-box.taskboard-column")!;
         expect(col).toHaveAttribute("data-status", "1");
         expect(col).toHaveAttribute("data-swimlane", "50");
+        // C-06: the DOM id folds in the swimlane identity so it is unique board-wide.
+        expect(col.id).toBe("column-1-50");
         expect(container.querySelectorAll("[data-id]").length).toBe(2);
         expect(container.querySelector(".kanban-task-counter")).not.toBeNull();
     });
@@ -155,7 +157,10 @@ describe("KanbanColumn DOM", () => {
             <KanbanColumn status={status({ id: 1 })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
                 cardIds={[101]} usMap={mkMap([101])} folded={false} />,
         );
-        expect(container.querySelector(".kanban-uses-box")!.hasAttribute("data-swimlane")).toBe(false);
+        const col = container.querySelector(".kanban-uses-box")!;
+        expect(col.hasAttribute("data-swimlane")).toBe(false);
+        // C-06: the null swimlane resolves to the -1 sentinel in the id.
+        expect(col.id).toBe("column-1--1");
     });
 
     it("shows .placeholder-collapsed (and hides the counter) when folded", () => {
@@ -233,5 +238,49 @@ describe("ColumnHeader", () => {
         expect(container.querySelector(".task-colum-name.vfold")).not.toBeNull();
         fireEvent.click(container.querySelector(".icon-unfold-column")!.closest("button")!);
         expect(onFoldStatus).toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// [M-14] Behavior 4 — sticky task-counter translation.
+// Ports KanbanTaskboardColumnDirective (kanban/main.coffee L1197-1204): the
+// column scrolls its cards vertically and the absolutely-positioned counter is
+// translated DOWN by `scrollTop` to remain pinned to the visible top edge.
+// ---------------------------------------------------------------------------
+describe("KanbanColumn [M-14] sticky task-counter translation", () => {
+    it("translates .kanban-task-counter by the column scrollTop on scroll", () => {
+        const { container } = render(
+            <KanbanColumn status={status({ id: 1 })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
+                cardIds={[101, 102]} usMap={mkMap([101, 102])} folded={false} />,
+        );
+        const col = container.querySelector(
+            ".kanban-uses-box.taskboard-column",
+        ) as HTMLElement;
+        const counter = container.querySelector(
+            ".kanban-task-counter",
+        ) as HTMLElement;
+        expect(counter).not.toBeNull();
+        Object.defineProperty(col, "scrollTop", {
+            configurable: true,
+            value: 18,
+        });
+        col.dispatchEvent(new Event("scroll"));
+        expect(counter.style.transform).toBe("translateY(18px)");
+    });
+
+    it("no-ops on scroll when folded (the counter is not rendered)", () => {
+        const { container } = render(
+            <KanbanColumn status={status({ id: 1 })} swimlaneId={null} project={project} zoom={ZOOM} zoomLevel={1}
+                cardIds={[101]} usMap={mkMap([101])} folded={true} />,
+        );
+        const col = container.querySelector(
+            ".kanban-uses-box.taskboard-column",
+        ) as HTMLElement;
+        expect(container.querySelector(".kanban-task-counter")).toBeNull();
+        Object.defineProperty(col, "scrollTop", {
+            configurable: true,
+            value: 30,
+        });
+        expect(() => col.dispatchEvent(new Event("scroll"))).not.toThrow();
     });
 });

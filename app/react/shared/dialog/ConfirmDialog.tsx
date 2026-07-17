@@ -31,14 +31,21 @@
  *
  * Accessibility (enterprise-standard; no Figma constrains this project): the
  * dialog is exposed as `role="dialog"` + `aria-modal="true"` with an accessible
- * name from the title, focuses the cancel control on open, and closes on
- * `Escape`.
+ * name from the title, focuses the cancel control on open, traps focus, returns
+ * focus to the opener on close, and closes on `Escape`. All of that is provided
+ * by the shared {@link useDialogA11y} primitive (QA finding M-09), so this
+ * dialog participates in the SAME module-level Escape stack as the lightboxes —
+ * a single Escape therefore dismisses ONLY the topmost dialog (e.g. this
+ * delete-confirm when it is nested inside `SprintEditLightbox`, leaving the
+ * sprint form open). Busy gating (`closeOnEscape: !busy`) preserves the prior
+ * behavior of ignoring Escape while the confirmed action is in flight.
  */
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useRef } from "react";
 import type { ReactNode, MouseEvent as ReactMouseEvent } from "react";
 
 import { t } from "../i18n/translate";
+import { useDialogA11y } from "./useDialogA11y";
 
 /* -------------------------------------------------------------------------- */
 /* Props                                                                      */
@@ -98,33 +105,20 @@ export function ConfirmDialog({
     onConfirm,
     onCancel,
 }: ConfirmDialogProps) {
-    const cancelRef = useRef<HTMLButtonElement | null>(null);
+    const cancelRef = useRef<HTMLButtonElement>(null);
 
-    // Move focus into the dialog when it opens (a11y: keyboard users land on a
-    // safe, non-destructive control). Guarded so it only runs on the open edge.
-    useEffect(() => {
-        if (open) {
-            // Focus after paint so the element exists and is focusable.
-            const id = window.setTimeout(() => cancelRef.current?.focus(), 0);
-            return () => window.clearTimeout(id);
-        }
-        return undefined;
-    }, [open]);
-
-    // Escape closes the dialog (equivalent to Cancel) — but never while busy.
-    useEffect(() => {
-        if (!open) {
-            return undefined;
-        }
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !busy) {
-                event.preventDefault();
-                onCancel();
-            }
-        };
-        document.addEventListener("keydown", onKeyDown);
-        return () => document.removeEventListener("keydown", onKeyDown);
-    }, [open, busy, onCancel]);
+    // [M-09] Complete modal-dialog accessibility via the shared primitive:
+    // role/aria-modal (spread from dialogProps), focus entry onto the cancel
+    // control, focus trap, focus return, background inert, and the nested-dialog
+    // Escape stack. Escape maps to Cancel but is gated while busy
+    // (`closeOnEscape: !busy`). The accessible NAME stays `aria-label={title}`
+    // (set on the root below), not `aria-labelledby`, matching the prior contract.
+    const { dialogRef, dialogProps } = useDialogA11y({
+        open,
+        onClose: onCancel,
+        closeOnEscape: !busy,
+        initialFocusRef: cancelRef,
+    });
 
     const handleConfirm = useCallback(
         (event: ReactMouseEvent<HTMLButtonElement>) => {
@@ -160,9 +154,9 @@ export function ConfirmDialog({
 
     return (
         <div
+            ref={dialogRef}
+            {...dialogProps}
             className={wrapperClass}
-            role="dialog"
-            aria-modal="true"
             aria-label={title}
         >
             {/* Ports tg-lightbox-close (tg-svg svg-icon="icon-close"). i18n COMMON.CLOSE */}

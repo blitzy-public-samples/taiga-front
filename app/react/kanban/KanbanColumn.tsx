@@ -6,11 +6,12 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { createElement, Fragment } from "react";
+import { createElement, Fragment, useCallback, useEffect, useRef } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Card } from "./Card";
 import { Icon } from "../shared/ui/Icon";
+import { t } from "../shared/i18n/translate";
 import type {
     BaseUser,
     KanbanProject,
@@ -20,17 +21,36 @@ import type {
 import { UNCLASSIFIED_SWIMLANE_ID } from "./useKanbanState";
 
 // ---------------------------------------------------------------------------
-// Labels (i18n keys in the AngularJS source; reproduced as plain text here
-// since no shared i18n adapter is in scope for the React screens).
+// Labels — routed through the shared runtime translator [M-06] so the React
+// board uses the SAME angular-translate catalog (and the SAME ~30 locales) as
+// the surrounding AngularJS shell. Each key is the authoritative catalog key
+// from the legacy Jade markup (app/partials/includes/modules/kanban-table.jade)
+// and its English fallback is the exact catalog value from
+// app/locales/taiga/locale-en.json, so the English locale and jsdom render the
+// verbatim legacy copy. The translator is invoked at RENDER time (inline in the
+// components below, never memoized at module load) because the React bundle is
+// evaluated by `loadJS(react-app.js)` BEFORE `angular.bootstrap`, so the live
+// `$translate` service only becomes reachable once a component actually renders
+// inside the mounted custom element. `KANBAN.WIP_LIMIT` had NO catalog key in
+// the legacy directive (kanban/main.coffee L839 emits a hardcoded
+// `<span>WIP Limit</span>`), so it resolves to the fallback — preserving the
+// exact legacy literal while still routing through the translator per M-06.
 // ---------------------------------------------------------------------------
 
-const NUMBER_US_LABEL = "Number of user stories";
-const ARCHIVED_LABEL = "Archived";
-const ADD_US_TITLE = "Add user story";
-const ADD_BULK_TITLE = "Add user stories in bulk";
-const FOLD_TITLE = "Fold";
-const UNFOLD_TITLE = "Unfold";
-const WIP_LIMIT_LABEL = "WIP Limit";
+const NUMBER_US_KEY = "KANBAN.NUMBER_US";
+const NUMBER_US_FALLBACK = "Number of US";
+const ARCHIVED_KEY = "KANBAN.ARCHIVED";
+const ARCHIVED_FALLBACK = "(Archived)";
+const ADD_US_KEY = "KANBAN.TITLE_ACTION_ADD_US";
+const ADD_US_FALLBACK = "Add new user story";
+const ADD_BULK_KEY = "KANBAN.TITLE_ACTION_ADD_BULK";
+const ADD_BULK_FALLBACK = "Add new bulk";
+const FOLD_KEY = "KANBAN.TITLE_ACTION_FOLD";
+const FOLD_FALLBACK = "Fold column";
+const UNFOLD_KEY = "KANBAN.TITLE_ACTION_UNFOLD";
+const UNFOLD_FALLBACK = "Unfold column";
+const WIP_LIMIT_KEY = "KANBAN.WIP_LIMIT";
+const WIP_LIMIT_FALLBACK = "WIP Limit";
 
 /**
  * Build the drag-and-drop container key for a (status, swimlane) cell.
@@ -171,8 +191,8 @@ export function ColumnHeader(props: ColumnHeaderProps): JSX.Element {
                     <button
                         type="button"
                         className="btn-board option"
-                        title={ADD_US_TITLE}
-                        aria-label={ADD_US_TITLE}
+                        title={t(ADD_US_KEY, ADD_US_FALLBACK)}
+                        aria-label={t(ADD_US_KEY, ADD_US_FALLBACK)}
                         onClick={() => onAddUs?.("standard", status.id)}
                     >
                         <Icon name="icon-add" wrapperClass="add-action" />
@@ -183,8 +203,8 @@ export function ColumnHeader(props: ColumnHeaderProps): JSX.Element {
                     <button
                         type="button"
                         className="btn-board option"
-                        title={ADD_BULK_TITLE}
-                        aria-label={ADD_BULK_TITLE}
+                        title={t(ADD_BULK_KEY, ADD_BULK_FALLBACK)}
+                        aria-label={t(ADD_BULK_KEY, ADD_BULK_FALLBACK)}
                         onClick={() => onAddUs?.("bulk", status.id)}
                     >
                         <Icon name="icon-bulk" wrapperClass="bulk-action" />
@@ -194,8 +214,8 @@ export function ColumnHeader(props: ColumnHeaderProps): JSX.Element {
                 <button
                     type="button"
                     className={"btn-board option" + (folded ? " hidden" : "")}
-                    title={FOLD_TITLE}
-                    aria-label={FOLD_TITLE}
+                    title={t(FOLD_KEY, FOLD_FALLBACK)}
+                    aria-label={t(FOLD_KEY, FOLD_FALLBACK)}
                     onClick={() => onFoldStatus?.(status)}
                 >
                     <Icon name="icon-fold-column" />
@@ -204,8 +224,8 @@ export function ColumnHeader(props: ColumnHeaderProps): JSX.Element {
                 <button
                     type="button"
                     className={"btn-board option hunfold" + (!folded ? " hidden" : "")}
-                    title={UNFOLD_TITLE}
-                    aria-label={UNFOLD_TITLE}
+                    title={t(UNFOLD_KEY, UNFOLD_FALLBACK)}
+                    aria-label={t(UNFOLD_KEY, UNFOLD_FALLBACK)}
                     onClick={() => onFoldStatus?.(status)}
                 >
                     <Icon name="icon-unfold-column" />
@@ -244,6 +264,8 @@ export interface KanbanColumnProps {
     onClickEdit?: (id: number) => void;
     onClickDelete?: (id: number) => void;
     onClickAssignedTo?: (id: number) => void;
+    /** [M-13] Move a card to the top of its column (drilled through to Card). */
+    onClickMoveToTop?: (id: number) => void;
     /** ctrl/meta-click multi-select toggle (QA-FUNC-01). */
     onToggleSelect?: (id: number) => void;
     resolveAvatar?: (user: BaseUser) => string;
@@ -269,18 +291,61 @@ export function KanbanColumn(props: KanbanColumnProps): JSX.Element {
         onClickEdit,
         onClickDelete,
         onClickAssignedTo,
+        onClickMoveToTop,
         onToggleSelect,
         resolveAvatar,
     } = props;
 
     const containerKey = buildContainerKey(status.id, swimlaneId);
+    // C-06: a column DOM id must be unique across the whole board. In swimlane
+    // mode the SAME status is rendered once per swimlane, so `column-${status.id}`
+    // alone (as the legacy Jade emitted, `id="column-{{s.id}}"`) collides once
+    // per swimlane — invalid HTML and ambiguous for `getElementById`/selectors.
+    // Compose the id from status AND swimlane identity, using the stable
+    // `UNCLASSIFIED_SWIMLANE_ID` (-1) sentinel for the no-swimlane / unclassified
+    // board so the id is deterministic even when `swimlaneId` is null.
+    const swimlaneSentinel =
+        swimlaneId === null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneId;
+    const columnDomId = `column-${status.id}-${swimlaneSentinel}`;
     const { setNodeRef } = useDroppable({
         id: containerKey,
         data: {
             statusId: status.id,
-            swimlaneId: swimlaneId === null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneId,
+            swimlaneId: swimlaneSentinel,
         },
     });
+
+    // [M-14] Behavior 4 — sticky task-counter translation.
+    // Port of `KanbanTaskboardColumnDirective` (kanban/main.coffee L1197-1204).
+    // The column body scrolls its cards vertically (SCSS `.taskboard-column`
+    // `overflow-y: auto`); the absolutely-positioned `.kanban-task-counter`
+    // (top-right) is translated DOWN by the column's `scrollTop` so it stays
+    // pinned to the visible top edge while the cards scroll beneath it. The
+    // counter is absent while the column is folded, so the handler no-ops then.
+    // We compose dnd-kit's droppable `setNodeRef` with a local ref so the same
+    // node backs both the drop target and this scroll listener.
+    const columnRef = useRef<HTMLDivElement | null>(null);
+    const setRefs = useCallback(
+        (node: HTMLDivElement | null) => {
+            setNodeRef(node);
+            columnRef.current = node;
+        },
+        [setNodeRef],
+    );
+    useEffect(() => {
+        const el = columnRef.current;
+        if (!el) {
+            return undefined;
+        }
+        const onScroll = (): void => {
+            const counter = el.querySelector<HTMLElement>(".kanban-task-counter");
+            if (counter) {
+                counter.style.transform = `translateY(${el.scrollTop}px)`;
+            }
+        };
+        el.addEventListener("scroll", onScroll);
+        return () => el.removeEventListener("scroll", onScroll);
+    }, []);
 
     // WIP-limit markers are never drawn for archived statuses (source gate:
     // `if status and not status.is_archived`).
@@ -298,14 +363,14 @@ export function KanbanColumn(props: KanbanColumnProps): JSX.Element {
 
     return (
         <div
-            ref={setNodeRef}
-            id={`column-${status.id}`}
+            ref={setRefs}
+            id={columnDomId}
             className={className}
             data-status={status.id}
             data-swimlane={swimlaneId === null ? undefined : swimlaneId}
         >
             {!folded ? (
-                <div className="kanban-task-counter" title={NUMBER_US_LABEL}>
+                <div className="kanban-task-counter" title={t(NUMBER_US_KEY, NUMBER_US_FALLBACK)}>
                     <AnimatedCounter
                         count={cardIds.length}
                         wip={status.wip_limit}
@@ -327,7 +392,7 @@ export function KanbanColumn(props: KanbanColumnProps): JSX.Element {
                         ) : null}
                         <div className="text-holder">
                             {status.is_archived ? (
-                                <div className="archived">{ARCHIVED_LABEL}</div>
+                                <div className="archived">{t(ARCHIVED_KEY, ARCHIVED_FALLBACK)}</div>
                             ) : null}
                             <div className="name">{status.name}</div>
                         </div>
@@ -372,12 +437,14 @@ export function KanbanColumn(props: KanbanColumnProps): JSX.Element {
                                 onClickEdit={onClickEdit}
                                 onClickDelete={onClickDelete}
                                 onClickAssignedTo={onClickAssignedTo}
+                                onClickMoveToTop={onClickMoveToTop}
+                                isFirst={index === 0}
                                 onToggleSelect={onToggleSelect}
                                 resolveAvatar={resolveAvatar}
                             />
                             {renderWip ? (
                                 <div className={"kanban-wip-limit " + wip.className}>
-                                    <span>{WIP_LIMIT_LABEL}</span>
+                                    <span>{t(WIP_LIMIT_KEY, WIP_LIMIT_FALLBACK)}</span>
                                 </div>
                             ) : null}
                         </Fragment>

@@ -131,6 +131,20 @@ describe("Burndown", () => {
     expect(shownC.querySelector(".empty-burndown")).toBeNull();
   });
 
+  it("[N-04] empty-burndown Admin link targets the project modules admin route", () => {
+    // Legacy `tg-nav=\"project-admin-project-profile-modules:project=project.slug\"`
+    // (backlog.jade). The placeholder anchor must resolve to that exact route,
+    // not the previous no-op `href=\"\"`.
+    const { container } = render(
+      <Burndown stats={makeStats()} project={makeProject({ slug: "proj", i_am_admin: true })} showGraphPlaceholder={true} collapsed={false} onToggleCollapsed={noop} />,
+    );
+    const link = container.querySelector(".empty-burndown a") as HTMLAnchorElement;
+    expect(link).not.toBeNull();
+    expect(link.getAttribute("href")).toBe(
+      "/project/proj/admin/project-profile/modules",
+    );
+  });
+
   it("adds an open/shown class to the graph container when not collapsed and renders an inline svg", () => {
     const milestones: BurndownPoint[] = [
       { name: "S1", optimal: 10, evolution: 8, "team-increment": 2, "client-increment": 1 },

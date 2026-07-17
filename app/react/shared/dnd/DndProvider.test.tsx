@@ -571,6 +571,55 @@ describe("DndProvider — drag lifecycle", () => {
         expect(screen.getByTestId("overlay-content")).toHaveTextContent("overlay:null");
     });
 
+    // [M-12] The provider surfaces the drag-active flag (replacing the legacy
+    // `tg-card.gu-mirror` DOM probe) so the board can gate folded-swimlane
+    // hover-open on "a card is being dragged".
+    it("reports onDragActiveChange(true) on start and (false) on drop", () => {
+        const onDragActiveChange = jest.fn();
+        render(
+            <DndProvider
+                project={enabledProject}
+                resolveDrop={() => null}
+                persist={() => undefined}
+                onDragActiveChange={onDragActiveChange}
+            >
+                <div>board</div>
+            </DndProvider>,
+        );
+
+        act(() => {
+            mockCaptured.onDragStart?.({ active: { id: "7" } });
+        });
+        expect(onDragActiveChange).toHaveBeenLastCalledWith(true);
+
+        act(() => {
+            mockCaptured.onDragEnd?.({ active: { id: "7" }, over: null });
+        });
+        expect(onDragActiveChange).toHaveBeenLastCalledWith(false);
+    });
+
+    it("reports onDragActiveChange(false) on cancel", () => {
+        const onDragActiveChange = jest.fn();
+        render(
+            <DndProvider
+                project={enabledProject}
+                resolveDrop={() => null}
+                persist={() => undefined}
+                onDragActiveChange={onDragActiveChange}
+            >
+                <div>board</div>
+            </DndProvider>,
+        );
+
+        act(() => {
+            mockCaptured.onDragStart?.({ active: { id: "7" } });
+        });
+        act(() => {
+            mockCaptured.onDragCancel?.();
+        });
+        expect(onDragActiveChange).toHaveBeenLastCalledWith(false);
+    });
+
     it("builds a NormalizedDragEnd and calls persist with provider-computed neighbors", () => {
         const resolved = makeResolved();
         const seen: NormalizedDragEnd[] = [];

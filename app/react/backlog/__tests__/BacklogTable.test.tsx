@@ -39,7 +39,7 @@
  * a subsequent explicit `trigger(true)` then exercises the load path.
  */
 
-import { render, fireEvent, act } from "@testing-library/react";
+import { render, fireEvent, act, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { DndContext } from "@dnd-kit/core";
 
@@ -592,6 +592,33 @@ describe("BacklogTable", () => {
         expect(props.onToggleSelection).toHaveBeenCalledWith(5, expect.any(Boolean), true);
     });
 
+    it("[M-21] exposes a keyboard-operable, named native checkbox (not display:none) with a decorative label", () => {
+        const { container } = renderTable({
+            project: makeProject({ my_permissions: ["modify_us"] }),
+            userstories: [makeUs({ id: 50, ref: 5, subject: "Wheels" })],
+            visibleRefs: [5],
+            selectedRefs: {},
+        });
+
+        const checkbox = container.querySelector("#us-check-5") as HTMLInputElement;
+        expect(checkbox).not.toBeNull();
+        // The real control carries an accessible name for assistive tech…
+        expect(checkbox.getAttribute("aria-label")).toMatch(/Select user story #5/);
+        // …is VISUALLY hidden but NOT removed from the a11y tree / tab order
+        // (the out-of-scope `.custom-checkbox input{display:none}` is overridden)…
+        expect(checkbox.style.display).not.toBe("none");
+        expect(checkbox.style.position).toBe("absolute");
+        // …and is itself focusable via the keyboard (the input, not the label).
+        checkbox.focus();
+        expect(document.activeElement).toBe(checkbox);
+
+        // The decorative label no longer steals the tab stop and is hidden from AT.
+        const label = container.querySelector('label[for="us-check-5"]') as HTMLLabelElement;
+        expect(label).not.toBeNull();
+        expect(label.hasAttribute("tabindex")).toBe(false);
+        expect(label.getAttribute("aria-hidden")).toBe("true");
+    });
+
     /* ---------------------------------------------------------------------- */
     /* Infinite-scroll (IntersectionObserver) gating                         */
     /* ---------------------------------------------------------------------- */
@@ -762,6 +789,143 @@ describe("BacklogTable", () => {
     });
 
     /* ---------------------------------------------------------------------- */
+    /* [M-21] Keyboard-accessible row popovers (complete ARIA menu pattern)   */
+    /* ---------------------------------------------------------------------- */
+
+    describe("[M-21] keyboard-accessible row popovers (menu semantics)", () => {
+        /* ---- STATUS popover ---------------------------------------------- */
+
+        it("status: exposes a role=menu of role=menuitem links wired to the trigger via aria-controls", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 50, ref: 5, status: 100 })],
+                visibleRefs: [5],
+            });
+            const trigger = container.querySelector(".us-status") as HTMLElement;
+            fireEvent.click(trigger);
+
+            const menu = container.querySelector("ul.pop-status") as HTMLElement;
+            expect(menu).not.toBeNull();
+            expect(menu).toHaveAttribute("role", "menu");
+            // The trigger's aria-controls resolves to the live menu element.
+            expect(menu.id).toBeTruthy();
+            expect(trigger).toHaveAttribute("aria-controls", menu.id);
+            // Every status choice is a keyboard-reachable menuitem (roving tabindex).
+            const items = menu.querySelectorAll('[role="menuitem"]');
+            expect(items).toHaveLength(2); // New + Done
+            items.forEach((item) => expect(item).toHaveAttribute("tabindex", "-1"));
+        });
+
+        it("status: focuses the first menuitem on open and roves with Arrow/Home/End (wrapping)", async () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 50, ref: 5, status: 100 })],
+                visibleRefs: [5],
+            });
+            fireEvent.click(container.querySelector(".us-status") as Element);
+            const menu = container.querySelector("ul.pop-status") as HTMLElement;
+            const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+
+            // focus-on-open lands on the first item (post-paint setTimeout(0)).
+            await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+            fireEvent.keyDown(menu, { key: "ArrowDown" });
+            expect(document.activeElement).toBe(items[1]);
+            // ArrowDown wraps back to the first item.
+            fireEvent.keyDown(menu, { key: "ArrowDown" });
+            expect(document.activeElement).toBe(items[0]);
+            // ArrowUp wraps to the last item.
+            fireEvent.keyDown(menu, { key: "ArrowUp" });
+            expect(document.activeElement).toBe(items[1]);
+            fireEvent.keyDown(menu, { key: "Home" });
+            expect(document.activeElement).toBe(items[0]);
+            fireEvent.keyDown(menu, { key: "End" });
+            expect(document.activeElement).toBe(items[items.length - 1]);
+        });
+
+        it("status: Escape closes the menu and returns focus to the trigger", async () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 50, ref: 5, status: 100 })],
+                visibleRefs: [5],
+            });
+            const trigger = container.querySelector(".us-status") as HTMLElement;
+            fireEvent.click(trigger);
+            const menu = container.querySelector("ul.pop-status") as HTMLElement;
+            const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+            await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+            fireEvent.keyDown(menu, { key: "Escape" });
+            expect(container.querySelector("ul.pop-status")).toBeNull();
+            expect(document.activeElement).toBe(trigger);
+        });
+
+        /* ---- POINTS popover (grouped menu) ------------------------------- */
+
+        it("points: exposes a grouped role=menu whose roving focus traverses every point across role groups", async () => {
+            const us = makeUs({ id: 50, ref: 5 });
+            const { container } = renderTable({ userstories: [us], visibleRefs: [5] });
+            const trigger = container.querySelector(".us-points") as HTMLElement;
+            fireEvent.click(trigger);
+
+            const menu = container.querySelector("ul.pop-points") as HTMLElement;
+            expect(menu).toHaveAttribute("role", "menu");
+            expect(trigger).toHaveAttribute("aria-controls", menu.id);
+            // Each computable role is a labelled group inside the menu.
+            const group = menu.querySelector('[role="group"]') as HTMLElement;
+            expect(group).not.toBeNull();
+            expect(group).toHaveAttribute("aria-labelledby");
+            // All point choices are menuitems (?, 1, 2 for the single computable role).
+            const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+            expect(items).toHaveLength(3);
+
+            await waitFor(() => expect(document.activeElement).toBe(items[0]));
+            fireEvent.keyDown(menu, { key: "End" });
+            expect(document.activeElement).toBe(items[2]);
+            // Roving focus crosses the group boundary and wraps to the first item.
+            fireEvent.keyDown(menu, { key: "ArrowDown" });
+            expect(document.activeElement).toBe(items[0]);
+        });
+
+        /* ---- OPTIONS popover --------------------------------------------- */
+
+        it("options: exposes a role=menu of edit/delete/move-to-top menuitems wired via aria-controls", async () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 7 })],
+                visibleRefs: [7],
+            });
+            const row = container.querySelector(".us-item-row") as HTMLElement;
+            openRowOptions(row);
+
+            const menu = container.querySelector("ul.us-option-popup") as HTMLElement;
+            expect(menu).not.toBeNull();
+            expect(menu).toHaveAttribute("role", "menu");
+            const kebab = row.querySelector(".us-option-popup-button") as HTMLElement;
+            expect(kebab).toHaveAttribute("aria-controls", menu.id);
+            // edit, delete, move-to-top (non-first row with modify+delete perms).
+            const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+            expect(items).toHaveLength(3);
+            items.forEach((item) => expect(item).toHaveAttribute("tabindex", "-1"));
+
+            await waitFor(() => expect(document.activeElement).toBe(items[0]));
+        });
+
+        it("options: Escape closes the menu and returns focus to the kebab trigger", async () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 7 })],
+                visibleRefs: [7],
+            });
+            const row = container.querySelector(".us-item-row") as HTMLElement;
+            openRowOptions(row);
+            const menu = container.querySelector("ul.us-option-popup") as HTMLElement;
+            const kebab = row.querySelector(".us-option-popup-button") as HTMLElement;
+            const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+            await waitFor(() => expect(document.activeElement).toBe(items[0]));
+
+            fireEvent.keyDown(menu, { key: "Escape" });
+            expect(container.querySelector("ul.us-option-popup")).toBeNull();
+            expect(document.activeElement).toBe(kebab);
+        });
+    });
+
+    /* ---------------------------------------------------------------------- */
     /* [A] Doomline banner                                                    */
     /* ---------------------------------------------------------------------- */
 
@@ -797,6 +961,72 @@ describe("BacklogTable", () => {
                 displayVelocity: false,
             });
             expect(container.querySelector(".doom-line")).toBeNull();
+        });
+    });
+
+    /* ---------------------------------------------------------------------- */
+    /* [M-07] baseHref-aware HTML5 navigation (no `#`-fragment)              */
+    /* ---------------------------------------------------------------------- */
+
+    describe("[M-07] HTML5 navigation", () => {
+        it("links each user story to the baseHref-aware HTML5 us route (not a #-fragment)", () => {
+            const { container } = renderTable({
+                project: makeProject({ slug: "myproj" }),
+                userstories: [makeUs({ id: 1000, ref: 42 })],
+            });
+            const link = container.querySelector("a.user-story-link") as HTMLAnchorElement | null;
+            expect(link).not.toBeNull();
+            expect(link!.getAttribute("href")).toBe("/project/myproj/us/42");
+            expect(link!.getAttribute("href")).not.toMatch(/^#/);
+        });
+    });
+
+    /* ---------------------------------------------------------------------- */
+    /* [M-08] Due-date icon / severity color / formatted-date tooltip       */
+    /* ---------------------------------------------------------------------- */
+
+    describe("[M-08] due-date parity", () => {
+        it("renders no due-date marker when the story has no due date", () => {
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 1, due_date: null })],
+            });
+            expect(container.querySelector(".due-date")).toBeNull();
+        });
+
+        it("renders the due-date clock icon with severity fill and a formatted tooltip", () => {
+            // Far-past due date -> "past due" (red #E44057) with default thresholds.
+            const { container } = renderTable({
+                userstories: [makeUs({ id: 1000, ref: 1, due_date: "2000-01-01" })],
+            });
+            const wrapper = container.querySelector(".due-date");
+            expect(wrapper).not.toBeNull();
+
+            const icon = wrapper!.querySelector("svg.icon.icon-clock") as SVGElement | null;
+            expect(icon).not.toBeNull();
+            expect((icon as unknown as HTMLElement).style.fill).toBe("#E44057");
+
+            // themed icon wrapper class
+            expect(wrapper!.querySelector(".due-date-icon")).not.toBeNull();
+
+            const title = icon!.querySelector("use > title");
+            expect(title).not.toBeNull();
+            expect(title!.textContent).toBe("Due date: 01 Jan 2000 (past due)");
+        });
+
+        it("uses the project's us_duedates thresholds when provided", () => {
+            const { container } = renderTable({
+                project: makeProject({
+                    us_duedates: [
+                        { color: "#00FF00", name: "custom green", days_to_due: null, by_default: true },
+                    ],
+                }),
+                userstories: [makeUs({ id: 1000, ref: 1, due_date: "2000-01-01" })],
+            });
+            const icon = container.querySelector(".due-date svg.icon.icon-clock") as SVGElement | null;
+            expect(icon).not.toBeNull();
+            expect((icon as unknown as HTMLElement).style.fill).toBe("#00FF00");
+            const title = icon!.querySelector("use > title");
+            expect(title!.textContent).toBe("Due date: 01 Jan 2000 (custom green)");
         });
     });
 });

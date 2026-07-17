@@ -42,7 +42,7 @@
  * verified values from app/locales/taiga/locale-en.json.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useId } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import moment from "moment";
 
@@ -61,6 +61,7 @@ import type { MilestoneWritable } from "../shared/api/milestones";
 import { t } from "../shared/i18n/translate";
 import { HttpError } from "../shared/api/httpClient";
 import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
+import { useDialogA11y } from "../shared/dialog/useDialogA11y";
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -226,24 +227,23 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         setServerError(null);
     }, [open, mode, sprint, initialValues]);
 
-    // Escape closes the lightbox (equivalent to the ✕ close button) — but never
-    // while a submit is in flight, and never while the nested delete-confirm
-    // dialog is open (that dialog owns its own Escape handler, so deferring to it
-    // here prevents a single Escape from dismissing both layers at once). Mirrors
-    // the shared ConfirmDialog behavior for consistent keyboard-driven chrome.
-    useEffect(() => {
-        if (!open) {
-            return undefined;
-        }
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === "Escape" && !submitting && !deleteConfirmOpen) {
-                event.preventDefault();
-                onClose();
-            }
-        };
-        document.addEventListener("keydown", onKeyDown);
-        return () => document.removeEventListener("keydown", onKeyDown);
-    }, [open, submitting, deleteConfirmOpen, onClose]);
+    // [M-09] Complete modal-dialog accessibility via the shared primitive:
+    // role/aria-modal (spread from dialogProps), focus entry onto the sprint
+    // name field, focus trap, focus return, background inert, and the shared
+    // nested-dialog Escape stack. Escape closes the lightbox (equivalent to the
+    // ✕ close button) but never while a submit is in flight
+    // (`closeOnEscape: !submitting`). The former `!deleteConfirmOpen` guard is no
+    // longer needed: because the nested {@link ConfirmDialog} now registers on
+    // the SAME module-level stack, a single Escape dismisses ONLY the topmost
+    // dialog — so while the delete-confirm is open it consumes Escape and this
+    // lightbox stays put, exactly as before, without any local coordination.
+    const titleId = useId();
+    const { dialogRef, dialogProps } = useDialogA11y({
+        open,
+        onClose,
+        closeOnEscape: !submitting,
+        initialFocusRef: nameRef,
+    });
 
     // Map a thrown adapter error onto the form. Ports `form.setErrors(data)` +
     // the `_error_message` / `__all__` notify branches (lightboxes.coffee
@@ -422,7 +422,12 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
             This component returns `null` when `!open` (see the guard above), so it is
             rendered exclusively in the open state — hence the `open` class is applied
             unconditionally here. */}
-        <div className="lightbox lightbox-sprint-add-edit open">
+        <div
+            ref={dialogRef}
+            {...dialogProps}
+            aria-labelledby={titleId}
+            className="lightbox lightbox-sprint-add-edit open"
+        >
             {/* Ports tg-lightbox-close (tg-svg svg-icon="icon-close"). i18n COMMON.CLOSE */}
             <button
                 className="close"
@@ -437,7 +442,7 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
             </button>
 
             <form onSubmit={handleSubmit} noValidate>
-                <h2 className="title">
+                <h2 className="title" id={titleId}>
                     {mode === "create"
                         ? t("LIGHTBOX.ADD_EDIT_SPRINT.TITLE", "New sprint")
                         : t("BACKLOG.EDIT_SPRINT", "Edit Sprint")}

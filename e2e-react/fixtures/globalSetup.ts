@@ -164,17 +164,39 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
         return;
     }
 
-    // No reseed configured: safe, non-failing no-op with an actionable warning.
+    // [M-16] No reseed configured. Determinism requires a known-clean dataset
+    // before the run, so this is FAIL-CLOSED: by default we THROW and abort the
+    // run rather than silently proceeding against an unknown/mutated backend
+    // (the previous behavior — a non-failing `console.warn` no-op — masked a
+    // missing reset and let a dirty dataset produce flaky, non-reproducible
+    // results). A run is only allowed to proceed without a reset when the
+    // operator EXPLICITLY opts in via E2E_ALLOW_NO_RESEED, which is off by
+    // default; that escape hatch exists solely for intentional front-end-only /
+    // exploratory runs and is announced loudly.
+    const guidance =
+        '  Configure ONE of:\n' +
+        '    • E2E_RESEED_CMD (e.g. "python manage.py sample_data" with ' +
+        'E2E_RESEED_CWD pointing at your taiga-back checkout), or\n' +
+        '    • E2E_RESEED_URL (an HTTP endpoint that reseeds sample_data).\n' +
+        '  Both reset paths already fail-closed (they throw if the reset fails).';
+
+    const allowNoReseed = /^(1|true|yes)$/i.test(process.env.E2E_ALLOW_NO_RESEED || '');
+    if (!allowNoReseed) {
+        throw new Error(
+            '[e2e-react globalSetup] No deterministic reseed configured — aborting the ' +
+                'run to avoid a non-reproducible dataset (fail-closed).\n' +
+                guidance +
+                '\n  To intentionally run WITHOUT a reset (front-end-only / exploratory ' +
+                'runs only), set E2E_ALLOW_NO_RESEED=1.',
+        );
+    }
+
+    // Explicit opt-out taken: proceed WITHOUT a reset, but say so loudly.
     // eslint-disable-next-line no-console
     console.warn(
-        '[e2e-react globalSetup] No deterministic reseed configured — running ' +
-            'against the backend as-is.\n' +
-            '  For a repeatable "twice-from-clean" run, set ONE of:\n' +
-            '    • E2E_RESEED_CMD (e.g. "python manage.py sample_data" with ' +
-            'E2E_RESEED_CWD pointing at your taiga-back checkout), or\n' +
-            '    • E2E_RESEED_URL (an HTTP endpoint that reseeds sample_data).\n' +
-            '  The mutating specs still use unique timestamped sprint names and ' +
-            'relative count-delta assertions, so they tolerate re-runs; but only ' +
-            'a configured reseed guarantees a fully clean baseline.',
+        '[e2e-react globalSetup] E2E_ALLOW_NO_RESEED is set — proceeding WITHOUT a ' +
+            'deterministic reseed. The dataset is NOT guaranteed clean; results may ' +
+            'not be reproducible.\n' +
+            guidance,
     );
 }
