@@ -17,7 +17,25 @@ var gulp = require("gulp"),
     rename = require("gulp-rename"),
     gulpif = require("gulp-if"),
     replace = require("gulp-replace"),
-    sass = require('gulp-sass')(require('node-sass'));
+    // node-sass (a native addon built via `nan`) cannot compile its V8 binding against
+    // Node >= 20/22 headers (the bundled nan.h calls the removed
+    // `v8::ObjectTemplate::SetAccessor` overload). Because the host dev runtime is Node
+    // v22 (mandated by the I3 tool restriction, overriding the .nvmrc v16 pin), eagerly
+    // `require('node-sass')` here would throw at gulpfile load time and break EVERY gulp
+    // task — including the React `react` (esbuild) bundle task, which does not use SCSS
+    // at all. It is therefore loaded LAZILY: the gulp-sass compiler is only constructed
+    // the first time the `sass-compile` task runs. Inside the Node-16 `docker/Dockerfile`
+    // build image node-sass loads normally at first use, so production SCSS output is
+    // byte-identical — only the require timing changed. [setup fix for I3 Node override]
+    sass = (function () {
+        var _compiler = null;
+        return function (options) {
+            if (_compiler === null) {
+                _compiler = require('gulp-sass')(require('node-sass'));
+            }
+            return _compiler(options);
+        };
+    })();
     minifyCSS = require("gulp-clean-css"),
     stylelint = require('gulp-stylelint');
     cache = require("gulp-cache"),
