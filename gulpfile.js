@@ -90,6 +90,10 @@ paths.css_vendor = [
 paths.locales = paths.app + "locales/**/*.json";
 paths.modulesLocales = paths.app + "modules/**/locales/*.json";
 paths.elements = `./elements.js`;
+// esbuild entry for the in-place React 18 screens (Kanban / Backlog). The
+// react task below bundles this TSX entry (and its imports) into react.js,
+// mirroring how paths.elements feeds the pre-existing elements.js bundle.
+paths.react = `./app/react/index.tsx`;
 
 paths.sass = [
     paths.app + "**/*.scss",
@@ -564,6 +568,33 @@ gulp.task("elements", function() {
         .pipe(gulp.dest(paths.distVersion + "js/"));
 });
 
+// esbuild bundler for the migrated React 18 screens. Loaded here (rather than
+// at the top of the file) so the require stays grouped with the task that uses
+// it. esbuild 0.21.5 exposes a Node API that is compatible with the project's
+// pinned Node 16.19.1 toolchain.
+var esbuild = require("esbuild");
+
+// Bundle the React entry (app/react/index.tsx) and everything it imports
+// (React, react-dom, @dnd-kit/core, immer, and the app/react/** sources) into a
+// single browser IIFE, react.js, written into the same versioned js/ output dir
+// the elements task uses. app-loader.coffee loads dist/<version>/js/react.js
+// before app.js and angular.bootstrap so the custom elements are registered
+// before AngularJS compiles the templates that host them. bundle:true means no
+// separate vendor loading is required and the AngularJS shell is unaffected.
+gulp.task("react", function() {
+    return esbuild.build({
+        entryPoints: [paths.react],
+        bundle: true,
+        format: "iife",
+        target: "es2018",
+        loader: { ".ts": "ts", ".tsx": "tsx" },
+        jsx: "automatic",
+        minify: isDeploy,
+        sourcemap: true,
+        outfile: paths.distVersion + "js/react.js"
+    });
+});
+
 gulp.task("app-watch", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader"));
 
 gulp.task("app-deploy", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader", function() {
@@ -705,6 +736,7 @@ gulp.task("watch", function(cb) {
     gulp.watch(paths.coffee, gulp.parallel(["app-watch"]));
     gulp.watch(paths.libs, gulp.parallel(["jslibs-watch"]));
     gulp.watch(paths.elements, gulp.parallel(["elements"]));
+    gulp.watch("./app/react/**/*", gulp.parallel(["react"]));
     gulp.watch([paths.locales, paths.modulesLocales], gulp.parallel(["locales"]));
     gulp.watch(paths.images, gulp.parallel(["copy-images"]));
 
@@ -721,6 +753,7 @@ gulp.task("deploy", gulp.series(
         "app-deploy",
         "jslibs-deploy",
         "elements",
+        "react",
         "link-images",
         "compile-themes"
     )
@@ -737,6 +770,7 @@ gulp.task("default", gulp.series(
         "jslibs-watch",
         "jade-deploy",
         "elements",
+        "react",
         "express",
         "watch"
     ))

@@ -109,9 +109,10 @@ mainLoad = ->
 
 loadApp = (emojisPromise) ->
     loadJS("#{window._version}/js/elements.js").then () ->
-        loadJS("#{window._version}/js/app.js").then () ->
-            emojisPromise.then ->
-                angular.bootstrap(document, ['taiga'])
+        loadJS("#{window._version}/js/react.js").then () ->
+            loadJS("#{window._version}/js/app.js").then () ->
+                emojisPromise.then ->
+                    angular.bootstrap(document, ['taiga'])
 
 promise = fetch "conf.json"
 promise
