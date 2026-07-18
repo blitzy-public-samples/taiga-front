@@ -224,12 +224,40 @@ function primeBoard(overrides: Partial<UseKanbanBoardResult> = {}): UseKanbanBoa
   return currentBoard;
 }
 
-/** Render `KanbanApp` with string attributes, type-checked against its props. */
-function renderApp(
+/**
+ * Flush the container's mount-time `filtersData` effect INSIDE `act(...)`.
+ *
+ * `KanbanApp` fires an asynchronous `filtersData(...)` request from a mount
+ * effect (the SOURCE `generateFilters` behaviour) and calls
+ * `setFiltersDataState` once it resolves. In jsdom that resolution is a
+ * microtask that settles AFTER a synchronous `render(...)`, so a test that
+ * rendered and then asserted synchronously would apply the resulting state
+ * update OUTSIDE `act(...)`, which React reports as
+ * "An update to KanbanApp inside a test was not wrapped in act(...)".
+ * Awaiting a single microtask turn inside `act(...)` applies the update
+ * deterministically and silences that warning. `filtersData` is mocked to
+ * resolve to `{}`, so one turn is always sufficient; on the invalid-project
+ * branch the effect returns early, making this a harmless no-op.
+ */
+async function flushMountEffects(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+  });
+}
+
+/**
+ * Render `KanbanApp` with string attributes (type-checked against its props)
+ * and settle the mount-time asynchronous effect inside `act(...)` before
+ * returning, so every caller observes a fully-committed board without React
+ * `act(...)` warnings. Callers must `await` this helper.
+ */
+async function renderApp(
   projectId: string | undefined = '7',
   projectSlug: string | undefined = 'proj-7',
-): ReturnType<typeof render> {
-  return render(<KanbanApp projectId={projectId} projectSlug={projectSlug} />);
+): Promise<ReturnType<typeof render>> {
+  const result = render(<KanbanApp projectId={projectId} projectSlug={projectSlug} />);
+  await flushMountEffects();
+  return result;
 }
 
 /**
@@ -278,8 +306,8 @@ afterEach(() => {
 
 describe('KanbanApp', () => {
   describe('projectId coercion', () => {
-    it('coerces the string project-id attribute to a number in the hook params', () => {
-      renderApp('7', 'proj-7');
+    it('coerces the string project-id attribute to a number in the hook params', async () => {
+      await renderApp('7', 'proj-7');
 
       // The container calls `useKanbanBoard({ projectId: Number(props.projectId), ... })`
       // — proving the coercion to the NUMBER 7 (not the "7" string).
@@ -288,8 +316,8 @@ describe('KanbanApp', () => {
       );
     });
 
-    it('does not pass the raw string "7" as projectId to the hook', () => {
-      renderApp('7', 'proj-7');
+    it('does not pass the raw string "7" as projectId to the hook', async () => {
+      await renderApp('7', 'proj-7');
 
       // Jest distinguishes 7 from "7"; asserting the string was NOT used guards
       // against a regression that drops the `Number(...)` coercion.
@@ -298,8 +326,8 @@ describe('KanbanApp', () => {
       );
     });
 
-    it('passes the current zoom level, search query and filter params to the hook', () => {
-      renderApp();
+    it('passes the current zoom level, search query and filter params to the hook', async () => {
+      await renderApp();
 
       // On first render: default zoom 1 (cleared localStorage), empty query, no
       // filter params — the four documented hook params are all present.
@@ -315,8 +343,8 @@ describe('KanbanApp', () => {
   });
 
   describe('invalid project-id guard', () => {
-    it('renders the inert host and no board when project-id is not a number', () => {
-      const { container } = renderApp('not-a-number');
+    it('renders the inert host and no board when project-id is not a number', async () => {
+      const { container } = await renderApp('not-a-number');
 
       // `Number("not-a-number")` is NaN -> `projectIdValid` is false -> the
       // container short-circuits to the inert wrapper host.
@@ -329,14 +357,14 @@ describe('KanbanApp', () => {
       expect(screen.queryByTestId('dnd-context')).toBeNull();
     });
 
-    it('still calls the hook unconditionally (Rules of Hooks) even when invalid', () => {
-      renderApp('not-a-number');
+    it('still calls the hook unconditionally (Rules of Hooks) even when invalid', async () => {
+      await renderApp('not-a-number');
 
       // The hook is invoked before the guard returns, so it is always called.
       expect(mockUseKanbanBoard).toHaveBeenCalled();
     });
 
-    it('treats a missing project-id (undefined) as invalid', () => {
+    it('treats a missing project-id (undefined) as invalid', async () => {
       // Render WITHOUT a `projectId` prop (not via `renderApp`, whose defaulted
       // parameter would substitute "7" when passed `undefined`). The custom
       // element mounted without a `project-id` attribute yields `props.projectId
@@ -351,28 +379,28 @@ describe('KanbanApp', () => {
   });
 
   describe('board render gating (initialLoad && project)', () => {
-    it('renders the shell but gates the board off before the first load resolves', () => {
+    it('renders the shell but gates the board off before the first load resolves', async () => {
       // A loaded project but initialLoad still false -> shell yes, board no.
       primeBoard({ project: makeProject(), initialLoad: false });
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       expect(container.querySelector('.kanban-header')).not.toBeNull();
       expect(container.querySelector('.taskboard-actions')).not.toBeNull();
       expect(screen.queryByTestId('dnd-context')).toBeNull();
     });
 
-    it('gates the board off when initialLoad is true but the project has not loaded', () => {
+    it('gates the board off when initialLoad is true but the project has not loaded', async () => {
       primeBoard({ project: null, initialLoad: true });
-      renderApp();
+      await renderApp();
 
       expect(screen.queryByTestId('dnd-context')).toBeNull();
     });
   });
 
   describe('no-swimlane render & shell classes', () => {
-    it('emits the exact shell class names verbatim', () => {
+    it('emits the exact shell class names verbatim', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       // Section: `main kanban` WITHOUT the `swimlane` modifier (no swimlanes).
       const section = container.querySelector('section.main.kanban');
@@ -400,9 +428,9 @@ describe('KanbanApp', () => {
       expect(table?.classList.contains('kanban-table-swimlane')).toBe(false);
     });
 
-    it('wraps the board in the DnD context and renders one TaskboardColumn per status', () => {
+    it('wraps the board in the DnD context and renders one TaskboardColumn per status', async () => {
       primeLoadedNoSwimlane();
-      renderApp();
+      await renderApp();
 
       const dnd = screen.getByTestId('dnd-context');
       expect(dnd).toBeInTheDocument();
@@ -421,9 +449,9 @@ describe('KanbanApp', () => {
       expect(screen.queryByTestId('swimlane-add-link')).toBeNull();
     });
 
-    it('renders one inline status-column header per status', () => {
+    it('renders one inline status-column header per status', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       expect(container.querySelectorAll('.task-colum-name')).toHaveLength(2);
     });
@@ -445,9 +473,9 @@ describe('KanbanApp', () => {
       });
     }
 
-    it('adds the `swimlane` section modifier and the `kanban-table-swimlane` table class', () => {
+    it('adds the `swimlane` section modifier and the `kanban-table-swimlane` table class', async () => {
       primeSwimlaneBoard();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       const section = container.querySelector('section.main.kanban');
       expect(section?.classList.contains('swimlane')).toBe(true);
@@ -456,9 +484,9 @@ describe('KanbanApp', () => {
       expect(table?.classList.contains('kanban-table-swimlane')).toBe(true);
     });
 
-    it('renders one Swimlane per entry plus a single SwimlaneAddLink', () => {
+    it('renders one Swimlane per entry plus a single SwimlaneAddLink', async () => {
       primeSwimlaneBoard();
-      renderApp();
+      await renderApp();
 
       expect(screen.getAllByTestId('swimlane')).toHaveLength(1);
       expect(screen.getByTestId('swimlane-add-link')).toBeInTheDocument();
@@ -475,9 +503,9 @@ describe('KanbanApp', () => {
   });
 
   describe('filter panel toggle', () => {
-    it('opens the filter sidebar, drops the manager `expanded` class and marks the button active', () => {
+    it('opens the filter sidebar, drops the manager `expanded` class and marks the button active', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       // Closed initially.
       expect(container.querySelector('.kanban-filter')).toBeNull();
@@ -495,9 +523,9 @@ describe('KanbanApp', () => {
       expect(container.querySelector('.kanban-manager')?.classList.contains('expanded')).toBe(false);
     });
 
-    it('hands the FiltersSidebar an empty custom-filter list and function callbacks', () => {
+    it('hands the FiltersSidebar an empty custom-filter list and function callbacks', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       fireEvent.click(container.querySelector('.btn-filter.e2e-open-filter') as HTMLElement);
 
@@ -514,9 +542,9 @@ describe('KanbanApp', () => {
   });
 
   describe('zoom control', () => {
-    it('persists the chosen zoom level to localStorage and updates the board zoom class', () => {
+    it('persists the chosen zoom level to localStorage and updates the board zoom class', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       const radios = container.querySelectorAll(
         '.board-zoom input[type="radio"]',
@@ -533,9 +561,9 @@ describe('KanbanApp', () => {
       expect(table?.classList.contains('zoom-1')).toBe(false);
     });
 
-    it('does not flash the zoom-loading indicator on the very first zoom change', () => {
+    it('does not flash the zoom-loading indicator on the very first zoom change', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       const radios = container.querySelectorAll(
         '.board-zoom input[type="radio"]',
@@ -552,7 +580,7 @@ describe('KanbanApp', () => {
       jest.useFakeTimers();
       try {
         primeLoadedNoSwimlane();
-        const { container } = renderApp();
+        const { container } = await renderApp();
 
         // Flush the mount-time filtersData microtask so its setState does not race
         // the fake-timer assertions below.
@@ -588,7 +616,7 @@ describe('KanbanApp', () => {
       jest.useFakeTimers();
       try {
         primeLoadedNoSwimlane();
-        const { container } = renderApp();
+        const { container } = await renderApp();
 
         await act(async () => {
           await Promise.resolve();
@@ -622,7 +650,7 @@ describe('KanbanApp', () => {
   describe('moveUs pipeline (onMoveUs -> board.move)', () => {
     it('forwards the frozen argument order and the raw swimlane id to board.move', async () => {
       const board = primeLoadedNoSwimlane();
-      renderApp();
+      await renderApp();
 
       expect(mockCaptured.dnd).not.toBeNull();
       expect(typeof mockCaptured.dnd.onMoveUs).toBe('function');
@@ -641,7 +669,7 @@ describe('KanbanApp', () => {
 
     it('clears the multi-selection before performing the move', async () => {
       const board = primeLoadedNoSwimlane();
-      renderApp();
+      await renderApp();
 
       // Select card 1 via a column callback, then confirm the selection is
       // observed as active on the next render.
@@ -678,7 +706,7 @@ describe('KanbanApp', () => {
         usMap: makeUsMap(cards),
       });
 
-      renderApp();
+      await renderApp();
 
       await act(async () => {
         mockCaptured.column[0].onClickMoveToTop(1);
@@ -691,7 +719,7 @@ describe('KanbanApp', () => {
 
     it('does nothing when the moved card is not in the board map', async () => {
       const board = primeLoadedNoSwimlane();
-      renderApp();
+      await renderApp();
 
       await act(async () => {
         mockCaptured.column[0].onClickMoveToTop(9999); // unknown id
@@ -702,9 +730,9 @@ describe('KanbanApp', () => {
   });
 
   describe('multi-select (onToggleSelectedUs)', () => {
-    it('toggles a card id in the selection set on successive calls', () => {
+    it('toggles a card id in the selection set on successive calls', async () => {
       primeLoadedNoSwimlane();
-      renderApp();
+      await renderApp();
 
       const toggle = mockCaptured.column[0].onToggleSelectedUs;
       expect(typeof toggle).toBe('function');
@@ -732,9 +760,9 @@ describe('KanbanApp', () => {
       });
     }
 
-    it('force-folds archived columns on first load and toggles the hook show/hide on unfold/fold', () => {
+    it('force-folds archived columns on first load and toggles the hook show/hide on unfold/fold', async () => {
       const board = primeArchivedBoard();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       // headers render in usStatusList order: [0]=normal(100), [1]=archived(200).
       let headers = container.querySelectorAll('.task-colum-name');
@@ -753,9 +781,9 @@ describe('KanbanApp', () => {
       expect(board.hideArchivedStatus).toHaveBeenCalledWith(200);
     });
 
-    it('folding a non-archived column adds `vfold` without calling the archived hooks', () => {
+    it('folding a non-archived column adds `vfold` without calling the archived hooks', async () => {
       const board = primeArchivedBoard();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       let headers = container.querySelectorAll('.task-colum-name');
       // The non-archived column (100) starts unfolded.
@@ -773,9 +801,9 @@ describe('KanbanApp', () => {
   });
 
   describe('status-column add actions (permission-gated)', () => {
-    it('renders the add / bulk buttons when the project grants add_us', () => {
+    it('renders the add / bulk buttons when the project grants add_us', async () => {
       const s100 = makeStatus({ id: 100, name: 'New', order: 1, is_archived: false });
-      primeBoard({
+      const board = primeBoard({
         project: makeProject({ my_permissions: ['view_us', 'add_us', 'modify_us'] }),
         initialLoad: true,
         usStatusList: [s100],
@@ -783,7 +811,7 @@ describe('KanbanApp', () => {
         usMap: {},
       });
 
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       const header = container.querySelector('.task-colum-name') as HTMLElement;
       const addBtn = within(header).getByTitle('Add new user story');
@@ -791,17 +819,32 @@ describe('KanbanApp', () => {
       expect(addBtn).toBeInTheDocument();
       expect(bulkBtn).toBeInTheDocument();
 
-      // The handlers are permission-gated no-ops (the lightbox is provided by the
-      // out-of-scope AngularJS shell) — they must not throw.
+      // AUTHORITATIVE CONTRACT (stronger than "does not throw"): the add / bulk
+      // create dialogs are the AngularJS COMMON module's `lightbox-us-bulk` /
+      // `genericform` directives. The AAP places the common module OUT OF SCOPE
+      // (§0.2.2 "the ... common ... modules are ... out of scope") and the AAP
+      // React file manifest (§0.4.1) defines NO Kanban lightbox component — only
+      // the two BACKLOG lightboxes. The SOURCE `KanbanController` never owned
+      // these dialogs either; it merely REACTED to their `usform:new:success` /
+      // `usform:bulk:success` outcomes, which the React screen now receives via the
+      // shared events bridge + `useKanbanBoard`. So `handleAddNewUs` /
+      // `handleAddBulk` must SAFELY DELEGATE: after their `add_us` permission check
+      // they perform NO board mutation of their own. Assert clicking them neither
+      // throws NOR moves / reloads / folds / toggles-archived on the board.
       expect(() => {
         fireEvent.click(addBtn);
         fireEvent.click(bulkBtn);
       }).not.toThrow();
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).not.toHaveBeenCalled();
+      expect(board.toggleFold).not.toHaveBeenCalled();
+      expect(board.showArchivedStatus).not.toHaveBeenCalled();
+      expect(board.hideArchivedStatus).not.toHaveBeenCalled();
     });
 
-    it('omits the add / bulk buttons when the project lacks add_us', () => {
+    it('omits the add / bulk buttons when the project lacks add_us', async () => {
       primeLoadedNoSwimlane(); // default project: my_permissions === ['view_us']
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       const header = container.querySelector('.task-colum-name') as HTMLElement;
       expect(within(header).queryByTitle('Add new user story')).toBeNull();
@@ -810,15 +853,54 @@ describe('KanbanApp', () => {
   });
 
   describe('card action callbacks (delegated, gated no-ops)', () => {
-    it('exposes edit / delete / assigned-to handlers to the columns that do not throw', () => {
-      primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us', 'delete_us'] });
-      renderApp();
+    it('safely delegates edit / delete / assigned-to with NO board side effects when GRANTED', async () => {
+      // GRANT the relevant per-US permissions so each handler PASSES its gate and
+      // reaches its delegation branch — the strongest path to exercise.
+      const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us', 'delete_us'] });
+      await renderApp();
 
       const col = mockCaptured.column[0];
       expect(typeof col.onClickEdit).toBe('function');
       expect(typeof col.onClickDelete).toBe('function');
       expect(typeof col.onClickAssignedTo).toBe('function');
       expect(typeof col.onToggleFold).toBe('function');
+
+      // AUTHORITATIVE CONTRACT (stronger than "does not throw"): edit / delete /
+      // assigned-to open the COMMON module's `genericform` / `askOnDelete` /
+      // `tg-lb-select-user` dialogs, which the AAP lists OUT OF SCOPE (§0.2.2
+      // common module) with NO Kanban React lightbox in the file manifest (§0.4.1);
+      // the SOURCE `KanbanController` only REACTED to their success via the events
+      // bridge. So even with the permissions GRANTED the handlers SAFELY DELEGATE —
+      // they neither throw NOR mutate the board themselves (no move / reload / fold
+      // / archived toggle). The board changes only in response to a lightbox
+      // SUCCESS event arriving through the bridge, never from the click itself.
+      expect(() => {
+        act(() => {
+          col.onClickEdit(1);
+          col.onClickDelete(1);
+          col.onClickAssignedTo(1);
+        });
+      }).not.toThrow();
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).not.toHaveBeenCalled();
+      expect(board.toggleFold).not.toHaveBeenCalled();
+      expect(board.showArchivedStatus).not.toHaveBeenCalled();
+      expect(board.hideArchivedStatus).not.toHaveBeenCalled();
+    });
+
+    it('safely delegates edit / delete / assigned-to with NO board side effects when DENIED', async () => {
+      // DENY: the default project grants only `view_us` (no modify_us / delete_us),
+      // so every handler is short-circuited by its permission gate. The columns
+      // still RECEIVE the handlers (the gate lives INSIDE the container handler,
+      // reproducing the SOURCE `canModifyUs` / `delete_us` checks), so this asserts
+      // the gate holds AND that denial is likewise side-effect-free.
+      const board = primeLoadedNoSwimlane(); // my_permissions === ['view_us']
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      expect(typeof col.onClickEdit).toBe('function');
+      expect(typeof col.onClickDelete).toBe('function');
+      expect(typeof col.onClickAssignedTo).toBe('function');
 
       expect(() => {
         act(() => {
@@ -827,20 +909,31 @@ describe('KanbanApp', () => {
           col.onClickAssignedTo(1);
         });
       }).not.toThrow();
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).not.toHaveBeenCalled();
+      expect(board.toggleFold).not.toHaveBeenCalled();
+      expect(board.showArchivedStatus).not.toHaveBeenCalled();
+      expect(board.hideArchivedStatus).not.toHaveBeenCalled();
     });
   });
 
   describe('filter add / remove wiring', () => {
-    it('adds a tag filter to the hook params and removes it again', () => {
+    it('adds a tag filter to the hook params and removes it again', async () => {
       primeLoadedNoSwimlane();
-      const { container } = renderApp();
+      const { container } = await renderApp();
 
       // Open the panel so the sidebar (and its captured callbacks) mount.
       fireEvent.click(container.querySelector('.btn-filter.e2e-open-filter') as HTMLElement);
       expect(mockCaptured.filters).not.toBeNull();
 
       // Add an "include" tag filter. For tags the query value is the tag NAME.
-      act(() => {
+      // Adding a filter mutates `filterParams`, which is a dependency of the
+      // container's `generateFilters` effect (KanbanApp.tsx:605-622); that effect
+      // re-issues the mocked `filtersData(...)` request whose resolution applies
+      // `setFiltersDataState` on a later microtask. Wrapping the interaction in an
+      // async `act(...)` (matching the moveUs pipeline tests) drains that microtask
+      // INSIDE `act`, so the re-run state update is never reported as un-acted.
+      await act(async () => {
         mockCaptured.filters.onAddFilter({
           category: { dataType: 'tags', title: 'Tags', content: [] },
           filter: { id: null, name: 'urgent', count: 1 },
@@ -854,7 +947,10 @@ describe('KanbanApp', () => {
       expect(sawTag).toBe(true);
 
       // Remove it via the applied-filter descriptor -> the tags param drops.
-      act(() => {
+      // Like the add above, this mutates `filterParams` and re-runs the
+      // `generateFilters` effect, so it is awaited inside an async `act(...)` to
+      // flush the follow-on `filtersData` microtask deterministically.
+      await act(async () => {
         mockCaptured.filters.onRemoveFilter({
           id: null,
           key: 'tags:urgent',
