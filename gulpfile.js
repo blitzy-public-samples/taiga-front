@@ -8,7 +8,6 @@
 
 var gulp = require("gulp"),
     fs = require('fs'),
-    imagemin = require("gulp-imagemin"),
     jade = require("gulp-jade"),
     coffee = require("gulp-coffee"),
     concat = require("gulp-concat"),
@@ -604,7 +603,6 @@ gulp.task("copy-theme-fonts", function() {
 
 gulp.task("copy-images", function() {
     return gulp.src([paths.app + "/images/**/*", paths.app + '/modules/compile-modules/**/images/*'])
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"));
 });
 
@@ -615,7 +613,6 @@ gulp.task("copy-emojis", function() {
 
 gulp.task("copy-theme-images", function() {
     return gulp.src(themes.current.path + "/images/**/*")
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"  + themes.current.name));
 });
 
