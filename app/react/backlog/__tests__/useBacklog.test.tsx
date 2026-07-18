@@ -7,62 +7,80 @@
  */
 
 /**
- * Browserless Jest (jsdom) unit spec for the EFFECTFUL Backlog state hook
- * (`app/react/backlog/state/useBacklog.ts`).
+ * useBacklog.test.tsx — browserless Jest (jsdom) unit spec for the EFFECTFUL
+ * Backlog state hook (`../state/useBacklog.ts`).
  *
  * WHAT IS ASSERTED
- *   The hook's EFFECTS and their behavioural parity with the AngularJS
- *   `BacklogController` (SOURCE `app/coffee/modules/backlog/main.coffee`):
- *     - initial load ORDER and shape (project -> subscribe -> parallel
- *       stats/sprints/userstories -> filtersData -> loading:false);
- *     - pagination-header handling (`x-pagination-next`,
- *       `Taiga-Info-Backlog-Total-Userstories`,
- *       `Taiga-Info-Userstories-Without-Swimlane`);
+ *   The hook's EFFECTS and their behavioural parity with the (deleted) AngularJS
+ *   `BacklogController` (`app/coffee/modules/backlog/main.coffee`) and
+ *   `sortable.coffee`:
+ *     - the initial-load ORDER and shape: load project → subscribe to live
+ *       changes → parallel [stats, sprints, userstories] → filters data →
+ *       clear the loading flag, plus unsubscribe-on-unmount;
  *     - the pending-drag QUEUE semantics of `moveUs` (optimistic dispatch +
- *       enqueue + single-in-flight gate + drain + `!events.connected` fallback
- *       reload) and the byte-for-byte WIRE FORMAT of
- *       `bulk_update_backlog_order` (an ARRAY OF US ID NUMBERS);
- *     - `moveToSprint` ({ us_id, order }[] to `bulk_update_milestone`),
- *       `bulkCreateUs`, `createSprint`/`saveSprint`/`removeSprint`, the filter /
- *       toggle / reload passthroughs, and the optimistic add/remove;
- *     - the WebSocket subscription routing (`onUserstories` / `onMilestones`)
- *       and unsubscribe-on-unmount; and
- *     - `findCurrentSprint` date math and `computeStats` arithmetic.
+ *       enqueue + single-in-flight gate + shift/recurse drain + the
+ *       `!events.connected` fallback reload) and — the CRITICAL lock — the
+ *       byte-for-byte WIRE FORMAT of `bulkUpdateBacklogOrder`
+ *       (`(projectId, currentSprintId, previousUs, nextUs, number[])` where the
+ *       5th argument is an ARRAY OF USER-STORY ID NUMBERS, main.coffee L535-537),
+ *       including the `currentSprintId = newSprintId !== oldSprintId ?
+ *       newSprintId : oldSprintId` rule (main.coffee L533) proven for the
+ *       reorder / backlog→sprint / sprint→backlog cases;
+ *     - server reconciliation (`reconcileMoveResult`, main.coffee L611-617);
+ *     - `moveToSprint` posting the CONTRASTING `{ us_id, order }[]` shape via
+ *       `bulkUpdateMilestone` (main.coffee L794-799);
+ *     - the sprint CRUD thunks (`createSprint`/`saveSprint`/`removeSprint`), the
+ *       optimistic `bulkCreateUs`/`addUsOptimistic`/`removeUsOptimistic`, the
+ *       filter/toggle/reload passthroughs, and the WebSocket
+ *       `onUserstories`/`onMilestones` handlers.
  *
- * TEST-LAYER ISOLATION
- *   No network, no browser engine, no AngularJS. The shared TRANSPORT adapter
- *   (`../../shared/api/client`) is mocked with a path-routing `api` double, so
- *   the real `fetch` never runs; the REAL `../../shared/api/userstories` and
- *   `../../shared/api/milestones` wrappers run on top of that double (proving
- *   their request bodies as an integration bonus). `../../shared/events` and
- *   `../../shared/session` are mocked so the events path is deterministic. Jest
- *   globals (`describe`/`it`/`expect`/`jest`/`beforeEach`/`afterEach`) come from
- *   the runner (jsdom env from the root `jest.config.js`); no Jest import is
- *   required. React's automatic JSX runtime means NO `import React`.
+ * RECONCILED-AGAINST-ACTUAL
+ *   Every mock, call assertion, and argument tuple below is aligned to the
+ *   AUTHORED `../state/useBacklog.ts` (not merely to the recorded spec). Notably:
+ *   the authored `bulkCreateUs` does NOT call the `bulkCreate` API — the
+ *   `BulkCreateUsLightbox` owns that call — so this spec asserts the AUTHORED
+ *   form (optimistic insert + stats reload; `bulkCreate` NOT called).
+ *
+ * TEST-LAYER ISOLATION (hard requirement)
+ *   No network, no real WebSocket, no browser engine, no AngularJS. EVERY
+ *   effectful shared module is mocked at the top level (hoisted): the transport
+ *   `../../shared/api/client`, the `../../shared/api/userstories` and
+ *   `../../shared/api/milestones` wrappers, the `../../shared/events` bridge and
+ *   the `../../shared/session` accessors. The PURE `../state/backlogReducer` and
+ *   `moment` are deliberately NOT mocked, so real reducer state makes the
+ *   assertions meaningful. Jest globals (`describe`/`it`/`expect`/`jest`/
+ *   `beforeEach`/`afterEach`) and the jest-dom matchers come from the runner
+ *   configuration (root `jest.config.js` + `tsconfig.json` `types`), so nothing
+ *   is imported for them. React's automatic JSX runtime means there is NO
+ *   `import React`.
  */
 
 import { renderHook, act, waitFor } from '@testing-library/react';
 
 import { useBacklog } from '../state/useBacklog';
 import { api } from '../../shared/api/client';
+import {
+    bulkUpdateBacklogOrder,
+    bulkUpdateMilestone,
+    bulkCreate,
+    filtersData,
+} from '../../shared/api/userstories';
+import { listMilestones, createMilestone, saveMilestone } from '../../shared/api/milestones';
 import { subscribeProjectChanges } from '../../shared/events';
 import { getEventsUrl } from '../../shared/session';
 import type { Project, UserStory, Milestone, FiltersData } from '../../shared/types';
-import {
-    makeProject,
-    makeUserStory,
-    makeUserStories,
-    makeMilestone,
-    makeFiltersData,
-} from './factories';
+import { makeProject, makeUserStory, makeMilestone, makeFiltersData } from './factories';
 
 /* ========================================================================== *
- * Module mocks
+ * Module mocks — ALL effectful shared modules (hoisted above the imports by
+ * jest). The factories reference no out-of-scope bindings, so they are safe
+ * under jest's mock hoisting.
  * ========================================================================== */
 
-// Transport adapter: a path-routing `api` double. The factory references no
-// out-of-scope bindings, so it is safe under jest's mock hoisting.
+// Transport adapter: a path-routing `api` double. The hook uses `api.get`,
+// `api.request` and `api.del` directly; the verb helpers are all provided.
 jest.mock('../../shared/api/client', () => ({
+    __esModule: true,
     api: {
         request: jest.fn(),
         get: jest.fn(),
@@ -74,15 +92,41 @@ jest.mock('../../shared/api/client', () => ({
     ApiError: class ApiError extends Error {},
 }));
 
-// Events bridge: subscribeProjectChanges returns an unsubscribe spy.
+// User-story bulk wrappers: mocked resolved fns. `bulkCreate` is mocked too
+// (per the folder contract) even though the AUTHORED hook does not call it — we
+// assert that it stays uncalled.
+jest.mock('../../shared/api/userstories', () => ({
+    __esModule: true,
+    bulkUpdateBacklogOrder: jest.fn(),
+    bulkUpdateMilestone: jest.fn(),
+    bulkCreate: jest.fn(),
+    filtersData: jest.fn(),
+}));
+
+// Milestone (sprint) wrappers: mocked resolved fns.
+jest.mock('../../shared/api/milestones', () => ({
+    __esModule: true,
+    listMilestones: jest.fn(),
+    createMilestone: jest.fn(),
+    saveMilestone: jest.fn(),
+}));
+
+// Events bridge: `subscribeProjectChanges` returns an unsubscribe spy.
 jest.mock('../../shared/events', () => ({
+    __esModule: true,
     subscribeProjectChanges: jest.fn(),
 }));
 
-// Session: getEventsUrl gates eventsConnected(); default "disabled" (null) so
-// the post-drag fallback reload path is the default under test.
+// Session accessors. Only `getEventsUrl` is consumed by the hook (it gates the
+// post-drag `eventsConnected()` fallback reload); the rest are provided as
+// harmless jest.fn()s for completeness.
 jest.mock('../../shared/session', () => ({
-    getEventsUrl: jest.fn(() => null),
+    __esModule: true,
+    getEventsUrl: jest.fn(),
+    getConfig: jest.fn(),
+    getApiUrl: jest.fn(),
+    getAuthToken: jest.fn(),
+    getSessionId: jest.fn(),
 }));
 
 /* ========================================================================== *
@@ -93,16 +137,34 @@ const requestMock = api.request as unknown as jest.Mock;
 const getMock = api.get as unknown as jest.Mock;
 const postMock = api.post as unknown as jest.Mock;
 const patchMock = api.patch as unknown as jest.Mock;
+const putMock = api.put as unknown as jest.Mock;
 const delMock = api.del as unknown as jest.Mock;
+
+const bulkBacklogOrderMock = bulkUpdateBacklogOrder as unknown as jest.Mock;
+const bulkMilestoneMock = bulkUpdateMilestone as unknown as jest.Mock;
+const bulkCreateMock = bulkCreate as unknown as jest.Mock;
+const filtersDataMock = filtersData as unknown as jest.Mock;
+
+const listMilestonesMock = listMilestones as unknown as jest.Mock;
+const createMilestoneMock = createMilestone as unknown as jest.Mock;
+const saveMilestoneMock = saveMilestone as unknown as jest.Mock;
+
 const subscribeMock = subscribeProjectChanges as unknown as jest.Mock;
 const getEventsUrlMock = getEventsUrl as unknown as jest.Mock;
 
-const PID = 1;
+/** The numeric project id under test (the hook receives a NUMBER). */
+const PID = 7;
 
 /* ========================================================================== *
- * Header double — a case-insensitive `.get()` like the WHATWG `Headers`
+ * Test-only helpers
  * ========================================================================== */
 
+/**
+ * A case-insensitive `.get()` header double, standing in for the WHATWG
+ * `Headers` the real `api.request` exposes. The hook reads `x-pagination-next`,
+ * `Taiga-Info-Backlog-Total-Userstories` and `Taiga-Info-Userstories-Without-
+ * Swimlane`, so those names must resolve regardless of casing.
+ */
 function makeHeaders(map: Record<string, string>): Headers {
     const lower: Record<string, string> = {};
     Object.keys(map).forEach((k) => {
@@ -116,8 +178,28 @@ function makeHeaders(map: Record<string, string>): Headers {
     } as unknown as Headers;
 }
 
+/** A manually-resolvable promise, used to drive the single-in-flight queue test. */
+interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason?: unknown) => void;
+}
+function deferred<T = unknown>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+/** Shape of a single server-returned reconcile row. */
+type MoveRow = { id: number; milestone: number | null; backlog_order?: number };
+
 /* ========================================================================== *
- * Mutable fixtures (reset in beforeEach) that the routing closures read
+ * Mutable fixtures (reset in beforeEach); the routing closures read them so a
+ * test can reassign one BEFORE `renderLoaded()` to change what the load returns.
  * ========================================================================== */
 
 let projectFixture: Project;
@@ -125,23 +207,36 @@ let statsFixture: Record<string, unknown>;
 let userstoriesFixture: UserStory[];
 let usHeaders: Record<string, string>;
 let openSprintsFixture: Milestone[];
-let sprintHeaders: Record<string, string>;
 let closedSprintsFixture: Milestone[];
+let openTotals: { open: number; closed: number };
+let closedTotals: { open: number; closed: number };
 let filtersDataFixture: FiltersData;
-let bulkBacklogResult: unknown;
 let unsubscribeSpy: jest.Mock;
 
 beforeEach(() => {
-    requestMock.mockReset();
-    getMock.mockReset();
-    postMock.mockReset();
-    patchMock.mockReset();
-    delMock.mockReset();
-    subscribeMock.mockReset();
-    getEventsUrlMock.mockReset();
+    // Fully reset every mock (calls + implementations + once-queues) so each
+    // test starts from a pristine baseline, then wire fresh implementations.
+    [
+        requestMock,
+        getMock,
+        postMock,
+        patchMock,
+        putMock,
+        delMock,
+        bulkBacklogOrderMock,
+        bulkMilestoneMock,
+        bulkCreateMock,
+        filtersDataMock,
+        listMilestonesMock,
+        createMilestoneMock,
+        saveMilestoneMock,
+        subscribeMock,
+        getEventsUrlMock,
+    ].forEach((m) => m.mockReset());
 
     projectFixture = makeProject({ id: PID });
-    // total_points || defined_points = 100; completedPercentage = round(100*25/100) = 25.
+    // total_points || defined_points = 100 basis; completedPercentage =
+    // round(100 * 25 / 100) = 25; showGraphPlaceholder = !(100 && 4) = false.
     statsFixture = {
         total_points: 100,
         defined_points: 80,
@@ -149,45 +244,22 @@ beforeEach(() => {
         total_milestones: 4,
         speed: 3,
     };
-    userstoriesFixture = makeUserStories(2, { milestone: null });
+    userstoriesFixture = [
+        makeUserStory({ id: 1, ref: 1, project: PID, milestone: null, backlog_order: 1 }),
+        makeUserStory({ id: 2, ref: 2, project: PID, milestone: null, backlog_order: 2 }),
+    ];
     usHeaders = {
         'Taiga-Info-Backlog-Total-Userstories': '2',
         'Taiga-Info-Userstories-Without-Swimlane': '0',
     };
     openSprintsFixture = [makeMilestone({ id: 10, name: 'Open Sprint' })];
-    sprintHeaders = {
-        'Taiga-Info-Total-Opened-Milestones': '1',
-        'Taiga-Info-Total-Closed-Milestones': '2',
-    };
     closedSprintsFixture = [makeMilestone({ id: 90, name: 'Closed Sprint', closed: true })];
+    openTotals = { open: 1, closed: 2 };
+    closedTotals = { open: 1, closed: 2 };
     filtersDataFixture = makeFiltersData();
-    bulkBacklogResult = [];
     unsubscribeSpy = jest.fn();
 
-    // api.request(method, path, { params }) — the header-exposing path.
-    requestMock.mockImplementation(
-        (_method: string, path: string, opts?: { params?: Record<string, unknown> }) => {
-            if (path === '/milestones') {
-                const closed = opts?.params?.closed;
-                const isClosed = closed === true || closed === 'true';
-                return Promise.resolve({
-                    data: isClosed ? closedSprintsFixture : openSprintsFixture,
-                    status: 200,
-                    headers: makeHeaders(sprintHeaders),
-                });
-            }
-            if (path === '/userstories') {
-                return Promise.resolve({
-                    data: userstoriesFixture,
-                    status: 200,
-                    headers: makeHeaders(usHeaders),
-                });
-            }
-            return Promise.reject(new Error(`unexpected api.request path: ${path}`));
-        },
-    );
-
-    // api.get(path, ...) — resolves to the BODY directly.
+    // api.get(path) — resolves to the BODY directly (project + stats routes).
     getMock.mockImplementation((path: string) => {
         if (path === `/projects/${PID}`) {
             return Promise.resolve(projectFixture);
@@ -195,42 +267,62 @@ beforeEach(() => {
         if (path === `/projects/${PID}/stats`) {
             return Promise.resolve(statsFixture);
         }
-        if (path === '/userstories/filters_data') {
-            return Promise.resolve(filtersDataFixture);
-        }
         return Promise.reject(new Error(`unexpected api.get path: ${path}`));
     });
 
-    // api.post(path, body) — resolves to the BODY directly.
-    postMock.mockImplementation((path: string, body: Record<string, unknown>) => {
-        if (path === '/userstories/bulk_update_backlog_order') {
-            return Promise.resolve(bulkBacklogResult);
+    // api.request(method, path, { params }) — the header-exposing userstories path.
+    requestMock.mockImplementation((_method: string, path: string) => {
+        if (path === '/userstories') {
+            return Promise.resolve({
+                data: userstoriesFixture,
+                status: 200,
+                headers: makeHeaders(usHeaders),
+            });
         }
-        if (path === '/userstories/bulk_update_milestone') {
-            return Promise.resolve([]);
-        }
-        if (path === '/milestones') {
-            return Promise.resolve(makeMilestone({ id: 100, ...(body as Partial<Milestone>) }));
-        }
-        return Promise.reject(new Error(`unexpected api.post path: ${path}`));
+        return Promise.reject(new Error(`unexpected api.request path: ${path}`));
     });
 
-    patchMock.mockImplementation((path: string, body: Record<string, unknown>) =>
-        Promise.resolve(makeMilestone({ id: 1, ...(body as Partial<Milestone>) })),
-    );
-
+    // api.del(path) — resolves empty (204-style).
     delMock.mockResolvedValue(undefined);
+    postMock.mockResolvedValue(undefined);
+    patchMock.mockResolvedValue(undefined);
+    putMock.mockResolvedValue(undefined);
+
+    // listMilestones(projectId, { closed }) — routes open vs closed sprints and
+    // returns the { milestones, open, closed } shape the reducer consumes.
+    listMilestonesMock.mockImplementation((_pid: number, opts?: { closed?: boolean }) => {
+        const isClosed = opts?.closed === true;
+        return Promise.resolve({
+            milestones: isClosed ? closedSprintsFixture : openSprintsFixture,
+            open: isClosed ? closedTotals.open : openTotals.open,
+            closed: isClosed ? closedTotals.closed : openTotals.closed,
+        });
+    });
+
+    filtersDataMock.mockImplementation(() => Promise.resolve(filtersDataFixture));
+    createMilestoneMock.mockImplementation((payload: Record<string, unknown>) =>
+        Promise.resolve(makeMilestone({ id: 100, ...(payload as Partial<Milestone>) })),
+    );
+    saveMilestoneMock.mockImplementation((payload: { id: number }) =>
+        Promise.resolve(makeMilestone({ ...(payload as Partial<Milestone>), id: payload.id })),
+    );
+    bulkBacklogOrderMock.mockResolvedValue([] as MoveRow[]);
+    bulkMilestoneMock.mockResolvedValue([]);
+    bulkCreateMock.mockResolvedValue([]);
 
     subscribeMock.mockReturnValue(unsubscribeSpy);
-    getEventsUrlMock.mockReturnValue(null);
+    // Default: events "connected" (a truthy URL) so the post-drag fallback
+    // reload is SUPPRESSED and per-test call counts stay focused. The dedicated
+    // 'events-disconnected reload' block overrides this to null.
+    getEventsUrlMock.mockReturnValue('ws://localhost:9000/events');
 });
 
-/* ========================================================================== *
- * Helpers
- * ========================================================================== */
+afterEach(() => {
+    jest.clearAllMocks();
+});
 
 /** Render the hook and wait until the initial load has settled. */
-async function renderLoaded(projectId = PID) {
+async function renderLoaded(projectId: number = PID) {
     const rendered = renderHook(({ id }: { id: number }) => useBacklog(id), {
         initialProps: { id: projectId },
     });
@@ -238,533 +330,646 @@ async function renderLoaded(projectId = PID) {
     return rendered;
 }
 
-/** Clear call records on every api double while preserving the routing impls. */
+/** Clear call records on the API doubles while preserving their routing impls. */
 function clearApiCalls(): void {
-    requestMock.mockClear();
-    getMock.mockClear();
-    postMock.mockClear();
-    patchMock.mockClear();
-    delMock.mockClear();
-}
-
-/** The most recent body passed to a jest.fn mocking a `(path, body)` verb. */
-function lastBody(mock: jest.Mock): Record<string, unknown> {
-    const call = mock.mock.calls[mock.mock.calls.length - 1];
-    return call[1] as Record<string, unknown>;
-}
-
-/** Count api.request calls to a given path (optionally filtered by closed). */
-function countRequest(path: string, closed?: boolean): number {
-    return requestMock.mock.calls.filter((c) => {
-        if (c[1] !== path) {
-            return false;
-        }
-        if (closed === undefined) {
-            return true;
-        }
-        const params = (c[2] as { params?: Record<string, unknown> } | undefined)?.params;
-        return params?.closed === closed;
-    }).length;
+    [
+        requestMock,
+        getMock,
+        postMock,
+        patchMock,
+        putMock,
+        delMock,
+        bulkBacklogOrderMock,
+        bulkMilestoneMock,
+        bulkCreateMock,
+        filtersDataMock,
+        listMilestonesMock,
+        createMilestoneMock,
+        saveMilestoneMock,
+    ].forEach((m) => m.mockClear());
 }
 
 /* ========================================================================== *
- * Initial load
+ * describe('useBacklog') — the full effect contract
  * ========================================================================== */
 
-describe('useBacklog — initial load', () => {
-    it('loads project, subscribes, runs the parallel loads + filters, then clears loading', async () => {
-        const { result } = await renderLoaded();
+describe('useBacklog', () => {
+    /* ---------------------------------------------------------------------- *
+     * Initial load
+     * ---------------------------------------------------------------------- */
+    describe('initial load', () => {
+        it('loads project, subscribes with both handlers, runs the parallel loads + filters, then clears loading', async () => {
+            // Seed the backlog OUT OF ORDER to prove the reducer sorts by backlog_order.
+            userstoriesFixture = [
+                makeUserStory({ id: 2, ref: 2, project: PID, milestone: null, backlog_order: 2 }),
+                makeUserStory({ id: 1, ref: 1, project: PID, milestone: null, backlog_order: 1 }),
+            ];
 
-        // Project loaded and backlog activation surfaced.
-        expect(getMock).toHaveBeenCalledWith(`/projects/${PID}`);
-        expect(result.current.state.project?.id).toBe(PID);
-        expect(result.current.state.isBacklogActivated).toBe(true);
+            const { result } = await renderLoaded();
 
-        // Subscription established with the numeric projectId + both handlers.
-        expect(subscribeMock).toHaveBeenCalledTimes(1);
-        expect(subscribeMock.mock.calls[0][0]).toBe(PID);
-        const handlers = subscribeMock.mock.calls[0][1];
-        expect(typeof handlers.onUserstories).toBe('function');
-        expect(typeof handlers.onMilestones).toBe('function');
+            // Project loaded and backlog activation surfaced.
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}`);
+            expect(result.current.state.project?.id).toBe(PID);
+            expect(result.current.state.isBacklogActivated).toBe(true);
 
-        // Stats computed (round(100*25/100) = 25) and graph placeholder off.
-        expect(result.current.state.stats?.completedPercentage).toBe(25);
-        expect(result.current.state.stats?.showGraphPlaceholder).toBe(false);
+            // Subscription established once with the numeric projectId + both handlers.
+            expect(subscribeMock).toHaveBeenCalledTimes(1);
+            expect(subscribeMock).toHaveBeenCalledWith(
+                PID,
+                expect.objectContaining({
+                    onUserstories: expect.any(Function),
+                    onMilestones: expect.any(Function),
+                }),
+            );
 
-        // Sprints + totals from headers (open 1 + closed 2 = 3).
-        expect(result.current.state.sprints).toHaveLength(1);
-        expect(result.current.state.totalMilestones).toBe(3);
-        expect(result.current.state.totalClosedMilestones).toBe(2);
+            // Parallel loads used the expected shared functions.
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(filtersDataMock).toHaveBeenCalledWith(PID, {});
 
-        // Userstories + pagination totals from headers.
-        expect(result.current.state.userstories).toHaveLength(2);
-        expect(result.current.state.totalUserStories).toBe(2);
-        expect(result.current.state.noSwimlaneUserStories).toBe(false);
+            // Stats computed by the hook (round(100 * 25 / 100) = 25; placeholder off).
+            expect(result.current.state.stats?.completedPercentage).toBe(25);
+            expect(result.current.state.stats?.showGraphPlaceholder).toBe(false);
 
-        // Filters populated and the /userstories query used the `milestone=null`
-        // backlog sentinel with no `page_size` on the normal path.
-        expect(result.current.state.filtersData).not.toBeNull();
-        const usCall = requestMock.mock.calls.find((c) => c[1] === '/userstories');
-        expect(usCall).toBeDefined();
-        const usParams = (usCall as unknown[])[2] as { params: Record<string, unknown> };
-        expect(usParams.params.milestone).toBe('null');
-        expect(usParams.params.project).toBe(PID);
-        expect('page_size' in usParams.params).toBe(false);
-    });
+            // Sprints + totals from the list result (open 1 + closed 2 = 3).
+            expect(result.current.state.sprints).toHaveLength(1);
+            expect(result.current.state.totalMilestones).toBe(3);
+            expect(result.current.state.totalClosedMilestones).toBe(2);
 
-    it('does nothing (no calls, stays loading) when projectId is falsy', async () => {
-        const { result } = renderHook(() => useBacklog(0));
-        // Give any (erroneously scheduled) microtasks a chance to run.
-        await act(async () => {
-            await Promise.resolve();
+            // Userstories sorted ascending by backlog_order, totals from headers.
+            expect(result.current.state.userstories.map((u) => u.id)).toEqual([1, 2]);
+            expect(result.current.state.totalUserStories).toBe(2);
+            expect(result.current.state.noSwimlaneUserStories).toBe(false);
+
+            // Filters populated; the /userstories query used the `milestone=null`
+            // backlog sentinel + `project` and carried NO `page_size` on the normal path.
+            expect(result.current.state.filtersData).not.toBeNull();
+            const usCall = requestMock.mock.calls.find((c) => c[1] === '/userstories');
+            expect(usCall).toBeDefined();
+            const usParams = (usCall as unknown[])[2] as { params: Record<string, unknown> };
+            expect(usParams.params.milestone).toBe('null');
+            expect(usParams.params.project).toBe(PID);
+            expect('page_size' in usParams.params).toBe(false);
         });
-        expect(getMock).not.toHaveBeenCalled();
-        expect(requestMock).not.toHaveBeenCalled();
-        expect(subscribeMock).not.toHaveBeenCalled();
-        expect(result.current.state.loading).toBe(true);
-    });
 
-    it('still clears loading when the project load rejects (no hang)', async () => {
-        getMock.mockImplementation((path: string) => {
-            if (path === `/projects/${PID}`) {
-                return Promise.reject(new Error('boom'));
-            }
-            return Promise.resolve({});
+        it('does nothing (no calls, stays loading) when projectId is falsy', async () => {
+            const { result } = renderHook(() => useBacklog(0));
+            // Let any (erroneously scheduled) microtasks run.
+            await act(async () => {
+                await Promise.resolve();
+            });
+
+            expect(getMock).not.toHaveBeenCalled();
+            expect(subscribeMock).not.toHaveBeenCalled();
+            expect(result.current.state.loading).toBe(true);
         });
-        const { result } = renderHook(() => useBacklog(PID));
-        await waitFor(() => expect(result.current.state.loading).toBe(false));
-        expect(result.current.state.project).toBeNull();
-    });
 
-    it('unsubscribes on unmount', async () => {
-        const { unmount } = await renderLoaded();
-        expect(unsubscribeSpy).not.toHaveBeenCalled();
-        unmount();
-        expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
-    });
-});
+        it('still clears loading when the project load rejects (no hang)', async () => {
+            getMock.mockImplementation((path: string) => {
+                if (path === `/projects/${PID}`) {
+                    return Promise.reject(new Error('boom'));
+                }
+                return Promise.resolve(statsFixture);
+            });
 
-/* ========================================================================== *
- * computeStats / findCurrentSprint
- * ========================================================================== */
+            const { result } = renderHook(() => useBacklog(PID));
+            await waitFor(() => expect(result.current.state.loading).toBe(false));
 
-describe('useBacklog — derived helpers', () => {
-    it('computeStats yields 0% + graph placeholder when there is no points basis', async () => {
-        statsFixture = { closed_points: 10 };
-        const { result } = await renderLoaded();
-        expect(result.current.state.stats?.completedPercentage).toBe(0);
-        expect(result.current.state.stats?.showGraphPlaceholder).toBe(true);
-        expect(result.current.state.stats?.speed).toBe(0);
-    });
-
-    it('findCurrentSprint selects the OPEN sprint whose date range contains now', async () => {
-        openSprintsFixture = [
-            makeMilestone({ id: 1, estimated_start: '2000-01-01', estimated_finish: '2000-02-01' }),
-            makeMilestone({ id: 2, estimated_start: '2000-01-01', estimated_finish: '2999-12-31' }),
-        ];
-        const { result } = await renderLoaded();
-        expect(result.current.state.currentSprint?.id).toBe(2);
-    });
-
-    it('findCurrentSprint returns null when no open sprint contains now', async () => {
-        openSprintsFixture = [
-            makeMilestone({ id: 1, estimated_start: '2000-01-01', estimated_finish: '2000-02-01' }),
-        ];
-        const { result } = await renderLoaded();
-        expect(result.current.state.currentSprint).toBeNull();
-    });
-});
-
-/* ========================================================================== *
- * Pagination
- * ========================================================================== */
-
-describe('useBacklog — pagination headers', () => {
-    it('advances the page and enables pagination when x-pagination-next is present', async () => {
-        usHeaders = {
-            'x-pagination-next': 'http://next',
-            'Taiga-Info-Backlog-Total-Userstories': '7',
-            'Taiga-Info-Userstories-Without-Swimlane': '3',
-        };
-        const { result } = await renderLoaded();
-        // page advanced 1 -> 2, pagination enabled, totals + no-swimlane flag set.
-        expect(result.current.state.page).toBe(2);
-        expect(result.current.state.disablePagination).toBe(false);
-        expect(result.current.state.totalUserStories).toBe(7);
-        expect(result.current.state.noSwimlaneUserStories).toBe(true);
-    });
-
-    it('disables pagination and keeps the page when there is no next page', async () => {
-        const { result } = await renderLoaded();
-        expect(result.current.state.page).toBe(1);
-        expect(result.current.state.disablePagination).toBe(true);
-    });
-});
-
-/* ========================================================================== *
- * moveUs — the critical drag thunk
- * ========================================================================== */
-
-describe('useBacklog — moveUs (pending-drag queue + wire format)', () => {
-    it('optimistically moves, posts the ARRAY-OF-IDS wire format, and reconciles', async () => {
-        // Reconcile result: server places the story into sprint 10 @ order 5.
-        bulkBacklogResult = [{ id: 1, milestone: 10, backlog_order: 5 }];
-        // Events CONNECTED so the post-drag fallback reload does NOT fire and
-        // overwrite the reconciled story with the (empty) sprint fixture — this
-        // test isolates the reconcile dispatch itself.
-        getEventsUrlMock.mockReturnValue('ws://events');
-        const { result } = await renderLoaded();
-        clearApiCalls();
-
-        const us = result.current.state.userstories[0];
-        await act(async () => {
-            result.current.actions.moveUs([us], 0, 10, null, 7);
+            // The project was never stored (the load short-circuited into the catch).
+            expect(result.current.state.project).toBeNull();
         });
-        await waitFor(() =>
-            expect(postMock).toHaveBeenCalledWith(
-                '/userstories/bulk_update_backlog_order',
-                expect.anything(),
-            ),
-        );
 
-        // WIRE FORMAT: bulk_userstories is an ARRAY OF US ID NUMBERS.
-        const body = lastBody(postMock);
-        expect(body.bulk_userstories).toEqual([us.id]);
-        (body.bulk_userstories as unknown[]).forEach((v) => expect(typeof v).toBe('number'));
-        // currentSprintId (10 != null) => milestone_id present; before anchor = nextUs (7).
-        expect(body.milestone_id).toBe(10);
-        expect(body.before_userstory_id).toBe(7);
+        it('unsubscribes on unmount (no listener leak)', async () => {
+            const { unmount } = await renderLoaded();
 
-        // Reconciliation applied the server row onto the moved story. The
-        // reconcile dispatch flushes AFTER the post resolves, so poll for it.
-        await waitFor(() => {
-            const reconciled =
-                result.current.state.sprints
-                    .flatMap((s) => s.user_stories)
-                    .find((u) => u.id === 1) ??
-                result.current.state.userstories.find((u) => u.id === 1);
-            expect(reconciled?.milestone).toBe(10);
-            expect(reconciled?.backlog_order).toBe(5);
+            expect(subscribeMock).toHaveBeenCalledTimes(1);
+            expect(unsubscribeSpy).not.toHaveBeenCalled();
+
+            unmount();
+
+            expect(unsubscribeSpy).toHaveBeenCalledTimes(1);
         });
     });
 
-    it('serialises concurrent drags through the queue (one in flight at a time)', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * Derived helpers exercised through the load (computeStats / findCurrentSprint)
+     * ---------------------------------------------------------------------- */
+    describe('derived load helpers', () => {
+        it('computeStats yields 0% + graph placeholder when there is no points basis', async () => {
+            // No total_points / total_milestones → basis 0 → 0%; placeholder on.
+            statsFixture = { closed_points: 10 };
 
-        const [a, b] = result.current.state.userstories;
-        await act(async () => {
-            // Two synchronous drags: the 2nd must WAIT behind the 1st.
-            result.current.actions.moveUs([a], 0, null, null, null);
-            result.current.actions.moveUs([b], 1, null, null, null);
+            const { result } = await renderLoaded();
+
+            expect(result.current.state.stats?.completedPercentage).toBe(0);
+            expect(result.current.state.stats?.showGraphPlaceholder).toBe(true);
         });
 
-        // Both drags eventually hit the endpoint exactly once each.
-        await waitFor(() =>
-            expect(
-                postMock.mock.calls.filter(
-                    (c) => c[0] === '/userstories/bulk_update_backlog_order',
-                ),
-            ).toHaveLength(2),
-        );
-    });
+        it('findCurrentSprint selects the OPEN sprint whose date range contains now', async () => {
+            const day = 86400000;
+            const fmt = (d: Date): string => d.toISOString().slice(0, 10); // YYYY-MM-DD
+            const now = Date.now();
+            openSprintsFixture = [
+                makeMilestone({
+                    id: 10,
+                    estimated_start: fmt(new Date(now - 5 * day)),
+                    estimated_finish: fmt(new Date(now + 5 * day)),
+                }),
+            ];
 
-    it('hard-refreshes (sprints/closed/stats) after the queue drains when events are disconnected', async () => {
-        getEventsUrlMock.mockReturnValue(null); // disconnected
-        const { result } = await renderLoaded();
-        clearApiCalls();
+            const { result } = await renderLoaded();
 
-        const us = result.current.state.userstories[0];
-        await act(async () => {
-            result.current.actions.moveUs([us], 0, null, null, null);
+            expect(result.current.state.currentSprint?.id).toBe(10);
         });
 
-        // Fallback reload: open sprints + closed sprints + stats.
-        await waitFor(() => expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1));
-        expect(countRequest('/milestones', true)).toBeGreaterThanOrEqual(1);
-        expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
-    });
+        it('findCurrentSprint returns null when no open sprint contains now', async () => {
+            const day = 86400000;
+            const fmt = (d: Date): string => d.toISOString().slice(0, 10);
+            const now = Date.now();
+            openSprintsFixture = [
+                makeMilestone({
+                    id: 10,
+                    estimated_start: fmt(new Date(now - 30 * day)),
+                    estimated_finish: fmt(new Date(now - 20 * day)),
+                }),
+            ];
 
-    it('does NOT hard-refresh after a drag when events are connected', async () => {
-        getEventsUrlMock.mockReturnValue('ws://events'); // connected
-        const { result } = await renderLoaded();
-        clearApiCalls();
+            const { result } = await renderLoaded();
 
-        const us = result.current.state.userstories[0];
-        await act(async () => {
-            result.current.actions.moveUs([us], 0, null, null, null);
+            expect(result.current.state.currentSprint).toBeNull();
         });
-        await waitFor(() =>
-            expect(postMock).toHaveBeenCalledWith(
-                '/userstories/bulk_update_backlog_order',
-                expect.anything(),
-            ),
-        );
-
-        // No fallback sprint/stat reloads occurred.
-        expect(countRequest('/milestones')).toBe(0);
-        expect(getMock).not.toHaveBeenCalledWith(`/projects/${PID}/stats`);
     });
 
-    it('moveUsToTopOfBacklog anchors before the first backlog story', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * moveUs thunk — WIRE FORMAT (the critical lock)
+     * ---------------------------------------------------------------------- */
+    describe('moveUs thunk — wire format', () => {
+        it('reorders within the backlog and posts the ARRAY-OF-IDS wire format (currentSprintId null)', async () => {
+            const us10 = makeUserStory({ id: 10, ref: 10, project: PID, milestone: null, backlog_order: 1 });
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            const us30 = makeUserStory({ id: 30, ref: 30, project: PID, milestone: null, backlog_order: 3 });
+            userstoriesFixture = [us10, us20, us30];
+            bulkBacklogOrderMock.mockResolvedValue([{ id: 20, milestone: null, backlog_order: 15 }]);
 
-        const firstId = result.current.state.userstories[0].id;
-        const mover = makeUserStory({ id: 999, milestone: null });
-        await act(async () => {
-            result.current.actions.moveUsToTopOfBacklog([mover]);
-        });
-        await waitFor(() =>
-            expect(postMock).toHaveBeenCalledWith(
-                '/userstories/bulk_update_backlog_order',
-                expect.anything(),
-            ),
-        );
+            const { result } = await renderLoaded();
+            clearApiCalls();
 
-        const body = lastBody(postMock);
-        expect(body.bulk_userstories).toEqual([999]);
-        // previousUs null, nextUs = firstId -> before_userstory_id anchor.
-        expect(body.before_userstory_id).toBe(firstId);
-    });
-});
+            await act(async () => {
+                result.current.actions.moveUs([us20], 1, null, 10, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
 
-/* ========================================================================== *
- * moveToSprint / bulkCreateUs / sprint CRUD
- * ========================================================================== */
+            // Reorder within the backlog: newSprintId null === oldSprintId null →
+            // currentSprintId === null; 5th arg is the NUMBER array [20].
+            expect(bulkBacklogOrderMock).toHaveBeenCalledWith(PID, null, 10, null, [20]);
 
-describe('useBacklog — sprint + bulk actions', () => {
-    it('moveToSprint removes from the backlog and posts { us_id, order }[]', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
-
-        const us = result.current.state.userstories[0];
-        const before = result.current.state.userstories.length;
-        await act(async () => {
-            await result.current.actions.moveToSprint([us], 55);
+            const lastCall = bulkBacklogOrderMock.mock.calls[bulkBacklogOrderMock.mock.calls.length - 1];
+            expect(Array.isArray(lastCall[4])).toBe(true);
+            expect(typeof lastCall[4][0]).toBe('number');
+            expect(lastCall[4]).toEqual([20]);
         });
 
-        // Optimistic removal from the backlog list.
-        expect(result.current.state.userstories.length).toBe(before - 1);
-        // Wire format: bulk_stories is an array of { us_id, order } objects.
-        expect(postMock).toHaveBeenCalledWith(
-            '/userstories/bulk_update_milestone',
-            expect.objectContaining({ project_id: PID, milestone_id: 55 }),
-        );
-        const body = lastBody(postMock);
-        expect(body.bulk_stories).toEqual([{ us_id: us.id, order: us.sprint_order ?? 0 }]);
-        // Sprints + stats reloaded afterwards.
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-        expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
-    });
+        it('backlog → sprint sets currentSprintId to the destination sprint id', async () => {
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us20];
 
-    it('bulkCreateUs inserts the created stories and refreshes stats', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+            const { result } = await renderLoaded();
+            clearApiCalls();
 
-        const created = [makeUserStory({ id: 501 }), makeUserStory({ id: 502 })];
-        await act(async () => {
-            result.current.actions.bulkCreateUs(created, 'top');
+            // Destination sprint id 10 (the open sprint), distinct from PID, so the
+            // 2nd argument unambiguously proves currentSprintId = newSprintId.
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, 10, null, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            const call = bulkBacklogOrderMock.mock.calls[0];
+            expect(call[0]).toBe(PID); // project = usList[0].project
+            expect(call[1]).toBe(10); // currentSprintId = newSprintId (10 !== null)
+            expect(call[4]).toEqual([20]);
         });
-        // Inserted at the top and flagged new.
-        expect(result.current.state.userstories[0].id).toBe(501);
-        expect(result.current.state.newUs).toEqual(expect.arrayContaining([501, 502]));
-        await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
+
+        it('sprint → backlog sends currentSprintId null via the !== rule (NOT ?? oldSprintId)', async () => {
+            // A story living in sprint 5, dragged to the backlog (newSprintId null).
+            const us40 = makeUserStory({ id: 40, ref: 40, project: PID, milestone: 5 });
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                result.current.actions.moveUs([us40], 0, null, null, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            const call = bulkBacklogOrderMock.mock.calls[0];
+            // null !== 5 → currentSprintId = null. A `payload.sprint ?? oldSprintId`
+            // would have WRONGLY sent 5; this proves the `!==` rule.
+            expect(call[1]).toBeNull();
+            expect(call[0]).toBe(PID);
+            expect(call[4]).toEqual([40]);
+        });
+
+        it('moveUsToTopOfBacklog anchors the move before the first backlog story', async () => {
+            const first = makeUserStory({ id: 10, ref: 10, project: PID, milestone: null, backlog_order: 1 });
+            const mover = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [first, mover];
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                result.current.actions.moveUsToTopOfBacklog(mover);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            // moveUsToTopOfBacklog → moveUs([mover], 0, null, null, nextUs=first.id).
+            const call = bulkBacklogOrderMock.mock.calls[0];
+            expect(call[0]).toBe(PID);
+            expect(call[1]).toBeNull(); // currentSprintId (backlog reorder)
+            expect(call[2]).toBeNull(); // previousUs
+            expect(call[3]).toBe(10); // nextUs = first backlog story id
+            expect(call[4]).toEqual([20]);
+        });
     });
 
-    it('createSprint posts /milestones then reloads open sprints', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * reconcileMoveResult after the server resolves
+     * ---------------------------------------------------------------------- */
+    describe('reconcileMoveResult after server resolve', () => {
+        it('applies the server-returned backlog_order to the moved story', async () => {
+            const us10 = makeUserStory({ id: 10, ref: 10, project: PID, milestone: null, backlog_order: 1 });
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            const us30 = makeUserStory({ id: 30, ref: 30, project: PID, milestone: null, backlog_order: 3 });
+            userstoriesFixture = [us10, us20, us30];
+            bulkBacklogOrderMock.mockResolvedValue([{ id: 20, milestone: null, backlog_order: 99 }]);
 
-        await act(async () => {
-            await result.current.actions.createSprint({
-                project: PID,
-                name: 'S2',
-                estimated_start: '2021-02-01',
-                estimated_finish: '2021-02-15',
+            const { result } = await renderLoaded();
+
+            await act(async () => {
+                result.current.actions.moveUs([us20], 1, null, 10, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            await waitFor(() => {
+                const found = result.current.state.userstories.find((u) => u.id === 20);
+                expect(found?.backlog_order).toBe(99);
             });
         });
-        expect(postMock).toHaveBeenCalledWith(
-            '/milestones',
-            expect.objectContaining({ name: 'S2' }),
-        );
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
     });
 
-    it('saveSprint patches /milestones/{id} then reloads open + closed sprints', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * pending-drag single-in-flight queue (shift + recurse)
+     * ---------------------------------------------------------------------- */
+    describe('pending-drag single-in-flight queue', () => {
+        it('serialises concurrent drags: one request in flight, the next fires when the first resolves', async () => {
+            const us10 = makeUserStory({ id: 10, ref: 10, project: PID, milestone: null, backlog_order: 1 });
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us10, us20];
 
-        await act(async () => {
-            await result.current.actions.saveSprint({ id: 10, name: 'Renamed' });
+            const d1 = deferred<MoveRow[]>();
+            const d2 = deferred<MoveRow[]>();
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            // First call → d1 (pending), second call → d2 (pending), rest → [].
+            bulkBacklogOrderMock.mockReset();
+            bulkBacklogOrderMock.mockResolvedValue([] as MoveRow[]);
+            bulkBacklogOrderMock.mockReturnValueOnce(d1.promise);
+            bulkBacklogOrderMock.mockReturnValueOnce(d2.promise);
+
+            // Fire two drags before resolving anything.
+            act(() => {
+                result.current.actions.moveUs([us10], 0, null, null, null);
+                result.current.actions.moveUs([us20], 1, null, 10, null);
+            });
+
+            // Only the FIRST is in flight; the second is queued (single-in-flight gate).
+            expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1);
+
+            // Resolve the first → the queue shifts and the second fires (recurse).
+            await act(async () => {
+                d1.resolve([]);
+                await d1.promise;
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(2));
+
+            // Drain the queue.
+            await act(async () => {
+                d2.resolve([]);
+                await d2.promise;
+            });
+            expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(2);
         });
-        expect(patchMock).toHaveBeenCalledWith(
-            '/milestones/10',
-            expect.objectContaining({ name: 'Renamed' }),
-        );
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/milestones', true)).toBeGreaterThanOrEqual(1);
     });
 
-    it('removeSprint deletes via the low-level client then reloads everything', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * moveToSprint — CONTRASTING { us_id, order }[] wire shape
+     * ---------------------------------------------------------------------- */
+    describe('moveToSprint uses bulkUpdateMilestone with { us_id, order }[]', () => {
+        it('removes the stories from the backlog and posts the object-array shape', async () => {
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, sprint_order: 3 });
+            userstoriesFixture = [us20];
 
-        await act(async () => {
-            await result.current.actions.removeSprint(10);
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                await result.current.actions.moveToSprint([us20], 10);
+            });
+
+            expect(bulkMilestoneMock).toHaveBeenCalledTimes(1);
+            // (projectId, milestoneId, [{ us_id, order }]) — NOT the backlog-order number[].
+            expect(bulkMilestoneMock).toHaveBeenCalledWith(PID, 10, [{ us_id: 20, order: 3 }]);
+
+            const arg = bulkMilestoneMock.mock.calls[0][2];
+            expect(Array.isArray(arg)).toBe(true);
+            expect(arg[0]).toHaveProperty('us_id');
+            expect(arg[0]).toHaveProperty('order');
+
+            // The story was optimistically removed from the backlog list.
+            expect(result.current.state.userstories.some((u) => u.id === 20)).toBe(false);
         });
-        expect(delMock).toHaveBeenCalledWith('/milestones/10');
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/milestones', true)).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/userstories')).toBeGreaterThanOrEqual(1);
-        expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
-    });
-});
-
-/* ========================================================================== *
- * Filters / toggles / passthroughs / optimistic
- * ========================================================================== */
-
-describe('useBacklog — filters, toggles, passthroughs', () => {
-    it('setFilters stores the filters, flags active, and reloads stories + facets', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
-
-        await act(async () => {
-            result.current.actions.setFilters({ status: '3' });
-        });
-        expect(result.current.state.selectedFilters).toEqual({ status: '3' });
-        expect(result.current.state.activeFilters).toBe(true);
-        await waitFor(() => expect(countRequest('/userstories')).toBeGreaterThanOrEqual(1));
-        // The active filter flows through into the /userstories query params.
-        const usCall = requestMock.mock.calls.find((c) => c[1] === '/userstories');
-        const params = (usCall as unknown[])[2] as { params: Record<string, unknown> };
-        expect(params.params.status).toBe('3');
-        expect(getMock).toHaveBeenCalledWith('/userstories/filters_data', expect.anything());
     });
 
-    it('toggleTags flips the tag visibility flag', async () => {
-        const { result } = await renderLoaded();
-        expect(result.current.state.showTags).toBe(true);
-        await act(async () => {
-            result.current.actions.toggleTags(false);
+    /* ---------------------------------------------------------------------- *
+     * sprint CRUD + bulk-create + filters/toggles/passthroughs
+     * ---------------------------------------------------------------------- */
+    describe('sprint CRUD & filters actions', () => {
+        it('createSprint calls createMilestone then reloads open sprints', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            const payload = {
+                project: PID,
+                name: 'New Sprint',
+                estimated_start: '2021-02-01',
+                estimated_finish: '2021-02-14',
+            };
+            await act(async () => {
+                await result.current.actions.createSprint(payload);
+            });
+
+            expect(createMilestoneMock).toHaveBeenCalledWith(payload);
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
         });
-        expect(result.current.state.showTags).toBe(false);
+
+        it('saveSprint calls saveMilestone then reloads open + closed sprints', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            const payload = {
+                id: 10,
+                name: 'Renamed Sprint',
+                estimated_start: '2021-03-01',
+                estimated_finish: '2021-03-14',
+            };
+            await act(async () => {
+                await result.current.actions.saveSprint(payload);
+            });
+
+            expect(saveMilestoneMock).toHaveBeenCalledWith(payload);
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
+        });
+
+        it('removeSprint deletes via the low-level api.del then reloads everything', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                await result.current.actions.removeSprint(10);
+            });
+
+            expect(delMock).toHaveBeenCalledWith('/milestones/10');
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
+            expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+        });
+
+        it('bulkCreateUs optimistically inserts the created stories and refreshes stats (authored form — no bulkCreate call)', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            const created = [makeUserStory({ id: 555, ref: 555, project: PID, milestone: null })];
+            act(() => {
+                result.current.actions.bulkCreateUs(created, 'top');
+            });
+
+            // Inserted optimistically...
+            expect(result.current.state.userstories.some((u) => u.id === 555)).toBe(true);
+            // ...and stats reloaded.
+            await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
+            // RECONCILE: the authored hook does NOT call the bulkCreate API here
+            // (the BulkCreateUsLightbox owns that call).
+            expect(bulkCreateMock).not.toHaveBeenCalled();
+        });
+
+        it('setFilters stores the filters, flags active, and reloads stories + facets', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            act(() => {
+                result.current.actions.setFilters({ status: '1' });
+            });
+
+            expect(result.current.state.selectedFilters).toEqual({ status: '1' });
+            expect(result.current.state.activeFilters).toBe(true);
+
+            await waitFor(() =>
+                expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything()),
+            );
+            // Facets reload forwards the just-applied filters (synchronous stateRef sync).
+            expect(filtersDataMock).toHaveBeenCalledWith(PID, { status: '1' });
+        });
+
+        it('toggleTags flips the tag-visibility flag', async () => {
+            const { result } = await renderLoaded();
+
+            expect(result.current.state.showTags).toBe(true); // initial default
+            act(() => {
+                result.current.actions.toggleTags();
+            });
+            expect(result.current.state.showTags).toBe(false);
+
+            act(() => {
+                result.current.actions.toggleTags(true);
+            });
+            expect(result.current.state.showTags).toBe(true);
+        });
+
+        it('toggleVelocity enables the forecast and lazy-loads closed sprints once', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            expect(result.current.state.displayVelocity).toBe(false);
+            expect(result.current.state.closedSprints).toHaveLength(0);
+
+            act(() => {
+                result.current.actions.toggleVelocity(true);
+            });
+
+            expect(result.current.state.displayVelocity).toBe(true);
+            await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true }));
+        });
+
+        it('reload passthroughs each hit their endpoint', async () => {
+            const { result } = await renderLoaded();
+
+            clearApiCalls();
+            act(() => {
+                result.current.actions.reloadUserstories();
+            });
+            await waitFor(() =>
+                expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything()),
+            );
+
+            clearApiCalls();
+            act(() => {
+                result.current.actions.reloadSprints();
+            });
+            await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false }));
+
+            clearApiCalls();
+            act(() => {
+                result.current.actions.reloadClosedSprints();
+            });
+            await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true }));
+
+            clearApiCalls();
+            act(() => {
+                result.current.actions.reloadStats();
+            });
+            await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
+        });
+
+        it('addUsOptimistic / removeUsOptimistic mutate the backlog list', async () => {
+            const { result } = await renderLoaded();
+
+            const created = makeUserStory({ id: 777, ref: 777, project: PID, milestone: null });
+            act(() => {
+                result.current.actions.addUsOptimistic([created], 'bottom');
+            });
+            expect(result.current.state.userstories.some((u) => u.id === 777)).toBe(true);
+
+            act(() => {
+                result.current.actions.removeUsOptimistic(777);
+            });
+            expect(result.current.state.userstories.some((u) => u.id === 777)).toBe(false);
+        });
     });
 
-    it('toggleVelocity enables velocity and lazy-loads closed sprints once', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * WebSocket handlers + actions stability
+     * ---------------------------------------------------------------------- */
+    describe('websocket handlers + stability', () => {
+        it('onUserstories reloads the paginated stories + open sprints', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
 
-        await act(async () => {
-            result.current.actions.toggleVelocity(true);
-        });
-        expect(result.current.state.displayVelocity).toBe(true);
-        // Closed sprints lazy-loaded because none were present.
-        await waitFor(() => expect(countRequest('/milestones', true)).toBe(1));
+            const handlers = subscribeMock.mock.calls[0][1];
+            await act(async () => {
+                handlers.onUserstories({});
+                await Promise.resolve();
+            });
 
-        // Toggling again with closed sprints already present does NOT reload them.
-        clearApiCalls();
-        await act(async () => {
-            result.current.actions.toggleVelocity(false);
+            await waitFor(() =>
+                expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything()),
+            );
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
         });
-        await act(async () => {
-            result.current.actions.toggleVelocity(true);
+
+        it('onMilestones reloads open + closed sprints + stats', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            const handlers = subscribeMock.mock.calls[0][1];
+            await act(async () => {
+                handlers.onMilestones({});
+                await Promise.resolve();
+            });
+
+            await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
         });
-        expect(countRequest('/milestones', true)).toBe(0);
+
+        it('exposes the full action contract and a referentially-stable actions object', async () => {
+            const { result, rerender } = await renderLoaded();
+
+            const actions = result.current.actions;
+            const expected = [
+                'moveUs',
+                'moveUsToTopOfBacklog',
+                'moveToSprint',
+                'bulkCreateUs',
+                'createSprint',
+                'saveSprint',
+                'removeSprint',
+                'setFilters',
+                'toggleTags',
+                'toggleVelocity',
+                'reloadUserstories',
+                'reloadSprints',
+                'reloadClosedSprints',
+                'reloadStats',
+                'addUsOptimistic',
+                'removeUsOptimistic',
+            ];
+            expected.forEach((key) => {
+                expect(typeof (actions as unknown as Record<string, unknown>)[key]).toBe('function');
+            });
+
+            // Stable across re-renders with the same projectId (all memoized).
+            rerender({ id: PID });
+            expect(result.current.actions).toBe(actions);
+        });
     });
 
-    it('reload passthroughs each hit their endpoint', async () => {
-        const { result } = await renderLoaded();
-        clearApiCalls();
+    /* ---------------------------------------------------------------------- *
+     * events-disconnected fallback reload after the queue drains
+     * ---------------------------------------------------------------------- */
+    describe('events-disconnected reload', () => {
+        it('hard-refreshes sprints/closed/stats after the queue drains when events are disconnected', async () => {
+            getEventsUrlMock.mockReturnValue(null); // eventsConnected() → false
 
-        await act(async () => {
-            result.current.actions.reloadUserstories();
-            result.current.actions.reloadSprints();
-            result.current.actions.reloadClosedSprints();
-            result.current.actions.reloadStats();
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us20];
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, null, null, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            // Queue drained + events NOT connected → fallback reload fires.
+            await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false }));
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
         });
-        await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
-        expect(countRequest('/userstories')).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/milestones', true)).toBeGreaterThanOrEqual(1);
-    });
 
-    it('addUsOptimistic / removeUsOptimistic mutate the backlog list', async () => {
-        const { result } = await renderLoaded();
-        const startLen = result.current.state.userstories.length;
+        it('does NOT hard-refresh after a drag when events are connected', async () => {
+            getEventsUrlMock.mockReturnValue('ws://localhost:9000/events'); // connected
 
-        await act(async () => {
-            result.current.actions.addUsOptimistic([makeUserStory({ id: 777 })], 'bottom');
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us20];
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, null, null, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+            await act(async () => {
+                await Promise.resolve();
+            });
+
+            // No fallback reload while events keep the board fresh.
+            expect(listMilestonesMock).not.toHaveBeenCalled();
+            expect(getMock).not.toHaveBeenCalled();
         });
-        expect(result.current.state.userstories.some((u) => u.id === 777)).toBe(true);
-        expect(result.current.state.userstories.length).toBe(startLen + 1);
-
-        await act(async () => {
-            result.current.actions.removeUsOptimistic(777);
-        });
-        expect(result.current.state.userstories.some((u) => u.id === 777)).toBe(false);
-        expect(result.current.state.userstories.length).toBe(startLen);
-    });
-});
-
-/* ========================================================================== *
- * WebSocket handlers + actions stability
- * ========================================================================== */
-
-describe('useBacklog — websocket handlers + stability', () => {
-    it('onUserstories reloads the paginated stories + open sprints', async () => {
-        await renderLoaded();
-        clearApiCalls();
-
-        const handlers = subscribeMock.mock.calls[0][1];
-        await act(async () => {
-            handlers.onUserstories();
-        });
-        await waitFor(() => expect(countRequest('/userstories')).toBeGreaterThanOrEqual(1));
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-    });
-
-    it('onMilestones reloads open + closed sprints + stats', async () => {
-        await renderLoaded();
-        clearApiCalls();
-
-        const handlers = subscribeMock.mock.calls[0][1];
-        await act(async () => {
-            handlers.onMilestones();
-        });
-        await waitFor(() => expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`));
-        expect(countRequest('/milestones', false)).toBeGreaterThanOrEqual(1);
-        expect(countRequest('/milestones', true)).toBeGreaterThanOrEqual(1);
-    });
-
-    it('exposes the full action contract and a referentially-stable actions object', async () => {
-        const { result, rerender } = await renderLoaded();
-
-        const before = result.current.actions;
-        for (const name of [
-            'moveUs',
-            'moveUsToTopOfBacklog',
-            'moveToSprint',
-            'bulkCreateUs',
-            'createSprint',
-            'saveSprint',
-            'removeSprint',
-            'setFilters',
-            'toggleTags',
-            'toggleVelocity',
-            'reloadUserstories',
-            'reloadSprints',
-            'reloadClosedSprints',
-            'reloadStats',
-            'addUsOptimistic',
-            'removeUsOptimistic',
-        ] as const) {
-            expect(typeof (before as Record<string, unknown>)[name]).toBe('function');
-        }
-
-        rerender({ id: PID });
-        // Memoised: the same object identity survives a re-render.
-        expect(result.current.actions).toBe(before);
     });
 });
