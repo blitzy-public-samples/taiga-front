@@ -363,14 +363,15 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
   const showLastSprintName =
     mode === 'create' && !!lastSprint?.name && name.length === 0 && !hasErrors;
 
-  // The label markup contains <strong>, so it is rendered with
-  // dangerouslySetInnerHTML. Built from LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME
-  // by substituting {{lastSprint}} → lastSprint.name.
-  const lastSprintLabelHtml =
-    mode === 'create' && lastSprint?.name
-      ? // i18n: LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME = 'last sprint is <strong> {{lastSprint}} ;-) </strong>'
-        `last sprint is <strong> ${lastSprint.name} ;-) </strong>`
-      : '';
+  // The last-sprint hint label ("last sprint is <strong> {{lastSprint}} ;-)
+  // </strong>", i18n key LIGHTBOX.ADD_EDIT_SPRINT.LAST_SPRINT_NAME) is rendered
+  // further down as JSX CHILDREN rather than through `dangerouslySetInnerHTML`.
+  // The only dynamic segment — the sprint name — is emitted as a JSX expression
+  // so React auto-escapes it. This reproduces the AngularJS
+  // `.useSanitizeValueStrategy('escapeParameters')` behaviour (app.coffee:803),
+  // which escaped the `{{lastSprint}}` translation parameter, and keeps a
+  // sprint named e.g. `<img src=x onerror=...>` INERT (no live DOM, no handler
+  // execution). See the `.last-sprint-name` label in the JSX below.
 
   return (
     <div className={`lightbox lightbox-sprint-add-edit${open ? ' open' : ''}`}>
@@ -427,14 +428,23 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
               </ul>
             )}
             {/*
-              `.last-sprint-name` label (create mode). Contains <strong> markup →
-              rendered with dangerouslySetInnerHTML; the `disappear` class toggles
-              exactly as the directive's keyup handler did.
+              `.last-sprint-name` label (create mode). Contains <strong> markup,
+              so the static text and the <strong> wrapper are written as JSX and
+              the sprint name is emitted as a JSX EXPRESSION (`{lastSprint.name}`)
+              — React auto-escapes it, so an attacker-controlled name cannot
+              inject live DOM (security parity with the AngularJS
+              `escapeParameters` strategy). The rendered DOM is byte-identical to
+              the previous `dangerouslySetInnerHTML` output for a benign name
+              (`last sprint is <strong> {name} ;-) </strong>`), and the
+              `disappear` class toggles exactly as the directive's keyup handler
+              did. Content is present only in create mode with a last sprint,
+              matching the previous conditional HTML string.
             */}
-            <label
-              className={`last-sprint-name${showLastSprintName ? '' : ' disappear'}`}
-              dangerouslySetInnerHTML={{ __html: lastSprintLabelHtml }}
-            />
+            <label className={`last-sprint-name${showLastSprintName ? '' : ' disappear'}`}>
+              {mode === 'create' && lastSprint?.name ? (
+                <>last sprint is <strong> {lastSprint.name} ;-) </strong></>
+              ) : null}
+            </label>
           </fieldset>
 
           <fieldset className="dates">

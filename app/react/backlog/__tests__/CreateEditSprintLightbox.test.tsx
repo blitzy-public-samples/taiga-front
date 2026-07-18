@@ -518,4 +518,68 @@ describe('CreateEditSprintLightbox', () => {
       expect(get(container, CLOSE)).toBeInTheDocument();
     });
   });
+
+  /*
+   * SECURITY REGRESSION GUARD (QA Issue #2 — stored XSS via the last-sprint hint).
+   *
+   * The create-mode `.last-sprint-name` hint interpolates the PREVIOUS sprint's
+   * (attacker-controllable) name. The AngularJS original escaped that
+   * translation parameter via `.useSanitizeValueStrategy('escapeParameters')`
+   * (app.coffee:803), so a sprint named `<img src=x onerror=...>` rendered
+   * INERT. The React port MUST preserve that behaviour by emitting the name as
+   * a JSX expression (React auto-escapes) rather than via
+   * `dangerouslySetInnerHTML`. These specs lock that in: with the unsafe
+   * `dangerouslySetInnerHTML` sink the malicious markup parses into a LIVE
+   * `<img>` node (jsdom builds it from innerHTML) and this test fails; with the
+   * escaped JSX-child rendering the payload is inert text and it passes.
+   */
+  describe('last sprint label — XSS safety (security parity)', () => {
+    /**
+     * A stored-XSS payload. Escaped, it is inert text; rendered as raw HTML it
+     * becomes a live `<img>` whose `onerror` executes attacker JavaScript.
+     */
+    const XSS_NAME = '<img src=x onerror="window.__xssFired=true">';
+
+    it('escapes a malicious lastSprint.name: no live <img>, no handler execution, payload shown as inert text', () => {
+      // Tripwire the injected `onerror` would flip if the markup became live DOM.
+      (window as unknown as { __xssFired?: boolean }).__xssFired = false;
+
+      const { container } = renderLightbox({
+        mode: 'create',
+        projectId: 7,
+        lastSprint: makeMilestone({ id: 6, name: XSS_NAME }),
+      });
+
+      const label = get(container, '.last-sprint-name');
+
+      // The hint IS present in create mode with a last sprint…
+      expect(label).toBeInTheDocument();
+      // …but the attacker markup is ESCAPED — no live <img> element exists…
+      expect(label.querySelector('img')).toBeNull();
+      // …the injected onerror never ran…
+      expect((window as unknown as { __xssFired?: boolean }).__xssFired).not.toBe(true);
+      // …the raw payload is visible as INERT TEXT (React-escaped)…
+      expect(label.textContent).toContain(XSS_NAME);
+      // …and the static <strong> wrapper is still real markup (structure preserved).
+      const strong = label.querySelector('strong');
+      expect(strong).not.toBeNull();
+      expect(strong?.textContent).toContain(XSS_NAME);
+    });
+
+    it('renders a benign lastSprint.name normally inside <strong> with the surrounding hint text', () => {
+      const { container } = renderLightbox({
+        mode: 'create',
+        projectId: 7,
+        lastSprint: makeMilestone({ id: 6, name: 'Sprint 7' }),
+      });
+
+      const label = get(container, '.last-sprint-name');
+      expect(label).toBeInTheDocument();
+      // No injection for a normal name either, and the emphasised name renders.
+      expect(label.querySelector('img')).toBeNull();
+      expect(label.textContent).toContain('last sprint is');
+      const strong = get(container, '.last-sprint-name strong');
+      expect(strong.textContent).toContain('Sprint 7');
+    });
+  });
 });

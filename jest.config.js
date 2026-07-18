@@ -44,8 +44,31 @@ module.exports = {
 
   // Compile TypeScript / TSX (specs and imported source) with ts-jest, reusing
   // the project's root TypeScript configuration for consistent type settings.
+  //
+  // `isolatedModules: true` makes ts-jest transpile each file INDEPENDENTLY
+  // (the single-file transpile path) instead of driving a shared TypeScript
+  // LanguageService program. This is required for CORRECTNESS, not merely
+  // speed: `tsconfig.json`'s `include: ["app/react/**/*"]` pulls every spec into
+  // one program, and two specs that share a basename but differ only by
+  // extension in the same directory
+  // (`app/react/kanban/__tests__/KanbanDndContext.test.ts` and
+  // `.../KanbanDndContext.test.tsx`) collide in the LanguageService's
+  // emit-output map — both map to `KanbanDndContext.test.js`. That collision
+  // makes `program.emit()` yield no output for one of the files, so ts-jest
+  // throws "Unable to process '...', please make sure that `outDir` in your
+  // tsconfig is neither '' or '.'" on a COLD cache and one suite fails to run
+  // (only a warm cache masked it). Single-file transpile sidesteps the shared
+  // emit map entirely, so `npm test` passes headlessly on a clean/CI cache.
+  // Full type-checking is unaffected: it is enforced separately by
+  // `tsc --noEmit -p tsconfig.json`. (The root `tsconfig.json` already sets
+  // `isolatedModules: true`, so all source already conforms to its single-file
+  // transpile constraints; ts-jest needs the flag in its OWN options to take
+  // that transpile path.)
   transform: {
-    '^.+\\.(ts|tsx)$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.json' }],
+    '^.+\\.(ts|tsx)$': [
+      'ts-jest',
+      { tsconfig: '<rootDir>/tsconfig.json', isolatedModules: true },
+    ],
   },
 
   // Module resolution order — TS/TSX first so React source is preferred, then
