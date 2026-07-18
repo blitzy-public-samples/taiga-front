@@ -79,21 +79,50 @@ To run a local Selenium Server, you will need to have the Java Development Kit (
 
 ## Tests
 
+The migrated Kanban and Backlog screens are React 18; every other screen is still AngularJS. Each stack keeps its own runner, so there is a React test layer and a retained legacy layer for both unit and e2e tests.
+
 #### Unit tests
 
--   To run **unit tests**
-
-    ```
-    npx gulp
-    ```
+-   To run the **React unit tests**
 
     ```
     npm test
     ```
 
+    `npm test` runs [Jest](https://jestjs.io/) against the React specs under
+    `app/react/**/__tests__/**` in a `jsdom` environment. It is browserless and
+    needs no running backend, no Playwright, and no Chrome or network access.
+
+-   To run the **legacy Karma unit tests** for the other (non-migrated) AngularJS screens
+
+    ```
+    npm run ci:test
+    ```
+
+    The 106 legacy Karma specs and the Karma configuration are retained
+    unchanged. You can also build the assets separately with:
+
+    ```
+    npx gulp
+    ```
+
 #### E2E tests
 
--   To run **e2e tests** you need [taiga-back](https://github.com/taigaio/taiga-back) running and
+-   To run the **React e2e tests** with [Playwright](https://playwright.dev/)
+
+    ```
+    npm run e2e
+    ```
+
+    `npm run e2e` runs the Playwright project in `e2e-react/` (configuration
+    `e2e-react/playwright.config.ts`), which captures the migrated Kanban and
+    Backlog React screens. The primary browser is Firefox; Chromium is a
+    fallback, launched with `--no-sandbox --disable-dev-shm-usage`. It requires
+    the full Taiga stack running (`taiga-back` plus the built `taiga-front`
+    served by nginx on host port 9000) and reads the login credential from the
+    `TAIGA_ADMIN_PASSWORD` environment variable, falling back to `admin123`.
+
+-   To run the **legacy Protractor e2e tests** for the remaining screens you need [taiga-back](https://github.com/taigaio/taiga-back) running and
 
     ```
     npx gulp
@@ -107,3 +136,5 @@ To run a local Selenium Server, you will need to have the Java Development Kit (
     protractor conf.e2e.js --suite=auth     # To tests authentication
     protractor conf.e2e.js --suite=full     # To test all the platform authenticated
     ```
+
+    The Protractor harness is retained; only the Kanban and Backlog suites were removed.
