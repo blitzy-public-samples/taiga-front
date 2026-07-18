@@ -98,7 +98,7 @@
     "merge-stream": "^1.0.0",
     "minimist": "^1.1.1",
     "mocha": "^2.2.4",
-    "node-sass": "8.0.0",
+    "sass": "1.77.8",
     "photoswipe": "^4.1.0",
     "pre-commit": "^1.0.5",
     "readable-stream": "~2.1.2",
