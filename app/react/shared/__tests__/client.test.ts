@@ -296,10 +296,11 @@ describe('api.patch — PATCH verb parity', () => {
 });
 
 /* ========================================================================== *
- * Remaining client.ts contract coverage — PUT / DELETE verbs, absolute-URL
- * passthrough, null/undefined query-param skipping, and the non-JSON body
- * fallback. These exercise the SAME in-scope client module and drive its line
- * coverage toward 100% (AAP 0.6.4 — the >= 70% line-coverage mandate).
+ * Remaining client.ts contract coverage — PUT / DELETE verbs, same-origin URL
+ * enforcement (cross-origin rejection), null/undefined query-param skipping, and
+ * the non-JSON body fallback. These exercise the SAME in-scope client module and
+ * drive its line coverage toward 100% (AAP 0.6.4 — the >= 70% line-coverage
+ * mandate).
  * ========================================================================== */
 
 describe('api — remaining verbs and URL / parse edge cases', () => {
@@ -329,15 +330,48 @@ describe('api — remaining verbs and URL / parse edge cases', () => {
         expect(init.headers['X-Session-Id']).toBe('sess-123');
     });
 
-    it('passes an already-absolute http(s) URL through unchanged (no base join)', async () => {
-        // Mirrors the AngularJS URL service `resolveAbsolute` guard: an
-        // absolute http(s) path is used verbatim and the config base is NOT
-        // prepended.
-        await api.get('https://cdn.example.test/attachments/1');
+    /* ---------------------------------------------------------------------- *
+     * Same-origin enforcement (findings #6 CWE-200 + #28 test-correctness).
+     *
+     * The adapter attaches the JWT Bearer token and X-Session-Id to EVERY call,
+     * so it MUST refuse to send them off-origin. These tests assert the SECURE
+     * contract — an off-origin endpoint is rejected and NO request is issued, so
+     * credentials can never leak — replacing the earlier test that wrongly
+     * blessed an absolute off-origin URL being used verbatim (which would have
+     * exfiltrated the token/session to a foreign host).
+     * ---------------------------------------------------------------------- */
+    it('rejects an off-origin absolute endpoint, issues NO request, and never transmits credentials', async () => {
+        // The configured API base is http://localhost:8000/api/v1/ (see
+        // beforeEach); this endpoint is a DIFFERENT origin.
+        await expect(api.get('https://cdn.example.test/attachments/1')).rejects.toThrow(/cross-origin/i);
 
-        const { url } = readFetchCall();
+        // Hard guarantee: fetch was never invoked, so the Bearer token and
+        // X-Session-Id were never transmitted to the foreign origin (CWE-200).
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
 
-        expect(url).toBe('https://cdn.example.test/attachments/1');
+    it('rejects a protocol-relative off-origin endpoint without issuing a request', async () => {
+        // `//host/…` inherits the page protocol and points at a foreign origin;
+        // it must be rejected exactly like an explicit http(s) absolute URL,
+        // regardless of the HTTP verb.
+        await expect(api.post('//evil.example.test/steal', { project_id: 1 })).rejects.toThrow(/cross-origin/i);
+
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('allows an absolute endpoint that is same-origin with the configured API base and still attaches credentials', async () => {
+        // An absolute URL on the SAME origin as the API base is safe and is used
+        // verbatim (the legitimate half of the legacy `resolveAbsolute` guard),
+        // and credentials attach exactly as on a relative path.
+        await api.get('http://localhost:8000/api/v1/attachments/1');
+
+        expect(global.fetch).toHaveBeenCalledTimes(1);
+
+        const { url, init } = readFetchCall();
+
+        expect(url).toBe('http://localhost:8000/api/v1/attachments/1');
+        expect(init.headers['Authorization']).toBe('Bearer jwt-abc');
+        expect(init.headers['X-Session-Id']).toBe('sess-123');
     });
 
     it('skips null and undefined query params while serializing the defined ones', async () => {

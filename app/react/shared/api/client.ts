@@ -115,27 +115,62 @@ export class ApiError extends Error {
  * ========================================================================== */
 
 /**
- * Join an API base URL with an endpoint path exactly as the AngularJS
- * `UrlsService.resolve` does (`app/coffee/modules/base/urls.coffee:34-37`):
- * `format("%s/%s", [_.trimEnd(mainUrl, "/"), _.trimStart(url, "/")])`.
+ * Resolve an endpoint `path` against the configured API `base`, mirroring the
+ * AngularJS `UrlsService.resolve` join (`app/coffee/modules/base/urls.coffee:34-37`)
+ * — `format("%s/%s", [_.trimEnd(mainUrl, "/"), _.trimStart(url, "/")])` — while
+ * ENFORCING that the resulting URL stays on the configured API origin.
  *
- * A single joining `/` is produced with no risk of a double slash: any trailing
- * slash(es) are stripped from `base` and any leading slash(es) from `path`. As
- * a defensive measure (mirroring `resolveAbsolute` at urls.coffee:41-42), an
- * already-absolute `http(s)://` path is returned unchanged.
+ * SECURITY INVARIANT (CWE-200 — off-origin credential exfiltration)
+ *   `request()` attaches the JWT `Authorization: Bearer` token and the
+ *   `X-Session-Id` correlation id to EVERY call. Those credentials must never be
+ *   transmitted to a foreign origin. This function therefore REJECTS — before a
+ *   single header is built or `fetch` is invoked — any endpoint that resolves to
+ *   an origin other than the configured API base's origin. The rejection is a
+ *   thrown `Error` (surfaced as a rejected promise to callers), so no request is
+ *   ever issued and no credential can leak.
  *
- * @example joinUrl('a/b/', '/c') === 'a/b/c'  // trailing + leading slash collapse to one
- * @example joinUrl('a/b',  'c')  === 'a/b/c'  // absent slashes yield exactly one
+ *   This is faithful to the legacy contract, not a behaviour change: the
+ *   AngularJS `UrlsService.resolve` only ever expanded named endpoint templates
+ *   against the API `mainUrl` (urls.coffee:23-37), so an arbitrary off-origin
+ *   endpoint was never a legitimate input, and every React caller
+ *   (`api/userstories.ts`, `api/milestones.ts`) passes a relative `/…` path.
+ *   The AAP's "one same-origin deployable client" directive (§0.6.1) is upheld.
+ *
+ * JOIN SEMANTICS (unchanged for the relative paths every caller actually uses)
+ *   A single joining `/` is produced with no risk of a double slash: any
+ *   trailing slash(es) are stripped from `base` and any leading slash(es) from
+ *   `path`. An absolute (`http(s)://…`) or protocol-relative (`//host/…`)
+ *   endpoint is used verbatim ONLY when it is same-origin with the API base;
+ *   otherwise it is rejected.
+ *
+ * @throws {Error} when `path` resolves to an origin other than the API origin.
+ * @example resolveUrl('a/b/', '/c') === 'a/b/c'  // trailing + leading slash collapse to one
+ * @example resolveUrl('a/b',  'c')  === 'a/b/c'  // absent slashes yield exactly one
  */
-function joinUrl(base: string, path: string): string {
-    if (/^https?:\/\//i.test(path)) {
-        return path;
+function resolveUrl(base: string, path: string): string {
+    // An absolute (`http(s)://…`) or protocol-relative (`//host/…`) endpoint is
+    // used verbatim; a relative path is joined onto the base (single-slash),
+    // exactly as urls.coffee:34-37 does for the relative paths every caller uses.
+    const isAbsolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(path);
+    const candidate = isAbsolute
+        ? path
+        : `${base.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
+
+    // Enforce the same-origin invariant. `window.location.href` resolves a
+    // relative config base (e.g. `/api/v1/`) or a protocol-relative candidate to
+    // a concrete origin so the comparison is always well-defined.
+    const apiOrigin = new URL(base, window.location.href).origin;
+    const resolvedOrigin = new URL(candidate, window.location.href).origin;
+    if (resolvedOrigin !== apiOrigin) {
+        // Report only the origins (never the full URL) so a sensitive query
+        // string can never be echoed into logs or error surfaces.
+        throw new Error(
+            `Refusing to issue a credentialed request to a cross-origin endpoint ` +
+                `(${resolvedOrigin}); the configured API origin is ${apiOrigin}.`,
+        );
     }
 
-    const trimmedBase = base.replace(/\/+$/, '');
-    const trimmedPath = path.replace(/^\/+/, '');
-
-    return `${trimmedBase}/${trimmedPath}`;
+    return candidate;
 }
 
 /**
@@ -213,7 +248,7 @@ function buildHeaders(hasBody: boolean, extra?: Record<string, string>): Record<
  * the parsed body together with the status and raw response headers.
  *
  * Behaviour reproduced from the AngularJS data layer:
- * - The URL is `getApiUrl()` joined with `path` (see {@link joinUrl}) plus any
+ * - The URL is `getApiUrl()` joined with `path` (see {@link resolveUrl}) plus any
  *   serialized query string.
  * - A JSON body is sent for every non-GET verb that supplies one
  *   (`repository.coffee` `create`/`save`).
@@ -233,7 +268,9 @@ async function request<T = unknown>(
     path: string,
     config: RequestConfig = {},
 ): Promise<ApiResponse<T>> {
-    const url = joinUrl(getApiUrl(), path) + buildQueryString(config.params);
+    // `resolveUrl` throws for a cross-origin endpoint BEFORE any header is built
+    // or `fetch` is invoked, so credentials are never transmitted off-origin.
+    const url = resolveUrl(getApiUrl(), path) + buildQueryString(config.params);
 
     const hasBody = config.body !== undefined && config.body !== null && method !== 'GET';
     const headers = buildHeaders(hasBody, config.headers);
@@ -244,8 +281,9 @@ async function request<T = unknown>(
     }
 
     // Intentionally leave `credentials` at the fetch default ('same-origin'):
-    // AngularJS `$http` authenticates with the Bearer token, not cookies, so a
-    // cross-origin call to the API must NOT rely on credentialed requests.
+    // AngularJS `$http` authenticates with the Bearer token, not cookies. Every
+    // request reaching this point is guaranteed same-origin with the API base by
+    // `resolveUrl`, so no cross-origin credentialed request is ever made.
     const response = await fetch(url, init);
 
     // Parse the body gracefully so empty (204) and non-JSON responses are safe.
