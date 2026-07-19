@@ -81,8 +81,24 @@ export const rowPreferringCollisionDetection: CollisionDetection = (args) => {
 
     const rowHits = hits.filter((collision) => isRowId(collision.id));
     if (rowHits.length > 0) {
-        const rowContainers = containersWithoutSelf.filter((container) => isRowId(container.id));
-        const byCenter = closestCenter({ ...args, droppableContainers: rowContainers });
+        // Pick the closest row center — but ONLY among the rows the pointer/rect
+        // actually hit (`rowHits`), never among every registered row. The legacy
+        // `dragula` resolved the drop from the DOM element under the pointer, so a
+        // backlog reorder could only ever land on a backlog row. Computing
+        // `closestCenter` over ALL rows (backlog AND sprint) instead let the
+        // dragged `collisionRect`'s center pull the target onto an unrelated
+        // SPRINT row when the two columns sit close together (e.g. the ~800px
+        // Playwright viewport): a multi-select backlog reorder toward row 0
+        // silently resolved `over` to a sprint story, so the block moved INTO the
+        // sprint (gained a `milestone_id`) instead of to the top of the backlog
+        // ([14] "reorder multiple us"). Restricting the candidate set to the hit
+        // rows preserves precise "closest of the overlapping rows" behavior while
+        // guaranteeing the drop stays in the column the pointer is actually over.
+        const hitRowIds = new Set<string | number>(rowHits.map((collision) => collision.id));
+        const hitRowContainers = containersWithoutSelf.filter(
+            (container) => isRowId(container.id) && hitRowIds.has(container.id),
+        );
+        const byCenter = closestCenter({ ...args, droppableContainers: hitRowContainers });
         return byCenter.length > 0 ? byCenter : rowHits;
     }
 
@@ -95,12 +111,33 @@ export const rowPreferringCollisionDetection: CollisionDetection = (args) => {
  * movement. Only row droppables are considered (containers are excluded) so a
  * single press never jumps past the neighbouring row to the container.
  *
+ * Two mechanics make repeated presses walk one row at a time reliably:
+ *
+ *  1. TOP-LEFT single-axis return. dnd-kit's `KeyboardSensor` derives
+ *     `currentCoordinates` from `{ x: collisionRect.left, y: collisionRect.top }`
+ *     and translates by `delta = newCoordinates - currentCoordinates`. Returning
+ *     the target row's *centre* injected a spurious `+width/2` delta on the
+ *     preserved axis — on the ~774px backlog rows that was a ~+387px HORIZONTAL
+ *     drift for a vertical move, shoving the drag reference into the sprint
+ *     column so the drop resolved onto a sprint row (the story silently gained a
+ *     `milestone_id` and left the backlog). We therefore return the target row's
+ *     top-left and only advance along the pressed axis, preserving the other.
+ *
+ *  2. `over`-based advancement. With a `DragOverlay`, `collisionRect` is
+ *     re-derived from the overlay each press and can pin to its start position,
+ *     so the nearest candidate would stay constant and the item would never move
+ *     past the first adjacent row. Mirroring dnd-kit's own
+ *     `sortableKeyboardCoordinates`, when the closest candidate is the row we are
+ *     already `over`, we step to the next-closest collision — so each press
+ *     advances exactly one further row even when `collisionRect` does not
+ *     accumulate.
+ *
  * Returns `undefined` (dnd-kit keeps the current position) when there is no row
  * in the pressed direction — e.g. pressing Down on the last row.
  */
 export const singleStepKeyboardCoordinates: KeyboardCoordinateGetter = (
     event,
-    { context: { active, collisionRect, droppableRects, droppableContainers } },
+    { context: { active, collisionRect, droppableRects, droppableContainers, over } },
 ) => {
     if (!DIRECTIONS.includes(event.code)) {
         return undefined;
@@ -155,9 +192,22 @@ export const singleStepKeyboardCoordinates: KeyboardCoordinateGetter = (
         droppableContainers: candidates,
         pointerCoordinates: null,
     });
-    const closestId = getFirstCollision(collisions, "id");
+    let closestId = getFirstCollision(collisions, "id");
     if (closestId == null) {
         return undefined;
+    }
+
+    // Advance PAST the row we are already hovering. dnd-kit's `over` tracks the
+    // droppable currently under the drag; when the drag reference does not
+    // accumulate between synchronous key presses (which happens with a
+    // `DragOverlay`, where `collisionRect` is re-derived from the overlay each
+    // press and can pin to its start), the nearest candidate stays constant and
+    // the item would never move more than one row. Mirroring dnd-kit's own
+    // `sortableKeyboardCoordinates`, when the closest candidate is the row we
+    // are already `over`, we step to the next-closest collision so each arrow
+    // press advances exactly one further row toward the pressed direction.
+    if (closestId === over?.id && collisions.length > 1) {
+        closestId = collisions[1].id;
     }
 
     const targetRect = droppableRects.get(closestId);
@@ -165,10 +215,24 @@ export const singleStepKeyboardCoordinates: KeyboardCoordinateGetter = (
         return undefined;
     }
 
-    // Move the drag reference to the centre of the adjacent row so the collision
-    // detection resolves the drop onto that exact row (single-step).
+    // Move the drag reference to the adjacent row using dnd-kit's TOP-LEFT
+    // coordinate convention. The KeyboardSensor derives `currentCoordinates`
+    // from `{ x: collisionRect.left, y: collisionRect.top }` and computes the
+    // translation as `delta = newCoordinates - currentCoordinates`
+    // (see @dnd-kit/core KeyboardSensor.handleKeyDown). Returning the target
+    // row's *centre* here previously injected a spurious delta of +width/2 on
+    // the axis being preserved — on the wide backlog rows (~774px) that was a
+    // ~+387px HORIZONTAL drift for a vertical move, which shoved the drag
+    // reference out of the backlog column and into the sprint column so the
+    // drop resolved onto a sprint row (the story silently gained a
+    // `milestone_id` and left the backlog). To guarantee single-axis movement
+    // with zero drift we preserve the coordinate on the non-travel axis and
+    // only advance along the pressed direction's axis, expressed in the same
+    // top-left reference dnd-kit measures against.
+    const isVertical =
+        event.code === KeyboardCode.Up || event.code === KeyboardCode.Down;
     return {
-        x: targetRect.left + targetRect.width / 2,
-        y: targetRect.top + targetRect.height / 2,
+        x: isVertical ? collisionRect.left : targetRect.left,
+        y: isVertical ? targetRect.top : collisionRect.top,
     };
 };

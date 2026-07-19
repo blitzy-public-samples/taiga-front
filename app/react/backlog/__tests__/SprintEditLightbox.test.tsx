@@ -379,6 +379,119 @@ describe("SprintEditLightbox — validation gates the API", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Live re-validation after first submit (checksley parity)                   */
+/* -------------------------------------------------------------------------- */
+
+describe("SprintEditLightbox — live re-validation after first submit", () => {
+    // checksley switches a field to LIVE validation after the first validation
+    // run, so once the user has submitted, correcting an invalid field clears its
+    // error immediately (no second submit). These tests lock that ported behavior.
+
+    it("clears the required-name error as soon as the name is corrected (no re-submit)", () => {
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({ name: "" }),
+        });
+
+        // First submit surfaces the required-name error.
+        fireEvent.submit(getForm(container));
+        expect(screen.getByText(REQUIRED_MESSAGE)).toBeInTheDocument();
+        const nameInput = container.querySelector(".sprint-name") as HTMLInputElement;
+        expect(nameInput).toHaveClass("checksley-error");
+
+        // Typing a valid name clears the error live — WITHOUT submitting again.
+        fireEvent.change(nameInput, { target: { value: "A real sprint name" } });
+
+        expect(screen.queryByText(REQUIRED_MESSAGE)).not.toBeInTheDocument();
+        expect(nameInput).not.toHaveClass("checksley-error");
+        // No API call happened — clearing an error must never persist.
+        expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("clears the date-range error as soon as the range becomes valid (no re-submit)", () => {
+        const { container } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({
+                name: "Valid name",
+                estimated_start: "2021-02-10",
+                estimated_finish: "2021-02-01",
+            }),
+        });
+
+        // First submit surfaces the inverted-range error on the finish field.
+        fireEvent.submit(getForm(container));
+        expect(screen.getByText(DATE_RANGE_MESSAGE)).toBeInTheDocument();
+        const finishInput = container.querySelector(".date-end") as HTMLInputElement;
+        expect(finishInput).toHaveClass("checksley-error");
+
+        // Open the finish DatePicker (readOnly input opens the Pikaday calendar on
+        // click); its viewMonth is the finish value's month (Feb 2021), so the
+        // valid day "15" is already visible — no month navigation needed.
+        fireEvent.click(finishInput);
+        const calendar = finishInput.parentElement?.querySelector(
+            ".pika-single",
+        ) as HTMLElement;
+        expect(calendar).toBeInTheDocument();
+        const day15 = calendar.querySelector(
+            'button.pika-button[data-day="15"]',
+        ) as HTMLButtonElement;
+        fireEvent.click(day15);
+
+        // Finish is now 2021-02-15 (>= start 2021-02-10): the range error clears
+        // live and the red invalid-field class is removed.
+        expect(screen.queryByText(DATE_RANGE_MESSAGE)).not.toBeInTheDocument();
+        expect(
+            container.querySelector(".date-end"),
+        ).not.toHaveClass("checksley-error");
+        expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet on a freshly (re)opened form until the first submit", () => {
+        // Open with an invalid (empty-name) form: because no submit has happened,
+        // the live-revalidation effect must NOT fire and no error should show.
+        const { container, rerender } = renderLightbox({
+            mode: "create",
+            initialValues: makeValues({ name: "" }),
+        });
+        expect(screen.queryByText(REQUIRED_MESSAGE)).not.toBeInTheDocument();
+
+        // Submit to enter live mode, then close+reopen: the reset must clear the
+        // "validated once" flag so the reopened form is quiet again.
+        fireEvent.submit(getForm(container));
+        expect(screen.getByText(REQUIRED_MESSAGE)).toBeInTheDocument();
+
+        rerender(
+            <SprintEditLightbox
+                open={false}
+                mode="create"
+                project={makeProject()}
+                sprint={null}
+                initialValues={makeValues({ name: "" })}
+                lastSprintName={null}
+                canDelete={false}
+                onChanged={jest.fn()}
+                onClose={jest.fn()}
+            />,
+        );
+        rerender(
+            <SprintEditLightbox
+                open
+                mode="create"
+                project={makeProject()}
+                sprint={null}
+                initialValues={makeValues({ name: "" })}
+                lastSprintName={null}
+                canDelete={false}
+                onChanged={jest.fn()}
+                onClose={jest.fn()}
+            />,
+        );
+
+        expect(screen.queryByText(REQUIRED_MESSAGE)).not.toBeInTheDocument();
+    });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Persistence (create / edit)                                                */
 /* -------------------------------------------------------------------------- */
 

@@ -894,7 +894,32 @@ function BacklogStoryRow({
                 )}
                 {canModifyUs && (
                     <div className="input">
-                        <div className="custom-checkbox">
+                        <div
+                            className="custom-checkbox"
+                            // [shift-range parity] The selection checkbox is
+                            // VISUALLY HIDDEN, so a real pointer click lands on the
+                            // adjacent <label>. Browsers do NOT forward a
+                            // Shift+click on a <label> to its associated control —
+                            // the input's `change` event never fires — which made
+                            // the shift-range-select (setSelection's inclusive
+                            // range, unit-tested in useBacklogState) unreachable by
+                            // mouse. Handle that one gesture here, where the click
+                            // reliably lands: when Shift is held on a <label> click,
+                            // suppress the (already dropped) default forwarding and
+                            // drive the SAME selection API with the toggled state.
+                            // Non-shift clicks forward normally and are handled by
+                            // the input's `onChange`; direct/keyboard input clicks
+                            // have target=INPUT and are ignored here — so this
+                            // handler fires exactly once per gesture and never
+                            // double-toggles.
+                            onClick={(event) => {
+                                const target = event.target as HTMLElement;
+                                if (event.shiftKey && target.tagName === "LABEL") {
+                                    event.preventDefault();
+                                    onToggleSelection(us.ref, !selected, true);
+                                }
+                            }}
+                        >
                             {/* [M-21] The native checkbox is the real, keyboard-
                                 operable control: visually hidden (not `display:none`)
                                 so it stays focusable and in the a11y tree, and given
@@ -913,13 +938,19 @@ function BacklogStoryRow({
                                     "Select user story #{{ref}} {{subject}}",
                                     { ref: us.ref, subject: subjectText },
                                 )}
-                                onChange={(event) =>
+                                onChange={(event) => {
+                                    // Non-shift label clicks forward here and
+                                    // keyboard Space fires a change too; read the
+                                    // event's own shiftKey for the direct-input and
+                                    // keyboard cases. Shift+label clicks never reach
+                                    // this handler (browsers drop that forwarding)
+                                    // and are handled by the container's onClick.
                                     onToggleSelection(
                                         us.ref,
                                         event.target.checked,
                                         (event.nativeEvent as MouseEvent).shiftKey,
-                                    )
-                                }
+                                    );
+                                }}
                             />
                             <label htmlFor={`us-check-${us.ref}`} aria-hidden="true" />
                         </div>

@@ -143,6 +143,24 @@ jest.mock("../../shared/api/httpClient", () => {
             Object.setPrototypeOf(this, HttpError.prototype);
         }
     }
+    // Faithful port of the real `isVersionConflict` (httpClient.ts), implemented
+    // here against THIS factory's local `HttpError` so `instanceof` matches the
+    // errors the SUT catches. [W1-1] A version conflict is HTTP 400 with a
+    // {"version": ...} body (WrongArguments -> BadRequest), 409 tolerated too.
+    const isVersionConflict = (err: unknown): boolean => {
+        if (!(err instanceof HttpError)) {
+            return false;
+        }
+        if (err.status === 409) {
+            return true;
+        }
+        return (
+            err.status === 400 &&
+            typeof err.body === "object" &&
+            err.body !== null &&
+            "version" in (err.body as Record<string, unknown>)
+        );
+    };
     return {
         __esModule: true,
         httpGet: jest.fn(),
@@ -151,6 +169,7 @@ jest.mock("../../shared/api/httpClient", () => {
         httpPatch: jest.fn(),
         httpDelete: jest.fn(),
         HttpError,
+        isVersionConflict,
     };
 });
 
@@ -941,10 +960,19 @@ test("onChangeStatus PATCHes { status, version } and reloads project stats", asy
     );
 });
 
-test("onChangeStatus reloads the backlog on a 409 version conflict", async () => {
+test("onChangeStatus reloads the backlog on a version conflict (HTTP 400 + version body)", async () => {
     await renderApp();
+    // [W1-1] The FROZEN backend signals an OCC version conflict as HTTP 400 with
+    // a {"version": "..."} body (WrongArguments -> BadRequest), NOT 409.
     mockHttpPatch.mockImplementation(() =>
-        Promise.reject(new HttpError(409, "Conflict", null, "userstories/1000")),
+        Promise.reject(
+            new HttpError(
+                400,
+                "Bad Request",
+                { version: "The version doesn't match with the current one" },
+                "userstories/1000",
+            ),
+        ),
     );
     const usBefore = countGet((p) => p === "userstories");
 
@@ -1389,10 +1417,19 @@ test("onEdit PATCHes userstories/{id} with the changed fields + version and relo
     );
 });
 
-test("onEdit reloads the backlog and rethrows on a 409 version conflict", async () => {
+test("onEdit reloads the backlog and rethrows on a version conflict (HTTP 400 + version body)", async () => {
     await renderApp();
+    // [W1-1] The FROZEN backend signals an OCC version conflict as HTTP 400 with
+    // a {"version": "..."} body (WrongArguments -> BadRequest), NOT 409.
     mockHttpPatch.mockImplementation(() =>
-        Promise.reject(new HttpError(409, "Conflict", null, "userstories/1000")),
+        Promise.reject(
+            new HttpError(
+                400,
+                "Bad Request",
+                { version: "The version doesn't match with the current one" },
+                "userstories/1000",
+            ),
+        ),
     );
     const usBefore = countGet((p) => p === "userstories");
 
@@ -1424,7 +1461,7 @@ test("onEdit reloads the backlog and rethrows on a 409 version conflict", async 
     });
     expect(caught).toBeInstanceOf(HttpError);
 
-    // A 409 triggers a fresh backlog re-read to pick up newer versions.
+    // A version conflict triggers a fresh backlog re-read to pick up newer versions.
     await waitFor(() =>
         expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
     );
@@ -2309,6 +2346,96 @@ test("[N] downward single-step persists after=<over-row>, before=null via the ba
     });
 });
 
+/* -------------------------------------------------------------------------- *
+ * Multi-select drag (legacy `window.dragMultiple` parity)                     *
+ * -------------------------------------------------------------------------- */
+
+test("[multi] resolveDrop moves the whole checked selection as a block when a SELECTED row is dragged", async () => {
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+
+    // Check the last two rows (selection is keyed by us.ref).
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(2, true, false);
+        mockCaptured.backlogTableProps?.onToggleSelection(3, true, false);
+    });
+
+    // Drag the SELECTED row 2000 over row 1000 → BOTH checked stories move as a
+    // block, in origin order [2000, 3000], landing at the front (mirrors the
+    // legacy `reorder multiple us` expectation: rows[0]=count-2, rows[1]=count-1).
+    const resolved = mockCaptured.dndProps?.resolveDrop(dragEnd(2000, 1000)) ?? null;
+    expect(resolved).not.toBeNull();
+    expect(resolved?.draggedIds).toEqual([2000, 3000]);
+    expect(resolved?.orderedIds).toEqual([2000, 3000, 1000]);
+    expect(resolved?.target.index).toBe(0);
+});
+
+test("[multi] dragging an UNCHECKED row ignores the selection (single-item move)", async () => {
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(2, true, false);
+        mockCaptured.backlogTableProps?.onToggleSelection(3, true, false);
+    });
+
+    // Legacy `isMultiple` requires the DRAGGED row itself to be checked; dragging
+    // the unchecked row 1000 moves only 1000.
+    const resolved = mockCaptured.dndProps?.resolveDrop(dragEnd(1000, 3000)) ?? null;
+    expect(resolved?.draggedIds).toEqual([1000]);
+});
+
+test("[multi] persist moves the whole selection into a sprint via ONE bulk call and clears the selection", async () => {
+    currentOpenSprints = [makeSprint({ id: 10, user_stories: [] })];
+    currentUserstories = [
+        makeUs({ id: 1000, ref: 1 }),
+        makeUs({ id: 2000, ref: 2 }),
+        makeUs({ id: 3000, ref: 3 }),
+    ];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "3" };
+    await renderApp();
+
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(2, true, false);
+        mockCaptured.backlogTableProps?.onToggleSelection(3, true, false);
+    });
+
+    const dnd = mockCaptured.dndProps;
+    const resolved = dnd?.resolveDrop(dragEnd(2000, "sprint:10")) ?? null;
+    expect(resolved?.draggedIds).toEqual([2000, 3000]);
+    expect(resolved?.target.containerKey).toBe("sprint:10");
+
+    await act(async () => {
+        await dnd?.persist(resolved as ResolvedDrop, { previous: null, next: null });
+    });
+
+    // ONE bulk request carries BOTH dragged ids.
+    expect(mockPersister).toHaveBeenCalledWith(
+        expect.objectContaining({ bulkUserstories: [2000, 3000] }),
+    );
+    // Optimistic move relocated both out of the backlog (backlog is not reloaded).
+    await waitFor(() => {
+        const ids = mockCaptured.backlogTableProps?.userstories.map((u) => u.id) ?? [];
+        expect(ids).toEqual([1000]);
+    });
+    // The multi-select was cleared after the bulk drag.
+    await waitFor(() =>
+        expect(
+            Object.values(mockCaptured.backlogTableProps?.selectedRefs ?? {}).some(Boolean),
+        ).toBe(false),
+    );
+});
+
 test("builds all six filter categories (null-id assignees/roles, epics with & without id)", async () => {
     currentFiltersData = {
         statuses: [{ id: 1, name: "New", color: "#fff", count: 2 }],
@@ -2879,9 +3006,11 @@ test("onMoveToTop rolls back the optimistic reorder when the request fails", asy
     errSpy.mockRestore();
 });
 
-test("onChangeStatus reports (does not reload) on a non-409 failure", async () => {
+test("onChangeStatus reports (does not reload) on a non-conflict failure (HTTP 500)", async () => {
     const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     await renderApp();
+    // A generic 500 is NOT a version conflict, so isVersionConflict is false and
+    // the handler reports the error instead of reloading.
     mockHttpPatch.mockImplementation(() =>
         Promise.reject(new HttpError(500, "Server Error", null, "userstories/1000")),
     );
@@ -2898,10 +3027,19 @@ test("onChangeStatus reports (does not reload) on a non-409 failure", async () =
     errSpy.mockRestore();
 });
 
-test("onChangePoints reloads the backlog on a 409 conflict", async () => {
+test("onChangePoints reloads the backlog on a version conflict (HTTP 400 + version body)", async () => {
     await renderApp();
+    // [W1-1] The FROZEN backend signals an OCC version conflict as HTTP 400 with
+    // a {"version": "..."} body (WrongArguments -> BadRequest), NOT 409.
     mockHttpPatch.mockImplementation(() =>
-        Promise.reject(new HttpError(409, "Conflict", null, "userstories/1000")),
+        Promise.reject(
+            new HttpError(
+                400,
+                "Bad Request",
+                { version: "The version doesn't match with the current one" },
+                "userstories/1000",
+            ),
+        ),
     );
     const usBefore = countGet((p) => p === "userstories");
 

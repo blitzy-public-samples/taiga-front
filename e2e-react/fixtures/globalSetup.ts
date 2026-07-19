@@ -51,13 +51,17 @@
  *
  * BEHAVIOR WHEN NO RESEED IS CONFIGURED
  * -------------------------------------
- * When neither variable is set (e.g. this front-end-only environment, where the
- * backend is intentionally absent), this hook is a SAFE, NON-FAILING no-op that
- * prints a clear, actionable warning. It never throws in that case, so the
- * config still loads and `--list` still works. When a reseed IS configured but
- * FAILS, this hook throws so the run aborts rather than proceeding against a
- * dirty dataset (which is exactly the twice-from-clean hazard the finding
- * describes).
+ * When neither variable is set, this hook is FAIL-CLOSED (see the [M-16] note on
+ * the default export below): by default it THROWS and ABORTS the run rather than
+ * silently proceeding against an unknown/dirty dataset — which is exactly the
+ * twice-from-clean hazard the finding describes. A run is only allowed to
+ * proceed WITHOUT a reset when the operator EXPLICITLY opts in via the
+ * off-by-default `E2E_ALLOW_NO_RESEED=1`, which downgrades the abort to a loud,
+ * non-failing warning; that escape hatch exists solely for intentional
+ * front-end-only / exploratory runs. (This throw applies to actual test runs;
+ * `playwright test --list` does NOT invoke globalSetup, so listing tests works
+ * regardless.) When a reseed IS configured but FAILS, this hook likewise throws
+ * so the run aborts rather than proceeding against a half-reset dataset.
  *
  * COMPLEMENTARY SPEC-LEVEL DETERMINISM
  * ------------------------------------

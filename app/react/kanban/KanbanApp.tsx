@@ -17,12 +17,14 @@ import {
     httpGet,
     httpPatch,
     HttpError,
+    isVersionConflict,
 } from "../shared/api/httpClient";
 import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import {
     bulkCreate,
     bulkUpdateKanbanOrder,
     filtersData,
+    getUserstory,
     listUserstories,
 } from "../shared/api/userstories";
 import { createEventsClient } from "../shared/events/websocket";
@@ -2481,9 +2483,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     /**
      * F3: open the React-native edit form for a single story (mirrors `editUs`,
      * kanban/main.coffee). The row model is looked up from the board state and
-     * seeded into the lightbox. QA finding — the previous `genericform:edit`
-     * broadcast targeted the removed Angular `tg-lb-create-edit` host and was a
-     * silent no-op.
+     * seeded into the lightbox for immediate open; the lightbox then hydrates the
+     * full story detail (description via `fetchDetail`) that the light board
+     * serializer omits, so a subject-only save cannot erase the stored
+     * description (D-1). QA finding — the previous `genericform:edit` broadcast
+     * targeted the removed Angular `tg-lb-create-edit` host and was a silent
+     * no-op.
      */
     const onEditUs = (usId: number): void => {
         const view = kanban.state.usMap[usId];
@@ -2559,14 +2564,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             }
             await reloadUserstories();
         } catch (err) {
-            // A 409 means the server advanced past our `version`; reload to
-            // reconcile (the only recovery the legacy save performed). Any other
-            // error leaves the board as-is.
-            if (
-                err instanceof HttpError &&
-                err.status === 409 &&
-                aliveRef.current
-            ) {
+            // A version conflict means the server advanced past our `version`;
+            // reload to reconcile (the only recovery the legacy save performed).
+            // The FROZEN backend signals this as HTTP 400 with a `version` body
+            // (not 409), so discriminate via `isVersionConflict`. Any other error
+            // leaves the board as-is.
+            if (isVersionConflict(err) && aliveRef.current) {
                 await reloadUserstories();
             }
         }
@@ -2662,7 +2665,8 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
      * [#2] Persist EDITS to an existing story from {@link UserStoryEditLightbox}.
      * Ports the generic-form `mode == 'edit'` branch: `PATCH userstories/{id}`
      * with the changed fields + `version` for optimistic concurrency, then re-read
-     * the board. A 409 version conflict reloads to pick up fresh versions; the
+     * the board. A version conflict (the FROZEN backend signals it as HTTP 400
+     * with a `version` body, not 409) reloads to pick up fresh versions; the
      * error is rethrown so the lightbox keeps itself open and surfaces the failure.
      */
     const onSaveUsEdit = async (
@@ -2675,7 +2679,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 status: changes.status,
                 points: changes.points,
                 assigned_to: changes.assigned_to,
-                description: changes.description,
+                // D-1: include `description` ONLY when the lightbox marked it
+                // authoritative (loaded from detail / row) or user-edited. When
+                // `undefined`, omit it entirely so a subject-only edit cannot
+                // overwrite the stored description with an empty string.
+                ...(changes.description !== undefined
+                    ? { description: changes.description }
+                    : {}),
                 tags: changes.tags,
                 due_date: changes.due_date,
                 is_blocked: changes.is_blocked,
@@ -2694,7 +2704,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             }
             await reloadUserstories();
         } catch (err) {
-            if (err instanceof HttpError && err.status === 409) {
+            if (isVersionConflict(err)) {
                 await reloadUserstories();
             }
             throw err;
@@ -2737,6 +2747,18 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             resolvedIdRef.current,
         );
         return response.data ?? [];
+    };
+
+    /**
+     * D-1: hydrate a story's FULL detail for the edit form. The board LIST
+     * endpoint uses a light serializer that OMITS `description`, so the lightbox
+     * calls this on edit-open (against the frozen `GET /userstories/{id}`) to
+     * populate the Description field and make a subject-only save safe. Ports the
+     * AngularJS `editUs` re-fetch (kanban/main.coffee).
+     */
+    const fetchUsDetail = async (usId: number): Promise<UserStoryModel> => {
+        const response = await getUserstory(usId);
+        return response.data as unknown as UserStoryModel;
     };
 
     /**
@@ -3461,6 +3483,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     onCreate={onCreateUs}
                     onEdit={onSaveUsEdit}
                     fetchAttachments={fetchUsAttachments}
+                    fetchDetail={fetchUsDetail}
                     onClose={() =>
                         setUsLightbox((prev) => ({ ...prev, open: false }))
                     }

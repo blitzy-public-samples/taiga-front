@@ -32,6 +32,7 @@ import {
     httpPatch,
     httpPost,
     httpPut,
+    isVersionConflict,
     request,
 } from "./httpClient";
 import { resetInterceptorHooks, setInterceptorHooks } from "./httpInterceptor";
@@ -517,6 +518,68 @@ describe("shared/api/httpClient", () => {
             expect(onBlocked).not.toHaveBeenCalled();
             expect(onSessionExpired).not.toHaveBeenCalled();
             expect(fetchMock).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    // [W1-1] Optimistic-concurrency (version) conflict discrimination. The FROZEN
+    // backend OCC mixin raises WrongArguments({"version": "..."}) which extends
+    // BadRequest -> HTTP 400 (NOT 409); the 400 body is the raw {"version": "..."}
+    // detail dict (taiga-back taiga/projects/occ/mixins.py L65 +
+    // taiga/base/exceptions.py BaseException.status_code / format_exception).
+    // isVersionConflict must recognize that 400+version shape AND still tolerate a
+    // literal 409 defensively, while rejecting every other error.
+    describe("isVersionConflict ([W1-1] OCC 400/409)", () => {
+        it("returns true for the real contract: HTTP 400 with a `version` body", () => {
+            const err = new HttpError(
+                400,
+                "Bad Request",
+                { version: "The version doesn't match with the current one" },
+                `${API_BASE}userstories/1000`,
+            );
+            expect(isVersionConflict(err)).toBe(true);
+        });
+
+        it("returns true for a literal 409 (defensive, contract may change)", () => {
+            const err = new HttpError(409, "Conflict", null, `${API_BASE}userstories/1000`);
+            expect(isVersionConflict(err)).toBe(true);
+        });
+
+        it("returns false for a 400 whose body has NO `version` key", () => {
+            const err = new HttpError(
+                400,
+                "Bad Request",
+                { __all__: ["A different validation problem"] },
+                `${API_BASE}userstories/1000`,
+            );
+            expect(isVersionConflict(err)).toBe(false);
+        });
+
+        it("returns false for a 400 with a null body", () => {
+            const err = new HttpError(400, "Bad Request", null, `${API_BASE}userstories/1000`);
+            expect(isVersionConflict(err)).toBe(false);
+        });
+
+        it("returns false for a 400 with a non-object (string) body", () => {
+            const err = new HttpError(400, "Bad Request", "plain text", `${API_BASE}userstories/1000`);
+            expect(isVersionConflict(err)).toBe(false);
+        });
+
+        it("returns false for other statuses (e.g. 500) even if a version body is present", () => {
+            const err = new HttpError(
+                500,
+                "Server Error",
+                { version: "irrelevant" },
+                `${API_BASE}userstories/1000`,
+            );
+            expect(isVersionConflict(err)).toBe(false);
+        });
+
+        it("returns false for non-HttpError values (plain Error, string, null, undefined)", () => {
+            expect(isVersionConflict(new Error("boom"))).toBe(false);
+            expect(isVersionConflict("nope")).toBe(false);
+            expect(isVersionConflict(null)).toBe(false);
+            expect(isVersionConflict(undefined)).toBe(false);
+            expect(isVersionConflict({ status: 400, body: { version: "x" } })).toBe(false);
         });
     });
 });

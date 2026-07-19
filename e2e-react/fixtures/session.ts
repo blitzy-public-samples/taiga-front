@@ -77,8 +77,9 @@ function normalizeBase(url: string | undefined): string {
  * mint its own token or session id (AAP §0.6.1).
  *
  * The credentials authenticate against the seeded `sample_data` fixtures so the
- * ported scenarios can later reach the expected projects (project-0 kanban;
- * project-3 / project-1 / project-5 backlog). This helper does not navigate to
+ * ported scenarios can later reach the expected projects (project-1 kanban;
+ * project-3 and project-2 backlog — the phantom `project-0` the legacy suite
+ * used never existed in sample_data, QA F-03). This helper does not navigate to
  * any project — the specs do — its login is simply what makes them reachable.
  *
  * @param page    The page provided by the Playwright `page` fixture.

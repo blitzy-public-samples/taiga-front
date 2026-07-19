@@ -608,6 +608,47 @@ describe("BacklogTable", () => {
         expect(props.onToggleSelection).toHaveBeenCalledWith(5, expect.any(Boolean), true);
     });
 
+    it("selects with shiftKey=true on a Shift+click of the visual <label> (browsers drop label→input forwarding for shift)", () => {
+        const { container, props } = renderTable({
+            project: makeProject({ my_permissions: ["modify_us"] }),
+            userstories: [makeUs({ id: 50, ref: 5 })],
+            visibleRefs: [5],
+            selectedRefs: {},
+        });
+
+        // The user-facing surface is the <label> (the hidden input is 1px-clipped).
+        // A real browser does NOT forward a Shift+click on a <label> to its input,
+        // so the input's onChange never fires — the container's onClick must carry
+        // the shift-range gesture. preventDefault suppresses jsdom's forwarding too,
+        // so this fires exactly once with shiftKey=true.
+        const label = container.querySelector('label[for="us-check-5"]') as HTMLElement;
+        expect(label).not.toBeNull();
+        fireEvent.click(label, { shiftKey: true });
+
+        expect(props.onToggleSelection).toHaveBeenCalledTimes(1);
+        // The row is currently unselected, so a shift-click toggles it (and its
+        // range) ON — the toggled state passed to setSelection is `true`.
+        expect(props.onToggleSelection).toHaveBeenCalledWith(5, true, true);
+    });
+
+    it("does NOT double-toggle on a plain (non-shift) label click — only onChange handles it", () => {
+        const { container, props } = renderTable({
+            project: makeProject({ my_permissions: ["modify_us"] }),
+            userstories: [makeUs({ id: 50, ref: 5 })],
+            visibleRefs: [5],
+            selectedRefs: {},
+        });
+
+        // A plain label click forwards to the input (onChange) — the container's
+        // onClick guard (shiftKey && LABEL) skips it, so selection fires once with
+        // shiftKey=false.
+        const label = container.querySelector('label[for="us-check-5"]') as HTMLElement;
+        fireEvent.click(label);
+
+        expect(props.onToggleSelection).toHaveBeenCalledTimes(1);
+        expect(props.onToggleSelection).toHaveBeenCalledWith(5, true, false);
+    });
+
     it("[M-21] exposes a keyboard-operable, named native checkbox (not display:none) with a decorative label", () => {
         const { container } = renderTable({
             project: makeProject({ my_permissions: ["modify_us"] }),

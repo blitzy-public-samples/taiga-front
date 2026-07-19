@@ -9,11 +9,22 @@
 import moment from "moment";
 
 /**
- * Maximum allowed length of a sprint name. Mirrors the legacy checksley
- * `data-maxlength="500"` attribute on the sprint-name input
- * (app/partials/includes/modules/lightbox-sprint-add-edit.jade L19).
+ * Maximum allowed length of a sprint name.
+ *
+ * This is bounded by the FROZEN Django contract: the milestone `name` column is
+ * `models.CharField(max_length=200)` (taiga-back
+ * `taiga/projects/milestones/models.py` L25), and the serializer applies no
+ * override — a name longer than 200 characters is rejected by the backend with
+ * an HTTP 400. Per AAP §0.7.1 the client conforms to the frozen backend, so the
+ * form validates at 200 to surface the limit up-front rather than round-tripping
+ * to a server error.
+ *
+ * (The legacy checksley input carried a looser client-only `data-maxlength="500"`
+ * in app/partials/includes/modules/lightbox-sprint-add-edit.jade L19, but any
+ * name in 201–500 was still rejected by the backend; validating at 200 is the
+ * contract-correct, user-friendly behavior.)
  */
-export const NAME_MAX_LENGTH = 500;
+export const NAME_MAX_LENGTH = 200;
 
 /**
  * Canonical wire/storage date format for sprint dates. The AngularJS lightbox
@@ -29,7 +40,7 @@ export const DATE_FORMAT = "YYYY-MM-DD";
 // the unit tests can reference them without duplicating string literals.
 export const REQUIRED_MESSAGE = "This value is required.";
 export const MAXLENGTH_MESSAGE =
-    "This value is too long. It should have 500 characters or less.";
+    "This value is too long. It should have 200 characters or less.";
 export const DATE_INVALID_MESSAGE = "This value should be a valid date.";
 export const DATE_RANGE_MESSAGE =
     "The start date must be on or before the finish date.";
@@ -78,7 +89,7 @@ const isBlank = (value: unknown): boolean =>
 export function validate(values: SprintFormValues): SprintFormValidationResult {
     const errors: SprintFormErrors = {};
 
-    // name: required + maxlength (mirrors data-required + data-maxlength="500")
+    // name: required + maxlength (data-required + the frozen backend's 200-char limit)
     const name = values.name;
     if (isBlank(name)) {
         errors.name = REQUIRED_MESSAGE;

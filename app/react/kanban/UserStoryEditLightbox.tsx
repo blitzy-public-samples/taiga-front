@@ -295,8 +295,14 @@ export interface UserStoryEditChanges {
     status: Id;
     points: Record<string, Id>;
     assigned_to: Id | null;
-    /** Free-text description (`textarea.description`). */
-    description: string;
+    /**
+     * Free-text description (`textarea.description`). `undefined` means "not
+     * authoritative — do NOT send" (D-1): the board LIST omits description, so
+     * when the detail was never loaded and the user never edited the field, the
+     * value is unknown and the parent must omit it from the PATCH rather than
+     * persist an empty string that would erase the stored description.
+     */
+    description: string | undefined;
     /** `[value, color]` tag pairs (`obj.tags`). */
     tags: UsTag[];
     /** ISO `YYYY-MM-DD` due date, or `null` when unset (`obj.due_date`). */
@@ -364,6 +370,15 @@ export interface UserStoryEditLightboxProps {
      * on open. When absent, the form falls back to `us.attachments` (if present).
      */
     fetchAttachments?: (usId: number) => Promise<UserStoryAttachment[]>;
+    /**
+     * Optional loader for the story's FULL detail (edit mode). The board list
+     * endpoint uses a light serializer that OMITS `description`, so the parent
+     * wires this to `getUserstory(usId)` to hydrate the Description field (and
+     * any other detail-only field) on open. Ports the AngularJS controllers'
+     * "re-fetch the story before editing" behavior (kanban/main.coffee `editUs`).
+     * When absent, the form falls back to `us.description` (if present).
+     */
+    fetchDetail?: (usId: number) => Promise<UserStoryModel>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -385,6 +400,7 @@ export function UserStoryEditLightbox(
         onEdit,
         onClose,
         fetchAttachments,
+        fetchDetail,
     } = props;
 
     // Ports `computableRoles = _.filter(project.roles, "computable")`, sorted by
@@ -431,6 +447,20 @@ export function UserStoryEditLightbox(
     const [error, setError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState<boolean>(false);
 
+    // D-1 — description-erasure guard. `descriptionLoaded` is true once the
+    // description value is AUTHORITATIVE (create mode, or the board row already
+    // carried a string description, or the detail hydration below succeeded).
+    // `descriptionDirty` is true once the user has typed in the textarea. A
+    // subject-only edit must NOT send `description` unless it is authoritative or
+    // dirty — otherwise the light-serializer's missing description would be
+    // persisted as an empty string, silently erasing the stored value.
+    const [descriptionLoaded, setDescriptionLoaded] = useState<boolean>(false);
+    const [descriptionDirty, setDescriptionDirty] = useState<boolean>(false);
+    // D-1: mirror `descriptionDirty` into a ref so the async detail-hydration
+    // `.then` (below) can read the CURRENT dirty state without a stale closure.
+    // If the user starts typing while the fetch is in flight, the resolved
+    // hydration must NOT clobber their edit.
+    const descriptionDirtyRef = useRef<boolean>(false);
     // M-10 — the secondary generic-form fields (`.main` description/tags/
     // attachments + sidebar `.ticket-detail-settings` + blocked-note).
     const [description, setDescription] = useState<string>("");
@@ -496,6 +526,12 @@ export function UserStoryEditLightbox(
             setDescription(
                 typeof us.description === "string" ? us.description : "",
             );
+            // D-1: the description is authoritative only if the row already
+            // carried a string value; otherwise the hydration effect below must
+            // load it before a save may include it.
+            setDescriptionLoaded(typeof us.description === "string");
+            setDescriptionDirty(false);
+            descriptionDirtyRef.current = false;
             // Clone the tag pairs so edits never mutate the row object in place.
             setTags(
                 Array.isArray(us.tags)
@@ -524,6 +560,10 @@ export function UserStoryEditLightbox(
             setPoints({});
             setAssignedTo(null);
             setDescription("");
+            // Create mode: the empty description IS authoritative (nothing to lose).
+            setDescriptionLoaded(true);
+            setDescriptionDirty(false);
+            descriptionDirtyRef.current = false;
             setTags([]);
             setDueDate("");
             setTeamRequirement(false);
@@ -579,6 +619,50 @@ export function UserStoryEditLightbox(
             alive = false;
         };
     }, [open, mode, us, fetchAttachments]);
+
+    // D-1: hydrate the Description from the full story detail on edit-open. The
+    // board LIST endpoint uses a light serializer that OMITS `description`, so a
+    // board-row seed leaves the field empty and a subject-only save would erase
+    // the stored value. This mirrors the AngularJS controllers, which re-fetched
+    // the story before editing (kanban/main.coffee `editUs`). Skip the network
+    // when the row already carried a string description (already authoritative)
+    // or when no detail loader is wired. On success the field shows the real
+    // description AND `descriptionLoaded` unlocks the save; on failure the field
+    // stays empty and `descriptionLoaded` stays false, so a subject-only save
+    // omits `description` entirely (never erases).
+    useEffect(() => {
+        if (!open || mode !== "edit" || !us?.id || !fetchDetail) {
+            return undefined;
+        }
+        if (typeof us.description === "string") {
+            // The board row already carried it — no fetch needed.
+            return undefined;
+        }
+        let alive = true;
+        fetchDetail(us.id)
+            .then((detail) => {
+                if (!alive || descriptionDirtyRef.current) {
+                    // Unmounted/re-opened, OR the user already started editing the
+                    // description while the fetch was in flight — do NOT clobber
+                    // their in-progress edit with the hydrated value.
+                    return;
+                }
+                setDescription(
+                    typeof detail.description === "string" ? detail.description : "",
+                );
+                // The description is now authoritative and safe to persist.
+                setDescriptionLoaded(true);
+            })
+            .catch(() => {
+                // A failed detail fetch must not break the form; the user can
+                // still edit every other field. `descriptionLoaded` stays false,
+                // so a subject-only save will NOT send (and therefore cannot
+                // erase) the description.
+            });
+        return () => {
+            alive = false;
+        };
+    }, [open, mode, us, fetchDetail]);
 
     // When the form opens for the "Assign to" affordance, focus the assignee
     // control so the user lands directly on it (ports the quick-assign focus).
@@ -898,7 +982,14 @@ export function UserStoryEditLightbox(
                         status: statusId,
                         points,
                         assigned_to: assignedTo,
-                        description,
+                        // D-1: only send the description when it is authoritative
+                        // (loaded from detail / row) or the user edited it. When
+                        // neither is true, send `undefined` so the parent omits it
+                        // from the PATCH and cannot erase the stored value.
+                        description:
+                            descriptionLoaded || descriptionDirty
+                                ? description
+                                : undefined,
                         tags,
                         due_date: dueDate || null,
                         is_blocked: isBlocked,
@@ -944,6 +1035,8 @@ export function UserStoryEditLightbox(
             assignedTo,
             usPosition,
             description,
+            descriptionLoaded,
+            descriptionDirty,
             tags,
             dueDate,
             isBlocked,
@@ -1136,7 +1229,14 @@ export function UserStoryEditLightbox(
                                     "COMMON.FIELDS.DESCRIPTION",
                                     LABEL_DESCRIPTION,
                                 )}
-                                onChange={(e) => setDescription(e.target.value)}
+                                onChange={(e) => {
+                                    setDescription(e.target.value);
+                                    // D-1: a user edit makes the description
+                                    // authoritative even if detail hydration is
+                                    // still pending / failed.
+                                    setDescriptionDirty(true);
+                                    descriptionDirtyRef.current = true;
+                                }}
                             />
                         </fieldset>
 

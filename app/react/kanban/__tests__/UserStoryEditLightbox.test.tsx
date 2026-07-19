@@ -413,12 +413,17 @@ test("edit submit passes (us, {subject, status, points, assigned_to}) and closes
     await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
     // M-10 — the edit payload now carries the full generic-form field surface.
     // `makeUs()` sets none of the secondary fields, so they seed to defaults.
+    // D-1 — `makeUs()` carries NO `description` (the light board serializer omits
+    // it) and no `fetchDetail` loader is wired here, so the description is NOT
+    // authoritative and the user did not edit it. The lightbox therefore emits
+    // `description: undefined`, which the parent omits from the PATCH so a
+    // subject-only edit cannot erase the stored description.
     expect(onEdit).toHaveBeenCalledWith(us, {
         subject: "Renamed",
         status: 101,
         points: { "11": 102 },
         assigned_to: 42,
-        description: "",
+        description: undefined,
         tags: [],
         due_date: null,
         is_blocked: false,
@@ -429,6 +434,111 @@ test("edit submit passes (us, {subject, status, points, assigned_to}) and closes
         attachmentsToDelete: [],
     });
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+});
+
+/* -------------------------------------------------------------------------- */
+/* D-1 — description-erasure guard. The board LIST serializer OMITS            */
+/* `description`, so the edit form hydrates it from `fetchDetail` (GET          */
+/* /userstories/{id}); a subject-only save must NOT erase the stored value.    */
+/* -------------------------------------------------------------------------- */
+
+test("[D-1] edit-open hydrates the description from fetchDetail when the row omits it", async () => {
+    // Row from the light board serializer: NO `description` property.
+    const us = makeUs();
+    const fetchDetail = jest.fn(() =>
+        Promise.resolve(makeUs({ description: "Full stored description" } as Partial<UserStoryModel>)),
+    );
+    const { container } = renderLightbox({ mode: "edit", us, fetchDetail });
+
+    // The loader is called with the story id.
+    await waitFor(() => expect(fetchDetail).toHaveBeenCalledWith(1000));
+    // The textarea shows the hydrated value (not the empty seed).
+    await waitFor(() =>
+        expect(
+            (container.querySelector("textarea.description") as HTMLTextAreaElement).value,
+        ).toBe("Full stored description"),
+    );
+});
+
+test("[D-1] a subject-only edit PRESERVES the hydrated description (sends the loaded value)", async () => {
+    const us = makeUs();
+    const fetchDetail = jest.fn(() =>
+        Promise.resolve(makeUs({ description: "Full stored description" } as Partial<UserStoryModel>)),
+    );
+    const { container, onEdit } = renderLightbox({ mode: "edit", us, fetchDetail });
+
+    // Wait for hydration to complete so the description is authoritative.
+    await waitFor(() =>
+        expect(
+            (container.querySelector("textarea.description") as HTMLTextAreaElement).value,
+        ).toBe("Full stored description"),
+    );
+
+    // Change ONLY the subject, then save.
+    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
+        target: { value: "Renamed" },
+    });
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    // The hydrated description is sent back verbatim — the stored value survives.
+    expect(onEdit.mock.calls[0][1]).toMatchObject({
+        subject: "Renamed",
+        description: "Full stored description",
+    });
+});
+
+test("[D-1] when fetchDetail FAILS, a subject-only edit omits description (undefined, never erases)", async () => {
+    const us = makeUs();
+    const fetchDetail = jest.fn(() => Promise.reject(new Error("network")));
+    const { container, onEdit } = renderLightbox({ mode: "edit", us, fetchDetail });
+
+    // Let the rejected hydration settle.
+    await waitFor(() => expect(fetchDetail).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
+        target: { value: "Renamed" },
+    });
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    // Description is NOT authoritative (fetch failed) and not dirty → undefined,
+    // so the parent omits it from the PATCH and cannot erase the stored value.
+    expect(onEdit.mock.calls[0][1].description).toBeUndefined();
+});
+
+test("[D-1] a row that already carries a string description is authoritative (no fetch, value sent)", async () => {
+    const us = makeUs({ description: "Row description" } as Partial<UserStoryModel>);
+    const fetchDetail = jest.fn(() => Promise.resolve(makeUs()));
+    const { container, onEdit } = renderLightbox({ mode: "edit", us, fetchDetail });
+
+    // The row already had it → no detail fetch is issued.
+    expect(fetchDetail).not.toHaveBeenCalled();
+    expect(
+        (container.querySelector("textarea.description") as HTMLTextAreaElement).value,
+    ).toBe("Row description");
+
+    fireEvent.change(container.querySelector('input[name="subject"]') as HTMLInputElement, {
+        target: { value: "Renamed" },
+    });
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    expect(onEdit.mock.calls[0][1].description).toBe("Row description");
+});
+
+test("[D-1] a user-edited description is always sent (dirty), even without hydration", async () => {
+    const us = makeUs();
+    // No fetchDetail wired at all — the user types a description directly.
+    const { container, onEdit } = renderLightbox({ mode: "edit", us });
+
+    fireEvent.change(container.querySelector("textarea.description") as HTMLTextAreaElement, {
+        target: { value: "typed by user" },
+    });
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() => expect(onEdit).toHaveBeenCalledTimes(1));
+    expect(onEdit.mock.calls[0][1].description).toBe("typed by user");
 });
 
 /* -------------------------------------------------------------------------- */

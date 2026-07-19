@@ -19,7 +19,7 @@
  * mandated by the migration plan (AAP §0.1.2, §0.4.1):
  *  - `checksley` (`form.checksley()`, lightboxes.coffee L44,L143) is REPLACED by
  *    the pure `validate()` from `../shared/validation/sprintForm` (required name,
- *    maxlength 500, valid dates, non-inverted range — range error on finish).
+ *    maxlength 200 (frozen backend), valid dates, non-inverted range — range error on finish).
  *  - `$repo.create/save/remove("milestones", ...)` become the frozen-`/api/v1/`
  *    adapter calls in `../shared/api/milestones` (create / save / remove).
  *  - the CoffeeScript `debounce 2000` on submit becomes a `submitting` guard
@@ -47,7 +47,7 @@ import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import moment from "moment";
 
 import type { Project, Sprint, Id } from "./types";
-import { validate, DATE_FORMAT } from "../shared/validation/sprintForm";
+import { validate, DATE_FORMAT, NAME_MAX_LENGTH } from "../shared/validation/sprintForm";
 import type {
     SprintFormValues,
     SprintFormErrors,
@@ -67,14 +67,6 @@ import { DatePicker } from "../shared/ui/DatePicker";
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
-
-/**
- * Maximum sprint-name length. Mirrors `data-maxlength="500"` on the sprint-name
- * input (lightbox-sprint-add-edit.jade L19); the same bound is enforced in
- * `validate()`. Kept as a literal here so the rendered `maxLength` attribute
- * matches the legacy markup byte-for-byte.
- */
-const NAME_MAX_LENGTH = 500;
 
 /**
  * Generic save-failure message shown when the server rejects the create/edit
@@ -219,6 +211,16 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
     const startRef = useRef<HTMLInputElement>(null);
     const finishRef = useRef<HTMLInputElement>(null);
 
+    // [checksley parity] Whether the form has been validated at least once (via a
+    // submit attempt). checksley (the replaced library) switches a field to LIVE
+    // validation after the first validation run, so once the user has submitted,
+    // correcting an invalid field clears its error immediately — WITHOUT needing a
+    // second submit. The React port originally cleared errors only on re-submit,
+    // a behavioral regression vs. checksley (AAP §0.1.2 "same field rules"). We
+    // port the live-after-first-submit behavior: this ref flips true on the first
+    // submit, after which the effect below re-runs validate() on every change.
+    const hasValidatedOnceRef = useRef<boolean>(false);
+
     // Reset the form whenever the lightbox is (re)opened or its target changes.
     // Ports `resetSprint()` + the `sprintform:create` / `sprintform:edit`
     // handlers (lightboxes.coffee L28-36, L136-215).
@@ -226,7 +228,28 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         setValues(initialValues);
         setErrors({});
         setServerError(null);
+        // Back to "not yet validated" so a freshly opened form never shows errors
+        // until its first submit (checksley starts each form in on-submit mode).
+        hasValidatedOnceRef.current = false;
     }, [open, mode, sprint, initialValues]);
+
+    // [checksley parity] Live re-validation after the first submit. Once
+    // hasValidatedOnceRef is set (first submit attempt), re-run validate() on
+    // every value change so a corrected field clears its error immediately and an
+    // inverted date range surfaces as soon as it becomes invalid — mirroring
+    // checksley's post-first-validation live behavior. Guarded by the ref so the
+    // form stays quiet until the user first submits.
+    useEffect(() => {
+        if (!hasValidatedOnceRef.current) {
+            return;
+        }
+        const normalized: SprintFormValues = {
+            ...values,
+            estimated_start: normalizeDate(values.estimated_start),
+            estimated_finish: normalizeDate(values.estimated_finish),
+        };
+        setErrors(validate(normalized).errors);
+    }, [values]);
 
     // [M-09] Complete modal-dialog accessibility via the shared primitive:
     // role/aria-modal (spread from dialogProps), focus entry onto the sprint
@@ -301,6 +324,9 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
 
             // 2. Validate. On failure show the errors, focus the first invalid
             //    field, and STOP (never call the API) — ports `form.validate()`.
+            // Mark the form as "validated once" so the live-revalidation effect
+            // takes over (checksley switches to live validation after first run).
+            hasValidatedOnceRef.current = true;
             const result = validate(normalized);
             if (!result.valid) {
                 setErrors(result.errors);

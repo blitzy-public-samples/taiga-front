@@ -105,6 +105,23 @@ export function filtersData(params?: QueryParams): Promise<HttpResponse<FiltersD
 }
 
 /**
+ * `GET /userstories/{id}` — fetch the FULL detail of a single user story.
+ * Mirrors `userstories.get(id)` (userstories.coffee via `queryOne`), which the
+ * AngularJS controllers called before opening the edit lightbox
+ * (kanban/main.coffee `editUs`, backlog/main.coffee `editUserStory` L653).
+ *
+ * This is required for edit-lightbox fidelity: the board LIST endpoint uses a
+ * light serializer that OMITS `description` (and any other detail-only field),
+ * so seeding the edit form from a board row leaves the Description empty and a
+ * subject-only save would erase the stored description. Callers fetch the
+ * detail on edit-open and hydrate the form from it — exactly like the legacy
+ * "re-fetch the story before editing" behavior (AAP §0.1.1 like-for-like).
+ */
+export function getUserstory(id: number): Promise<HttpResponse<UserStory>> {
+    return httpGet<UserStory>(`/userstories/${id}`);
+}
+
+/**
  * `POST /userstories/bulk_create` — create many stories from newline-separated text.
  * Body `{ project_id, status_id, bulk_stories, swimlane_id }`; `swimlane_id` is
  * ALWAYS included (userstories.coffee L64-L74).

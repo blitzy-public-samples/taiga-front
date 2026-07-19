@@ -621,7 +621,7 @@ gulp.task("esbuild", function() {
         minify: isDeploy,
         // [N-08] Emit a source map ONLY for non-deploy (dev/watch) builds. A
         // `deploy` build must NOT ship a public source map: an inline/adjacent
-        // map embeds `sourcesContent` for the entire app/react/** tree (~326
+        // map embeds `sourcesContent` for the entire app/react/** tree (~99
         // files, ~2 MiB of original TypeScript) and would be served verbatim by
         // nginx, exposing the full un-minified source. Tie it to the same
         // `isDeploy` switch that already governs `minify` and the NODE_ENV

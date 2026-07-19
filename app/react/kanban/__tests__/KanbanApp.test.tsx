@@ -118,6 +118,24 @@ jest.mock("../../shared/api/httpClient", () => {
             Object.setPrototypeOf(this, HttpError.prototype);
         }
     }
+    // Faithful port of the real `isVersionConflict` (httpClient.ts), implemented
+    // here against THIS factory's local `HttpError` so `instanceof` matches the
+    // errors the SUT catches. [W1-1] A version conflict is HTTP 400 with a
+    // {"version": ...} body (WrongArguments -> BadRequest), 409 tolerated too.
+    const isVersionConflict = (err: unknown): boolean => {
+        if (!(err instanceof HttpError)) {
+            return false;
+        }
+        if (err.status === 409) {
+            return true;
+        }
+        return (
+            err.status === 400 &&
+            typeof err.body === "object" &&
+            err.body !== null &&
+            "version" in (err.body as Record<string, unknown>)
+        );
+    };
     return {
         __esModule: true,
         httpGet: jest.fn(),
@@ -126,6 +144,7 @@ jest.mock("../../shared/api/httpClient", () => {
         httpPatch: jest.fn(),
         httpDelete: jest.fn(),
         HttpError,
+        isVersionConflict,
     };
 });
 
@@ -1957,6 +1976,13 @@ describe("KanbanApp — edit & assignee callbacks (F3)", () => {
             });
         }).not.toThrow();
         expect(document.querySelector(".lightbox-create-edit.open")).not.toBeNull();
+        // D-1: opening the edit form kicks off an async description hydration
+        // (fetchDetail → GET /userstories/{id}). Flush that pending promise chain
+        // inside act() so the resulting state update settles here and is not
+        // reported as an "update not wrapped in act(...)" warning.
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
     });
 });
 

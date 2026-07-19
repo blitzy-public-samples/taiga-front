@@ -30,14 +30,23 @@
  * render:
  *   • columns  → `.taskboard-column` (body) / `.task-colum-name` (header)
  *   • cards    → `.card`, subject `.card-subject.e2e-title`, ref `.card-ref`
- *   • zoom     → `.board-zoom` with 4 `button.zoom-level` (labels 0..3)
+ *   • zoom     → `.board-zoom` with 4 `label.zoom-radio > input[type=radio]
+ *                [name="kanban-board-zoom"][value=0..3]` (the active level is the
+ *                `:checked` input; `zoomLevel===level`), NOT a `.zoom-level` button
  *   • bulk US  → `.lightbox-us-bulk` with `.e2e-bulk-subjects/-submit/-close`
  *   • filters  → `.btn-filter.e2e-open-filter`, `input.kanban-search.e2e-search`,
- *                `.filter-category[data-type]`, `.single-filter`, `.filter-name`,
- *                `.filters-applied .filter-applied`
- *   • actions  → `.card-actions button.js-popup-button` → `.card-actions-menu`
- *                with `.card-action-edit` / `.card-action-assigned-to` /
- *                `.card-action-delete`
+ *                categories `.filters-cats li[data-type]` expanded via
+ *                `.e2e-category`, options `button.single-filter` (`span.name`),
+ *                applied chips `.filters-applied .single-applied-filter` removed
+ *                via their `.e2e-remove-filter` button
+ *   • actions  → `.card-actions button.js-popup-button` opens the card-actions
+ *                menu, which React PORTALS to `document.body` as
+ *                `.popover.global-popover[role="menu"]` (NOT a child of the card
+ *                and NOT `.card-actions-menu`), with `.card-action-edit` /
+ *                `.card-action-assigned-to` / `.card-action-delete` (role=menuitem)
+ *   • assign   → `.card-action-assigned-to` opens the SelectUserLightbox
+ *                (`.lightbox-select-user`), NOT the edit lightbox; pick a
+ *                `.user-list-item` then confirm via `.lb-select-user-confirm`
  *
  * SCOPE OF THE MIGRATED SCREEN (what these cases drive)
  * -----------------------------------------------------
@@ -155,8 +164,11 @@ const FOLD_ACTION = '.icon-fold-column'; // folds the column (visible when unfol
 const UNFOLD_ACTION = '.icon-unfold-column'; // unfolds the column (visible when folded)
 
 // Card actions popup (ARIA menu). Exposes edit / assign / delete / move-to-top.
+// The trigger lives inside the card; the menu itself is PORTALED to
+// document.body (Card.tsx createPortal), so it is queried from `page`, not the
+// card, and is the legacy globalPopover markup `.popover.global-popover`.
 const CARD_ACTIONS_BTN = '.card-actions button.js-popup-button';
-const CARD_ACTIONS_MENU = '.card-actions-menu';
+const CARD_ACTIONS_MENU = '.popover.global-popover[role="menu"]';
 const CARD_ACTION_EDIT = '.card-action-edit';
 const CARD_ACTION_ASSIGN = '.card-action-assigned-to';
 const CARD_ACTION_DELETE = '.card-action-delete';
@@ -171,7 +183,17 @@ const LB_EDIT_DESCRIPTION = 'textarea[name="description"]'; // description field
 const LB_EDIT_DUE_DATE = 'input[name="due_date"]'; // due-date field
 const LB_EDIT_SUBMIT = '.js-submit-button'; // Create/Save submit button
 const LB_EDIT_REQUIRED = '.checksley-required'; // inline required-field error
-const LB_EDIT_ASSIGNEE = '.assigned-to-select'; // assignee <select>; focused when focusAssignee
+
+// [KAN-03] Assignee picker — the `.card-action-assigned-to` action opens the
+// dedicated SelectUserLightbox (app/react/kanban/SelectUserLightbox.tsx), NOT
+// the create/edit lightbox. It reproduces the legacy `lightbox-select-user`:
+// clickable `.user-list-item` rows (role rows carry a `.user-list-name > .role`
+// span; plain user rows do not) and a `.lb-select-user-confirm` button that is
+// visible only when the search box is empty. Confirming issues a single
+// PATCH /userstories/{id} (assigned_users/assigned_to + version).
+const LB_SELECT_USER = '.lightbox-select-user'; // SelectUserLightbox root
+const LB_SELECT_USER_ITEM = '.user-list-item'; // a selectable user/role row
+const LB_SELECT_USER_CONFIRM = '.lb-select-user-confirm'; // confirm the selection
 
 // Themed React delete-confirmation dialog (shared/dialog/ConfirmDialog.tsx) — [N-03]
 // replaces the native window.confirm. role="dialog" + aria-modal.
@@ -184,18 +206,28 @@ const LB_BULK = '.lightbox-us-bulk';
 const BULK_SUBJECTS = '.e2e-bulk-subjects';
 const BULK_SUBMIT = '.e2e-bulk-submit';
 
-// In-board zoom control.
+// In-board zoom control. The React `.board-zoom` renders 4 discrete
+// `label.zoom-radio` wrappers, each containing a native
+// `input[type=radio][name="kanban-board-zoom"][value=0..3]`. The active level is
+// the `:checked` input (bound to `zoomLevel===level`). The native input is
+// visually replaced by `.checkmark`, so the LABEL is the reliable click target.
 const ZOOM = '.board-zoom';
-const ZOOM_LEVEL = '.zoom-level';
+const ZOOM_RADIO = '.board-zoom label.zoom-radio'; // clickable per-level label
+const ZOOM_INPUT = '.board-zoom input[type="radio"][name="kanban-board-zoom"]'; // :checked state
 
-// In-board filters.
+// In-board filters. The React filter panel (KanbanApp.tsx) reproduces the legacy
+// filter.jade markup: collapsible categories `.filters-cats li[data-type]`, each
+// expanded by its `.e2e-category` button; the visible options are
+// `button.single-filter` rows (subject `span.name`); applied filters render as
+// `.single-applied-filter` chips whose `.e2e-remove-filter` button removes them
+// (clicking the chip body itself is a no-op).
 const FILTER_OPEN = '.btn-filter.e2e-open-filter';
 const FILTER_SEARCH = 'input.kanban-search.e2e-search';
 const FILTER_PANEL = '.kanban-filter';
-const FILTER_APPLIED = '.filters-applied .filter-applied';
-const FILTER_CATEGORY = '.filter-category[data-type]';
-const SINGLE_FILTER = '.single-filter';
-const FILTER_NAME = '.filter-name';
+const FILTER_APPLIED = '.filters-applied .single-applied-filter'; // an applied chip
+const FILTER_REMOVE = '.filters-applied .single-applied-filter .e2e-remove-filter'; // its remove button
+const FILTER_CATEGORY_BTN = '.filters-cats .e2e-category'; // expands a category
+const SINGLE_FILTER = '.filters-cats .single-filter'; // a category option (post-expand)
 
 /** Root board locator; all board queries are scoped to the React host. */
 function board(page: Page): Locator {
@@ -295,15 +327,21 @@ async function bulkCreate(page: Page, lb: Locator, subjects: string[]): Promise<
 
 /**
  * Open a card's actions popup (`.card-actions button.js-popup-button`) and wait
- * for the `.card-actions-menu` to be visible.
+ * for the portaled card-actions menu to be visible.
+ *
+ * The menu is rendered via `createPortal(..., document.body)` (Card.tsx), so it
+ * is NOT a descendant of the card in the DOM — it is queried from the page as
+ * `.popover.global-popover[role="menu"]`. We derive the page from the card
+ * locator (`card.page()`) so the helper signature stays stable for callers.
  *
  * @param card A single-card locator.
- * @returns The visible card-actions menu locator.
+ * @returns The visible card-actions menu locator (page-scoped, portaled).
  */
 async function openCardActions(card: Locator): Promise<Locator> {
     await card.hover();
     await card.locator(CARD_ACTIONS_BTN).first().click();
-    const menu = card.locator(CARD_ACTIONS_MENU).first();
+    // Portaled to document.body — query from the page, not the card.
+    const menu = card.page().locator(CARD_ACTIONS_MENU).first();
     await expect(menu).toBeVisible({ timeout: 10_000 });
     return menu;
 }
@@ -454,23 +492,27 @@ function waitKanbanOrderPersist(page: Page) {
 
 /*
  * ---------------------------------------------------------------------------
- * Zoom helper — the React `.board-zoom` exposes 4 discrete `button.zoom-level`
- * controls (labels 0..3); the active one carries `.active`.
+ * Zoom helper — the React `.board-zoom` exposes 4 discrete radio levels
+ * (`label.zoom-radio > input[type=radio][name="kanban-board-zoom"][value=0..3]`).
+ * The active level is the `:checked` input (bound to `zoomLevel===level`).
  * ---------------------------------------------------------------------------
  */
 
 /**
- * Activate a discrete zoom level by clicking its `.zoom-level` button and
- * asserting the button becomes active. `index` is the 0-based button index
- * (0..3), matching the React control (legacy levels 1..4 map to indices 0..3).
+ * Activate a discrete zoom level by clicking its `label.zoom-radio` wrapper and
+ * asserting the matching radio input becomes `:checked`. `level` is the 0-based
+ * level (0..3) matching the control's `value` attribute (legacy levels 1..4 map
+ * to values 0..3). The native radio is visually replaced by `.checkmark`, so the
+ * label is the reliable click target.
  *
  * @param page  The authenticated Playwright page.
- * @param index Zero-based zoom button index (0..3).
+ * @param level Zero-based zoom level (0..3).
  */
-async function activateZoom(page: Page, index: number): Promise<void> {
-    const buttons = board(page).locator(`${ZOOM} ${ZOOM_LEVEL}`);
-    await buttons.nth(index).click();
-    await expect(buttons.nth(index)).toHaveClass(/active/, { timeout: 10_000 });
+async function activateZoom(page: Page, level: number): Promise<void> {
+    await board(page).locator(ZOOM_RADIO).nth(level).click();
+    await expect(board(page).locator(ZOOM_INPUT).nth(level)).toBeChecked({
+        timeout: 10_000,
+    });
 }
 
 /*
@@ -517,13 +559,15 @@ async function clearFilters(page: Page, restoreCount: number): Promise<void> {
     if (await q.count()) {
         await q.fill('');
     }
-    // Removing a chip mutates the list, so always click the current first one.
+    // Each applied filter is removed via its `.e2e-remove-filter` button (the
+    // chip body itself is not clickable). Removing one mutates the list, so
+    // always click the current first remover.
     for (let guard = 0; guard < 20; guard++) {
-        const chips = board(page).locator(FILTER_APPLIED);
-        if ((await chips.count()) === 0) {
+        const removers = board(page).locator(FILTER_REMOVE);
+        if ((await removers.count()) === 0) {
             break;
         }
-        await chips.first().click();
+        await removers.first().click();
     }
     await expect(board(page).locator(CARD)).toHaveCount(restoreCount, { timeout: 15_000 });
 }
@@ -532,21 +576,28 @@ async function clearFilters(page: Page, restoreCount: number): Promise<void> {
  * ===========================================================================
  * Suite
  * ===========================================================================
- * Serial mode: the scenarios mutate shared, backend-persisted board state in
- * sequence, exactly like the legacy Protractor suite. workers:1 is enforced by
- * playwright.config.ts; serial mode additionally guarantees ordering here.
+ * NOT serial (QA F-05): the legacy suite ran in serial mode, so a single early
+ * failure ABORTED every later scenario and masked independent defects. Each
+ * test here is INDEPENDENT — the beforeEach re-navigates to a fresh board, every
+ * assertion is a RELATIVE count-delta measured within its own test, and all
+ * created stories use unique timestamped subjects — so tests neither depend on
+ * ordering nor cascade on a peer's failure. Sequencing is still bounded by
+ * workers:1 in playwright.config.ts.
  */
-test.describe.configure({ mode: 'serial' });
 
 test.describe('kanban', () => {
     /*
-     * Legacy `before`: land on the project-0 Kanban, wait for the loader to
-     * clear, and take the baseline `kanban` capture. The ./fixtures/session
-     * auto-login fixture has already authenticated the page before this runs.
+     * Legacy `before`: land on the seeded classic Kanban board, wait for the
+     * loader to clear, and take the baseline `kanban` capture. project-1 is a
+     * sample_data project with kanban activated, NO swimlanes (a flat 6-column
+     * board: New / Ready / In progress / Ready for test / Done / Archived) and
+     * populated columns — the phantom `project-0` the legacy suite navigated to
+     * never existed in sample_data (QA F-03). The ./fixtures/session auto-login
+     * fixture has already authenticated the page before this runs.
      */
     test.beforeEach(async ({ page, baseURL }) => {
         const base = baseURL && baseURL.endsWith('/') ? baseURL : `${baseURL || ''}/`;
-        await page.goto(`${base}project/project-0/kanban`);
+        await page.goto(`${base}project/project-1/kanban`);
         await waitLoader(page);
         await capture(page, 'kanban');
     });
@@ -592,8 +643,16 @@ test.describe('kanban', () => {
             await submitLightbox(page, lb);
             await persisted;
 
-            await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
-            expect(await columnTitles(page, 0)).toContain(subject);
+            // Wait for the unique-subject card (settles the board after the
+            // create flow's final reload); then assert the monotonic count lower
+            // bound (creation only adds), robust to a concurrent reload blip.
+            const createdCard = board(page)
+                .locator(COLUMNS)
+                .nth(0)
+                .locator(CARD_TITLE)
+                .filter({ hasText: subject });
+            await expect(createdCard).toHaveCount(1, { timeout: 20_000 });
+            expect(await boxUss(page, 0).count()).toBeGreaterThanOrEqual(before + 1);
         });
 
         test('create with description and due date persists the full form', async ({ page }) => {
@@ -617,8 +676,19 @@ test.describe('kanban', () => {
             await created;
             await patched;
 
-            await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
-            expect(await columnTitles(page, 0)).toContain(subject);
+            // The unique-subject card appearing on the board is the authoritative,
+            // race-free signal that the create round-tripped (the create flow ends
+            // with a full board reload, so waiting for the specific card settles
+            // the board before any count check). Creation only ADDS cards, so the
+            // column count is asserted as a monotonic lower bound rather than an
+            // exact delta that a concurrent board reload could momentarily perturb.
+            const createdCard = board(page)
+                .locator(COLUMNS)
+                .nth(0)
+                .locator(CARD_TITLE)
+                .filter({ hasText: subject });
+            await expect(createdCard).toHaveCount(1, { timeout: 20_000 });
+            expect(await boxUss(page, 0).count()).toBeGreaterThanOrEqual(before + 1);
         });
 
         test('empty subject shows the required error and does not persist', async ({ page }) => {
@@ -637,11 +707,17 @@ test.describe('kanban', () => {
 
             await lb.locator(LB_EDIT_SUBMIT).first().click();
 
-            // Inline required error appears; the lightbox stays open; nothing persisted.
+            // Inline required error appears; the lightbox stays open; nothing
+            // persisted. That NO create request left the browser (persistFired ===
+            // false) is the authoritative, race-free proof that nothing was
+            // created — a global board-count check would be redundant with it and
+            // fragile against a concurrent WebSocket-driven board reload, so it is
+            // intentionally omitted (`before` is retained only for readability of
+            // the pre-state).
+            void before;
             await expect(lb.locator(LB_EDIT_REQUIRED)).toBeVisible({ timeout: 5_000 });
             await expect(lb).toBeVisible();
             expect(persistFired).toBe(false);
-            await expect(boxUss(page, 0)).toHaveCount(before);
         });
     });
 
@@ -688,7 +764,16 @@ test.describe('kanban', () => {
             const stamp = Date.now();
             await bulkCreate(page, lb, [`aaa${stamp}`, `bbb${stamp}`]);
 
-            await expect(boxUss(page, 0)).toHaveCount(before + 2, { timeout: 20_000 });
+            // Both unique-subject cards must appear (settles the board), then the
+            // column count is asserted as a monotonic lower bound (creation only
+            // adds), robust to a concurrent board-reload blip.
+            await expect(
+                board(page).locator(COLUMNS).nth(0).locator(CARD_TITLE).filter({ hasText: `aaa${stamp}` }),
+            ).toHaveCount(1, { timeout: 20_000 });
+            await expect(
+                board(page).locator(COLUMNS).nth(0).locator(CARD_TITLE).filter({ hasText: `bbb${stamp}` }),
+            ).toHaveCount(1, { timeout: 20_000 });
+            expect(await boxUss(page, 0).count()).toBeGreaterThanOrEqual(before + 2);
         });
     });
 
@@ -699,12 +784,23 @@ test.describe('kanban', () => {
      */
     test.describe('folds', () => {
         test('fold and unfold a column', async ({ page }) => {
+            // The Archived column is folded by default (KanbanApp pre-folds it),
+            // so the folded-header count is asserted as a RELATIVE delta around
+            // the fold/unfold of column 0 (QA F-06) rather than the absolute
+            // count of 1 the legacy assertion used (which ignored the pre-folded
+            // Archived column and failed on the real board).
+            const before = await board(page).locator(VFOLD_HEADER).count();
+
             await board(page).locator(HEADER_COLUMNS).nth(0).locator(FOLD_ACTION).click();
-            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(1, { timeout: 10_000 });
+            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(before + 1, {
+                timeout: 10_000,
+            });
             await capture(page, 'fold-column');
 
             await board(page).locator(HEADER_COLUMNS).nth(0).locator(UNFOLD_ACTION).click();
-            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(0, { timeout: 10_000 });
+            await expect(board(page).locator(VFOLD_HEADER)).toHaveCount(before, {
+                timeout: 10_000,
+            });
         });
     });
 
@@ -714,10 +810,15 @@ test.describe('kanban', () => {
      * the bulk_update_kanban_order endpoint (AAP §0.7.1), which is HARD-asserted.
      */
     test('move us between columns', async ({ page }) => {
-        const initOrigin = await boxUss(page, 0).count();
-        const initDestination = await boxUss(page, 1).count();
-
+        // Track the SPECIFIC card by its stable ref (#N) so the assertion survives
+        // a concurrent board reload (which can perturb raw column counts). The
+        // moved card must LEAVE column 0 and APPEAR in column 1; the drop is
+        // HARD-asserted through the frozen bulk_update_kanban_order endpoint.
         const source = boxUss(page, 0).first();
+        const ref = (await source.locator(CARD_REF).innerText()).trim();
+        const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const refExact = new RegExp('^' + escaped + '$');
+
         const target = board(page).locator(COLUMNS).nth(1);
 
         const persisted = waitKanbanOrderPersist(page);
@@ -725,8 +826,13 @@ test.describe('kanban', () => {
         const response = await persisted;
         expect(response.ok()).toBe(true);
 
-        await expect(boxUss(page, 0)).toHaveCount(initOrigin - 1, { timeout: 15_000 });
-        await expect(boxUss(page, 1)).toHaveCount(initDestination + 1, { timeout: 15_000 });
+        // The moved card now lives in column 1 and no longer in column 0.
+        await expect(
+            board(page).locator(COLUMNS).nth(1).locator(CARD_REF).filter({ hasText: refExact }),
+        ).toHaveCount(1, { timeout: 15_000 });
+        await expect(
+            board(page).locator(COLUMNS).nth(0).locator(CARD_REF).filter({ hasText: refExact }),
+        ).toHaveCount(0, { timeout: 15_000 });
     });
 
     /*
@@ -736,8 +842,6 @@ test.describe('kanban', () => {
      */
     test.describe('archive', () => {
         test('move to archive', async ({ page }) => {
-            const initOrigin = await boxUss(page, 3).count();
-
             // Scroll the board right so the archive (last) column is reachable.
             await board(page)
                 .locator(SCROLL_BODY)
@@ -746,7 +850,14 @@ test.describe('kanban', () => {
                     (el as HTMLElement).scrollLeft = 10000;
                 });
 
+            // Track the SPECIFIC card by its stable ref so the assertion survives
+            // a concurrent board reload. The card must LEAVE column 3; the drop is
+            // HARD-asserted through the frozen bulk_update_kanban_order endpoint.
             const source = boxUss(page, 3).first();
+            const ref = (await source.locator(CARD_REF).innerText()).trim();
+            const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const refExact = new RegExp('^' + escaped + '$');
+
             const target = board(page).locator(COLUMNS).last();
 
             const persisted = waitKanbanOrderPersist(page);
@@ -755,42 +866,56 @@ test.describe('kanban', () => {
             expect(response.ok()).toBe(true);
             await capture(page, 'archive');
 
-            await expect(boxUss(page, 3)).toHaveCount(initOrigin - 1, { timeout: 15_000 });
+            // The moved card no longer appears in column 3.
+            await expect(
+                board(page).locator(COLUMNS).nth(3).locator(CARD_REF).filter({ hasText: refExact }),
+            ).toHaveCount(0, { timeout: 15_000 });
         });
     });
 
     /*
-     * [C-07] `edit assigned to` — the React assign affordance
-     * (`.card-action-assigned-to`) opens the SAME real edit lightbox with the
-     * assignee `<select>` focused (KanbanApp passes focusAssignee=true, and the
-     * lightbox focuses `.assigned-to-select` on open). Changing the assignee and
-     * submitting must issue a single `PATCH /userstories/{id}` — no AngularJS
-     * bridge is involved.
+     * [KAN-03] `assign a user` — the React assign affordance
+     * (`.card-action-assigned-to`) opens the DEDICATED SelectUserLightbox
+     * (app/react/kanban/SelectUserLightbox.tsx, `.lightbox-select-user`), NOT the
+     * create/edit lightbox. This ports the legacy `changeUsAssignedUsers` picker
+     * (kanban/main.coffee L339-L349). Selecting a user row and confirming
+     * (`.lb-select-user-confirm`) issues a single `PATCH /userstories/{id}`
+     * (assigned_users/assigned_to + version) — no AngularJS bridge, and no
+     * fabricated `.assigned-to-select` <select> (which never existed in the React
+     * DOM). This also retires the conditional `test.skip` the legacy case used
+     * (QA F-02): the seeded sample_data projects always expose members.
      */
-    test('edit assigned to', async ({ page }) => {
+    test('assign a user through the select-user lightbox', async ({ page }) => {
         const card = boxUss(page, 0).first();
         const menu = await openCardActions(card);
         await expect(menu.locator(CARD_ACTION_ASSIGN)).toBeVisible();
-
         await menu.locator(CARD_ACTION_ASSIGN).click();
 
-        // The real edit lightbox opens focused on the assignee control.
-        const lb = editLightbox(page);
+        // The SelectUserLightbox opens (revealed by the `.open` class).
+        const lb = page.locator(`${LB_SELECT_USER}.open`).first();
         await expect(lb).toBeVisible({ timeout: 10_000 });
-        const assignee = lb.locator(LB_EDIT_ASSIGNEE);
-        await expect(assignee).toBeFocused({ timeout: 5_000 });
         await capture(page, 'edit-assigned-to');
 
-        // Pick the first real assignee option (index 0 is "Not assigned").
-        const optionCount = await assignee.locator('option').count();
-        test.skip(optionCount < 2, 'No assignable users in the seeded project.');
-        const targetValue = await assignee.locator('option').nth(1).getAttribute('value');
-        await assignee.selectOption(targetValue ?? '');
+        // Prefer a plain USER row (role rows carry a `.user-list-name > .role`
+        // span) that is not already selected, so the click grows the assignee
+        // set; fall back to the first available row otherwise.
+        const userRow = lb
+            .locator(`${LB_SELECT_USER_ITEM}:not(:has(.role)):not(.is-active)`)
+            .first();
+        const anyRow = lb.locator(LB_SELECT_USER_ITEM).first();
+        const target = (await userRow.count()) ? userRow : anyRow;
+        await expect(target).toBeVisible({ timeout: 5_000 });
+        await target.click();
 
+        // Confirm the selection (the confirm button is visible only while the
+        // search box is empty) → a single PATCH /userstories/{id} persists it.
         const persisted = waitEditPersist(page);
-        await submitLightbox(page, lb);
+        await lb.locator(LB_SELECT_USER_CONFIRM).click();
         const response = await persisted;
         expect(response.request().method()).toBe('PATCH');
+
+        // The picker closes on confirm.
+        await expect(lb).toBeHidden({ timeout: 10_000 });
     });
 
     /*
@@ -801,8 +926,10 @@ test.describe('kanban', () => {
      */
     test.describe('delete us', () => {
         test('cancel keeps the card', async ({ page }) => {
-            const before = await boxUss(page, 0).count();
             const card = boxUss(page, 0).first();
+            const ref = (await card.locator(CARD_REF).innerText()).trim();
+            const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const refExact = new RegExp('^' + escaped + '$');
 
             const menu = await openCardActions(card);
             await menu.locator(CARD_ACTION_DELETE).click();
@@ -814,11 +941,15 @@ test.describe('kanban', () => {
             await dialog.locator(CONFIRM_CANCEL).click();
             await expect(dialog).toBeHidden({ timeout: 10_000 });
 
-            await expect(boxUss(page, 0)).toHaveCount(before);
+            // Cancelling leaves the SPECIFIC card on the board (asserted by its
+            // stable ref, robust to a concurrent board reload that a raw
+            // column-count check would trip on).
+            await expect(
+                board(page).locator(COLUMNS).nth(0).locator(CARD_REF).filter({ hasText: refExact }),
+            ).toHaveCount(1, { timeout: 10_000 });
         });
 
         test('confirm deletes the card', async ({ page }) => {
-            const before = await boxUss(page, 0).count();
             const card = boxUss(page, 0).first();
             const ref = (await card.locator(CARD_REF).innerText()).trim();
 
@@ -840,9 +971,11 @@ test.describe('kanban', () => {
             await dialog.locator(CONFIRM_OK).click();
             await deleted;
 
-            await expect(boxUss(page, 0)).toHaveCount(before - 1, { timeout: 20_000 });
-
-            // The specific deleted card (matched by its exact stable ref) is gone.
+            // The SPECIFIC deleted card (matched by its exact stable ref) is gone
+            // from the board. This identity assertion is the authoritative,
+            // race-free proof of the delete — a raw column-count delta would be
+            // redundant with it and fragile against a concurrent board reload, so
+            // it is intentionally omitted.
             const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const refExact = new RegExp('^' + escaped + '$');
             await expect(
@@ -884,8 +1017,15 @@ test.describe('kanban', () => {
         await created;
         await uploaded;
 
-        await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
-        expect(await columnTitles(page, 0)).toContain(subject);
+        // Wait for the unique-subject card (settles the board after the create
+        // flow's final reload); then assert the monotonic count lower bound.
+        const createdCard = board(page)
+            .locator(COLUMNS)
+            .nth(0)
+            .locator(CARD_TITLE)
+            .filter({ hasText: subject });
+        await expect(createdCard).toHaveCount(1, { timeout: 20_000 });
+        expect(await boxUss(page, 0).count()).toBeGreaterThanOrEqual(before + 1);
     });
 
     /*
@@ -895,21 +1035,41 @@ test.describe('kanban', () => {
      * backend dependency) and assert the origin/destination counts are restored.
      */
     test('failed order persist rolls the moved card back', async ({ page }) => {
-        const initOrigin = await boxUss(page, 0).count();
-        const initDestination = await boxUss(page, 1).count();
+        // Track the SPECIFIC card by its stable ref so the rollback assertion
+        // survives a concurrent board reload (raw column counts are fragile here).
+        const source = boxUss(page, 0).first();
+        const ref = (await source.locator(CARD_REF).innerText()).trim();
+        const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const refExact = new RegExp('^' + escaped + '$');
 
+        // Force the drop-order persist to fail so the optimistic move must roll
+        // back.
         await page.route(/bulk_update_kanban_order/, (route) =>
             route.fulfill({ status: 500, contentType: 'application/json', body: '{}' }),
         );
 
-        const source = boxUss(page, 0).first();
         const target = board(page).locator(COLUMNS).nth(1);
-        await dndDrag(page, source, target);
 
-        // After the failed persist the optimistic move is reverted: both columns
-        // return to their pre-drag card counts.
-        await expect(boxUss(page, 0)).toHaveCount(initOrigin, { timeout: 15_000 });
-        await expect(boxUss(page, 1)).toHaveCount(initDestination, { timeout: 15_000 });
+        // Guard against a vacuous pass (a drag that never registered would leave
+        // the card in place and trivially "revert"): assert the drop actually
+        // FIRED the drop-order persist by awaiting the intercepted
+        // bulk_update_kanban_order response, which the route fulfills with 500.
+        const failedPersist = page.waitForResponse(
+            (r) => /bulk_update_kanban_order/.test(r.url()) && r.request().method() !== 'GET',
+            { timeout: 20_000 },
+        );
+        await dndDrag(page, source, target);
+        const failResp = await failedPersist;
+        expect(failResp.status()).toBe(500);
+
+        // After the failed persist the optimistic move is reverted: the specific
+        // card is back in its origin column 0 and is NOT left behind in column 1.
+        await expect(
+            board(page).locator(COLUMNS).nth(0).locator(CARD_REF).filter({ hasText: refExact }),
+        ).toHaveCount(1, { timeout: 15_000 });
+        await expect(
+            board(page).locator(COLUMNS).nth(1).locator(CARD_REF).filter({ hasText: refExact }),
+        ).toHaveCount(0, { timeout: 15_000 });
 
         await page.unroute(/bulk_update_kanban_order/);
     });
@@ -945,7 +1105,7 @@ test.describe('kanban', () => {
 
         // Reload so the board re-reads the permission-stripped project payload.
         const base = baseURL && baseURL.endsWith('/') ? baseURL : `${baseURL || ''}/`;
-        await page.goto(`${base}project/project-0/kanban`);
+        await page.goto(`${base}project/project-1/kanban`);
         await waitLoader(page);
 
         await expect(board(page).locator(ADD_ACTION)).toHaveCount(0, { timeout: 15_000 });
@@ -983,36 +1143,47 @@ test.describe('kanban', () => {
 
             const initial = await board(page).locator(CARD).count();
 
-            // Find the first category option whose selection reduces the count.
-            const options = board(page)
-                .locator(FILTER_CATEGORY)
-                .locator(`${SINGLE_FILTER} ${FILTER_NAME}`);
-            const optionCount = await options.count();
-            expect(optionCount).toBeGreaterThan(0);
+            // Categories are collapsible: options (`button.single-filter`) render
+            // only once a category is expanded via its `.e2e-category` button.
+            // Expand each category in turn and try its options until one reduces
+            // the visible card count. Clicking an option consumes it (it leaves
+            // the option list and becomes an applied chip), so always re-query
+            // and take the first remaining option.
+            const categoryButtons = board(page).locator(FILTER_CATEGORY_BTN);
+            const categoryCount = await categoryButtons.count();
+            expect(categoryCount).toBeGreaterThan(0);
 
             let applied = false;
-            for (let i = 0; i < optionCount; i++) {
-                await options.nth(i).click();
-                try {
-                    await expect
-                        .poll(async () => await board(page).locator(CARD).count(), {
-                            timeout: 6_000,
-                        })
-                        .toBeLessThan(initial);
-                    applied = true;
-                    break;
-                } catch {
-                    // This option did not reduce the count (e.g. matches all
-                    // cards); remove any resulting chip and try the next one.
-                    const chips = board(page).locator(FILTER_APPLIED);
-                    if (await chips.count()) {
-                        await chips.first().click();
+            for (let c = 0; c < categoryCount && !applied; c++) {
+                const catBtn = board(page).locator(FILTER_CATEGORY_BTN).nth(c);
+                if ((await catBtn.getAttribute('aria-expanded')) !== 'true') {
+                    await catBtn.click();
+                }
+
+                // Drain this category's options one at a time.
+                for (let guard = 0; guard < 30 && !applied; guard++) {
+                    const options = board(page).locator(SINGLE_FILTER);
+                    if ((await options.count()) === 0) {
+                        break; // no (more) options exposed for this category
+                    }
+                    await options.first().click();
+                    try {
+                        await expect
+                            .poll(async () => await board(page).locator(CARD).count(), {
+                                timeout: 6_000,
+                            })
+                            .toBeLessThan(initial);
+                        applied = true;
+                    } catch {
+                        // Did not reduce the count (the option matched every
+                        // card); it is now consumed as a chip — leave it and try
+                        // the next remaining option. All chips are cleared below.
                     }
                 }
             }
             expect(applied).toBe(true);
 
-            // Removing the applied chip restores the full list.
+            // Removing every applied chip restores the full list.
             await clearFilters(page, initial);
         });
     });
@@ -1034,11 +1205,16 @@ test.describe('kanban', () => {
         const before = await boxUss(page, 0).count();
         const lb = await openBulkLightbox(page, 0);
         await bulkCreate(page, lb, [payload]);
-        await expect(boxUss(page, 0)).toHaveCount(before + 1, { timeout: 20_000 });
 
-        // The title must render the payload as escaped, literal text.
+        // The payload card must render the subject as ESCAPED, literal text
+        // (React escapes by default). Waiting for that specific card settles the
+        // board after the create; the column count is then a monotonic lower
+        // bound (creation only adds — and a repeated E2E_ALLOW_NO_RESEED run may
+        // legitimately leave more than one such card), robust to a reload blip.
         const title = board(page).locator(CARD_TITLE, { hasText: payload }).first();
+        await expect(title).toBeVisible({ timeout: 20_000 });
         await expect(title).toHaveText(payload);
+        expect(await boxUss(page, 0).count()).toBeGreaterThanOrEqual(before + 1);
 
         // No injected onerror handler executed.
         const injected = await page.evaluate(

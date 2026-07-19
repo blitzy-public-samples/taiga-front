@@ -96,6 +96,44 @@ export class HttpError extends Error {
 }
 
 /**
+ * Recognize an optimistic-concurrency (version) conflict from the FROZEN Django
+ * `/api/v1/` contract.
+ *
+ * The backend's OCC mixin (`taiga-back` `taiga/projects/occ/mixins.py`) raises
+ * `WrongArguments({"version": "The version doesn't match with the current one"})`
+ * when a write carries a stale `version`. `WrongArguments` extends `BadRequest`,
+ * whose inherited `status_code` is **HTTP 400** — NOT 409. The 400 response body
+ * is the raw detail dict `{ "version": "..." }` (see
+ * `taiga/base/exceptions.format_exception`, which passes a dict detail through
+ * unchanged).
+ *
+ * Callers therefore cannot discriminate a version conflict on the HTTP status
+ * alone: it is a `400` whose parsed body carries a `version` field. This
+ * predicate centralizes that check so every save / status / points / reorder
+ * recovery path treats the conflict uniformly (reloading to pick up the fresh
+ * server version), while still tolerating a literal `409` defensively should the
+ * contract ever change.
+ */
+export function isVersionConflict(err: unknown): boolean {
+    if (!(err instanceof HttpError)) {
+        return false;
+    }
+
+    // Defensive: honor a literal 409 even though the current contract returns 400.
+    if (err.status === 409) {
+        return true;
+    }
+
+    // The authoritative signal: a 400 whose body is an object carrying `version`.
+    return (
+        err.status === 400 &&
+        typeof err.body === "object" &&
+        err.body !== null &&
+        "version" in (err.body as Record<string, unknown>)
+    );
+}
+
+/**
  * Join the configured API base URL with a relative path, mirroring the
  * AngularJS `UrlsService.resolve` (`urls.coffee` L34-37):
  * `trimEnd(base, "/") + "/" + trimStart(path, "/")`.

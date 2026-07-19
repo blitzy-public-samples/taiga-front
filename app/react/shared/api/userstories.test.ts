@@ -12,6 +12,7 @@ import {
     bulkUpdateKanbanOrder,
     bulkUpdateMilestone,
     filtersData,
+    getUserstory,
     listUserstories,
 } from "./userstories";
 
@@ -97,6 +98,25 @@ describe("shared/api/userstories", () => {
             expect(sent.url).toContain("http://localhost:8000/api/v1/userstories/filters_data?");
             expect(sent.url).toContain("project=42");
             expect(sent.headers["x-disable-pagination"]).toBe("1");
+        });
+    });
+
+    describe("getUserstory", () => {
+        // D-1: the edit lightbox re-fetches the FULL story detail on open so a
+        // subject-only save cannot erase the `description` that the light board
+        // LIST serializer omits. This GETs the detail endpoint by id.
+        it("GETs /userstories/{id} for a single story detail", async () => {
+            fetchMock.mockResolvedValue(
+                makeResponse({ id: 77, subject: "S", description: "the body" }),
+            );
+
+            const res = await getUserstory(77);
+
+            const sent = lastRequest();
+            expect(sent.method).toBe("GET");
+            expect(sent.url).toBe("http://localhost:8000/api/v1/userstories/77");
+            // The parsed detail (with its description) is returned to the caller.
+            expect(res.data).toMatchObject({ id: 77, description: "the body" });
         });
     });
 

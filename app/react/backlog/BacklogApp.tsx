@@ -86,7 +86,7 @@ import type {
     UserStoryCreateFields,
     UserStoryEditChanges,
 } from "./UserStoryEditLightbox";
-import { httpGet, httpPatch, httpDelete, HttpError } from "../shared/api/httpClient";
+import { httpGet, httpPatch, httpDelete, HttpError, isVersionConflict } from "../shared/api/httpClient";
 import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import * as userstoriesApi from "../shared/api/userstories";
 import * as attachmentsApi from "../shared/api/attachments";
@@ -499,6 +499,72 @@ function applyOptimisticMove(
             closedSprints = mapSprintStories(closedSprints, targetId, (l) =>
                 insertUs(l, movedUs, targetIndex),
             );
+        }
+    }
+
+    return { userstories, sprints, closedSprints };
+}
+
+/**
+ * Multi-select variant of {@link applyOptimisticMove}: relocate a CONTIGUOUS
+ * block of dragged stories (legacy `window.dragMultiple`, backlog/sortable.coffee
+ * L75-137) out of their origin container(s) and insert them — in the supplied
+ * order — at `targetIndex` of the target container, rewriting each story's
+ * `milestone` to the target. Every dragged id is removed from EVERY container
+ * first (robust to any origin distribution) before the block is re-inserted, so
+ * relative order inside the block is preserved exactly. Returns `null` if any
+ * dragged id cannot be resolved (mirrors the single-item guard).
+ */
+function applyOptimisticMoveMulti(
+    collections: MovedCollections,
+    draggedIds: number[],
+    targetKey: string,
+    targetIndex: number,
+): MovedCollections | null {
+    // Flatten every story across backlog + open/closed sprints so a dragged id
+    // can be resolved regardless of which container currently holds it.
+    const all: UserStory[] = collections.userstories.concat(
+        collections.sprints
+            .concat(collections.closedSprints)
+            // F-B: `.reduce` (ES2018) not `.flatMap` (ES2019) — see applyOptimisticMove.
+            .reduce<UserStory[]>((acc, s) => acc.concat(s.user_stories), []),
+    );
+    const draggedStories: UserStory[] = [];
+    for (const id of draggedIds) {
+        const found = all.find((u) => u.id === id);
+        if (!found) {
+            return null;
+        }
+        draggedStories.push(found);
+    }
+
+    const targetMilestoneId = milestoneIdFromKey(targetKey);
+    const movedStories = draggedStories.map((u) => ({ ...u, milestone: targetMilestoneId }));
+    const draggedSet = new Set(draggedIds);
+
+    // Remove every dragged id from every container (backlog + all sprints).
+    let userstories = collections.userstories.filter((u) => !draggedSet.has(u.id));
+    let sprints = collections.sprints.map((s) => ({
+        ...s,
+        user_stories: s.user_stories.filter((u) => !draggedSet.has(u.id)),
+    }));
+    let closedSprints = collections.closedSprints.map((s) => ({
+        ...s,
+        user_stories: s.user_stories.filter((u) => !draggedSet.has(u.id)),
+    }));
+
+    // Insert the ordered block at the target index of the target container.
+    const insertBlock = (list: UserStory[]): UserStory[] => {
+        const at = Math.max(0, Math.min(targetIndex, list.length));
+        return list.slice(0, at).concat(movedStories, list.slice(at));
+    };
+    if (targetKey === BACKLOG_KEY) {
+        userstories = insertBlock(userstories);
+    } else {
+        const targetId = milestoneIdFromKey(targetKey);
+        if (targetId != null) {
+            sprints = mapSprintStories(sprints, targetId, insertBlock);
+            closedSprints = mapSprintStories(closedSprints, targetId, insertBlock);
         }
     }
 
@@ -1928,7 +1994,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * index) or an unresolvable drop.
      */
     const resolveDrop = useCallback((event: NormalizedDragEnd): ResolvedDrop | null => {
-        const { userstories, sprints, closedSprints } = stateRef.current;
+        const { userstories, sprints, closedSprints, selection } = stateRef.current;
         const draggedId = event.activeId;
         const overId = event.overId;
         if (overId == null || overId === draggedId) {
@@ -1940,6 +2006,34 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             return null;
         }
 
+        // Multi-select drag parity (legacy `window.dragMultiple` / `isMultiple`,
+        // backlog/sortable.coffee L75-137): when the physically-dragged row is
+        // itself checked AND ≥2 stories in its container are checked, the WHOLE
+        // checked set moves as a contiguous block — ordered by their origin
+        // container order and positioned by the dragged row's drop point.
+        // NOTE: `selection.checked` is keyed by `us.ref` (BacklogTable), while the
+        // DnD layer identifies rows by `us.id` (`activeId`), so map ref→id here.
+        // Dragging an UNCHECKED row (or with <2 checked in-container) yields
+        // `[draggedId]`, so the block logic below collapses to the exact prior
+        // single-item behavior (zero change for single drags).
+        const refById = new Map<number, number>();
+        for (const u of userstories) {
+            refById.set(u.id, u.ref);
+        }
+        for (const s of sprints.concat(closedSprints)) {
+            for (const u of s.user_stories) {
+                refById.set(u.id, u.ref);
+            }
+        }
+        const isChecked = (id: number): boolean => {
+            const ref = refById.get(id);
+            return ref != null && selection.checked[String(ref)] === true;
+        };
+        const checkedInOrigin = origin.ids.filter(isChecked);
+        const isMulti = isChecked(draggedId) && checkedInOrigin.length > 1;
+        const draggedIds: number[] = isMulti ? checkedInOrigin : [draggedId];
+        const isDragged = (id: number): boolean => draggedIds.indexOf(id) !== -1;
+
         let targetKey: string;
         let dropIndex: number;
 
@@ -1947,7 +2041,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             // Dropped on a container itself → append at the end.
             targetKey = overId;
             const base = containerIds(targetKey, userstories, sprints, closedSprints).filter(
-                (id) => id !== draggedId,
+                (id) => !isDragged(id),
             );
             dropIndex = base.length;
         } else {
@@ -1956,8 +2050,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             if (!overLoc) {
                 return null;
             }
+            // Dropping onto a CO-SELECTED row (part of the moving block) is a no-op.
+            if (isDragged(overId)) {
+                return null;
+            }
             targetKey = overLoc.containerKey;
-            const base = overLoc.ids.filter((id) => id !== draggedId);
+            const base = overLoc.ids.filter((id) => !isDragged(id));
             const k = base.indexOf(overId);
             if (k === -1) {
                 dropIndex = base.length;
@@ -1985,17 +2083,17 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         }
 
         const targetIds = containerIds(targetKey, userstories, sprints, closedSprints).filter(
-            (id) => id !== draggedId,
+            (id) => !isDragged(id),
         );
         const insertAt = Math.max(0, Math.min(dropIndex, targetIds.length));
         const orderedIds = targetIds.slice();
-        orderedIds.splice(insertAt, 0, draggedId);
+        orderedIds.splice(insertAt, 0, ...draggedIds);
 
         const resolved: ResolvedDrop = {
             origin: { containerKey: origin.containerKey, index: origin.index },
             target: { containerKey: targetKey, index: insertAt },
             orderedIds,
-            draggedIds: [draggedId],
+            draggedIds,
         };
 
         if (
@@ -2024,19 +2122,33 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 sprints: s.sprints,
                 closedSprints: s.closedSprints,
             };
-            const draggedId = resolved.draggedIds[0];
-            const moved = applyOptimisticMove(
-                prev,
-                draggedId,
-                resolved.origin.containerKey,
-                resolved.target.containerKey,
-                resolved.target.index,
-            );
+            const draggedIds = resolved.draggedIds;
+            const moved =
+                draggedIds.length > 1
+                    ? applyOptimisticMoveMulti(
+                          prev,
+                          draggedIds,
+                          resolved.target.containerKey,
+                          resolved.target.index,
+                      )
+                    : applyOptimisticMove(
+                          prev,
+                          draggedIds[0],
+                          resolved.origin.containerKey,
+                          resolved.target.containerKey,
+                          resolved.target.index,
+                      );
             if (!moved) {
                 return;
             }
 
             applyMovedUserstories(moved);
+
+            // Legacy `moveUs` clears the multi-select after a bulk drag so the
+            // moved rows do not stay checked in their new location.
+            if (draggedIds.length > 1) {
+                clearSelection();
+            }
 
             const targetMilestoneId = milestoneIdFromKey(resolved.target.containerKey);
             const persister = createBacklogPersister(resolvedId);
@@ -2093,7 +2205,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 );
             }
         },
-        [resolvedId, applyMovedUserstories, patchUserStory, loadSprints, loadProjectStats, loadClosedSprints],
+        [
+            resolvedId,
+            applyMovedUserstories,
+            clearSelection,
+            patchUserStory,
+            loadSprints,
+            loadProjectStats,
+            loadClosedSprints,
+        ],
     );
 
     /**
@@ -2172,14 +2292,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * Port of `editUserStory` (main.coffee L653). In AngularJS the controller
      * re-fetched the story + attachments and broadcast to the generic-form
      * lightbox; here the row `us` seeds the React-owned {@link
-     * UserStoryEditLightbox} directly (the Angular host was removed by the
-     * migration — QA finding #2).
+     * UserStoryEditLightbox} for immediate open, and the lightbox then hydrates
+     * the full detail (description via `fetchDetail` / attachments via
+     * `fetchAttachments`) that the light board serializer omits (D-1). The
+     * Angular host was removed by the migration — QA finding #2.
      */
     const onEditUserStory = useCallback((us: UserStory): void => {
         // [#2] Open the React-owned create/edit lightbox in EDIT mode, seeded
         // from the row. Previously this broadcast "genericform:edit" to the
         // Angular `tg-lb-create-edit` host that the migrated backlog.jade
-        // removed, so it was a silent no-op.
+        // removed, so it was a silent no-op. D-1: the lightbox re-fetches the
+        // story detail on open so a subject-only save cannot erase the stored
+        // description (the board LIST row omits `description`).
         setUsLightbox({ open: true, mode: "edit", us });
     }, []);
 
@@ -2251,7 +2375,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     /**
      * Port of the `tgUsStatus` save + `updateUserStoryStatus` (main.coffee L646):
      * PATCH `{ status, version }`, patch state with the server response, then
-     * reload stats. A 409 version conflict reloads the backlog to pick up fresh
+     * reload stats. A version conflict (the FROZEN backend signals it as HTTP 400
+     * with a `version` body, not 409) reloads the backlog to pick up fresh
      * versions.
      */
     const onChangeStatus = useCallback(
@@ -2267,7 +2392,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 patchUserStory(us.id, res.data);
                 await loadProjectStats();
             } catch (err) {
-                if (err instanceof HttpError && err.status === 409) {
+                if (isVersionConflict(err)) {
                     await loadUserstories({ reset: true });
                 } else {
                     reportError(
@@ -2284,7 +2409,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     /**
      * Port of `tgBacklogUsPoints.onSelectedPointForRole`: merge the new
      * role→point into `us.points`, PATCH `{ points, version }`, patch state,
-     * reload stats. 409 reloads the backlog.
+     * reload stats. A version conflict (HTTP 400 with a `version` body) reloads
+     * the backlog.
      */
     const onChangePoints = useCallback(
         async (us: UserStory, roleId: Id, pointId: Id): Promise<void> => {
@@ -2300,7 +2426,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 patchUserStory(us.id, res.data);
                 await loadProjectStats();
             } catch (err) {
-                if (err instanceof HttpError && err.status === 409) {
+                if (isVersionConflict(err)) {
                     await loadUserstories({ reset: true });
                 } else {
                     reportError(
@@ -2546,9 +2672,10 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
      * Ports the generic-form `mode == 'edit'` branch (common/lightboxes.coffee
      * L794): `PATCH userstories/{id}` with the changed fields + `version` for
      * optimistic concurrency, then patch state + reload stats + re-read the
-     * backlog. A 409 version conflict reloads to pick up fresh versions (ports
-     * the 409 branch of `onChangeStatus`); the error is rethrown so the lightbox
-     * keeps itself open and surfaces the failure.
+     * backlog. A version conflict (HTTP 400 with a `version` body, not 409)
+     * reloads to pick up fresh versions (ports the conflict branch of
+     * `onChangeStatus`); the error is rethrown so the lightbox keeps itself open
+     * and surfaces the failure.
      */
     const onSaveUserStoryEdit = useCallback(
         async (target: UserStory, changes: UserStoryEditChanges): Promise<void> => {
@@ -2558,7 +2685,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     status: changes.status,
                     points: changes.points,
                     assigned_to: changes.assigned_to,
-                    description: changes.description,
+                    // D-1: include `description` ONLY when the lightbox marked it
+                    // authoritative (loaded from detail / row) or user-edited. When
+                    // `undefined`, omit it entirely so a subject-only edit cannot
+                    // overwrite the stored description with an empty string.
+                    ...(changes.description !== undefined
+                        ? { description: changes.description }
+                        : {}),
                     tags: changes.tags,
                     due_date: changes.due_date,
                     is_blocked: changes.is_blocked,
@@ -2580,7 +2713,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 await loadProjectStats();
                 await loadUserstories({ reset: true });
             } catch (err) {
-                if (err instanceof HttpError && err.status === 409) {
+                if (isVersionConflict(err)) {
                     await loadUserstories({ reset: true });
                 }
                 throw err;
@@ -2629,6 +2762,22 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 resolvedIdRef.current,
             );
             return response.data ?? [];
+        },
+        [],
+    );
+
+    /**
+     * D-1: hydrate a story's FULL detail (including `description`) for the edit
+     * form. The backlog list endpoint uses a light serializer that OMITS
+     * `description`, so the lightbox calls this on open to load the real value
+     * (against the frozen `GET /userstories/{id}` endpoint). Ports the AngularJS
+     * `editUserStory` re-fetch. Without it, a subject-only edit would persist an
+     * empty description and silently erase the stored text.
+     */
+    const fetchUsDetail = useCallback(
+        async (usId: number): Promise<UserStory> => {
+            const response = await userstoriesApi.getUserstory(usId);
+            return response.data as unknown as UserStory;
         },
         [],
     );
@@ -3581,6 +3730,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 onCreate={onCreateUserStory}
                 onEdit={onSaveUserStoryEdit}
                 fetchAttachments={fetchUsAttachments}
+                fetchDetail={fetchUsDetail}
                 onClose={() => setUsLightbox((s) => ({ ...s, open: false }))}
             />
             <SprintEditLightbox
