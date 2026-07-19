@@ -68,6 +68,17 @@ import {
 } from './state/kanbanReducer';
 import { DndProvider } from '../shared/dnd/DndProvider';
 import { createKanbanDragEndHandler } from '../shared/dnd/sortable';
+import { buildFilterCategories } from '../shared/filters';
+import {
+  locationHasManagedParams,
+  parseAppliedFiltersFromSearch,
+  reconcileAppliedFilterNames,
+  readLocationSearch,
+  extractQueryText,
+  writeFiltersToLocation,
+  type RestoredAppliedFilter,
+} from '../shared/filterUrl';
+import type { CreateExtra } from '../shared/api/userstories';
 
 /* ------------------------------------------------------------------------- *
  * Module-level constants (reproduce `KanbanController` class fields)
@@ -114,6 +125,10 @@ const VALID_QUERY_PARAMS: string[] = [
  * by the sibling `components/Board.tsx`.
  */
 const I18N: Record<string, string> = {
+  // H1 fix: the Kanban header shows the SECTION name ("Kanban"), matching the
+  // AngularJS `tg-main-title` directive (sectionName = KANBAN.SECTION_NAME),
+  // NOT the project name.
+  'KANBAN.SECTION_NAME': 'Kanban',
   'BACKLOG.FILTERS.TITLE': 'Filters',
   'BACKLOG.FILTERS.HIDE_TITLE': 'Hide filters',
   'COMMON.FILTERS.INPUT_PLACEHOLDER': 'Search',
@@ -132,6 +147,19 @@ const I18N: Record<string, string> = {
   // Single-story create subject placeholder (KB-5); matches COMMON.FIELDS.SUBJECT
   // ("Subject") from the legacy locale.
   'US.SUBJECT_PLACEHOLDER': 'Subject',
+  // Inline create/edit form field labels (findings #7 + #8), sourced from the
+  // legacy locale (`locale-en.json` COMMON.FIELDS.* / US.*).
+  'COMMON.FIELDS.SUBJECT': 'Subject',
+  'COMMON.FIELDS.STATUS': 'Status',
+  'COMMON.FIELDS.DESCRIPTION': 'Description',
+  'COMMON.FIELDS.TAGS': 'Tags',
+  'COMMON.FIELDS.DUE_DATE': 'Due date',
+  'US.TAGS_PLACEHOLDER': 'Comma-separated tags',
+  'US.IS_BLOCKED': 'Blocked',
+  'US.BLOCKED_NOTE': 'Blocked note',
+  // Inline assign-users popover title (finding #8), matching the legacy
+  // `tg-lb-select-user` `lbTitle` (COMMON.ASSIGNED_USERS.ADD).
+  'COMMON.ASSIGNED_USERS.ADD': 'Add assigned users',
   'COMMON.PERMISSION_DENIED': 'You do not have permission to view this board.',
   // Generic error strings reused from the legacy notification service
   // (`app/locales/taiga/locale-en.json` -> NOTIFICATION.*) so the failed-load
@@ -143,6 +171,75 @@ const I18N: Record<string, string> = {
 
 /** Translate a message key to its English source string (or the key itself). */
 const t = (key: string): string => I18N[key] ?? key;
+
+/* ------------------------------------------------------------------------- *
+ * Inline create/edit user-story form (findings #7 + #8)
+ * ------------------------------------------------------------------------- *
+ * The AngularJS card Edit action broadcast `genericform:edit` and the standard
+ * "+" broadcast `genericform:new`, both opening the shared generic user-story
+ * form that lives in the OUT-OF-SCOPE `common` AngularJS module
+ * (`app/coffee/modules/common/lightboxes.coffee`, AAP 0.2.2). Reproducing that
+ * entire cross-app surface (WYSIWYG description, custom attributes, watchers,
+ * multi-assignee widget, colour-picker tags, team/client requirement toggles)
+ * would be over-building far past the two migrated screens. The proportionate,
+ * in-scope parity fix (AAP D1 - fix the root cause inside `app/react/**`) is an
+ * inline create/edit lightbox IN the Kanban React tree covering the core,
+ * card-relevant fields, so the user edits a story WITHOUT leaving the board
+ * (this replaces the previous `window.location.assign('/us/<ref>')` navigation
+ * that finding #8 flagged). Points-per-role (edited in the backlog row / US
+ * detail) and the generic-form-only fields are deliberately omitted.
+ *
+ * `tags` is a comma-separated free-text field: the model stores `[name, colour]`
+ * tuples, so the form joins the NAMES for display and splits back to a string[]
+ * on submit (the server re-colourises new names), matching how the legacy quick
+ * paths added tags without a colour picker.
+ */
+interface UsFormFields {
+  subject: string;
+  statusId: number | null;
+  description: string;
+  tags: string; // comma-separated tag NAMES
+  isBlocked: boolean;
+  blockedNote: string;
+  dueDate: string; // 'YYYY-MM-DD' or ''
+}
+
+/** A pristine form (single-story create with no column status yet resolved). */
+const EMPTY_US_FORM: UsFormFields = {
+  subject: '',
+  statusId: null,
+  description: '',
+  tags: '',
+  isBlocked: false,
+  blockedNote: '',
+  dueDate: '',
+};
+
+/**
+ * Split the comma-separated tags field into a trimmed, de-duplicated, non-empty
+ * array of tag names (order preserved). `'a, b ,,a '` -> `['a','b']`.
+ */
+function parseTagsField(raw: string): string[] {
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const name = part.trim();
+    if (name.length > 0 && out.indexOf(name) === -1) {
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/** Join a model's `[name, colour]` tag tuples into the comma-separated field. */
+function formatTagsField(tags: unknown): string {
+  if (!Array.isArray(tags)) {
+    return '';
+  }
+  return tags
+    .map((tuple) => (Array.isArray(tuple) ? String(tuple[0] ?? '') : String(tuple ?? '')))
+    .filter((name) => name.length > 0)
+    .join(', ');
+}
 
 /* ------------------------------------------------------------------------- *
  * Host-tag constants -- render legacy custom-element tags as inert hosts.
@@ -356,12 +453,25 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   /* ----------------------------------------------------------------------- *
    * Filter state (FiltersMixin / UsFiltersMixin the controller inherited)
    * ----------------------------------------------------------------------- */
-  const [filterQ, setFilterQ] = useState<string>('');
   const filtersStorageKey = `${projectSlug}:${STORE_FILTERS_NAME}`;
   const customFiltersStorageKey = `${projectSlug}:${STORE_CUSTOM_FILTERS_NAME}`;
-  const [selectedFilters, setSelectedFilters] = useState<AppliedFilter[]>(() =>
-    readStored<AppliedFilter[]>(filtersStorageKey, []),
+  // Restore filters + free-text `q` from the URL first, falling back to
+  // `localStorage` ONLY when the URL carries no managed params -- reproducing the
+  // legacy "URL wins on load" precedence in `applyStoredFilters`
+  // (controllerMixins.coffee:106-118). Names are the raw ids at this point and
+  // are reconciled to their labels once `filters_data` resolves (see effect below).
+  const [filterQ, setFilterQ] = useState<string>(() =>
+    extractQueryText(readLocationSearch()),
   );
+  const [selectedFilters, setSelectedFilters] = useState<AppliedFilter[]>(() => {
+    if (locationHasManagedParams(VALID_QUERY_PARAMS)) {
+      return parseAppliedFiltersFromSearch(
+        readLocationSearch(),
+        VALID_QUERY_PARAMS,
+      ) as AppliedFilter[];
+    }
+    return readStored<AppliedFilter[]>(filtersStorageKey, []);
+  });
   const [customFilters, setCustomFilters] = useState<CustomFilter[]>(() =>
     readStored<CustomFilter[]>(customFiltersStorageKey, []),
   );
@@ -372,24 +482,38 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   /* ----------------------------------------------------------------------- *
    * Lightbox coordination state (main.coffee:266-315)
    * ----------------------------------------------------------------------- */
-  // The create/delete lightbox host reproduces `.lightbox-create-edit`. Two
-  // intents remain in React ownership:
-  //   - `create`: a FUNCTIONAL single-story create (KB-5) - a subject input that
+  // The create/edit/delete lightbox host reproduces `.lightbox-create-edit`.
+  // Three intents are owned by React:
+  //   - `create`: the FUNCTIONAL single-story create form (KB-5 + finding #7) -
   //     POSTs `/userstories` and adds the story to the board (user stays here).
+  //   - `edit`:   the FUNCTIONAL single-story edit form (finding #8) - PATCHes
+  //     `/userstories/{id}` (via the hook `saveUs`) and updates the board IN
+  //     PLACE, replacing the previous whole-page navigation to `/us/<ref>`.
   //   - `delete`: the confirm dialog before the pessimistic `DELETE /userstories`
   //     (KB-4).
-  // The former `edit`/`assign` intents were inert shells; per the coexistence
-  // boundary (AAP 0.4.2) those card actions now NAVIGATE to the AngularJS
-  // user-story detail route instead (see `navigateToUsDetail`), so they no
-  // longer open this host.
   const [createEditLightbox, setCreateEditLightbox] = useState<{
     open: boolean;
-    intent: 'create' | 'delete';
+    intent: 'create' | 'edit' | 'delete';
     statusId: number | null;
     usId: number | null;
   }>({ open: false, intent: 'create', statusId: null, usId: null });
-  // Subject text for the functional single-story create (KB-5).
-  const [createSubject, setCreateSubject] = useState<string>('');
+  // The create/edit form fields (subject/status/description/tags/blocked/due).
+  const [usForm, setUsForm] = useState<UsFormFields>(EMPTY_US_FORM);
+  // In-flight guard for the create/edit write (finding #9): a synchronous ref so
+  // a rapid second click short-circuits BEFORE a second POST/PATCH is dispatched
+  // (state updates are async and would race), plus a `submitting` render flag
+  // that disables the Save button. Mirrors the Backlog add-story guard (#16).
+  const submittingRef = useRef<boolean>(false);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  // The inline assign-users popover (finding #8) reproduces the legacy
+  // `tg-lb-select-user` lightbox (`.lightbox-select-user`): a member checklist
+  // whose save PATCHes `assigned_users`/`assigned_to` in place (no navigation).
+  const [assignLightbox, setAssignLightbox] = useState<{ open: boolean; usId: number | null }>({
+    open: false,
+    usId: null,
+  });
+  // Currently-checked member ids in the assign popover.
+  const [assignSelected, setAssignSelected] = useState<number[]>([]);
   // The bulk lightbox host reproduces `.lightbox-generic-bulk`; it is fully
   // functional -- a textarea that posts through the clean bulk-create endpoint.
   const [bulkLightbox, setBulkLightbox] = useState<{ open: boolean; statusId: number | null }>({
@@ -443,6 +567,7 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     projectId: resolvedProjectId,
     usersById,
     foldedSwimlane,
+    filtersData,
     isFirstLoad,
     notFoundUserstories,
     permissionError,
@@ -452,6 +577,7 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     moveUsToTop,
     addUsBulk,
     addUsStandard,
+    saveUs,
     deleteUs,
     toggleFold,
     toggleSwimlane,
@@ -468,10 +594,19 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   /* ----------------------------------------------------------------------- *
    * Effects: filter persistence + reload-on-filter-change
    * ----------------------------------------------------------------------- */
-  // Persist the applied and custom filters (documented UI-preference storage).
+  // Persist the applied filters to BOTH `localStorage` (survives reload) AND the
+  // URL query string (shareable / bookmarkable), reproducing the legacy behaviour
+  // where `FiltersMixin` wrote `$location.search()` and mirrored it to storage.
+  // The URL write uses `history.replaceState` (no route reload) -- see
+  // `writeFiltersToLocation`.
   useEffect(() => {
     writeStored(filtersStorageKey, selectedFilters);
-  }, [filtersStorageKey, selectedFilters]);
+    writeFiltersToLocation(
+      selectedFilters as RestoredAppliedFilter[],
+      VALID_QUERY_PARAMS,
+      filterQ,
+    );
+  }, [filtersStorageKey, selectedFilters, filterQ]);
   useEffect(() => {
     writeStored(customFiltersStorageKey, customFilters);
   }, [customFiltersStorageKey, customFilters]);
@@ -508,12 +643,34 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     };
   }, [project]);
 
-  const filters = useMemo(
-    // `filtersNonce` forces a regenerate after a move even if the project
-    // reference is unchanged.
-    () => buildFilters(project, EXCLUDE_FILTERS),
-    [project, filtersNonce],
+  const filters = useMemo<FilterCategory[]>(
+    // KB-3..KB-6: build the sidebar from the server `filters_data` (real
+    // categories incl. Epic, per-option counts, and the Unassigned /
+    // Not-in-an-epic pseudo-options, with tags hidden when unused). Until the
+    // fetch resolves, fall back to the static project-derived list so the
+    // sidebar is never empty in the brief pre-fetch window. `filtersNonce`
+    // still forces a regenerate after a move even if the reference is unchanged.
+    () =>
+      filtersData
+        ? buildFilterCategories(filtersData, EXCLUDE_FILTERS)
+        : buildFilters(project, EXCLUDE_FILTERS),
+    [filtersData, project, filtersNonce],
   );
+
+  // Once the sidebar categories are available, fill in the display labels/colors
+  // of any filters restored from the URL with placeholder (id) names (reproduces
+  // the legacy `formatSelectedFilters` id->chip resolution that ran after
+  // `filters_data` arrived). `reconcileAppliedFilterNames` returns the SAME
+  // reference once every label is resolved, so the guarded `setSelectedFilters`
+  // is a no-op then and does NOT loop with the persistence effect.
+  useEffect(() => {
+    setSelectedFilters((prev) => {
+      const reconciled = reconcileAppliedFilterNames(prev as RestoredAppliedFilter[], filters);
+      return reconciled === (prev as RestoredAppliedFilter[])
+        ? prev
+        : (reconciled as AppliedFilter[]);
+    });
+  }, [filters]);
 
   /* ----------------------------------------------------------------------- *
    * Zoom handler (main.coffee:127 `setZoom`). ZoomControl owns the storage and
@@ -621,7 +778,8 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         setBulkText('');
         setBulkLightbox({ open: true, statusId });
       } else {
-        setCreateSubject('');
+        // Seed a pristine form with the clicked column's status pre-selected.
+        setUsForm({ ...EMPTY_US_FORM, statusId });
         setCreateEditLightbox({ open: true, intent: 'create', statusId, usId: null });
       }
       setLightboxOpen(true);
@@ -629,34 +787,51 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     [setLightboxOpen],
   );
 
-  // KB-2/KB-3: single-story edit and assignment are NOT reproduced as in-React
-  // lightboxes. Per the coexistence boundary (AAP 0.4.2 - interop is globals +
-  // URL + REST only, NEVER the AngularJS injector/$rootScope), the card Edit and
-  // Assign actions (and the avatar quick-assign) NAVIGATE to the AngularJS
-  // user-story DETAIL route `/project/:pslug/us/:usref`
-  // [app/coffee/app.coffee:254], whose page exposes the full edit + assignment
-  // surface. This is sanctioned URL interop (a plain same-origin browser
-  // navigation via the `window.location` global), NOT a cross-framework bridge,
-  // and it replaces the previously-inert edit/assign shells.
-  const navigateToUsDetail = useCallback(
+  // `editUs(id)` (main.coffee:278) - open the INLINE edit form seeded from the
+  // story model (finding #8). The user edits IN PLACE and stays on the board;
+  // this REPLACES the previous `window.location.assign('/us/<ref>')` whole-page
+  // navigation that finding #8 flagged. `statusId` is carried in `usForm`.
+  const handleEditUs = useCallback(
     (id: number) => {
       const us = getUsModel(state, id);
-      const ref = us == null ? null : Number(us.ref);
-      if (ref == null || Number.isNaN(ref)) {
+      if (!us) {
         return;
       }
-      window.location.assign(`/project/${projectSlug}/us/${ref}`);
+      setUsForm({
+        subject: String(us.subject ?? ''),
+        statusId: typeof us.status === 'number' ? us.status : null,
+        description: String(us.description ?? ''),
+        tags: formatTagsField(us.tags),
+        isBlocked: !!us.is_blocked,
+        blockedNote: String(us.blocked_note ?? ''),
+        dueDate: us.due_date == null ? '' : String(us.due_date),
+      });
+      setCreateEditLightbox({ open: true, intent: 'edit', statusId: null, usId: id });
+      setLightboxOpen(true);
     },
-    [state, projectSlug],
+    [state, setLightboxOpen],
   );
 
-  // `editUs(id)` (main.coffee:278) -> navigate to the US detail page (KB-2).
-  const handleEditUs = navigateToUsDetail;
-
-  // `changeUsAssignedUsers(id)` (main.coffee:339) + avatar quick-assign ->
-  // navigate to the US detail page, whose assignment control replaces the legacy
-  // assign lightbox (KB-3).
-  const handleAssignedTo = navigateToUsDetail;
+  // `changeUsAssignedUsers(id)` (main.coffee:339) - open the INLINE assign-users
+  // popover seeded with the story's current assignees (finding #8). The initial
+  // checked set reproduces `_.compact(_.union(assigned_users, [assigned_to]))`.
+  // This REPLACES the previous navigation to the US detail page.
+  const handleAssignedTo = useCallback(
+    (id: number) => {
+      const us = getUsModel(state, id);
+      if (!us) {
+        return;
+      }
+      const current = Array.isArray(us.assigned_users) ? [...us.assigned_users] : [];
+      if (us.assigned_to != null && current.indexOf(us.assigned_to) === -1) {
+        current.push(us.assigned_to);
+      }
+      setAssignSelected(current);
+      setAssignLightbox({ open: true, usId: id });
+      setLightboxOpen(true);
+    },
+    [state, setLightboxOpen],
+  );
 
   // `deleteUs(id)` (main.coffee:297) -- open the confirm shell + raise gate. The
   // actual removal happens on confirm (see `confirmDelete`).
@@ -693,14 +868,40 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   // deferred `projects`-change event set its refresh-needed flag while open.
   const closeCreateEdit = useCallback(() => {
     setCreateEditLightbox({ open: false, intent: 'create', statusId: null, usId: null });
+    setUsForm(EMPTY_US_FORM);
+    submittingRef.current = false;
+    setSubmitting(false);
     setLightboxOpen(false);
   }, [setLightboxOpen]);
 
   const closeBulk = useCallback(() => {
     setBulkLightbox({ open: false, statusId: null });
     setBulkText('');
+    submittingRef.current = false;
+    setSubmitting(false);
     setLightboxOpen(false);
   }, [setLightboxOpen]);
+
+  // Close the inline assign-users popover (finding #8) and lower the gate.
+  const closeAssign = useCallback(() => {
+    setAssignLightbox({ open: false, usId: null });
+    setAssignSelected([]);
+    submittingRef.current = false;
+    setSubmitting(false);
+    setLightboxOpen(false);
+  }, [setLightboxOpen]);
+
+  // Toggle a member id in the assign popover's checked set.
+  const toggleAssignMember = useCallback((memberId: number) => {
+    setAssignSelected((prev) =>
+      prev.indexOf(memberId) === -1 ? [...prev, memberId] : prev.filter((x) => x !== memberId),
+    );
+  }, []);
+
+  // Update a single field of the create/edit form.
+  const setFormField = useCallback(<K extends keyof UsFormFields>(key: K, value: UsFormFields[K]) => {
+    setUsForm((prev) => ({ ...prev, [key]: value }));
+  }, []);
 
   // Confirm delete (KB-4). Resolve the raw model, close the confirm dialog
   // immediately (parity: the confirm lightbox dismisses on click), then fire the
@@ -718,6 +919,11 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   }, [createEditLightbox.usId, state, deleteUs, closeCreateEdit]);
 
   const submitBulk = useCallback(() => {
+    // Double-submit guard (#9): a synchronous ref so a rapid second click cannot
+    // dispatch a second bulk POST before the first resolves.
+    if (submittingRef.current) {
+      return;
+    }
     const statusId = bulkLightbox.statusId;
     const text = bulkText.trim();
     if (statusId == null || text.length === 0) {
@@ -726,25 +932,154 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     }
     // `addUsBulk` performs the clean bulk-create POST and adds the created
     // stories to the board state (no reload needed).
+    submittingRef.current = true;
+    setSubmitting(true);
     void addUsBulk(statusId, text).then(() => {
+      submittingRef.current = false;
+      setSubmitting(false);
       closeBulk();
     });
   }, [bulkLightbox.statusId, bulkText, addUsBulk, closeBulk]);
 
-  // Submit the functional single-story create (KB-5). `addUsStandard` POSTs
-  // `/userstories` and adds the created story (with its server id/ref) to the
-  // board; the user stays on the board. An empty subject just closes the shell.
-  const submitStandard = useCallback(() => {
-    const statusId = createEditLightbox.statusId;
-    const subject = createSubject.trim();
+  // Submit the inline create/edit form (findings #7 + #8 + #9). Dispatches on the
+  // open intent:
+  //   - `create`: `addUsStandard(statusId, subject, extra)` POSTs `/userstories`
+  //     with the core fields and adds the created story (server id/ref) to the
+  //     board; an empty subject just closes the shell (KB-5 parity).
+  //   - `edit`:   `saveUs(id, changed)` PATCHes `/userstories/{id}` with the
+  //     changed core fields PLUS the concurrency `version`, then updates the
+  //     board IN PLACE; an empty subject is rejected (kept open), since the
+  //     server requires a subject.
+  // Both paths are wrapped by the `submittingRef` double-submit guard (#9): a
+  // second click while a write is in flight short-circuits, so two rapid clicks
+  // never create/patch twice.
+  const submitForm = useCallback(() => {
+    if (submittingRef.current) {
+      return;
+    }
+    const subject = usForm.subject.trim();
+
+    if (createEditLightbox.intent === 'edit') {
+      const id = createEditLightbox.usId;
+      if (id == null) {
+        closeCreateEdit();
+        return;
+      }
+      // Subject is required on edit; an empty subject keeps the form open.
+      if (subject.length === 0) {
+        return;
+      }
+      const us = getUsModel(state, id);
+      if (!us) {
+        closeCreateEdit();
+        return;
+      }
+      const changed: Record<string, unknown> = {
+        subject,
+        status: usForm.statusId ?? us.status,
+        description: usForm.description,
+        tags: parseTagsField(usForm.tags),
+        is_blocked: usForm.isBlocked,
+        blocked_note: usForm.isBlocked ? usForm.blockedNote : '',
+        due_date: usForm.dueDate === '' ? null : usForm.dueDate,
+        version: us.version,
+      };
+      submittingRef.current = true;
+      setSubmitting(true);
+      void saveUs(id, changed).then(() => {
+        submittingRef.current = false;
+        setSubmitting(false);
+        closeCreateEdit();
+      });
+      return;
+    }
+
+    // create intent (KB-5 + #7): the column status is pre-selected but the user
+    // may change it via the status <select>.
+    const statusId = usForm.statusId ?? createEditLightbox.statusId;
     if (statusId == null || subject.length === 0) {
       closeCreateEdit();
       return;
     }
-    void addUsStandard(statusId, subject).then(() => {
+    // Build the `extra` payload with ONLY the fields the user actually supplied,
+    // so a subject-only create posts a byte-identical body to the legacy quick
+    // add (the adapter merges only-present keys).
+    const extra: CreateExtra = {};
+    if (usForm.description.trim().length > 0) {
+      extra.description = usForm.description;
+    }
+    const tagNames = parseTagsField(usForm.tags);
+    if (tagNames.length > 0) {
+      extra.tags = tagNames;
+    }
+    if (usForm.isBlocked) {
+      extra.is_blocked = true;
+      if (usForm.blockedNote.trim().length > 0) {
+        extra.blocked_note = usForm.blockedNote;
+      }
+    }
+    if (usForm.dueDate !== '') {
+      extra.due_date = usForm.dueDate;
+    }
+    submittingRef.current = true;
+    setSubmitting(true);
+    void addUsStandard(statusId, subject, extra).then(() => {
+      submittingRef.current = false;
+      setSubmitting(false);
       closeCreateEdit();
     });
-  }, [createEditLightbox.statusId, createSubject, addUsStandard, closeCreateEdit]);
+  }, [
+    createEditLightbox.intent,
+    createEditLightbox.usId,
+    createEditLightbox.statusId,
+    usForm,
+    state,
+    addUsStandard,
+    saveUs,
+    closeCreateEdit,
+  ]);
+
+  // Submit the inline assign-users popover (finding #8). Reproduces the legacy
+  // `tg-lb-select-user` `onClose` (main.coffee:342-349): the checked set becomes
+  // `assigned_users`; `assigned_to` is recomputed (first of the set if the
+  // current primary is no longer selected, `null` if the set is empty); then a
+  // single PATCH persists it and the board updates in place. Guarded by the same
+  // in-flight ref (#9).
+  const submitAssign = useCallback(() => {
+    if (submittingRef.current) {
+      return;
+    }
+    const id = assignLightbox.usId;
+    if (id == null) {
+      closeAssign();
+      return;
+    }
+    const us = getUsModel(state, id);
+    if (!us) {
+      closeAssign();
+      return;
+    }
+    const assignedUsersIds = [...assignSelected];
+    let assignedTo: number | null = us.assigned_to;
+    if (assignedUsersIds.length > 0 && assignedUsersIds.indexOf(us.assigned_to as number) === -1) {
+      assignedTo = assignedUsersIds[0];
+    }
+    if (assignedUsersIds.length === 0) {
+      assignedTo = null;
+    }
+    const changed: Record<string, unknown> = {
+      assigned_users: assignedUsersIds,
+      assigned_to: assignedTo,
+      version: us.version,
+    };
+    submittingRef.current = true;
+    setSubmitting(true);
+    void saveUs(id, changed).then(() => {
+      submittingRef.current = false;
+      setSubmitting(false);
+      closeAssign();
+    });
+  }, [assignLightbox.usId, assignSelected, state, saveUs, closeAssign]);
 
   /* ----------------------------------------------------------------------- *
    * Drag-and-drop (provide context; mechanics live in ../shared/dnd)
@@ -821,10 +1156,40 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
   const hasSwimlanes = swimlanesList.length > 0;
   const projectName = project ? String((project as Record<string, unknown>).name ?? '') : '';
+
+  // T1 fix: reproduce the AngularJS `appMetaService.setAll` browser-title
+  // behavior (kanban/main.coffee:117-122). The legacy KanbanController set the
+  // document title to `KANBAN.PAGE_TITLE` ("Kanban - <projectName>") once the
+  // initial board data resolved. React sets it when the project name is known
+  // and restores the prior title on unmount so leaving the route (an AngularJS
+  // navigation) does not leave a stale "Kanban - ..." title behind.
+  useEffect(() => {
+    if (!projectName) {
+      return undefined;
+    }
+    const previousTitle = document.title;
+    document.title = `Kanban - ${projectName}`;
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [projectName]);
+
   const createEditTitle =
     createEditLightbox.intent === 'delete'
       ? t('COMMON.CONFIRM.TITLE')
-      : t('LIGHTBOX.CREATE_EDIT_US.NEW');
+      : createEditLightbox.intent === 'edit'
+        ? t('LIGHTBOX.CREATE_EDIT_US.EDIT')
+        : t('LIGHTBOX.CREATE_EDIT_US.NEW');
+  // Project members for the inline assign popover (finding #8). `project.members`
+  // is the embedded member list; each is an opaque `{ id, ... }` record.
+  const projectMembers: Array<Record<string, unknown>> = Array.isArray(
+    (project as Record<string, unknown> | null)?.members,
+  )
+    ? ((project as Record<string, unknown>).members as Array<Record<string, unknown>>)
+    : [];
+  // Display name for a member row (full_name_display -> full_name -> username).
+  const memberName = (m: Record<string, unknown>): string =>
+    String(m.full_name_display ?? m.full_name ?? m.username ?? `#${String(m.id ?? '')}`);
 
   /* ----------------------------------------------------------------------- *
    * Render -- reproduce the kanban.jade shell DOM exactly (zero visual change).
@@ -838,7 +1203,7 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         <div className="kanban-header">
           {/* mainTitle include reproduced (header > h1). */}
           <header>
-            <h1>{projectName}</h1>
+            <h1>{t('KANBAN.SECTION_NAME')}</h1>
           </header>
           <div className="taskboard-actions">
             <div className="kanban-table-options-start">
@@ -954,31 +1319,141 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             </div>
           ) : (
             <div className="lightbox-body">
-              {/* Functional single-story create (KB-5): a subject input that
-                  POSTs `/userstories` into the clicked column and adds the story
-                  to the board. Enter submits; the user stays on the board. */}
-              <input
-                type="text"
-                className="create-us-subject"
-                name="create-us-subject"
-                id="create-us-subject"
-                aria-label={t('LIGHTBOX.CREATE_EDIT_US.NEW')}
-                placeholder={t('US.SUBJECT_PLACEHOLDER')}
-                value={createSubject}
-                autoFocus
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setCreateSubject(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.preventDefault();
-                    submitStandard();
+              {/* Inline create/edit user-story form (findings #7 + #8): the core,
+                  card-relevant fields. On `create` this POSTs `/userstories` into
+                  the clicked column and adds the story to the board; on `edit` it
+                  PATCHes the story IN PLACE. The user never leaves the board.
+                  Enter in the subject submits. */}
+              <label className="us-field us-field-subject">
+                <span className="us-field-label">{t('COMMON.FIELDS.SUBJECT')}</span>
+                <input
+                  type="text"
+                  className="create-us-subject"
+                  name="create-us-subject"
+                  id="create-us-subject"
+                  aria-label={t('COMMON.FIELDS.SUBJECT')}
+                  placeholder={t('US.SUBJECT_PLACEHOLDER')}
+                  value={usForm.subject}
+                  autoFocus
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setFormField('subject', event.target.value)
                   }
-                }}
-              />
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      submitForm();
+                    }
+                  }}
+                />
+              </label>
+
+              <label className="us-field us-field-status">
+                <span className="us-field-label">{t('COMMON.FIELDS.STATUS')}</span>
+                <select
+                  className="create-us-status"
+                  name="create-us-status"
+                  aria-label={t('COMMON.FIELDS.STATUS')}
+                  value={usForm.statusId == null ? '' : String(usForm.statusId)}
+                  onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                    setFormField(
+                      'statusId',
+                      event.target.value === '' ? null : Number(event.target.value),
+                    )
+                  }
+                >
+                  {statuses.map((s) => (
+                    <option key={s.id} value={String(s.id)}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="us-field us-field-description">
+                <span className="us-field-label">{t('COMMON.FIELDS.DESCRIPTION')}</span>
+                <textarea
+                  className="create-us-description"
+                  name="create-us-description"
+                  aria-label={t('COMMON.FIELDS.DESCRIPTION')}
+                  value={usForm.description}
+                  onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                    setFormField('description', event.target.value)
+                  }
+                />
+              </label>
+
+              <label className="us-field us-field-tags">
+                <span className="us-field-label">{t('COMMON.FIELDS.TAGS')}</span>
+                <input
+                  type="text"
+                  className="create-us-tags"
+                  name="create-us-tags"
+                  aria-label={t('COMMON.FIELDS.TAGS')}
+                  placeholder={t('US.TAGS_PLACEHOLDER')}
+                  value={usForm.tags}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setFormField('tags', event.target.value)
+                  }
+                />
+              </label>
+
+              <label className="us-field us-field-due-date">
+                <span className="us-field-label">{t('COMMON.FIELDS.DUE_DATE')}</span>
+                <input
+                  type="date"
+                  className="create-us-due-date"
+                  name="create-us-due-date"
+                  aria-label={t('COMMON.FIELDS.DUE_DATE')}
+                  value={usForm.dueDate}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setFormField('dueDate', event.target.value)
+                  }
+                />
+              </label>
+
+              <label className="us-field us-field-blocked">
+                <input
+                  type="checkbox"
+                  className="create-us-blocked"
+                  name="create-us-blocked"
+                  checked={usForm.isBlocked}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setFormField('isBlocked', event.target.checked)
+                  }
+                />
+                <span className="us-field-label">{t('US.IS_BLOCKED')}</span>
+              </label>
+
+              {usForm.isBlocked ? (
+                <label className="us-field us-field-blocked-note">
+                  <span className="us-field-label">{t('US.BLOCKED_NOTE')}</span>
+                  <textarea
+                    className="create-us-blocked-note"
+                    name="create-us-blocked-note"
+                    aria-label={t('US.BLOCKED_NOTE')}
+                    value={usForm.blockedNote}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setFormField('blockedNote', event.target.value)
+                    }
+                  />
+                </label>
+              ) : null}
+
               <div className="lightbox-actions">
-                <button type="button" className="btn-cancel" onClick={closeCreateEdit}>
+                <button
+                  type="button"
+                  className="btn-cancel"
+                  onClick={closeCreateEdit}
+                  disabled={submitting}
+                >
                   {t('COMMON.CANCEL')}
                 </button>
-                <button type="button" className="btn-save" onClick={submitStandard}>
+                <button
+                  type="button"
+                  className="btn-save"
+                  onClick={submitForm}
+                  disabled={submitting}
+                >
                   {t('COMMON.SAVE')}
                 </button>
               </div>
@@ -996,15 +1471,79 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
           <div className="lightbox-body">
             <textarea
               className="bulk-textarea"
+              name="bulk-us-subjects"
+              aria-label={t('KANBAN.ADD_BULK')}
               placeholder={t('US.BULK_PLACEHOLDER')}
               value={bulkText}
               onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setBulkText(event.target.value)}
             />
             <div className="lightbox-actions">
-              <button type="button" className="btn-cancel" onClick={closeBulk}>
+              <button
+                type="button"
+                className="btn-cancel"
+                onClick={closeBulk}
+                disabled={submitting}
+              >
                 {t('COMMON.CANCEL')}
               </button>
-              <button type="button" className="btn-save" onClick={submitBulk}>
+              <button
+                type="button"
+                className="btn-save"
+                onClick={submitBulk}
+                disabled={submitting}
+              >
+                {t('COMMON.SAVE')}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Lightbox: inline assign-users popover (.lightbox-select-user) - finding
+          #8. Reproduces the legacy `tg-lb-select-user` member checklist; saving
+          PATCHes `assigned_users`/`assigned_to` in place (no navigation). */}
+      {assignLightbox.open ? (
+        <div className="lightbox lightbox-select-user open">
+          <div className="lightbox-header">
+            <h2 className="title">{t('COMMON.ASSIGNED_USERS.ADD')}</h2>
+          </div>
+          <div className="lightbox-body">
+            <ul className="assign-user-list">
+              {projectMembers.map((m) => {
+                const mid = Number(m.id);
+                const checked = assignSelected.indexOf(mid) !== -1;
+                return (
+                  <li key={String(mid)} className="assign-user-row">
+                    <label>
+                      <input
+                        type="checkbox"
+                        className="assign-user-checkbox"
+                        name={`assign-user-${mid}`}
+                        id={`assign-user-${mid}`}
+                        checked={checked}
+                        onChange={() => toggleAssignMember(mid)}
+                      />
+                      <span className="assign-user-name">{memberName(m)}</span>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="lightbox-actions">
+              <button
+                type="button"
+                className="btn-cancel"
+                onClick={closeAssign}
+                disabled={submitting}
+              >
+                {t('COMMON.CANCEL')}
+              </button>
+              <button
+                type="button"
+                className="btn-save"
+                onClick={submitAssign}
+                disabled={submitting}
+              >
                 {t('COMMON.SAVE')}
               </button>
             </div>

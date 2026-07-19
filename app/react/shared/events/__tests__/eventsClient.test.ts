@@ -184,6 +184,44 @@ describe('createEventsClient — connection lifecycle', () => {
   });
 });
 
+describe('createEventsClient — isConnected() (parity: moveUs `@events.connected`, F/Gap 21)', () => {
+  it('is false before connect() and before the socket opens', () => {
+    const client = createEventsClient();
+    expect(client.isConnected()).toBe(false);
+    client.connect();
+    // connect() constructs the socket but the open handshake has not fired yet.
+    expect(client.isConnected()).toBe(false);
+    client.disconnect();
+  });
+
+  it('becomes true after onOpen and false again after onClose', () => {
+    const client = createEventsClient();
+    client.connect();
+    lastSocket().emitOpen();
+    expect(client.isConnected()).toBe(true);
+    lastSocket().emitClose();
+    expect(client.isConnected()).toBe(false);
+    client.disconnect();
+  });
+
+  it('is false after an explicit disconnect() even if the socket was open', () => {
+    const client = createEventsClient();
+    client.connect();
+    lastSocket().emitOpen();
+    expect(client.isConnected()).toBe(true);
+    client.disconnect();
+    expect(client.isConnected()).toBe(false);
+  });
+
+  it('is false when eventsUrl is unconfigured (no socket ever opens)', () => {
+    setConfig({ api: 'http://x/api/v1/', defaultLanguage: 'en', eventsUrl: null });
+    const client = createEventsClient();
+    client.connect();
+    expect(client.isConnected()).toBe(false);
+    client.disconnect();
+  });
+});
+
 describe('createEventsClient — queue-and-flush', () => {
   it('defers a subscribe sent before open and sends it (AFTER auth) once connected — auth is FIRST (F02)', () => {
     const client = createEventsClient();

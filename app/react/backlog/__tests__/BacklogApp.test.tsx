@@ -47,7 +47,7 @@
  * interception.
  */
 
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, act } from '@testing-library/react';
 
 // The container under test. `BacklogApp` is exported BOTH as a named export and
 // as the default; the named form is imported to match the sibling specs.
@@ -76,6 +76,24 @@ const mockDragEndSentinel = jest.fn();
 jest.mock('../hooks/useBacklog', () => ({
   __esModule: true,
   useBacklog: jest.fn(),
+  // BacklogApp ALSO imports these named exports for its Phase 10 URL/localStorage
+  // filter persistence; the mock must provide real-shaped values so the
+  // persistence effect (writeFiltersToLocation + backlogFiltersStorageKey) runs.
+  VALID_QUERY_PARAMS: [
+    'exclude_status',
+    'status',
+    'exclude_tags',
+    'tags',
+    'exclude_assigned_users',
+    'assigned_users',
+    'exclude_role',
+    'role',
+    'exclude_epic',
+    'epic',
+    'exclude_owner',
+    'owner',
+  ],
+  backlogFiltersStorageKey: (slug: string | undefined) => `${slug ?? ''}:backlog-filters`,
 }));
 
 // BacklogTable stub: captures the props BacklogApp passes so the container ->
@@ -162,6 +180,10 @@ jest.mock('../components/SprintForm', () => {
           'data-testid': 'sprint-form',
           'data-open': String(!!props.open),
           'data-mode': String(props.mode ?? ''),
+          // finding #14: echo the create-mode default-start seed so the container's
+          // `lastSprintEndDate = selectLastSprint(state.sprints)?.estimated_finish`
+          // wiring is directly assertable. Empty string when null/undefined.
+          'data-last-sprint-end-date': String(props.lastSprintEndDate ?? ''),
         },
         react.createElement(
           'button',
@@ -422,6 +444,14 @@ beforeEach(() => {
   // Clean the prop-capture globals between tests to avoid cross-test leakage.
   delete (globalThis as any).__btProps;
   delete (globalThis as any).__dndProps;
+  // Reset the jsdom URL + storage so the Phase 10 filter->URL persistence effect
+  // starts from a clean query on every spec and does not leak between tests.
+  try {
+    window.history.replaceState(null, '', '/');
+    window.localStorage.clear();
+  } catch {
+    /* jsdom - safe to ignore */
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -750,7 +780,11 @@ describe('BacklogApp - sidebar & sprint-form wiring', () => {
     expect(currentBacklog.actions.closeSprintForm).toHaveBeenCalledTimes(1);
   });
 
-  it('SprintForm delete trigger removes the sprint being edited (edit mode with an id)', () => {
+  it('SprintForm delete trigger OPENS the confirm dialog (does NOT delete synchronously) — finding #13', () => {
+    // finding #13: the legacy `.delete-sprint` click first ran the blocking
+    // `$confirm.askOnDelete(DELETE_SPRINT.TITLE, sprint.name)` gate
+    // (lightboxes.coffee:103-118, 225-227). The React delete button must therefore
+    // OPEN a confirmation dialog rather than issue DELETE /milestones/{id} at once.
     currentBacklog = makeBacklog({
       state: {
         sprintForm: {
@@ -769,12 +803,19 @@ describe('BacklogApp - sidebar & sprint-form wiring', () => {
       },
     });
     mockUseBacklog.mockReturnValue(currentBacklog);
-    renderApp();
+    const { container } = renderApp();
+
+    // Precondition: no confirm dialog yet.
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId('sprint-form-delete'));
-    // handleDeleteSprint reads state.sprintForm.values.id and removes it.
-    expect(currentBacklog.actions.removeSprint).toHaveBeenCalledTimes(1);
-    expect(currentBacklog.actions.removeSprint).toHaveBeenCalledWith(55);
+
+    // The confirm dialog is now open and names the sprint; removeSprint has NOT fired.
+    const dialog = container.querySelector('.lightbox-confirm-delete-sprint');
+    expect(dialog).toBeInTheDocument();
+    expect(dialog).toHaveTextContent('Delete sprint');
+    expect(dialog).toHaveTextContent('Are you sure you want to delete "Sprint 1"?');
+    expect(currentBacklog.actions.removeSprint).not.toHaveBeenCalled();
   });
 
   it('the velocity-forecasting toggle calls toggleVelocityForecasting', () => {
@@ -786,6 +827,205 @@ describe('BacklogApp - sidebar & sprint-form wiring', () => {
 
     fireEvent.click(velocityBtn as HTMLElement);
     expect(currentBacklog.actions.toggleVelocityForecasting).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* ================================================================== *
+ * Phase E (cont.) -- Sprint delete confirmation (#13) + create-sprint
+ *                    default start date (#14)
+ * ================================================================== *
+ * #13: legacy `.delete-sprint` first ran the blocking
+ *   `$confirm.askOnDelete(DELETE_SPRINT.TITLE, sprint.name)` gate
+ *   (lightboxes.coffee:103-118, 225-227); only on confirmation did it call
+ *   `$repo.remove(sprint)`. The React screen must reproduce that blocking gate:
+ *   delete OPENS `.lightbox-confirm-delete-sprint`; Cancel dismisses with no
+ *   side effect (edit form stays open); Delete calls `actions.removeSprint(id)`.
+ * #14: legacy `getLastSprint` seeded the create form start to the last OPEN
+ *   sprint's `estimated_finish` (lightboxes.coffee:120-160). The container wires
+ *   `lastSprintEndDate = selectLastSprint(state.sprints)?.estimated_finish` into
+ *   <SprintForm>; the mock echoes it as `data-last-sprint-end-date`.
+ * ================================================================== */
+
+// Edit-mode fixture: sprint-form open on an existing sprint (id 55) with delete
+// permission, so the SprintForm delete trigger is meaningful.
+function editingSprintBacklog(over: any = {}) {
+  return makeBacklog({
+    ...over,
+    state: {
+      sprintForm: {
+        open: true,
+        mode: 'edit',
+        values: {
+          project: 7,
+          name: 'Sprint 1',
+          estimated_start: '2021-01-01',
+          estimated_finish: '2021-01-15',
+          id: 55,
+        },
+        lastSprintName: null,
+        canDelete: true,
+      },
+      ...(over.state || {}),
+    },
+  });
+}
+
+describe('BacklogApp - sprint delete confirmation (finding #13)', () => {
+  it('Cancel in the confirm dialog dismisses it WITHOUT calling removeSprint (edit form stays open)', () => {
+    currentBacklog = editingSprintBacklog();
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    // Open the confirm dialog.
+    fireEvent.click(screen.getByTestId('sprint-form-delete'));
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).toBeInTheDocument();
+
+    // Cancel.
+    fireEvent.click(container.querySelector('.lightbox-confirm-delete-sprint .e2e-cancel') as HTMLElement);
+
+    // Dialog gone; removeSprint never fired; the edit form is still mounted.
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).not.toBeInTheDocument();
+    expect(currentBacklog.actions.removeSprint).not.toHaveBeenCalled();
+    expect(screen.getByTestId('sprint-form')).toHaveAttribute('data-open', 'true');
+  });
+
+  it('Delete in the confirm dialog calls removeSprint(id) once and dismisses the dialog', () => {
+    currentBacklog = editingSprintBacklog();
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByTestId('sprint-form-delete'));
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).toBeInTheDocument();
+
+    // Confirm the delete.
+    fireEvent.click(container.querySelector('.lightbox-confirm-delete-sprint .e2e-delete') as HTMLElement);
+
+    expect(currentBacklog.actions.removeSprint).toHaveBeenCalledTimes(1);
+    expect(currentBacklog.actions.removeSprint).toHaveBeenCalledWith(55);
+    // Dialog is dismissed once the delete is dispatched.
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).not.toBeInTheDocument();
+  });
+
+  it('the confirm dialog falls back to "this sprint" when the sprint has no name', () => {
+    currentBacklog = editingSprintBacklog({
+      state: {
+        sprintForm: {
+          open: true,
+          mode: 'edit',
+          values: {
+            project: 7,
+            name: null,
+            estimated_start: '2021-01-01',
+            estimated_finish: '2021-01-15',
+            id: 55,
+          },
+          lastSprintName: null,
+          canDelete: true,
+        },
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByTestId('sprint-form-delete'));
+    const dialog = container.querySelector('.lightbox-confirm-delete-sprint');
+    expect(dialog).toBeInTheDocument();
+    expect(dialog).toHaveTextContent('Are you sure you want to delete this sprint?');
+  });
+
+  it('delete is a no-op when there is no sprint id (create mode / unsaved)', () => {
+    // Default fixture: sprintForm is create-mode with values.id undefined.
+    currentBacklog = makeBacklog({
+      state: {
+        sprintForm: {
+          open: true,
+          mode: 'create',
+          values: {
+            project: 7,
+            name: 'Draft',
+            estimated_start: null,
+            estimated_finish: null,
+            // no id
+          },
+          lastSprintName: null,
+          canDelete: true,
+        },
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByTestId('sprint-form-delete'));
+
+    // No id -> handleDeleteSprint does nothing: no dialog, no removeSprint.
+    expect(container.querySelector('.lightbox-confirm-delete-sprint')).not.toBeInTheDocument();
+    expect(currentBacklog.actions.removeSprint).not.toHaveBeenCalled();
+  });
+});
+
+describe('BacklogApp - create-sprint default start date (finding #14)', () => {
+  it('threads lastSprintEndDate = the last OPEN sprint\u2019s estimated_finish into <SprintForm>', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        sprints: [
+          {
+            id: 70,
+            name: 'Sprint 2',
+            closed: false,
+            total_points: 0,
+            user_stories: [],
+            estimated_finish: '2021-03-15',
+          },
+        ],
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    renderApp();
+
+    expect(screen.getByTestId('sprint-form')).toHaveAttribute(
+      'data-last-sprint-end-date',
+      '2021-03-15',
+    );
+  });
+
+  it('ignores CLOSED sprints when resolving the last sprint end date', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        sprints: [
+          {
+            id: 70,
+            name: 'Open',
+            closed: false,
+            total_points: 0,
+            user_stories: [],
+            estimated_finish: '2021-03-15',
+          },
+          {
+            id: 71,
+            name: 'Closed later',
+            closed: true,
+            total_points: 0,
+            user_stories: [],
+            estimated_finish: '2021-09-15',
+          },
+        ],
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    renderApp();
+
+    // selectLastSprint filters out the (later-finishing) closed sprint.
+    expect(screen.getByTestId('sprint-form')).toHaveAttribute(
+      'data-last-sprint-end-date',
+      '2021-03-15',
+    );
+  });
+
+  it('passes an empty last-sprint-end-date when no open sprint carries a finish date', () => {
+    // Default fixture sprint has no estimated_finish -> selectLastSprint(...)?.estimated_finish
+    // is undefined -> `?? null` -> the mock echoes ''.
+    renderApp();
+    expect(screen.getByTestId('sprint-form')).toHaveAttribute('data-last-sprint-end-date', '');
   });
 });
 
@@ -857,5 +1097,594 @@ describe('BacklogApp - mount data load', () => {
     expect(currentBacklog.actions.loadSprints).not.toHaveBeenCalled();
     expect(currentBacklog.actions.loadProjectStats).not.toHaveBeenCalled();
     expect(currentBacklog.actions.loadMoreUserstories).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Finding #12 -- inline row controls: reference-data derivation,
+ * handler threading, and the blocking delete-confirm lightbox.
+ * ------------------------------------------------------------------ *
+ * The BacklogTable stub records the props it receives on
+ * `globalThis.__btProps`, so these specs prove BacklogApp (a) derives the
+ * status / points / roles reference data + `canDeleteUs` gate from
+ * `state.project`, (b) threads the five inline-control actions straight
+ * through to the table, and (c) owns the Delete flow itself -- opening a
+ * blocking `.lightbox-confirm-delete-us` confirm on `onDeleteStory`, calling
+ * `actions.deleteUserStory` only on confirm, and dismissing on cancel. */
+describe('BacklogApp - inline row controls (finding #12)', () => {
+  // Project fixture carrying the estimation reference data + `delete_us`
+  // permission the inline controls need (the default `makeBacklog` project
+  // deliberately omits points/roles/delete_us to keep the baseline inert).
+  function makeRichProject() {
+    return {
+      id: 7,
+      slug: 'proj-slug',
+      name: 'Sample Project',
+      i_am_admin: true,
+      my_permissions: ['add_us', 'modify_us', 'delete_us'],
+      us_statuses: [
+        { id: 1, name: 'New', color: '#999999' },
+        { id: 2, name: 'Ready', color: '#E44057' },
+      ],
+      points: [
+        { id: 25, name: '?', value: null },
+        { id: 28, name: '1', value: 1 },
+      ],
+      roles: [
+        { id: 13, name: 'UX', computable: true },
+        { id: 17, name: 'PO', computable: false },
+      ],
+    };
+  }
+
+  it('derives status/points/roles reference data + canDeleteUs and threads the five inline actions to BacklogTable', () => {
+    const changeUsStatus = jest.fn();
+    const changeUsPoints = jest.fn();
+    const moveUsToTop = jest.fn();
+    const setPointsViewRole = jest.fn();
+    const deleteUserStory = jest.fn();
+    currentBacklog = makeBacklog({
+      state: { project: makeRichProject(), pointsViewRoleId: 13 },
+      actions: {
+        changeUsStatus,
+        changeUsPoints,
+        moveUsToTop,
+        setPointsViewRole,
+        deleteUserStory,
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    renderApp();
+
+    const p = (globalThis as any).__btProps;
+    // Reference data derived verbatim from state.project.
+    expect(p.statuses).toEqual([
+      { id: 1, name: 'New', color: '#999999' },
+      { id: 2, name: 'Ready', color: '#E44057' },
+    ]);
+    expect(p.points).toEqual([
+      { id: 25, name: '?', value: null },
+      { id: 28, name: '1', value: 1 },
+    ]);
+    expect(p.roles).toEqual([
+      { id: 13, name: 'UX', computable: true },
+      { id: 17, name: 'PO', computable: false },
+    ]);
+    // Header points-per-role selection + delete gate.
+    expect(p.pointsViewRoleId).toBe(13);
+    expect(p.canDeleteUs).toBe(true);
+    // The three "pure" inline actions are threaded straight through.
+    expect(p.onChangeStatus).toBe(changeUsStatus);
+    expect(p.onChangePoints).toBe(changeUsPoints);
+    expect(p.onMoveToTop).toBe(moveUsToTop);
+    expect(p.onSelectRoleView).toBe(setPointsViewRole);
+    // Edit + Delete are container-owned wrappers (navigation / confirm), NOT the
+    // raw actions -- so they must be functions distinct from deleteUserStory.
+    expect(typeof p.onEditStory).toBe('function');
+    expect(typeof p.onDeleteStory).toBe('function');
+    expect(p.onDeleteStory).not.toBe(deleteUserStory);
+  });
+
+  it('sets canDeleteUs=false when the project lacks the delete_us permission', () => {
+    // The default makeBacklog project has modify_us but NOT delete_us.
+    renderApp();
+    expect((globalThis as any).__btProps.canDeleteUs).toBe(false);
+  });
+
+  it('returns empty points/roles reference data when the project omits them', () => {
+    // Default project has us_statuses but no points/roles keys.
+    renderApp();
+    const p = (globalThis as any).__btProps;
+    expect(p.points).toEqual([]);
+    expect(p.roles).toEqual([]);
+    // us_statuses is still mapped (single "New" status).
+    expect(p.statuses).toEqual([{ id: 1, name: 'New', color: '#999999' }]);
+  });
+
+  it('onDeleteStory opens a blocking confirm lightbox naming the story; deleteUserStory is NOT called until confirmed', () => {
+    const deleteUserStory = jest.fn();
+    currentBacklog = makeBacklog({
+      state: { project: makeRichProject() },
+      actions: { deleteUserStory },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    // No dialog on first render.
+    expect(container.querySelector('.lightbox-confirm-delete-us')).toBeNull();
+
+    const us = { id: 101, ref: 5, subject: 'My story', status: 1 };
+    // The row would invoke the captured onDeleteStory; this is an out-of-event
+    // state update, so wrap in act().
+    act(() => {
+      (globalThis as any).__btProps.onDeleteStory(us);
+    });
+
+    const dialog = container.querySelector('.lightbox-confirm-delete-us');
+    expect(dialog).toBeInTheDocument();
+    expect(dialog).toHaveClass('lightbox', 'lightbox-generic-form', 'open');
+    // The confirm names the specific story (blocking askOnDelete parity).
+    expect(dialog).toHaveTextContent('My story');
+    // Blocking: nothing deleted yet.
+    expect(deleteUserStory).not.toHaveBeenCalled();
+  });
+
+  it('confirming the delete lightbox calls actions.deleteUserStory with the target story and dismisses the dialog', () => {
+    const deleteUserStory = jest.fn();
+    currentBacklog = makeBacklog({
+      state: { project: makeRichProject() },
+      actions: { deleteUserStory },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    const us = { id: 101, ref: 5, subject: 'Doomed story', status: 1 };
+    act(() => {
+      (globalThis as any).__btProps.onDeleteStory(us);
+    });
+
+    fireEvent.click(container.querySelector('.lightbox-confirm-delete-us .e2e-delete') as HTMLElement);
+
+    expect(deleteUserStory).toHaveBeenCalledTimes(1);
+    expect(deleteUserStory).toHaveBeenCalledWith(us);
+    // Dialog dismissed after confirming.
+    expect(container.querySelector('.lightbox-confirm-delete-us')).toBeNull();
+  });
+
+  it('cancelling the delete lightbox dismisses it WITHOUT calling deleteUserStory', () => {
+    const deleteUserStory = jest.fn();
+    currentBacklog = makeBacklog({
+      state: { project: makeRichProject() },
+      actions: { deleteUserStory },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    act(() => {
+      (globalThis as any).__btProps.onDeleteStory({ id: 101, ref: 5, subject: 'Spared', status: 1 });
+    });
+    expect(container.querySelector('.lightbox-confirm-delete-us')).toBeInTheDocument();
+
+    fireEvent.click(container.querySelector('.lightbox-confirm-delete-us .e2e-cancel') as HTMLElement);
+
+    expect(deleteUserStory).not.toHaveBeenCalled();
+    expect(container.querySelector('.lightbox-confirm-delete-us')).toBeNull();
+  });
+
+  it('uses a generic confirm message when the story has no subject', () => {
+    currentBacklog = makeBacklog({
+      state: { project: makeRichProject() },
+      actions: { deleteUserStory: jest.fn() },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    act(() => {
+      (globalThis as any).__btProps.onDeleteStory({ id: 101, ref: 5, status: 1 });
+    });
+
+    const dialog = container.querySelector('.lightbox-confirm-delete-us');
+    expect(dialog).toBeInTheDocument();
+    expect(dialog).toHaveTextContent('this user story');
+  });
+});
+
+/* ================================================================== *
+ * Add-user-story wiring (finding #16)
+ * ------------------------------------------------------------------ *
+ * The header "+ Add" button, the bulk-add icon, and the empty-state
+ * "Create your first user story" button open an add-story lightbox
+ * (single-subject input or bulk textarea) whose submit delegates to the
+ * hook's `addStoryStandard` / `addStoryBulk` actions. A double-submit
+ * guard ensures one submit yields exactly one create call.
+ * ================================================================== */
+
+/** A promise plus its resolver, so a test can hold a create in flight. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+describe('BacklogApp - add user story (finding #16)', () => {
+  it('opens the single-subject lightbox from the header "+ Add" button and creates on submit', async () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    // No lightbox until the header button is pressed.
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+
+    const lightbox = container.querySelector('.lightbox-add-story');
+    expect(lightbox).toBeInTheDocument();
+    const input = container.querySelector('.e2e-add-story-subject') as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: '  A brand new story  ' } });
+    // Submit resolves the create promise, whose `.finally` closes the lightbox on
+    // a microtask -> flush it inside act() so the async close is captured.
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-add-story .e2e-create') as HTMLElement);
+    });
+
+    // Trimmed subject forwarded to the hook; bulk untouched.
+    expect(addStoryStandard).toHaveBeenCalledTimes(1);
+    expect(addStoryStandard).toHaveBeenCalledWith('A brand new story');
+    // Lightbox closed after a successful create.
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+  });
+
+  it('submits the single-subject lightbox on Enter', async () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+    const input = container.querySelector('.e2e-add-story-subject') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'Enter-submitted story' } });
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Enter' });
+    });
+
+    expect(addStoryStandard).toHaveBeenCalledWith('Enter-submitted story');
+  });
+
+  it('opens the bulk lightbox from the bulk icon and bulk-creates on submit', async () => {
+    const addStoryBulk = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryBulk } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user stories in bulk'));
+
+    const lightbox = container.querySelector('.lightbox-add-story-bulk');
+    expect(lightbox).toBeInTheDocument();
+    const textarea = container.querySelector('.e2e-add-story-bulk') as HTMLTextAreaElement;
+    expect(textarea).toBeInTheDocument();
+
+    fireEvent.change(textarea, { target: { value: 'Story A\nStory B\nStory C' } });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-add-story-bulk .e2e-create') as HTMLElement);
+    });
+
+    expect(addStoryBulk).toHaveBeenCalledTimes(1);
+    expect(addStoryBulk).toHaveBeenCalledWith('Story A\nStory B\nStory C');
+  });
+
+  it('Cancel dismisses the lightbox without creating anything', () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+    expect(container.querySelector('.lightbox-add-story')).toBeInTheDocument();
+
+    fireEvent.click(container.querySelector('.lightbox-add-story .e2e-cancel') as HTMLElement);
+
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+    expect(addStoryStandard).not.toHaveBeenCalled();
+  });
+
+  it('a blank subject closes the lightbox and does not call the create action', () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+    const input = container.querySelector('.e2e-add-story-subject') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '     ' } });
+    fireEvent.click(container.querySelector('.lightbox-add-story .e2e-create') as HTMLElement);
+
+    expect(addStoryStandard).not.toHaveBeenCalled();
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+  });
+
+  it('guards against double submit: two rapid Create clicks yield exactly one create call', async () => {
+    const gate = deferred();
+    const addStoryStandard = jest.fn(() => gate.promise);
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+    const input = container.querySelector('.e2e-add-story-subject') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'Only once' } });
+
+    const createBtn = container.querySelector('.lightbox-add-story .e2e-create') as HTMLElement;
+    // First click starts the (still-pending) create; second click must be ignored
+    // because the in-flight guard is set.
+    fireEvent.click(createBtn);
+    fireEvent.click(createBtn);
+    expect(addStoryStandard).toHaveBeenCalledTimes(1);
+
+    // Resolve the in-flight create -> guard clears and the lightbox closes.
+    await act(async () => {
+      gate.resolve();
+      await gate.promise;
+    });
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+  });
+
+  it('opens the single-subject lightbox from the empty-state "Create your first user story" button', async () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByTitle('Create new user story'));
+
+    expect(container.querySelector('.lightbox-add-story')).toBeInTheDocument();
+    const input = container.querySelector('.e2e-add-story-subject') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'First story' } });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-add-story .e2e-create') as HTMLElement);
+    });
+
+    expect(addStoryStandard).toHaveBeenCalledWith('First story');
+  });
+
+  it('does not render the add-story buttons when the user lacks add_us permission', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        project: {
+          ...makeBacklog().state.project,
+          my_permissions: ['view_us', 'view_milestones'],
+        },
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    renderApp();
+
+    expect(screen.queryByLabelText('Add user story')).toBeNull();
+    expect(screen.queryByLabelText('Add user stories in bulk')).toBeNull();
+    expect(screen.queryByTitle('Create new user story')).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * Burndown chart — toggle wiring + real SVG rendering (finding #1)            *
+ * -------------------------------------------------------------------------- *
+ * The default fixture (makeBacklog) sets `showGraphPlaceholder: true` and a   *
+ * `stats` object WITHOUT `milestones`, so the toggle button is hidden and the *
+ * chart collapses (empty-burndown placeholder path). These specs use a        *
+ * NON-placeholder variant (`showGraphPlaceholder: false` + `stats.milestones`)*
+ * so the toggle button renders and <Burndown> can draw the real inline-SVG    *
+ * chart. localStorage is cleared before each spec so the persisted collapse   *
+ * flag starts from a known (expanded) state.                                  */
+describe('BacklogApp — burndown chart (finding #1)', () => {
+  const statsWithMilestones = {
+    total_points: 806,
+    defined_points: 1206.5,
+    closed_points: 35,
+    assigned_points: 200,
+    speed: 0,
+    total_milestones: 3,
+    completedPercentage: 4,
+    milestones: [
+      { name: 'Sprint A', optimal: 806, evolution: 806, 'team-increment': 0, 'client-increment': 0 },
+      { name: 'Sprint B', optimal: 400, evolution: 771, 'team-increment': 10, 'client-increment': 5 },
+      { name: 'Sprint C', optimal: 0, evolution: null, 'team-increment': 0, 'client-increment': 0 },
+    ],
+  };
+
+  function renderWithChart(): ReturnType<typeof renderApp> {
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* jsdom storage always present; guard for safety */
+    }
+    currentBacklog = makeBacklog({
+      state: { showGraphPlaceholder: false, stats: statsWithMilestones },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    return renderApp();
+  }
+
+  it('renders a real <svg> burndown chart inside .burndown when milestone data is present', () => {
+    const { container } = renderWithChart();
+    const host = container.querySelector('.burndown');
+    expect(host).toBeInTheDocument();
+    const chart = host!.querySelector('[data-testid="burndown-chart"]');
+    expect(chart).toBeInTheDocument();
+    expect(chart!.tagName.toLowerCase()).toBe('svg');
+    // Four VISIBLE series groups (the invisible zero-baseline series 0 is omitted).
+    expect(container.querySelectorAll('g[data-series-index]')).toHaveLength(4);
+    // At least one plotted point circle is present.
+    expect(container.querySelectorAll('circle').length).toBeGreaterThan(0);
+  });
+
+  it('shows the chart by default (.shown container + .active button) and wires the toggle', () => {
+    const { container } = renderWithChart();
+    const gc = container.querySelector('.graphics-container.js-burndown-graph');
+    const btn = container.querySelector('.js-toggle-burndown-visibility-button');
+    expect(gc).toBeInTheDocument();
+    expect(btn).toBeInTheDocument();
+    expect(gc).toHaveClass('shown');
+    expect(btn).toHaveClass('active');
+  });
+
+  it('clicking the toggle HIDES the chart and persists the collapse flag', () => {
+    const { container } = renderWithChart();
+    const btn = container.querySelector('.js-toggle-burndown-visibility-button')!;
+    act(() => {
+      fireEvent.click(btn);
+    });
+    const gc = container.querySelector('.graphics-container.js-burndown-graph')!;
+    expect(gc).not.toHaveClass('shown');
+    expect(gc).not.toHaveClass('open');
+    expect(
+      container.querySelector('.js-toggle-burndown-visibility-button'),
+    ).not.toHaveClass('active');
+    // The collapse flag is persisted under the legacy (typo-preserved) key.
+    expect(window.localStorage.getItem('is-burndown-grpahs-collapsed')).toBe('true');
+  });
+
+  it('toggling twice RE-SHOWS the chart with .open (animated reveal) + .active button', () => {
+    const { container } = renderWithChart();
+    act(() => {
+      fireEvent.click(container.querySelector('.js-toggle-burndown-visibility-button')!);
+    }); // hide
+    act(() => {
+      fireEvent.click(container.querySelector('.js-toggle-burndown-visibility-button')!);
+    }); // re-show
+    const gc = container.querySelector('.graphics-container.js-burndown-graph')!;
+    expect(gc).toHaveClass('open');
+    expect(gc).not.toHaveClass('shown');
+    expect(
+      container.querySelector('.js-toggle-burndown-visibility-button'),
+    ).toHaveClass('active');
+    expect(window.localStorage.getItem('is-burndown-grpahs-collapsed')).toBe('false');
+  });
+
+  it('does not render the toggle button when showGraphPlaceholder is true (placeholder path)', () => {
+    try {
+      window.localStorage.clear();
+    } catch {
+      /* ignore */
+    }
+    currentBacklog = makeBacklog({
+      state: { showGraphPlaceholder: true, stats: statsWithMilestones },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+    expect(
+      container.querySelector('.js-toggle-burndown-visibility-button'),
+    ).toBeNull();
+  });
+});
+
+
+/* ------------------------------------------------------------------ *
+ * Phase 10 — filter persistence to the URL (location.search)
+ * ------------------------------------------------------------------ *
+ * Proves BacklogApp's persistence effect mirrors the reducer filter model to the
+ * URL (via history.replaceState) AND to per-project localStorage, and that chips
+ * restored from the URL with placeholder (id) names are reconciled to their
+ * labels once `filters_data` resolves — fixing the tracked MINOR deviation.
+ */
+describe('BacklogApp — Phase 10: filter persistence to the URL', () => {
+  it('writes the applied filters from reducer state to window.location.search on mount', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        filters: {
+          query: '',
+          selected: [{ id: '1', name: 'New', dataType: 'status', mode: 'include', color: null }],
+          custom: [],
+        },
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+
+    renderApp();
+
+    expect(window.location.search).toBe('?status=1');
+  });
+
+  it('writes the free-text query to the URL as q', () => {
+    currentBacklog = makeBacklog({
+      state: { filters: { query: 'needle', selected: [], custom: [] } },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+
+    renderApp();
+
+    expect(window.location.search).toBe('?q=needle');
+  });
+
+  it('mirrors the applied filters to per-project localStorage', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        // resolvedSlug falls back to the prop `proj-slug` when project.slug matches.
+        filters: {
+          query: '',
+          selected: [{ id: 'foo', name: 'foo', dataType: 'tags', mode: 'exclude', color: null }],
+          custom: [],
+        },
+      },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+
+    renderApp();
+
+    const stored = window.localStorage.getItem('proj-slug:backlog-filters');
+    expect(stored).not.toBeNull();
+    expect(JSON.parse(stored as string)).toEqual([
+      { id: 'foo', name: 'foo', dataType: 'tags', mode: 'exclude', color: null },
+    ]);
+    // and the URL carries the exclude form
+    expect(window.location.search).toBe('?exclude_tags=foo');
+  });
+
+  it('clears the managed query when there are no filters', () => {
+    window.history.replaceState(null, '', '/project/proj-slug/backlog?status=99&page=2');
+    currentBacklog = makeBacklog({
+      state: { filters: { query: '', selected: [], custom: [] } },
+    });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+
+    renderApp();
+
+    // status (managed) removed; page (unrelated) preserved.
+    expect(window.location.search).toBe('?page=2');
+  });
+
+  it('reconciles a URL-restored chip name against filters_data (id -> label)', () => {
+    currentBacklog = makeBacklog({
+      state: {
+        activeFilters: true, // renders the FilterBar sidebar
+        filters: {
+          query: '',
+          // placeholder (id) name, as produced by a URL restore before data loads
+          selected: [{ id: '1', name: '1', dataType: 'status', mode: 'include', color: null }],
+          custom: [],
+        },
+      },
+    });
+    // Provide filters_data so filterCategories resolves the id -> 'New' label.
+    mockUseBacklog.mockReturnValue({
+      ...currentBacklog,
+      filtersData: {
+        statuses: [{ id: 1, name: 'New', color: '#aaa', count: 2 }],
+        tags: [],
+        assigned_users: [],
+        roles: [],
+        owners: [],
+        epics: [],
+      },
+    });
+
+    const { container } = renderApp();
+
+    const chip = container.querySelector('.single-applied-filter .name');
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toBe('New');
   });
 });

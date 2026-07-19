@@ -223,6 +223,15 @@ export interface BacklogState {
   // View toggles / filters
   showTags: boolean; // DEFAULT true (main.coffee:91)
   activeFilters: boolean; // DEFAULT false (main.coffee:92)
+  /**
+   * "View points per Role" selection for the backlog table header
+   * (`tg-us-role-points-selector`, `backlog-table.jade:14`). `null` = "All roles"
+   * (show each story's total points); a role id = show that role's per-role
+   * points label + the total, matching the legacy `uspoints:select` /
+   * `uspoints:clear-selection` broadcast the `UsRolePointsSelectorDirective`
+   * (`backlog/main.coffee:995-1021`) drove across every row's points widget.
+   */
+  pointsViewRoleId: number | null;
   filters: BacklogFilters;
   // Multi-select + drag
   selectedIds: number[]; // .ui-multisortable-multiple selection
@@ -368,6 +377,7 @@ export function createInitialState(): BacklogState {
     // View toggles / filters
     showTags: true,
     activeFilters: false,
+    pointsViewRoleId: null,
     filters: { query: '', selected: [], custom: [] },
     // Multi-select + drag
     selectedIds: [],
@@ -788,11 +798,22 @@ export function unloadClosedSprints(state: BacklogState): BacklogState {
  * `showGraphPlaceholder = !(stats.total_points? && stats.total_milestones?)`.
  */
 export function setProjectStats(state: BacklogState, stats: BacklogStats): BacklogState {
+  const nextStats: BacklogStats = { ...stats };
+  nextStats.completedPercentage = computeCompletedPercentage(stats);
+  // Reproduce `loadProjectStats` -> `calculateForecasting` (main.coffee:267):
+  // recompute the forecast against the freshly-stored stats so `speed` is
+  // current. Computed from a plain snapshot (not the immer draft) so only fresh
+  // outputs are stored. When velocity is being displayed, also refresh the
+  // visible list so it tracks the new stats.
+  const forecast = calculateForecasting({ ...state, stats: nextStats });
   return produce(state, (draft: BacklogState) => {
-    const nextStats: BacklogStats = { ...stats };
-    nextStats.completedPercentage = computeCompletedPercentage(stats);
     draft.stats = nextStats;
     draft.showGraphPlaceholder = !(stats.total_points != null && stats.total_milestones != null);
+    draft.forecastedStories = forecast.forecastedStories;
+    draft.forecastNewSprint = forecast.forecastNewSprint;
+    if (draft.displayVelocity) {
+      draft.visibleUserStories = forecast.forecastedStories.map((us) => us.ref);
+    }
   });
 }
 
@@ -815,6 +836,63 @@ export function markNewUs(state: BacklogState, ids: number[]): BacklogState {
         draft.newUs.push(id);
       }
     }
+  });
+}
+
+/**
+ * Replace a single user story in the backlog list with an updated server copy.
+ *
+ * Used by the inline status/points row controls (finding #12): after the
+ * `userstories.save` PATCH resolves with the server-updated story (new `version`,
+ * recomputed `total_points`, changed `status`/`points`), this producer swaps the
+ * matching row IN PLACE by `id`, preserving list order. Reproduces the legacy
+ * `render(us)` re-display after `$repo.save` (`common/popovers.coffee:59-67`,
+ * `estimation.coffee:154-166`) — the story object mutates in the AngularJS scope
+ * and the row re-renders. A story not present in the list is a no-op.
+ */
+export function updateUserStory(state: BacklogState, us: UserStory): BacklogState {
+  return produce(state, (draft: BacklogState) => {
+    const idx = draft.userstories.findIndex((u) => u.id === us.id);
+    if (idx !== -1) {
+      // Cast through the reducer's UserStory shape; the server copy carries the
+      // full payload (index signature tolerates every field).
+      draft.userstories[idx] = us as unknown as (typeof draft.userstories)[number];
+    }
+  });
+}
+
+/**
+ * Remove a single user story from the backlog list.
+ *
+ * Used by the ⋮ options menu "Delete" action (finding #12): after the confirm
+ * dialog and the `userstories.deleteUserStory` DELETE resolve, the deleted story
+ * is dropped from the visible list. Reproduces the legacy
+ * `@scope.userstories = _.without(@scope.userstories, us)` (`backlog/main.coffee:667`)
+ * optimistic removal. A story not present is a no-op.
+ */
+export function removeUserStory(state: BacklogState, usId: number): BacklogState {
+  return produce(state, (draft: BacklogState) => {
+    draft.userstories = draft.userstories.filter((u) => u.id !== usId);
+    // Drop it from the multi-selection too, so a stale id cannot leak into a
+    // subsequent bulk move.
+    draft.selectedIds = draft.selectedIds.filter((id) => id !== usId);
+  });
+}
+
+/**
+ * Set the "view points per Role" selection for the backlog table header.
+ *
+ * `null` clears the selection (show totals — legacy `uspoints:clear-selection`);
+ * a role id selects that role (legacy `uspoints:select`). Reproduces the state
+ * the `UsRolePointsSelectorDirective` (`backlog/main.coffee:995-1021`) broadcast
+ * to every row's points widget so they all switch display mode together.
+ */
+export function setPointsViewRole(
+  state: BacklogState,
+  roleId: number | null,
+): BacklogState {
+  return produce(state, (draft: BacklogState) => {
+    draft.pointsViewRoleId = roleId;
   });
 }
 
@@ -1127,18 +1205,74 @@ export function toggleActiveFilters(state: BacklogState): BacklogState {
 }
 
 /**
+ * Velocity-forecasting maths. Reproduces `calculateForecasting`
+ * (main.coffee:444-467) as a PURE function over board state (finding #17):
+ *
+ *   - Seed `backlogPointsSum` from the FIRST sprint's total points
+ *     (`sprintTotalPoints(sprints[0])`) when at least one sprint exists.
+ *     `forecastNewSprint` starts `true`; when `speed > 0` AND that first
+ *     sprint is already over capacity (`backlogPointsSum > speed`) the running
+ *     sum is reset to 0 and `forecastNewSprint` stays `true` (a NEW sprint is
+ *     forecast); otherwise `forecastNewSprint` becomes `false` (the current
+ *     sprint still has room).
+ *   - Walk `userstories` in order, accumulating each `total_points` into
+ *     `backlogPointsSum` and pushing the story into `forecastedStories`, and
+ *     STOP as soon as `speed > 0` AND `backlogPointsSum > speed`.
+ *
+ * With `speed === 0` (the guard is `speed > 0`) nothing ever breaks: every
+ * story is forecast and `forecastNewSprint` is `false` whenever sprints exist —
+ * exactly matching the AngularJS behaviour for zero-velocity projects. The
+ * function only READS `state`; it returns fresh outputs the callers store.
+ */
+export function calculateForecasting(state: BacklogState): {
+  forecastedStories: UserStory[];
+  forecastNewSprint: boolean;
+} {
+  const speed = state.stats?.speed ?? 0;
+  const forecastedStories: UserStory[] = [];
+  let forecastNewSprint = true;
+  let backlogPointsSum = 0;
+
+  if (state.sprints.length > 0) {
+    backlogPointsSum = sprintTotalPoints(state.sprints[0]);
+    if (speed > 0 && backlogPointsSum > speed) {
+      backlogPointsSum = 0;
+    } else {
+      forecastNewSprint = false;
+    }
+  }
+
+  for (const us of state.userstories) {
+    backlogPointsSum += us.total_points;
+    forecastedStories.push(us);
+    if (speed > 0 && backlogPointsSum > speed) {
+      break;
+    }
+  }
+
+  return { forecastedStories, forecastNewSprint };
+}
+
+/**
  * Toggle velocity forecasting. Reproduces `toggleVelocityForecasting`
  * (main.coffee:244-254): flip the flag, then recompute `visibleUserStories`
- * from `userstories` (off) or `forecastedStories` (on). The velocity maths that
- * populates `forecastedStories` runs in the hook via `setForecastedStories`.
+ * from `userstories` (off) or `forecastedStories` (on). On toggle-ON the
+ * forecast is RECOMPUTED fresh via `calculateForecasting` (main.coffee:250
+ * calls it before rebuilding the visible list), so `forecastedStories` /
+ * `forecastNewSprint` always reflect current stats/sprints/userstories.
  */
 export function toggleVelocityForecasting(state: BacklogState): BacklogState {
+  // Compute the forecast from the (non-draft) input so no immer proxies leak
+  // into the stored arrays; it is only consumed on the toggle-ON branch.
+  const forecast = calculateForecasting(state);
   return produce(state, (draft: BacklogState) => {
     draft.displayVelocity = !draft.displayVelocity;
     if (!draft.displayVelocity) {
       draft.visibleUserStories = draft.userstories.map((us) => us.ref);
     } else {
-      draft.visibleUserStories = draft.forecastedStories.map((us) => us.ref);
+      draft.forecastedStories = forecast.forecastedStories;
+      draft.forecastNewSprint = forecast.forecastNewSprint;
+      draft.visibleUserStories = forecast.forecastedStories.map((us) => us.ref);
     }
   });
 }
@@ -1377,6 +1511,9 @@ export type BacklogAction =
   | { type: 'UNLOAD_CLOSED_SPRINTS' }
   | { type: 'SET_PROJECT_STATS'; stats: BacklogStats }
   | { type: 'MARK_NEW_US'; ids: number[] }
+  | { type: 'UPDATE_US'; us: UserStory }
+  | { type: 'REMOVE_US'; usId: number }
+  | { type: 'SET_POINTS_VIEW_ROLE'; roleId: number | null }
   | { type: 'TOGGLE_SHOW_TAGS' }
   | { type: 'TOGGLE_ACTIVE_FILTERS' }
   | { type: 'TOGGLE_VELOCITY' }
@@ -1395,7 +1532,8 @@ export type BacklogAction =
   | { type: 'APPLY_DRAG'; result: BacklogDragResult }
   | { type: 'MOVE_TO_CURRENT_SPRINT' }
   | { type: 'MOVE_TO_LATEST_SPRINT' }
-  | { type: 'APPLY_MOVE_RESULT'; updated: BacklogMoveResultEntry[] };
+  | { type: 'APPLY_MOVE_RESULT'; updated: BacklogMoveResultEntry[] }
+  | { type: 'RESTORE_STATE'; state: BacklogState };
 
 /**
  * Pure dispatcher. Delegates each action to its producer; the `default` case
@@ -1422,6 +1560,12 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
       return setProjectStats(state, action.stats);
     case 'MARK_NEW_US':
       return markNewUs(state, action.ids);
+    case 'UPDATE_US':
+      return updateUserStory(state, action.us);
+    case 'REMOVE_US':
+      return removeUserStory(state, action.usId);
+    case 'SET_POINTS_VIEW_ROLE':
+      return setPointsViewRole(state, action.roleId);
     case 'TOGGLE_SHOW_TAGS':
       return toggleShowTags(state);
     case 'TOGGLE_ACTIVE_FILTERS':
@@ -1462,6 +1606,9 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
       return moveToLatestSprint(state).state;
     case 'APPLY_MOVE_RESULT':
       return applyMoveResult(state, action.updated);
+    case 'RESTORE_STATE':
+      // Rollback: return the provided pre-move snapshot verbatim (QA BL-1/BL-2).
+      return action.state;
     default:
       return state;
   }

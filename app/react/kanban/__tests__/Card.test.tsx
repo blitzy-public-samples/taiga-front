@@ -387,7 +387,10 @@ describe('card-actions popover', () => {
     expect(button).not.toHaveClass('popover-open');
     fireEvent.click(button);
     expect(button).toHaveClass('popover-open');
-    const menu = container.querySelector('.card-actions-popover') as HTMLElement;
+    // The menu reproduces `taiga.globalPopover`: a `.popover.global-popover
+    // .active` body-portaled div (not an inline child of `.card-actions`).
+    const menu = document.querySelector('.popover.global-popover.active') as HTMLElement;
+    expect(menu).toBeInTheDocument();
     const items = within(menu).getAllByRole('menuitem');
     expect(items.map((i) => i.textContent)).toEqual(
       expect.arrayContaining(['Edit', 'Assign to', 'Delete', 'Move to top']),
@@ -426,7 +429,7 @@ describe('card-actions popover', () => {
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
     fireEvent.click(screen.getByText('Edit'));
     expect(onEdit).toHaveBeenCalledWith(101);
-    expect(container.querySelector('.card-actions-popover')).toBeNull();
+    expect(document.querySelector('.popover.global-popover')).toBeNull();
   });
 
   it('routes Delete / Assign to / Move to top to their callbacks', () => {
@@ -461,14 +464,14 @@ describe('card-actions popover', () => {
     const button = container.querySelector('.js-popup-button') as HTMLElement;
 
     fireEvent.click(button);
-    expect(container.querySelector('.card-actions-popover')).toBeInTheDocument();
+    expect(document.querySelector('.popover.global-popover.active')).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(container.querySelector('.card-actions-popover')).toBeNull();
+    expect(document.querySelector('.popover.global-popover')).toBeNull();
 
     fireEvent.click(button);
-    expect(container.querySelector('.card-actions-popover')).toBeInTheDocument();
+    expect(document.querySelector('.popover.global-popover.active')).toBeInTheDocument();
     fireEvent.pointerDown(document.body);
-    expect(container.querySelector('.card-actions-popover')).toBeNull();
+    expect(document.querySelector('.popover.global-popover')).toBeNull();
   });
 });
 
@@ -839,15 +842,69 @@ describe('card-tasks, card-unfold and the transit ghost', () => {
     expect(container.querySelector('.loading-extra')).toBeInTheDocument();
   });
 
-  it('renders the slideshow host only when attachments are visible and tasks are permitted', () => {
+  it('renders the slideshow host with a single image (no arrows) only when attachments are visible and tasks are permitted (finding #10)', () => {
     const withImages = renderCard({
       canViewTasks: true,
       item: makeItem({ images: [{ thumbnail_card_url: 'https://x/t.png' }] }),
     });
     expect(withImages.container.querySelector('tg-card-slideshow')).toBeInTheDocument();
+    // The single image is shown in the wrapper.
+    const img = withImages.container.querySelector(
+      '.card-slideshow-wrapper img',
+    ) as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe('https://x/t.png');
+    // A lone image has NO prev/next arrows (legacy `ng-if="vm.images.size > 1"`).
+    expect(withImages.container.querySelector('.slideshow-left')).toBeNull();
+    expect(withImages.container.querySelector('.slideshow-right')).toBeNull();
 
     const withoutImages = renderCard({ canViewTasks: true });
     expect(withoutImages.container.querySelector('tg-card-slideshow')).toBeNull();
+  });
+
+  it('shows prev/next arrows and cycles through images with wrap-around (finding #10)', () => {
+    const { container } = renderCard({
+      canViewTasks: true,
+      item: makeItem({
+        images: [
+          { thumbnail_card_url: 'https://x/a.png' },
+          { thumbnail_card_url: 'https://x/b.png' },
+          { thumbnail_card_url: 'https://x/c.png' },
+        ],
+      }),
+    });
+    const src = (): string | null =>
+      (container.querySelector('.card-slideshow-wrapper img') as HTMLImageElement).getAttribute(
+        'src',
+      );
+    const left = (): HTMLElement => container.querySelector('.slideshow-left') as HTMLElement;
+    const right = (): HTMLElement => container.querySelector('.slideshow-right') as HTMLElement;
+
+    // With >1 image the arrows render; the carousel starts on the first image.
+    expect(left()).toBeInTheDocument();
+    expect(right()).toBeInTheDocument();
+    expect(src()).toBe('https://x/a.png');
+
+    // next(): a -> b -> c -> wraps back to a (index++ then 0 once past the end).
+    fireEvent.click(right());
+    expect(src()).toBe('https://x/b.png');
+    fireEvent.click(right());
+    expect(src()).toBe('https://x/c.png');
+    fireEvent.click(right());
+    expect(src()).toBe('https://x/a.png');
+
+    // previous(): from a wraps to c (index-- then size-1 below 0), then to b.
+    fireEvent.click(left());
+    expect(src()).toBe('https://x/c.png');
+    fireEvent.click(left());
+    expect(src()).toBe('https://x/b.png');
+  });
+
+  it('does not render the slideshow when the view_tasks permission is absent (finding #10)', () => {
+    const { container } = renderCard({
+      canViewTasks: false,
+      item: makeItem({ images: [{ thumbnail_card_url: 'https://x/t.png' }] }),
+    });
+    expect(container.querySelector('tg-card-slideshow')).toBeNull();
   });
 
   it('always renders the multi-drag transit ghost skeleton', () => {

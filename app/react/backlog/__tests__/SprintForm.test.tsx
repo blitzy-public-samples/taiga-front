@@ -110,6 +110,23 @@ describe('SprintForm — F34 close button', () => {
     expect(container.querySelector('form')).toBeNull();
     expect(container.querySelector('a.close')).not.toBeNull();
   });
+
+  it('reproduces the AngularJS `tg-lb-create-edit-sprint` directive attribute (Gap 18)', () => {
+    // PARITY: the pre-migration backlog.jade declared the sprint lightbox as
+    // `div.lightbox.lightbox-sprint-add-edit(tg-lb-create-edit-sprint)`. The e2e
+    // suite selects the sprint lightbox by `[tg-lb-create-edit-sprint].open`, so
+    // the inert directive attribute must be present on the root in BOTH states.
+    const openRender = renderForm({ open: true });
+    const openHost = openRender.container.querySelector('[tg-lb-create-edit-sprint]');
+    expect(openHost).not.toBeNull();
+    expect(openHost).toHaveClass('lightbox', 'lightbox-sprint-add-edit', 'open');
+
+    const closedRender = renderForm({ open: false });
+    const closedHost = closedRender.container.querySelector('[tg-lb-create-edit-sprint]');
+    expect(closedHost).not.toBeNull();
+    expect(closedHost).toHaveClass('lightbox', 'lightbox-sprint-add-edit');
+    expect(closedHost).not.toHaveClass('open');
+  });
 });
 
 describe('SprintForm — F36 localized copy + "Save" label', () => {

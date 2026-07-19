@@ -944,11 +944,16 @@ describe('createBacklogDragEndHandler', () => {
     document.body.appendChild(el('div', ['doom-line']));
 
     const handler = createBacklogDragEndHandler({ projectId: 100, onMove, api });
+    // Cross-container: card 7 (from sprint 40) dropped OVER card 8 in sprint 55,
+    // whose current order is [11, 8] (the moved card is not yet part of it).
+    // Simulating the drop splices 7 in at 8's slot -> [11, 7, 8], so 7 lands at
+    // index 1 with previous 11 (after-precedence).
     await handler(
       makeEvent(
         7,
         { sprintId: 40, oldIndex: 0 },
-        { sprintId: 55, orderedIds: [11, 7, 8] },
+        { sprintId: 55, orderedIds: [11, 8] },
+        8,
       ),
     );
 
@@ -968,11 +973,16 @@ describe('createBacklogDragEndHandler', () => {
 
   it('backlog-list target -> targetSprintId null + after-precedence NEXT', async () => {
     const handler = createBacklogDragEndHandler({ projectId: 100, onMove, api });
+    // Cross-container into the backlog: card 7 (from sprint 40) dropped OVER card
+    // 8 (the current first backlog row), whose container holds [8]. Simulating the
+    // drop splices 7 in at 8's slot -> [7, 8], so 7 lands FIRST -> no previous,
+    // next = 8 (after-precedence).
     await handler(
       makeEvent(
         7,
         { sprintId: 40, oldIndex: 0 },
-        { isBacklog: true, orderedIds: [7, 8] },
+        { isBacklog: true, orderedIds: [8] },
+        8,
       ),
     );
 
@@ -1002,11 +1012,16 @@ describe('createBacklogDragEndHandler', () => {
   it('NO-OP GUARD: same sprint + unchanged index -> no onMove/api, but cleanup still ran', async () => {
     document.body.classList.add(DND_CLASS.dragActive);
     const handler = createBacklogDragEndHandler({ projectId: 100, onMove, api });
+    // Card 7 (oldIndex 1) is picked up and released back over ITSELF in the same
+    // sprint 55 (order [11, 7, 8]). Simulating the drop over its own slot is a
+    // no-op (arrayMove(order, 1 -> 1)), so the final index (1) equals oldIndex (1)
+    // in the same container -> the guard returns with NO onMove and NO request.
     await handler(
       makeEvent(
         7,
         { sprintId: 55, oldIndex: 1 },
         { sprintId: 55, orderedIds: [11, 7, 8] },
+        7,
       ),
     );
     expect(onMove).not.toHaveBeenCalled();
@@ -1098,11 +1113,17 @@ describe('createBacklogDragEndHandler', () => {
       api,
       getSelectedIds: () => [7, 8, 9],
     });
+    // Cross-container multi-drag: active card 7 (from sprint 40) dropped OVER card
+    // 8 in sprint 55, whose current order is [11, 8, 9] (the moved cards are not
+    // yet part of it). Simulating the drop splices 7 in at 8's slot -> [11,7,8,9],
+    // so 7 lands at index 1 with previous 11; the moved-id set carries the whole
+    // selection because it contains the active id (resolveMovedIds).
     await handler(
       makeEvent(
         7,
         { sprintId: 40, oldIndex: 0 },
-        { sprintId: 55, orderedIds: [11, 7, 8, 9] },
+        { sprintId: 55, orderedIds: [11, 8, 9] },
+        8,
       ),
     );
     expect(bulkUpdateBacklogOrder).toHaveBeenCalledWith(100, 55, 11, null, [7, 8, 9]);
@@ -1167,7 +1188,43 @@ describe('createBacklogDragEndHandler', () => {
     );
   });
 
-  it('continues the queue even if a drop rejects (a failed request does not wedge it)', async () => {
+  it('swallows a failed drop write (no unhandled rejection), notifies onMoveError with the rejected result, and keeps the queue running (BL-1)', async () => {
+    const err = new Error('network');
+    bulkUpdateBacklogOrder
+      .mockImplementationOnce(() => Promise.reject(err))
+      .mockImplementationOnce(() => Promise.resolve());
+    const onMoveError = jest.fn();
+
+    const handler = createBacklogDragEndHandler({ projectId: 100, onMove, api, onMoveError });
+
+    const p1 = handler(
+      makeEvent(7, { sprintId: 40, oldIndex: 0 }, { sprintId: 55, orderedIds: [11, 7] }),
+    );
+    // BL-1: the failed write is CAUGHT inside the handler, so the drop promise
+    // RESOLVES - it must NOT reject / surface an "Uncaught (in promise)" (the
+    // pre-fix behavior this test previously encoded).
+    await expect(p1).resolves.toBeUndefined();
+    // The consumer is notified with the rejection AND the drop result it must
+    // roll back (the SAME object passed to onMove).
+    expect(onMoveError).toHaveBeenCalledTimes(1);
+    expect(onMoveError).toHaveBeenCalledWith(err, {
+      movedIds: [7],
+      targetSprintId: 55,
+      index: 1,
+      previousUs: 11,
+      nextUs: null,
+      isBacklog: false,
+    });
+
+    // The queue is not wedged: a subsequent drop still processes.
+    const p2 = handler(
+      makeEvent(8, { sprintId: 41, oldIndex: 0 }, { sprintId: 55, orderedIds: [7, 8] }),
+    );
+    await p2;
+    expect(bulkUpdateBacklogOrder).toHaveBeenCalledTimes(2);
+  });
+
+  it('without onMoveError, a failed drop write is still swallowed (no unhandled rejection) and the queue continues', async () => {
     bulkUpdateBacklogOrder
       .mockImplementationOnce(() => Promise.reject(new Error('network')))
       .mockImplementationOnce(() => Promise.resolve());
@@ -1177,8 +1234,9 @@ describe('createBacklogDragEndHandler', () => {
     const p1 = handler(
       makeEvent(7, { sprintId: 40, oldIndex: 0 }, { sprintId: 55, orderedIds: [11, 7] }),
     );
-    // First drop rejects; swallow so it is not an unhandled rejection.
-    await expect(p1).rejects.toThrow('network');
+    // No onMoveError provided -> the error is simply swallowed; the promise
+    // resolves rather than rejecting.
+    await expect(p1).resolves.toBeUndefined();
 
     const p2 = handler(
       makeEvent(8, { sprintId: 41, oldIndex: 0 }, { sprintId: 55, orderedIds: [7, 8] }),

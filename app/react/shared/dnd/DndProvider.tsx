@@ -62,6 +62,9 @@ import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
+  pointerWithin,
+  rectIntersection,
+  type CollisionDetection,
   type DragStartEvent,
   type DragOverEvent,
   type DragEndEvent,
@@ -95,6 +98,34 @@ function readContainerEl(data: Record<string, unknown> | undefined): HTMLElement
   const el = data?.['columnEl'];
   return el instanceof HTMLElement ? el : null;
 }
+
+/**
+ * Collision detection for the BACKLOG screen.
+ *
+ * WHY NOT the `@dnd-kit` default (`rectIntersection`): the backlog reorder-to-top
+ * gesture is a LONG drag driven by the window auto-scroller
+ * (`getAutoScrollOptions('backlog')` + the test harness holding the pointer at
+ * the viewport top until `scrollY === 0`). `rectIntersection` resolves `over`
+ * from the ACTIVE draggable's translated bounding rect, which after a long
+ * scroll-assisted travel across a tall page can intersect a STALE-measured
+ * droppable in the right-hand sprint panel MORE than the intended backlog row —
+ * so a pure backlog REORDER would resolve `over` to a sprint row and (because
+ * each row now carries its container identity, see UserStoryRow/MilestoneRow)
+ * wrongly route the stories INTO that sprint.
+ *
+ * The legacy `dragula` drakes resolved the drop container from the element
+ * UNDER THE POINTER (`document.elementFromPoint`, via `isContainer` —
+ * backlog/sortable.coffee:42), NOT from rect overlap. `pointerWithin` is the
+ * faithful `@dnd-kit` analog: it returns only droppables whose rect contains the
+ * pointer, so a drop resolves to whatever the pointer is actually over (the
+ * backlog row for a reorder, the sprint table/row for a cross-panel move). We
+ * fall back to `rectIntersection` for the rare frame where the pointer sits in a
+ * 1px gap between droppables so `over` is never spuriously lost.
+ */
+const backlogCollisionDetection: CollisionDetection = (args) => {
+  const pointerCollisions = pointerWithin(args);
+  return pointerCollisions.length > 0 ? pointerCollisions : rectIntersection(args);
+};
 
 /* ------------------------------------------------------------------------- *
  * Public component API
@@ -186,6 +217,18 @@ export const DndProvider: React.FC<DndProviderProps> = ({
   // identity stable across re-renders so `<DndContext>` does not churn its
   // auto-scroll setup when nothing relevant changed.
   const autoScroll = useMemo(() => getAutoScrollOptions(mode), [mode]);
+
+  // Collision detection. Kanban keeps the `@dnd-kit` default (`rectIntersection`)
+  // — its short, side-by-side column drags resolve correctly and the whole
+  // kanban suite passes on it. The backlog uses a pointer-first strategy (see
+  // `backlogCollisionDetection`) so its long, auto-scroll-assisted reorders
+  // resolve `over` from the pointer position — faithful to the legacy dragula
+  // `elementFromPoint` container test — rather than from a translated rect that
+  // can spuriously intersect the right-hand sprint panel.
+  const collisionDetection = useMemo<CollisionDetection | undefined>(
+    () => (mode === 'backlog' ? backlogCollisionDetection : undefined),
+    [mode],
+  );
 
   // The id of the item currently being dragged, surfaced to `renderOverlay`.
   const [activeId, setActiveId] = useState<UsId | null>(null);
@@ -328,6 +371,7 @@ export const DndProvider: React.FC<DndProviderProps> = ({
     <DndContext
       sensors={sensors}
       autoScroll={autoScroll}
+      collisionDetection={collisionDetection}
       accessibility={DND_ACCESSIBILITY}
       onDragStart={handleDragStart}
       onDragOver={handleDragOver}

@@ -43,17 +43,29 @@
  *    (main.coffee:646) is the status-change callback, threaded here via
  *    `onStatusClick`.
  *
- * SCOPE NOTE — embedded sub-widgets (`.status`, `.points`, `tg-due-date`):
- * the AngularJS row hosts three self-contained directives — `tgUsStatus` (status
- * dropdown), `tgBacklogUsPoints` (per-role points editor), and `tgDueDate` (date
- * badge) — that are OUT of this folder's component scope to fully re-implement.
- * Per the presentational-split rule, this component reproduces only their OUTER
- * structural container + exact class names + primary display value
- * (`statusName`, `pointsLabel`, the due-date string) and threads any interaction
- * through props/callbacks (`onStatusClick`, `onOptionsClick`). Their popovers /
- * inline editors are intentionally NOT re-implemented here; the parent
- * `BacklogTable` owns those. This keeps "zero visual change" (the SCSS targets
- * the container classes) while the row stays presentational.
+ * INLINE CONTROLS (finding #12) — the row hosts three self-contained AngularJS
+ * directives whose behavior is now FULLY reproduced here so the controls are
+ * functional (the QA gate required they not be inert no-ops):
+ *   - `tgUsStatus` (status dropdown, `common/popovers.coffee:19-92`): clicking
+ *     `.us-status` opens the `pop-status` popover; selecting an option calls
+ *     `onChangeStatus(us, statusId)` which PATCHes the status upstream.
+ *   - `tgBacklogUsPoints` (per-role points editor, `main.coffee:1057-1160` +
+ *     `estimation.coffee`): clicking `.us-points` opens the role picker
+ *     (`pop-role`) then the point picker (`pop-points-open`); selecting a point
+ *     calls `onChangePoints(us, roleId, pointId)`. The displayed total is
+ *     computed live from `us.points` via the shared estimation helpers, honoring
+ *     the header "view per role" selection.
+ *   - `tgUsEditSelector` (⋮ options menu, `main.coffee:966-989` +
+ *     `us-edit-popover.jade`): clicking the `.us-option-popup-button` opens the
+ *     Edit / Delete / Move-to-top menu, routing to `onEditStory` / `onDeleteStory`
+ *     / `onMoveToTop`.
+ * `tg-due-date` remains an INERT structural host (there is no editing affordance
+ * for it in the backlog row). Every popover reproduces the exact template class
+ * names so the existing compiled SCSS renders them with zero visual change; the
+ * `display:'block'` inline style overrides the `.popover` mixin's default
+ * `display:none` exactly as the jQuery popover plugin did on `.open()`. All
+ * PATCH/DELETE side effects are owned upstream (the hook), keeping the row's only
+ * effect its local open/close popover state.
  *
  * Part of the AngularJS 1.5.10 -> React 18 coexistence migration of the Backlog
  * screen (AAP Section 0). Uses the automatic JSX runtime (`jsx: "react-jsx"`), so
@@ -62,11 +74,36 @@
  * this component calls.
  */
 
+// `useState` drives the row's inline popover open/close state (finding #12: the
+// status dropdown, per-role points editor, and ⋮ options menu are now
+// FUNCTIONAL, reproducing the AngularJS `tgUsStatus` / `tgBacklogUsPoints` /
+// `tgUsEditSelector` directives that each appended their popover into the row).
+import { useMemo, useState } from 'react';
 // `UserStory` is a TYPE-only import — required by `isolatedModules: true`.
 import type { UserStory } from '../state/backlogReducer';
 // Runtime values (a hook and a constant object) -> normal imports.
 import { useSortableRow } from '../../shared/dnd/sortable';
 import { DND_CLASS } from '../../shared/dnd/types';
+// Pure estimation helpers reproducing `$tgEstimationsService`
+// (`estimation.coffee`): the per-role points math the points widget displays.
+import {
+  buildPointsById,
+  calculateTotalPoints,
+  calculateRoles,
+  type EstimationPoint,
+  type EstimationRole,
+} from '../../shared/estimation';
+
+/**
+ * A user-story status option for the inline status dropdown. Mirrors the fields
+ * the `popover-us-status` template read from `project.us_statuses`
+ * (`{ id, name, color }`, `popover-us-status.jade:10-16`).
+ */
+export interface RowStatusOption {
+  id: number;
+  name: string;
+  color?: string;
+}
 
 /**
  * Module-local references to the AngularJS custom-element host tags.
@@ -125,14 +162,56 @@ export interface UserStoryRowProps {
   statusName: string;
   /** Resolved status color (applied as an inline style to `.us-status`), optional. */
   statusColor?: string;
-  /** Display label for `div.points` (e.g. total points or `'?'`), optional. */
+  /**
+   * Display label for `div.points` — the FALLBACK shown when the estimation
+   * inputs (`points`/`roles`) are not supplied (e.g. in unit tests). When they
+   * ARE supplied, the label is computed live from `us.points` via the estimation
+   * helpers so it reflects the per-role "view" selection (finding #12). Optional.
+   */
   pointsLabel?: string;
   /** Checkbox click -> `(usId, shiftKey)`. `BacklogTable` owns the shift-range computation. */
   onToggleSelect: (usId: number, shiftKey: boolean) => void;
-  /** Click the status link -> open the status dropdown (handled upstream), optional. */
+  /**
+   * Click the status link -> also fires this "status widget activated" signal
+   * (kept for parity/telemetry; the dropdown itself opens inline). Optional.
+   */
   onStatusClick?: (usId: number) => void;
-  /** Click the options (⋮) button -> open the US options popover (handled upstream), optional. */
+  /**
+   * Click the options (⋮) button -> also fires this signal; the options popover
+   * opens inline. Optional.
+   */
   onOptionsClick?: (usId: number) => void;
+
+  /* ------------------- inline controls (finding #12) ------------------- */
+  /**
+   * All project user-story statuses for the inline status dropdown
+   * (`project.us_statuses`). When present AND `canModify`, clicking `.us-status`
+   * opens the `pop-status` popover; selecting an option calls `onChangeStatus`.
+   * Absent -> the status link is display-only (legacy read-only parity).
+   */
+  statuses?: RowStatusOption[];
+  /** Project estimation points (`project.points`) for the inline points editor. */
+  points?: EstimationPoint[];
+  /** Project roles (`project.roles`); only `computable` ones participate in points. */
+  roles?: EstimationRole[];
+  /**
+   * "View points per Role" header selection (`null` = totals). When a role is
+   * selected AND there is more than one computable role, the points cell shows
+   * `"{rolePointName} / {total}"` (legacy `estimation` render, main.coffee:1104).
+   */
+  pointsViewRoleId?: number | null;
+  /** `delete_us` permission — gates the ⋮ menu "Delete" item. */
+  canDelete?: boolean;
+  /** Select a status from the dropdown -> PATCH status (owned upstream). */
+  onChangeStatus?: (us: UserStory, statusId: number) => void;
+  /** Select a per-role point -> PATCH points (owned upstream). */
+  onChangePoints?: (us: UserStory, roleId: number, pointId: number) => void;
+  /** ⋮ "Edit" -> open/navigate to the story editor (owned upstream). */
+  onEditStory?: (us: UserStory) => void;
+  /** ⋮ "Delete" -> confirm + delete (owned upstream; confirm lives in BacklogApp). */
+  onDeleteStory?: (us: UserStory) => void;
+  /** ⋮ "Move to top" -> bulk backlog-order move (owned upstream). */
+  onMoveToTop?: (us: UserStory) => void;
 }
 
 /**
@@ -154,7 +233,48 @@ export function UserStoryRow(props: UserStoryRowProps) {
     onToggleSelect,
     onStatusClick,
     onOptionsClick,
+    statuses,
+    points,
+    roles,
+    pointsViewRoleId = null,
+    canDelete = false,
+    onChangeStatus,
+    onChangePoints,
+    onEditStory,
+    onDeleteStory,
+    onMoveToTop,
   } = props;
+
+  // Which inline popover (if any) is open. Only ONE opens at a time, matching the
+  // legacy single-popover behavior. `points-roles` is the intermediate role
+  // picker; `points` is the point picker for `pointsRoleId`.
+  const [openPopover, setOpenPopover] = useState<
+    'status' | 'options' | 'points-roles' | 'points' | null
+  >(null);
+  // The role currently being estimated in the `points` popover.
+  const [pointsRoleId, setPointsRoleId] = useState<number | null>(null);
+
+  const closePopover = () => {
+    setOpenPopover(null);
+    setPointsRoleId(null);
+  };
+
+  // pointId -> point lookup (reproduces groupBy(project.points, id)).
+  const pointsById = useMemo(
+    () => (points ? buildPointsById(points) : {}),
+    [points],
+  );
+  // Computable roles annotated with their selected point name (calculateRoles).
+  const usPoints = (us as Record<string, unknown>).points as
+    | Record<string, number | null | undefined>
+    | undefined;
+  const computableRoles = useMemo(
+    () => (roles ? calculateRoles(roles, usPoints, pointsById) : []),
+    [roles, usPoints, pointsById],
+  );
+  // Whether the points editor is usable: needs points, at least one computable
+  // role, AND modify permission (estimation.coffee:144 isEditable + :182 roles).
+  const pointsEditable = Boolean(points && canModify && computableRoles.length > 0);
 
   // @dnd-kit sortable wiring. The row itself is the draggable node (setNodeRef +
   // style); the `.draggable-us-row` grip below receives attributes + listeners
@@ -190,6 +310,93 @@ export function UserStoryRow(props: UserStoryRowProps) {
   if (!canModify) rowClasses.push('readonly');
   if (selected) rowClasses.push(DND_CLASS.selected, 'is-checked');
   if (sortable.className) rowClasses.push(sortable.className);
+
+  // Points display value. When estimation inputs are provided, compute live from
+  // `us.points` (reproduces the estimation `render`, main.coffee:1101-1108):
+  // with a selected role AND >1 computable role show "{rolePointName} / {total}",
+  // else just the total. Otherwise fall back to the `pointsLabel` prop.
+  const totalPoints =
+    points ? calculateTotalPoints(usPoints, pointsById) : undefined;
+  let pointsDisplay: string;
+  if (points) {
+    if (
+      pointsViewRoleId != null &&
+      computableRoles.length > 1 &&
+      usPoints &&
+      usPoints[pointsViewRoleId] != null
+    ) {
+      const pid = usPoints[pointsViewRoleId] as number;
+      const name = pointsById[pid]?.name ?? '?';
+      pointsDisplay = `${name} / ${String(totalPoints)}`;
+    } else {
+      pointsDisplay = String(totalPoints);
+    }
+  } else {
+    pointsDisplay = pointsLabel ?? '';
+  }
+
+  // --- inline control handlers (finding #12) ---
+
+  // Status link: fire the legacy "activated" signal, then (when editable) toggle
+  // the status dropdown. Reproduces `$el.on "click", ".us-status"` open
+  // (common/popovers.coffee:46-49).
+  const handleStatusClick = (e: { preventDefault: () => void }) => {
+    e.preventDefault();
+    onStatusClick?.(us.id);
+    if (canModify && statuses && statuses.length > 0) {
+      setOpenPopover((cur) => (cur === 'status' ? null : 'status'));
+    }
+  };
+
+  // Pick a status: PATCH via the upstream handler, then close (the widget's
+  // debounced save + close, common/popovers.coffee:51-67).
+  const handleSelectStatus = (statusId: number) => {
+    closePopover();
+    onChangeStatus?.(us, statusId);
+  };
+
+  // Options (⋮): fire the signal, then toggle the options popover
+  // (tgUsEditSelector open, main.coffee:975-982).
+  const handleOptionsClick = () => {
+    onOptionsClick?.(us.id);
+    setOpenPopover((cur) => (cur === 'options' ? null : 'options'));
+  };
+
+  // Points cell: open the role picker, or (single role / preselected header
+  // role) jump straight to the point picker (estimation bindClickElements +
+  // main.coffee:1135-1141).
+  const handlePointsClick = (e: { preventDefault: () => void; stopPropagation: () => void }) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!pointsEditable) {
+      return;
+    }
+    // Preselect: the header "view per role" role, else the single computable role.
+    const preselected =
+      pointsViewRoleId != null
+        ? pointsViewRoleId
+        : computableRoles.length === 1
+          ? computableRoles[0].id
+          : null;
+    if (preselected != null) {
+      setPointsRoleId(preselected);
+      setOpenPopover('points');
+    } else {
+      setOpenPopover('points-roles');
+    }
+  };
+
+  // Pick a role in the role popover -> show that role's point picker.
+  const handleSelectRole = (roleId: number) => {
+    setPointsRoleId(roleId);
+    setOpenPopover('points');
+  };
+
+  // Pick a point -> PATCH via the upstream handler, then close.
+  const handleSelectPoint = (roleId: number, pointId: number) => {
+    closePopover();
+    onChangePoints?.(us, roleId, pointId);
+  };
 
   return (
     <div
@@ -291,20 +498,117 @@ export function UserStoryRow(props: UserStoryRowProps) {
           href=""
           title="Status"
           style={statusColor ? { color: statusColor } : undefined}
-          onClick={(e) => {
-            e.preventDefault();
-            onStatusClick?.(us.id);
-          }}
+          onClick={handleStatusClick}
         >
           <span className="us-status-bind">{statusName}</span>
           {canModify && <Svg icon="icon-arrow-down" />}
         </a>
+        {/* Status dropdown (`popover-us-status.jade`): rendered inline only when
+            open. `display:'block'` overrides the `.popover` mixin's default
+            `display:none` (the jQuery popover plugin did the same on `.open()`).
+            Each option carries `active-popover` when it is the current status,
+            byte-identical to the template's `data-status-id` + `.item-text`. */}
+        {openPopover === 'status' && statuses && (
+          <ul className="popover pop-status" style={{ display: 'block' }}>
+            {statuses.map((s) => (
+              <li className="popover-status" key={s.id}>
+                <a
+                  id="js-status-btn"
+                  className={us.status === s.id ? 'status active-popover' : 'status'}
+                  href=""
+                  title={s.name}
+                  data-status-id={s.id}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    handleSelectStatus(s.id);
+                  }}
+                >
+                  <span className="item-text">{s.name}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
-      {/* Points cell (SCOPE NOTE: outer structure only). `pointsLabel` is the
-          primary display value (e.g. total points or `'?'`); the per-role points
-          editor (`tg-backlog-us-points`) is owned upstream. */}
-      <div className="points">{pointsLabel ?? ''}</div>
+      {/* Points cell (`div.points(tg-backlog-us-points="us")`, finding #12).
+          Now FUNCTIONAL: when the estimation inputs are supplied and the user can
+          modify, the total is a clickable `.us-points` button that opens the
+          per-role points editor (reproducing `UsPointsDirective` +
+          `$tgEstimationsService`, main.coffee:1057-1160 / estimation.coffee).
+          The `.points-value` span + `.us-points`/`not-clickable` classes match
+          `us-estimation-total.jade`. When estimation inputs are absent (unit
+          tests / read-only), it degrades to the plain display value. */}
+      <div className="points">
+        {points ? (
+          <button
+            type="button"
+            className={pointsEditable ? 'us-points' : 'us-points not-clickable'}
+            onClick={handlePointsClick}
+          >
+            <span className="points-value">{pointsDisplay}</span>
+          </button>
+        ) : (
+          pointsDisplay
+        )}
+
+        {/* Role picker (`us-points-roles-popover.jade` -> `.pop-role`): shown when
+            more than one computable role and none preselected. Each role shows
+            "name (points)" and drills into the point picker. */}
+        {openPopover === 'points-roles' && (
+          <ul className="popover pop-role" style={{ display: 'block' }}>
+            {computableRoles.map((role) => (
+              <li key={role.id}>
+                <a
+                  className="role"
+                  href=""
+                  title={role.name}
+                  data-role-id={role.id}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleSelectRole(role.id);
+                  }}
+                >
+                  <span className="item-text">
+                    {role.name} ({role.points})
+                  </span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {/* Point picker (`us-estimation-points.jade` -> `.pop-points-open`):
+            lists every project point; the currently-selected one omits the
+            `active` class (matching the template's `point.selected` inversion).
+            Selecting a point calls `onChangePoints(us, roleId, pointId)`. */}
+        {openPopover === 'points' && pointsRoleId != null && points && (
+          <ul className="popover pop-points-open" style={{ display: 'block' }}>
+            {points.map((p) => {
+              const isSelected = usPoints ? usPoints[pointsRoleId] === p.id : false;
+              return (
+                <li key={p.id}>
+                  <a
+                    className={isSelected ? 'point' : 'point active'}
+                    href=""
+                    title={p.name}
+                    data-point-id={p.id}
+                    data-role-id={pointsRoleId}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleSelectPoint(pointsRoleId, p.id);
+                    }}
+                  >
+                    <span className="item-text">{p.name}</span>
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
 
       {/* Options (⋮) button — gated by `modify_us`. Reproduces
           `ng-class="{first: us.id === first_us_in_backlog}"`: the first backlog
@@ -316,13 +620,68 @@ export function UserStoryRow(props: UserStoryRowProps) {
             type="button"
             className={
               isFirstInBacklog
-                ? 'us-option-popup-button js-popup-button first'
+                ? 'us-option-popup-button js-popup-button first popover-open'
                 : 'us-option-popup-button js-popup-button'
             }
-            onClick={() => onOptionsClick?.(us.id)}
+            onClick={handleOptionsClick}
           >
             <Svg icon="icon-more-vertical" />
           </button>
+          {/* Options popover (`us-edit-popover.jade`): Edit / Delete / Move-to-top.
+              Byte-identical `ul.popover.us-option-popup` + `li > button` classes
+              (`e2e-edit edit-story`, `e2e-delete`, `e2e-edit move-to-top`), each
+              gated by permission exactly as the AngularJS `tg-check-permission`
+              did (Edit/Move need `modify_us` -> `canModify`; Delete needs
+              `delete_us` -> `canDelete`). Selecting an item routes to the upstream
+              handler. */}
+          {openPopover === 'options' && (
+            <ul
+              className={isFirstInBacklog ? 'popover us-option-popup first' : 'popover us-option-popup'}
+              style={{ display: 'block' }}
+            >
+              <li>
+                <button
+                  type="button"
+                  className="e2e-edit edit-story"
+                  onClick={() => {
+                    closePopover();
+                    onEditStory?.(us);
+                  }}
+                >
+                  <Svg icon="icon-edit" />
+                  <span>Edit</span>
+                </button>
+              </li>
+              {canDelete && (
+                <li>
+                  <button
+                    type="button"
+                    className="e2e-delete"
+                    onClick={() => {
+                      closePopover();
+                      onDeleteStory?.(us);
+                    }}
+                  >
+                    <Svg icon="icon-trash" />
+                    <span>Delete</span>
+                  </button>
+                </li>
+              )}
+              <li>
+                <button
+                  type="button"
+                  className="e2e-edit move-to-top"
+                  onClick={() => {
+                    closePopover();
+                    onMoveToTop?.(us);
+                  }}
+                >
+                  <Svg icon="icon-move-to-top" />
+                  <span>Move to top</span>
+                </button>
+              </li>
+            </ul>
+          )}
         </div>
       )}
     </div>

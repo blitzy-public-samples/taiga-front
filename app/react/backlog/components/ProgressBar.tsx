@@ -38,11 +38,11 @@
  *    `.summary-progress-wrapper > .sprint-progress-bar(tg-progress-bar="100 *
  *    sprint.closed_points / sprint.total_points")`.
  *  - app/coffee/modules/common/components.coffee:433-452 — `TgProgressBarDirective`
- *    (registered `tgProgressBar`): the sprint math. NOTE the source CLAMPS ONLY
- *    (`_.max([0, p])` then `_.min([100, p])`) and does NOT round; the AAP §0.3.3
- *    authoritatively specifies round + clamp for the React port, and mandates the
- *    `.full` class at 100% — the `.full { background: … }` rule already exists in
- *    the CSS (sprints.scss:185) but the AngularJS source never toggled it.
+ *    (registered `tgProgressBar`): the sprint math. The source CLAMPS ONLY
+ *    (`_.max([0, p])` then `_.min([100, p])`), does NOT round, and does NOT
+ *    toggle any state class. The sprint variant below reproduces this exactly
+ *    (finding #2). The `.full { background: … }` rule at sprints.scss:185 is dead
+ *    CSS the AngularJS source never activated, so it is left untouched/unused.
  *  - app/partials/backlog/progress-bar.jade:8-13 — the backlog-summary inner
  *    template: `.defined-points` + `.project-points-progress` + `.closed-points-progress`.
  *  - app/partials/includes/components/summary.jade:9 — the backlog-summary host:
@@ -106,24 +106,33 @@ export function ProgressBar(props: ProgressBarProps) {
   if (props.variant === 'sprint') {
     // --- Sprint bar (host `.sprint-progress-bar`, child `.current-progress`) ---
     //
-    // Source `tgProgressBar` (components.coffee:442-445) evaluated
+    // Source `tgProgressBar` (components.coffee:436-445) evaluated
     //   `100 * sprint.closed_points / sprint.total_points`
-    // then CLAMPED ONLY: `_.max([0, p])` → `_.min([100, p])` (no rounding). Per
-    // AAP §0.3.3 the React port additionally ROUNDS and toggles the `.full`
-    // class at 100% (the `.full` rule exists at sprints.scss:185 but the legacy
-    // directive never added it). When `total_points` is falsy the raw ratio
-    // would be `n/0` (→ Infinity/NaN); the spec pins that degenerate case to 0%.
+    // then CLAMPED ONLY: `_.max([0, p])` → `_.min([100, p])`. The legacy
+    // directive does NOT round the width and does NOT toggle any state class.
+    //
+    // Finding #2: an earlier port ROUNDED the width (e.g. showed 21% for a raw
+    // 20.528%) AND added a `.full` class at ≥100%. Neither behavior exists in the
+    // AngularJS source, and the AAP defines no progress-bar rule that would
+    // override exact parity (§0.3.3 is "Design Pattern Applications" — it says
+    // nothing about rounding or a `.full` state), so BOTH are removed here to
+    // match the legacy clamp-only computation exactly. The `.full { … }` rule at
+    // sprints.scss:185 is dead CSS the legacy directive never activated; we
+    // likewise never activate it.
+    //
+    // When `total_points` is falsy the raw ratio would be `n/0` (→ Infinity/NaN);
+    // we pin that degenerate case to 0% to avoid emitting a `width: NaN%` (the
+    // browser would ignore a NaN width anyway, so this matches the rendered
+    // legacy effect).
     const total = Number(props.totalPoints) || 0;
     const closed = Number(props.closedPoints) || 0;
     const raw = total > 0 ? (100 * closed) / total : 0;
-    const percentage = Math.min(100, Math.max(0, Math.round(raw)));
+    // Clamp to [0, 100] ONLY — no Math.round (legacy parity, finding #2).
+    const percentage = Math.min(100, Math.max(0, raw));
 
     return (
       <div className="sprint-progress-bar">
-        <div
-          className={percentage >= 100 ? 'current-progress full' : 'current-progress'}
-          style={{ width: `${percentage}%` }}
-        />
+        <div className="current-progress" style={{ width: `${percentage}%` }} />
       </div>
     );
   }

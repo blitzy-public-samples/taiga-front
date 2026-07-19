@@ -75,6 +75,10 @@ import {
   setProjectStats,
   setProject,
   markNewUs,
+  // Inline row-control producers (finding #12)
+  updateUserStory,
+  removeUserStory,
+  setPointsViewRole,
   // Movement producers (server-observable: return { state, payload })
   applyDrag,
   applyMoveResult,
@@ -84,6 +88,7 @@ import {
   toggleShowTags,
   toggleActiveFilters,
   toggleVelocityForecasting,
+  calculateForecasting,
   setForecastedStories,
   toggleClosedSprintsVisible,
   setFilterQuery,
@@ -1020,17 +1025,159 @@ describe('velocity forecasting', () => {
     expect(next.forecastNewSprint).toBe(false);
   });
 
-  it('toggleVelocityForecasting flips displayVelocity and recomputes visibleUserStories from the active source', () => {
+  it('toggleVelocityForecasting RECOMPUTES the forecast on toggle-ON, then rebuilds visibleUserStories (#17)', () => {
+    // Legacy `toggleVelocityForecasting` (main.coffee:250) calls
+    // `calculateForecasting()` before rebuilding the visible list, so a stale
+    // `forecastedStories` set beforehand must be IGNORED and recomputed fresh.
     let s = setUserstories(createInitialState(), [makeUs({ id: 1, ref: 10 }), makeUs({ id: 2, ref: 20 })]);
+    // Seed a deliberately-stale forecast that the toggle must overwrite.
     s = setForecastedStories(s, [makeUs({ id: 3, ref: 30 })], true);
-    // OFF -> ON: visibleUserStories comes from forecastedStories.
+    // OFF -> ON: forecast is recomputed from userstories (speed 0, no sprints) ->
+    // every story forecast, so visibleUserStories == all userstory refs.
     const on = toggleVelocityForecasting(s);
     expect(on.displayVelocity).toBe(true);
-    expect(on.visibleUserStories).toEqual([30]);
+    expect(on.forecastedStories.map((u) => u.ref)).toEqual([10, 20]);
+    expect(on.visibleUserStories).toEqual([10, 20]);
+    // No sprints -> forecastNewSprint stays true (nothing sets it false).
+    expect(on.forecastNewSprint).toBe(true);
     // ON -> OFF: visibleUserStories comes back from userstories.
     const off = toggleVelocityForecasting(on);
     expect(off.displayVelocity).toBe(false);
     expect(off.visibleUserStories).toEqual([10, 20]);
+  });
+
+  /* ------------------------------------------------------------------ *
+   * calculateForecasting — velocity accumulation math (finding #17).
+   * Reproduces `calculateForecasting` (main.coffee:444-467) exactly.
+   * ------------------------------------------------------------------ */
+  describe('calculateForecasting (#17)', () => {
+    it('with speed 0 (every seeded project): forecasts EVERY story, forecastNewSprint false when sprints exist', () => {
+      let s = setUserstories(createInitialState(), [
+        makeUs({ id: 1, ref: 1, total_points: 3 }),
+        makeUs({ id: 2, ref: 2, total_points: 5 }),
+        makeUs({ id: 3, ref: 3, total_points: 8 }),
+      ]);
+      s = setSprints(s, {
+        milestones: [makeSprint({ id: 100, user_stories: [] })],
+        closed: 0,
+        open: 1,
+        nowMs: parseYmdToMs('2021-01-10'),
+      });
+      s = setProjectStats(s, makeStats({ speed: 0 }));
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(s);
+      // speed 0 -> guard `speed > 0` never fires -> no break -> all stories.
+      expect(forecastedStories.map((u) => u.ref)).toEqual([1, 2, 3]);
+      // sprints exist AND not over-capacity (speed 0) -> forecastNewSprint false.
+      expect(forecastNewSprint).toBe(false);
+    });
+
+    it('no sprints -> forecastNewSprint stays true and all stories forecast (speed 0)', () => {
+      const s = setUserstories(createInitialState(), [
+        makeUs({ id: 1, ref: 1, total_points: 2 }),
+        makeUs({ id: 2, ref: 2, total_points: 4 }),
+      ]);
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(s);
+      expect(forecastedStories.map((u) => u.ref)).toEqual([1, 2]);
+      expect(forecastNewSprint).toBe(true);
+    });
+
+    it('speed > 0: STOPS accumulating once backlogPointsSum exceeds speed (break)', () => {
+      // No sprints -> backlogPointsSum starts at 0. speed = 6.
+      //   us1 (+3) -> sum 3, push, 3 !> 6
+      //   us2 (+5) -> sum 8, push, 8 > 6 -> BREAK (us3 never forecast)
+      let s = setUserstories(createInitialState(), [
+        makeUs({ id: 1, ref: 1, total_points: 3 }),
+        makeUs({ id: 2, ref: 2, total_points: 5 }),
+        makeUs({ id: 3, ref: 3, total_points: 8 }),
+      ]);
+      s = setProjectStats(s, makeStats({ speed: 6 }));
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(s);
+      expect(forecastedStories.map((u) => u.ref)).toEqual([1, 2]);
+      // No sprints -> forecastNewSprint never set false.
+      expect(forecastNewSprint).toBe(true);
+    });
+
+    it('speed > 0 AND first sprint already over capacity: resets running sum to 0 and forecasts a NEW sprint', () => {
+      // First sprint carries 10 points; speed 6 -> 10 > 6 -> sum reset to 0,
+      // forecastNewSprint stays TRUE. Then us accumulation restarts from 0:
+      //   us1 (+3) -> 3 !> 6 ; us2 (+5) -> 8 > 6 -> break after us2.
+      const sprint = makeSprint({
+        id: 100,
+        user_stories: [makeUs({ id: 9, ref: 9, milestone: 100, total_points: 10 })],
+      });
+      let s = setSprints(createInitialState(), {
+        milestones: [sprint],
+        closed: 0,
+        open: 1,
+        nowMs: parseYmdToMs('2021-01-10'),
+      });
+      s = setUserstories(s, [
+        makeUs({ id: 1, ref: 1, total_points: 3 }),
+        makeUs({ id: 2, ref: 2, total_points: 5 }),
+        makeUs({ id: 3, ref: 3, total_points: 8 }),
+      ]);
+      s = setProjectStats(s, makeStats({ speed: 6 }));
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(s);
+      expect(forecastNewSprint).toBe(true);
+      expect(forecastedStories.map((u) => u.ref)).toEqual([1, 2]);
+    });
+
+    it('speed > 0 AND first sprint within capacity: seeds the running sum and does NOT forecast a new sprint', () => {
+      // First sprint carries 2 points; speed 10 -> 2 !> 10 -> forecastNewSprint
+      // false, running sum SEEDED at 2. Then:
+      //   us1 (+3) -> 5 !> 10 ; us2 (+5) -> 10 !> 10 ; us3 (+8) -> 18 > 10 -> break.
+      const sprint = makeSprint({
+        id: 100,
+        user_stories: [makeUs({ id: 9, ref: 9, milestone: 100, total_points: 2 })],
+      });
+      let s = setSprints(createInitialState(), {
+        milestones: [sprint],
+        closed: 0,
+        open: 1,
+        nowMs: parseYmdToMs('2021-01-10'),
+      });
+      s = setUserstories(s, [
+        makeUs({ id: 1, ref: 1, total_points: 3 }),
+        makeUs({ id: 2, ref: 2, total_points: 5 }),
+        makeUs({ id: 3, ref: 3, total_points: 8 }),
+      ]);
+      s = setProjectStats(s, makeStats({ speed: 10 }));
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(s);
+      expect(forecastNewSprint).toBe(false);
+      // seeded sum 2: +3=5, +5=10, +8=18>10 -> stories 1,2,3 all pushed (break AFTER push of the one that exceeds).
+      expect(forecastedStories.map((u) => u.ref)).toEqual([1, 2, 3]);
+    });
+
+    it('empty userstories -> empty forecast', () => {
+      const { forecastedStories, forecastNewSprint } = calculateForecasting(createInitialState());
+      expect(forecastedStories).toEqual([]);
+      expect(forecastNewSprint).toBe(true);
+    });
+  });
+
+  it('setProjectStats recomputes forecastedStories from current stats/userstories (loadProjectStats parity, #17)', () => {
+    // Reproduces `loadProjectStats` -> `calculateForecasting` (main.coffee:267).
+    let s = setUserstories(createInitialState(), [
+      makeUs({ id: 1, ref: 1, total_points: 4 }),
+      makeUs({ id: 2, ref: 2, total_points: 6 }),
+    ]);
+    expect(s.forecastedStories).toEqual([]);
+    s = setProjectStats(s, makeStats({ speed: 0 }));
+    // speed 0 -> all stories forecast even without a toggle.
+    expect(s.forecastedStories.map((u) => u.ref)).toEqual([1, 2]);
+  });
+
+  it('setProjectStats refreshes visibleUserStories when velocity is already being displayed (#17)', () => {
+    let s = setUserstories(createInitialState(), [
+      makeUs({ id: 1, ref: 1, total_points: 4 }),
+      makeUs({ id: 2, ref: 2, total_points: 6 }),
+    ]);
+    // Turn velocity ON first (recomputes forecast -> visible = [1,2]).
+    s = toggleVelocityForecasting(s);
+    expect(s.displayVelocity).toBe(true);
+    // A fresh stats load while displaying velocity refreshes the visible list.
+    s = setProjectStats(s, makeStats({ speed: 0 }));
+    expect(s.visibleUserStories).toEqual([1, 2]);
   });
 });
 
@@ -1354,6 +1501,26 @@ describe('backlogReducer dispatcher — every action type is routed', () => {
       { type: 'APPLY_MOVE_RESULT', updated: [{ id: 1, milestone: 100, backlog_order: 9 }] },
       (n) => expect(n.userstories.find((u) => u.id === 1)!.backlog_order).toBe(9),
     ],
+    // Inline row-control actions (finding #12).
+    [
+      'UPDATE_US',
+      { type: 'UPDATE_US', us: makeUs({ id: 2, ref: 2, backlog_order: 2, total_points: 99 }) },
+      (n) => expect(n.userstories.find((u) => u.id === 2)!.total_points).toBe(99),
+    ],
+    [
+      'REMOVE_US',
+      { type: 'REMOVE_US', usId: 1 },
+      (n) => {
+        expect(n.userstories.some((u) => u.id === 1)).toBe(false);
+        // id 1 was in the seeded selection -> also dropped from selectedIds.
+        expect(n.selectedIds).not.toContain(1);
+      },
+    ],
+    [
+      'SET_POINTS_VIEW_ROLE',
+      { type: 'SET_POINTS_VIEW_ROLE', roleId: 15 },
+      (n) => expect(n.pointsViewRoleId).toBe(15),
+    ],
   ];
 
   it.each(cases)('routes %s to its producer', (_name, action, check) => {
@@ -1395,6 +1562,10 @@ describe('immutability sweep — producers never mutate their input', () => {
     ['removeSprint', (s) => removeSprint(s, 100)],
     ['upsertSprint', (s) => upsertSprint(s, makeSprint({ id: 100, name: 'Up' }))],
     ['applyMoveResult', (s) => applyMoveResult(s, [{ id: 1, milestone: 100, backlog_order: 9 }])],
+    // Inline row-control producers (finding #12).
+    ['updateUserStory', (s) => updateUserStory(s, makeUs({ id: 2, ref: 2, total_points: 42 }))],
+    ['removeUserStory', (s) => removeUserStory(s, 1)],
+    ['setPointsViewRole', (s) => setPointsViewRole(s, 15)],
     // Server-observable producers: assert purity on `.state`.
     ['applyDrag', (s) => applyDrag(s, drag).state],
     ['moveToCurrentSprint', (s) => moveToCurrentSprint(s).state],
@@ -1414,6 +1585,71 @@ describe('immutability sweep — producers never mutate their input', () => {
     // Every producer here changes something on the seeded state, so immer must
     // return a fresh top-level object (never the same reference).
     expect(result).not.toBe(seeded);
+  });
+});
+
+/* ================================================================== *
+ * Inline row-control producers (finding #12): updateUserStory,
+ * removeUserStory, setPointsViewRole — direct-call behavioural specs.
+ * These reproduce the legacy in-place US update / optimistic remove /
+ * "view points per role" selection (backlog/main.coffee:662-684, the
+ * status/points widgets, and the header role selector).
+ * ================================================================== */
+
+describe('updateUserStory — replaces a story in place by id', () => {
+  it('replaces the matching story with the server copy, preserving order', () => {
+    const s = seededState(); // userstories ids [1, 2, 3]
+    const updated = makeUs({ id: 2, ref: 2, backlog_order: 2, status: 16, total_points: 99 });
+    const next = updateUserStory(s, updated);
+    // Same length + order; only id 2 changed.
+    expect(next.userstories.map((u) => u.id)).toEqual([1, 2, 3]);
+    const row = next.userstories.find((u) => u.id === 2)!;
+    expect(row.total_points).toBe(99);
+    expect(row.status).toBe(16);
+  });
+
+  it('is a no-op when the id is not present', () => {
+    const s = seededState();
+    const next = updateUserStory(s, makeUs({ id: 999, ref: 999 }));
+    expect(next.userstories.map((u) => u.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('removeUserStory — optimistic removal + selection cleanup', () => {
+  it('removes the story from the backlog list', () => {
+    const s = seededState();
+    const next = removeUserStory(s, 2);
+    expect(next.userstories.map((u) => u.id)).toEqual([1, 3]);
+  });
+
+  it('also drops the removed id from the multi-selection', () => {
+    const s = seededState(); // seeded selection is [1]
+    expect(s.selectedIds).toContain(1);
+    const next = removeUserStory(s, 1);
+    expect(next.userstories.some((u) => u.id === 1)).toBe(false);
+    expect(next.selectedIds).not.toContain(1);
+  });
+
+  it('is a no-op (list unchanged) when the id is absent', () => {
+    const s = seededState();
+    const next = removeUserStory(s, 999);
+    expect(next.userstories.map((u) => u.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('setPointsViewRole — header "view points per Role" selection', () => {
+  it('stores the selected role id', () => {
+    const s = seededState();
+    expect(s.pointsViewRoleId).toBeNull();
+    const next = setPointsViewRole(s, 15);
+    expect(next.pointsViewRoleId).toBe(15);
+  });
+
+  it('clears the selection when passed null ("All roles")', () => {
+    let s = seededState();
+    s = setPointsViewRole(s, 15);
+    const next = setPointsViewRole(s, null);
+    expect(next.pointsViewRoleId).toBeNull();
   });
 });
 

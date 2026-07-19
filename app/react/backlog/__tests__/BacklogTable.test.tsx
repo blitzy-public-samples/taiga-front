@@ -148,6 +148,14 @@ jest.mock('@dnd-kit/sortable', () => {
   const react = require('react');
   return {
     __esModule: true,
+    // Real (pure) `arrayMove` — the production drag-end handler's `computeFinalOrder`
+    // uses it to simulate the drop when resolving same-container reorder adjacency
+    // (backlog "move to top" fix). Matches @dnd-kit/sortable's implementation.
+    arrayMove: (array: unknown[], from: number, to: number): unknown[] => {
+      const next = array.slice();
+      next.splice(to < 0 ? next.length + to : to, 0, next.splice(from, 1)[0]);
+      return next;
+    },
     SortableContext: (props: { items?: unknown; children?: unknown }) =>
       react.createElement(
         'div',
@@ -378,6 +386,106 @@ describe('BacklogTable — role-points filter control (accessibility + popover a
       fireEvent.keyDown(el, { key: 'Enter' });
       fireEvent.keyDown(el, { key: ' ' });
     }).not.toThrow();
+  });
+});
+
+// --- finding #12: the header "view points per Role" popover. Rendered ONLY when
+// `roles` (with computable entries) + `onSelectRoleView` are supplied; drives the
+// reducer `pointsViewRoleId` so every row's points cell switches display together.
+describe('BacklogTable — header role-view popover (finding #12)', () => {
+  /** Two computable roles (UX, Front) + one non-computable (Product Owner). */
+  const ROLES = [
+    { id: 13, name: 'UX', computable: true },
+    { id: 15, name: 'Front', computable: true },
+    { id: 17, name: 'Product Owner', computable: false },
+  ];
+  /** The `.points .inner` header control. */
+  const control = (container: HTMLElement): HTMLElement =>
+    container.querySelector('.points .inner') as HTMLElement;
+
+  it('opens the .pop-role popover with "All roles" + one entry per computable role', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn() })} />,
+    );
+    // Closed initially.
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+    fireEvent.click(control(container));
+    const popover = container.querySelector('.points .pop-role') as HTMLElement;
+    expect(popover).toBeInTheDocument();
+    // "All roles" clear-selection + the two COMPUTABLE roles (PO excluded).
+    expect(popover.querySelector('.clear-selection')).toBeInTheDocument();
+    expect(popover.querySelectorAll('a.role')).toHaveLength(2);
+    expect(popover).toHaveTextContent('UX');
+    expect(popover).toHaveTextContent('Front');
+    expect(popover).not.toHaveTextContent('Product Owner');
+  });
+
+  it('shows the header label "Points" when no role is selected', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn(), pointsViewRoleId: null })} />,
+    );
+    expect(container.querySelector('.header-points')).toHaveTextContent('Points');
+  });
+
+  it('shows the selected role name as the header label', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn(), pointsViewRoleId: 15 })} />,
+    );
+    expect(container.querySelector('.header-points')).toHaveTextContent('Front');
+  });
+
+  it('marks the selected role entry with active-popover', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn(), pointsViewRoleId: 15 })} />,
+    );
+    fireEvent.click(control(container));
+    const front = container.querySelector('.points .pop-role a[data-role-id="15"]') as HTMLElement;
+    expect(front).toHaveClass('role', 'active-popover');
+  });
+
+  it('marks "All roles" active-popover when no role is selected', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn(), pointsViewRoleId: null })} />,
+    );
+    fireEvent.click(control(container));
+    expect(container.querySelector('.points .pop-role .clear-selection')).toHaveClass('active-popover');
+  });
+
+  it('calls onSelectRoleView(roleId) and closes when a role is chosen', () => {
+    const onSelectRoleView = jest.fn();
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView })} />,
+    );
+    fireEvent.click(control(container));
+    fireEvent.click(container.querySelector('.points .pop-role a[data-role-id="13"]') as HTMLElement);
+    expect(onSelectRoleView).toHaveBeenCalledWith(13);
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+  });
+
+  it('calls onSelectRoleView(null) and closes when "All roles" is chosen', () => {
+    const onSelectRoleView = jest.fn();
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView, pointsViewRoleId: 15 })} />,
+    );
+    fireEvent.click(control(container));
+    fireEvent.click(container.querySelector('.points .pop-role .clear-selection') as HTMLElement);
+    expect(onSelectRoleView).toHaveBeenCalledWith(null);
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+  });
+
+  it('does NOT open the role-view popover when onSelectRoleView is absent (baseline)', () => {
+    const { container } = render(<BacklogTable {...makeProps({ roles: ROLES })} />);
+    fireEvent.click(control(container));
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+  });
+
+  it('does NOT open the role-view popover when there are no computable roles', () => {
+    const nonComputable = [{ id: 17, name: 'Product Owner', computable: false }];
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: nonComputable, onSelectRoleView: jest.fn() })} />,
+    );
+    fireEvent.click(control(container));
+    expect(container.querySelector('.points .pop-role')).toBeNull();
   });
 });
 
@@ -773,11 +881,23 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
    */
   type DragEndEventLike = Parameters<ReturnType<typeof createBacklogDragEndHandler>>[0];
 
-  /** Build a minimal drag-end event exposing only the fields the handler reads. */
+  /**
+   * Build a minimal drag-end event exposing only the fields the handler reads.
+   *
+   * `overId` is the id of the drop target the shared handler simulates the drop
+   * over (`over.id`): the container key `'backlog'` for a drop on the list BODY
+   * (past the last row -> the row moves to the END), or a sibling ROW id for an
+   * interior reorder (the row is relocated to that row's slot). It defaults to
+   * the container so body-drop cases read naturally. NOTE: `overData.orderedIds`
+   * is the container's CURRENT (pre-drop) row order — the exact list the real
+   * `BacklogTable` registers on its body droppable — and the handler SIMULATES
+   * the drop of `activeId` over `overId` to derive the final geometry.
+   */
   const makeBacklogEvent = (
     activeId: number,
     activeData: Record<string, unknown> | undefined,
     overData: Record<string, unknown> | null,
+    overId: number | string = 'backlog',
   ): DragEndEventLike => {
     const active = {
       id: activeId,
@@ -787,7 +907,7 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
     const over =
       overData === null
         ? null
-        : { id: 'backlog', rect: {}, data: { current: overData }, disabled: false };
+        : { id: overId, rect: {}, data: { current: overData }, disabled: false };
     return {
       activatorEvent: new Event('pointerup'),
       active,
@@ -835,11 +955,13 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
     const api = makeApi();
     const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
 
-    // Story 10 dropped onto the backlog body; it originated at index 2, so this is
-    // a real reorder (not a no-op). Final order places it first -> previous=null,
-    // next=20 (after-precedence).
+    // Story 10 (currently the FIRST row, pre-drop index 0) is dropped onto the
+    // backlog BODY past the last row. A body drop resolves to "move to the end",
+    // so the handler simulates the drop and lands it LAST -> previous=30,
+    // next=null (after-precedence). oldIndex 0 != final index 2, so this is a real
+    // reorder, not a no-op.
     await handler(
-      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 2 }, overData),
+      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 0 }, overData),
     );
 
     expect(onMove).toHaveBeenCalledTimes(1);
@@ -847,15 +969,15 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
     expect(result).toEqual({
       movedIds: [10],
       targetSprintId: null,
-      index: 0,
-      previousUs: null,
-      nextUs: 20,
+      index: 2,
+      previousUs: 30,
+      nextUs: null,
       isBacklog: true,
     });
 
     // Frozen contract: bulkUpdateBacklogOrder(project, milestone|null, after, before, ids).
     expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1);
-    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, null, 20, [10]);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, 30, null, [10]);
   });
 
   it('resolves an interior body drop to the correct previous neighbor', async () => {
@@ -882,9 +1004,12 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
     const api = makeApi();
     const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
 
-    // Story 10 is already at index 0 and originated at index 0 -> no-op guard.
+    // Story 30 is already the LAST row (pre-drop index 2). Dropping it on the
+    // backlog body resolves to "move to the end", i.e. back to index 2 -> the
+    // simulated final index equals oldIndex 2, so the same-container no-op guard
+    // fires: no optimistic move and no request.
     await handler(
-      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 0 }, overData),
+      makeBacklogEvent(30, { sprintId: null, isBacklog: true, oldIndex: 2 }, overData),
     );
 
     expect(onMove).not.toHaveBeenCalled();
@@ -915,26 +1040,33 @@ describe('BacklogTable — production drag-end integration (real handler)', () =
       getSelectedIds: () => [10, 20],
     });
 
+    // Selection is {10,20} and the active row 10 (pre-drop index 0) is dropped on
+    // the body -> move to the end. The whole selection travels with the anchor,
+    // so movedIds carries [10,20]; the anchor's simulated neighbors are
+    // previous=30, next=null (after-precedence).
     await handler(
-      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 2 }, overData),
+      makeBacklogEvent(10, { sprintId: null, isBacklog: true, oldIndex: 0 }, overData),
     );
 
     const result = onMove.mock.calls[0][0] as BacklogDragResult;
     expect(result.movedIds).toEqual([10, 20]);
     expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledTimes(1);
-    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, null, 20, [10, 20]);
+    expect(api.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, 30, null, [10, 20]);
   });
 
   it('routes a story dragged FROM a sprint INTO the backlog (targetSprintId null)', async () => {
-    const overData = registeredBacklogData();
     const onMove = jest.fn();
     const api = makeApi();
     const handler = createBacklogDragEndHandler({ projectId: 7, onMove, api, getSelectedIds: () => [] });
 
-    // Active story 20 came from sprint 9 (isBacklog:false) and is dropped onto the
-    // backlog body -> isBacklog true, targetSprintId null; it lands at index 1.
+    // Active story 20 came from sprint 9 (isBacklog:false); the backlog currently
+    // holds rows [10, 30] (20 is not among them until the move applies). Dropping
+    // 20 OVER backlog row 30 cross-inserts it at row 30's slot -> final
+    // [10, 20, 30], so it lands at index 1 with previous=10 (after-precedence);
+    // isBacklog true, targetSprintId null.
+    const overData = { sprintId: null, isBacklog: true, orderedIds: [10, 30] };
     await handler(
-      makeBacklogEvent(20, { sprintId: 9, isBacklog: false, oldIndex: 0 }, overData),
+      makeBacklogEvent(20, { sprintId: 9, isBacklog: false, oldIndex: 0 }, overData, 30),
     );
 
     const result = onMove.mock.calls[0][0] as BacklogDragResult;

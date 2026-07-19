@@ -487,3 +487,294 @@ describe('defensive fallbacks (nullable fields and optional callbacks)', () => {
     ).not.toThrow();
   });
 });
+
+/* ========================================================================== *
+ * Inline row controls (finding #12): status dropdown, per-role points editor,
+ * and ⋮ options menu. These are rendered ONLY when the reference-data props
+ * (`statuses` / `points` / `roles`) are supplied — the baseline (inert) tests
+ * above never supply them, so they keep exercising the pre-#12 behaviour.
+ *
+ * BEHAVIOURAL ORIGIN (reproduced, never imported):
+ *   - `popover-us-status.jade` + `common/popovers.coffee` (status widget).
+ *   - `us-points-roles-popover.jade` + `us-estimation-points.jade` +
+ *     `common/estimation.coffee` (per-role points editor).
+ *   - `us-edit-popover.jade` + `backlog/main.coffee:653-684` (Edit/Delete/Move).
+ * ========================================================================== */
+
+/** Project status option list (mirrors `project.us_statuses`). */
+const STATUSES = [
+  { id: 1, name: 'New', color: '#999' },
+  { id: 2, name: 'Ready', color: '#E44057' },
+  { id: 3, name: 'In progress', color: '#E47C40' },
+];
+/** Project estimation points (the "?" point carries value null). */
+const POINTS = [
+  { id: 25, name: '?', value: null },
+  { id: 28, name: '1', value: 1 },
+  { id: 29, name: '2', value: 2 },
+];
+/** Project roles: two computable (UX, Front) + one non-computable (PO). */
+const ROLES = [
+  { id: 13, name: 'UX', computable: true },
+  { id: 15, name: 'Front', computable: true },
+  { id: 17, name: 'Product Owner', computable: false },
+];
+
+describe('inline status dropdown', () => {
+  it('opens the .pop-status popover with one option per status on status click', () => {
+    const { root } = renderRow({ statuses: STATUSES, us: makeUs({ status: 1 }) });
+    // No popover before the click.
+    expect(root.querySelector('.pop-status')).toBeNull();
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    const popover = root.querySelector('.pop-status') as HTMLElement;
+    expect(popover).toBeInTheDocument();
+    expect(popover.querySelectorAll('li.popover-status')).toHaveLength(3);
+  });
+
+  it('marks the current status option with active-popover', () => {
+    const { root } = renderRow({ statuses: STATUSES, us: makeUs({ status: 2 }) });
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    const active = root.querySelector('.pop-status a.status.active-popover') as HTMLElement;
+    expect(active).toBeInTheDocument();
+    expect(within(active).getByText('Ready')).toBeInTheDocument();
+  });
+
+  it('calls onChangeStatus(us, statusId) and closes when an option is selected', () => {
+    const onChangeStatus = jest.fn();
+    const us = makeUs({ id: 7, status: 1 });
+    const { root } = renderRow({ statuses: STATUSES, us, onChangeStatus });
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    // Select "In progress" (id 3).
+    const options = Array.from(root.querySelectorAll('.pop-status a.status')) as HTMLElement[];
+    const inProgress = options.find((a) => a.textContent?.includes('In progress'))!;
+    fireEvent.click(inProgress);
+    expect(onChangeStatus).toHaveBeenCalledTimes(1);
+    expect(onChangeStatus).toHaveBeenCalledWith(us, 3);
+    // Popover closes after selection.
+    expect(root.querySelector('.pop-status')).toBeNull();
+  });
+
+  it('still fires the onStatusClick signal when opening the dropdown', () => {
+    const onStatusClick = jest.fn();
+    const { root } = renderRow({ statuses: STATUSES, us: makeUs({ id: 7 }), onStatusClick });
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    expect(onStatusClick).toHaveBeenCalledWith(7);
+  });
+
+  it('does NOT open a dropdown when statuses are not supplied (baseline preserved)', () => {
+    const onStatusClick = jest.fn();
+    const { root } = renderRow({ statuses: undefined, onStatusClick });
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    expect(root.querySelector('.pop-status')).toBeNull();
+    // The click signal still fires.
+    expect(onStatusClick).toHaveBeenCalled();
+  });
+
+  it('does NOT open a dropdown when the user cannot modify', () => {
+    const { root } = renderRow({ statuses: STATUSES, canModify: false });
+    fireEvent.click(root.querySelector('a.us-status') as HTMLElement);
+    expect(root.querySelector('.pop-status')).toBeNull();
+  });
+});
+
+describe('inline per-role points editor', () => {
+  it('shows the live total computed from us.points when points+roles are supplied', () => {
+    // UX->1 (value 1) + Front->2 (value 2) => total 3, overriding pointsLabel.
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      pointsLabel: 'IGNORED',
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    expect(root.querySelector('.points-value')).toHaveTextContent('3');
+  });
+
+  it('opens the .pop-role role picker (2+ computable roles, no header selection)', () => {
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    const rolePopover = root.querySelector('.pop-role') as HTMLElement;
+    expect(rolePopover).toBeInTheDocument();
+    // Only the two COMPUTABLE roles are listed (Product Owner excluded).
+    expect(rolePopover.querySelectorAll('a.role')).toHaveLength(2);
+    expect(rolePopover).toHaveTextContent('UX (1)');
+    expect(rolePopover).toHaveTextContent('Front (2)');
+  });
+
+  it('drills into the .pop-points-open point picker after choosing a role', () => {
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    // Choose UX.
+    const ux = Array.from(root.querySelectorAll('.pop-role a.role')).find((a) =>
+      a.textContent?.includes('UX'),
+    ) as HTMLElement;
+    fireEvent.click(ux);
+    const pointPopover = root.querySelector('.pop-points-open') as HTMLElement;
+    expect(pointPopover).toBeInTheDocument();
+    expect(pointPopover.querySelectorAll('a.point')).toHaveLength(3);
+  });
+
+  it('inverts the active class: the currently-selected point omits active', () => {
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      // UX currently at point id 28 ("1").
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    fireEvent.click(
+      Array.from(root.querySelectorAll('.pop-role a.role')).find((a) =>
+        a.textContent?.includes('UX'),
+      ) as HTMLElement,
+    );
+    const selected = root.querySelector('.pop-points-open a[data-point-id="28"]') as HTMLElement;
+    const other = root.querySelector('.pop-points-open a[data-point-id="29"]') as HTMLElement;
+    // Selected point: class "point" (NO active); others: "point active".
+    expect(selected).toHaveClass('point');
+    expect(selected).not.toHaveClass('active');
+    expect(other).toHaveClass('point', 'active');
+  });
+
+  it('calls onChangePoints(us, roleId, pointId) and closes when a point is picked', () => {
+    const onChangePoints = jest.fn();
+    const us = makeUs({ points: { 13: 28, 15: 29 } });
+    const { root } = renderRow({ points: POINTS, roles: ROLES, us, onChangePoints });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    fireEvent.click(
+      Array.from(root.querySelectorAll('.pop-role a.role')).find((a) =>
+        a.textContent?.includes('Front'),
+      ) as HTMLElement,
+    );
+    // Pick point "2" (id 29) for Front (id 15).
+    fireEvent.click(root.querySelector('.pop-points-open a[data-point-id="29"]') as HTMLElement);
+    expect(onChangePoints).toHaveBeenCalledTimes(1);
+    expect(onChangePoints).toHaveBeenCalledWith(us, 15, 29);
+    expect(root.querySelector('.pop-points-open')).toBeNull();
+  });
+
+  it('jumps straight to the point picker when there is a single computable role', () => {
+    const singleRole = [
+      { id: 15, name: 'Front', computable: true },
+      { id: 17, name: 'Product Owner', computable: false },
+    ];
+    const { root } = renderRow({
+      points: POINTS,
+      roles: singleRole,
+      us: makeUs({ points: { 15: 29 } }),
+    });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    // No intermediate role picker; the point picker opens directly.
+    expect(root.querySelector('.pop-role')).toBeNull();
+    expect(root.querySelector('.pop-points-open')).toBeInTheDocument();
+  });
+
+  it('jumps straight to the point picker for the header-selected role (pointsViewRoleId)', () => {
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      pointsViewRoleId: 15,
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    fireEvent.click(root.querySelector('.us-points') as HTMLElement);
+    expect(root.querySelector('.pop-role')).toBeNull();
+    const pointPopover = root.querySelector('.pop-points-open') as HTMLElement;
+    expect(pointPopover).toBeInTheDocument();
+    // The picker targets the header-selected role id 15.
+    expect(pointPopover.querySelector('a.point')).toHaveAttribute('data-role-id', '15');
+  });
+
+  it('shows "{rolePointName} / {total}" when a header role is selected and >1 role', () => {
+    // Header views role 15 (Front -> point "2"); total is 1+2 = 3 -> "2 / 3".
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      pointsViewRoleId: 15,
+      us: makeUs({ points: { 13: 28, 15: 29 } }),
+    });
+    expect(root.querySelector('.points-value')).toHaveTextContent('2 / 3');
+  });
+
+  it('renders a non-clickable points cell that does not open when not editable', () => {
+    const { root } = renderRow({
+      points: POINTS,
+      roles: ROLES,
+      canModify: false,
+      us: makeUs({ points: { 13: 28 } }),
+    });
+    const cell = root.querySelector('.us-points') as HTMLElement;
+    expect(cell).toHaveClass('not-clickable');
+    fireEvent.click(cell);
+    expect(root.querySelector('.pop-role')).toBeNull();
+    expect(root.querySelector('.pop-points-open')).toBeNull();
+  });
+});
+
+describe('inline ⋮ options menu', () => {
+  const optionProps = {
+    statuses: STATUSES,
+    onEditStory: jest.fn(),
+    onDeleteStory: jest.fn(),
+    onMoveToTop: jest.fn(),
+  };
+
+  it('opens the .us-option-popup with Edit + Move-to-top on options click', () => {
+    const { root } = renderRow({ ...optionProps, canDelete: false });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    const menu = root.querySelector('.us-option-popup') as HTMLElement;
+    expect(menu).toBeInTheDocument();
+    expect(menu.querySelector('.e2e-edit.edit-story')).toBeInTheDocument();
+    expect(menu.querySelector('.e2e-edit.move-to-top')).toBeInTheDocument();
+    // No Delete item without the delete_us permission.
+    expect(menu.querySelector('.e2e-delete')).toBeNull();
+  });
+
+  it('shows the Delete item only when canDelete is true', () => {
+    const { root } = renderRow({ ...optionProps, canDelete: true });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    expect(root.querySelector('.us-option-popup .e2e-delete')).toBeInTheDocument();
+  });
+
+  it('calls onEditStory(us) and closes when Edit is clicked', () => {
+    const onEditStory = jest.fn();
+    const us = makeUs({ id: 7 });
+    const { root } = renderRow({ ...optionProps, us, onEditStory });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    fireEvent.click(root.querySelector('.us-option-popup .e2e-edit.edit-story') as HTMLElement);
+    expect(onEditStory).toHaveBeenCalledWith(us);
+    expect(root.querySelector('.us-option-popup')).toBeNull();
+  });
+
+  it('calls onDeleteStory(us) and closes when Delete is clicked', () => {
+    const onDeleteStory = jest.fn();
+    const us = makeUs({ id: 7 });
+    const { root } = renderRow({ ...optionProps, canDelete: true, us, onDeleteStory });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    fireEvent.click(root.querySelector('.us-option-popup .e2e-delete') as HTMLElement);
+    expect(onDeleteStory).toHaveBeenCalledWith(us);
+    expect(root.querySelector('.us-option-popup')).toBeNull();
+  });
+
+  it('calls onMoveToTop(us) and closes when Move-to-top is clicked', () => {
+    const onMoveToTop = jest.fn();
+    const us = makeUs({ id: 7 });
+    const { root } = renderRow({ ...optionProps, us, onMoveToTop });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    fireEvent.click(root.querySelector('.us-option-popup .e2e-edit.move-to-top') as HTMLElement);
+    expect(onMoveToTop).toHaveBeenCalledWith(us);
+    expect(root.querySelector('.us-option-popup')).toBeNull();
+  });
+
+  it('still fires the onOptionsClick signal with the story id', () => {
+    const onOptionsClick = jest.fn();
+    const { root } = renderRow({ ...optionProps, us: makeUs({ id: 7 }), onOptionsClick });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    expect(onOptionsClick).toHaveBeenCalledWith(7);
+  });
+});

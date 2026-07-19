@@ -146,9 +146,105 @@ export interface BulkUpdateKanbanOrderPayload {
   swimlane_id?: number;
 }
 
+/**
+ * A single option row inside a `GET /userstories/filters_data` category array.
+ *
+ * The Django `filters_data` endpoint (frozen `/api/v1/`) returns, PER project,
+ * one array per filterable dimension. The concrete keys differ slightly per
+ * dimension (statuses/roles carry `name`+`color`+`order`; assigned_to/owners
+ * carry `full_name`+avatar fields; tags carry `name`+`color` but NO numeric id;
+ * epics carry `ref`+`subject`). Every row carries a `count` (the number of
+ * stories matching that option). A single tolerant shape models them all; the
+ * builder in `../../shared/filters` reads only the fields present per category.
+ *
+ * `id` is `number | null` — `null` denotes the "Unassigned" pseudo-option for
+ * assigned_to/assigned_users/roles and the "Not in an epic" pseudo-option for
+ * epics (reproducing `controllerMixins.coffee:263-303`).
+ */
+export interface FiltersDataOption {
+  /** Numeric id, or `null` for the Unassigned / Not-in-an-epic pseudo-option. Absent for tags. */
+  id?: number | null;
+  /** statuses / roles display name. */
+  name?: string;
+  /** assigned_to / assigned_users / owners display name. */
+  full_name?: string;
+  /** epics: referenced story number. */
+  ref?: number | null;
+  /** epics: referenced epic subject. */
+  subject?: string | null;
+  /** statuses / tags / roles swatch color. */
+  color?: string | null;
+  /** statuses / roles / epics ordering hint. */
+  order?: number;
+  /** The number of stories matching this option (drives count badges + hideEmpty). */
+  count: number;
+  /** assigned_users / owners avatar url. */
+  photo?: string | null;
+  /** assigned_users / owners large avatar url. */
+  big_photo?: string | null;
+  /** assigned_users / owners gravatar id. */
+  gravatar_id?: string | null;
+  /** Tolerate any additional per-row fields the server may include. */
+  [key: string]: unknown;
+}
+
+/**
+ * Body of `GET /userstories/filters_data?project=<id>[&milestone=<id>]`.
+ *
+ * Reproduces the object the AngularJS `$tgResources.userstories.filtersData`
+ * resolves (consumed by `UsFiltersMixin.generateFilters`,
+ * `controllerMixins.coffee:246-304`). Each field is an array of
+ * {@link FiltersDataOption}. The Kanban and Backlog filter sidebars are built
+ * ENTIRELY from this payload (Epic category, per-option counts, Unassigned /
+ * Not-in-an-epic pseudo-options, and in-use-only tags all derive from here).
+ */
+export interface FiltersDataResponse {
+  statuses: FiltersDataOption[];
+  /** Assigned-to rows WITHOUT avatar fields (id may be null => Unassigned). */
+  assigned_to: FiltersDataOption[];
+  /** Assigned-to rows WITH avatar fields; the category the sidebar renders. */
+  assigned_users: FiltersDataOption[];
+  /** Story creators (owners); rendered as the "Created by" category. */
+  owners: FiltersDataOption[];
+  /** All project tags with per-tag story counts (count===0 => not in use). */
+  tags: FiltersDataOption[];
+  /** Epics with counts (id null => "Not in an epic"). */
+  epics: FiltersDataOption[];
+  /** Project roles with counts (id null => "Unassigned"). */
+  roles: FiltersDataOption[];
+  /** Tolerate additional dimensions the server may add without breaking. */
+  [key: string]: FiltersDataOption[] | undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint adapters
 // ---------------------------------------------------------------------------
+
+/**
+ * Fetch the per-project filter dimension data used to build the Kanban and
+ * Backlog filter sidebars.
+ *
+ * Reproduces `service.filtersData` (`resources/userstories.coffee`) which the
+ * AngularJS `UsFiltersMixin.generateFilters` (`controllerMixins.coffee:245`)
+ * calls as `@rs.userstories.filtersData(loadFilters)` — a `GET
+ * /userstories/filters_data` with the applied filters + `project` (+ optional
+ * `milestone`) as query params. This adapter sends only `project` and, when
+ * provided, `milestone` (the loaded-filter cross-population that AngularJS does
+ * server-side is not needed to POPULATE the sidebar). The endpoint is a frozen
+ * `/api/v1/` read; adding a typed adapter is contract-preserving.
+ *
+ * @param projectId - Target project id (-> `project`).
+ * @param milestone - Optional milestone id to scope counts to a sprint (-> `milestone`).
+ */
+export function filtersData(projectId: number, milestone?: number | null) {
+  const params: Record<string, unknown> = { project: projectId };
+  // Only send milestone when truthy (matches the legacy `if milestone` guard,
+  // controllerMixins.coffee:243-244); the backlog passes none (project-wide).
+  if (milestone) {
+    params.milestone = milestone;
+  }
+  return httpClient.get<FiltersDataResponse>('userstories/filters_data', params);
+}
 
 /**
  * Bulk-create user stories from a newline-separated subjects string.
@@ -356,7 +452,30 @@ export interface CreatePayload {
    * default US status only when omitted.
    */
   status: number;
+  /**
+   * OPTIONAL extra model fields reproduced from the AngularJS new-US generic
+   * form (`common/lightboxes.coffee`), so the Kanban "standard" create can set
+   * the same core fields the legacy form did instead of subject-only (finding
+   * #7). Each key is a real writable `UserStory` model attribute on the frozen
+   * `POST /userstories` contract — only sent when the caller supplies it, so the
+   * server keeps applying its own defaults for anything omitted.
+   */
+  description?: string;
+  tags?: Array<string | [string, string | null]>;
+  is_blocked?: boolean;
+  blocked_note?: string;
+  due_date?: string | null;
 }
+
+/**
+ * OPTIONAL extra fields a caller may pass to {@link createUserStory} beyond the
+ * mandatory subject/status. Mirrors the writable core fields of the legacy
+ * new-US generic form (finding #7). All are optional; omitted keys are not sent.
+ */
+export type CreateExtra = Pick<
+  CreatePayload,
+  'description' | 'tags' | 'is_blocked' | 'blocked_note' | 'due_date'
+>;
 
 /**
  * Create a SINGLE user story, used by the Kanban column "+" (standard, non-bulk)
@@ -371,13 +490,35 @@ export interface CreatePayload {
  * @param projectId - Target project id (-> `project`).
  * @param statusId  - Target status id the story is created in (-> `status`).
  * @param subject   - The new story subject (-> `subject`).
+ * @param extra     - OPTIONAL core fields (description/tags/is_blocked/
+ *                    blocked_note/due_date) from the legacy new-US form (finding
+ *                    #7). Only keys that are provided (not `undefined`) are sent,
+ *                    so the server keeps its defaults for anything omitted.
  */
-export function createUserStory(projectId: number, statusId: number, subject: string) {
+export function createUserStory(
+  projectId: number,
+  statusId: number,
+  subject: string,
+  extra?: CreateExtra,
+) {
   const data: CreatePayload = {
     project: projectId,
     subject,
     status: statusId,
   };
+
+  // Merge only the extra keys the caller actually supplied. Sending `undefined`
+  // would serialise to nothing anyway, but filtering keeps the POST body minimal
+  // and identical to subject-only when no extra fields are set.
+  if (extra) {
+    const bag = data as unknown as Record<string, unknown>;
+    (Object.keys(extra) as Array<keyof CreateExtra>).forEach((key) => {
+      const value = extra[key];
+      if (value !== undefined) {
+        bag[key] = value;
+      }
+    });
+  }
 
   return httpClient.post('userstories', data);
 }
@@ -400,6 +541,38 @@ export function deleteUserStory(usId: number) {
   return httpClient.delete(`userstories/${usId}`);
 }
 
+/**
+ * Partially UPDATE a single user story (a `$repo.save(us)` equivalent).
+ *
+ * Reproduces the AngularJS `$repo.save(model)` call (`repository.coffee:54-68`,
+ * default `patch = true`) that every inline Backlog row control ultimately
+ * invokes: the status widget (`common/popovers.coffee:66` -> `$repo.save(us)`),
+ * the per-role points editor (`estimation.coffee:165` -> `$repo.save(@us)`), and
+ * the generic edit form. Verb = **PATCH** `userstories/{id}`, body = the CHANGED
+ * attributes PLUS the concurrency `version` the server requires for optimistic
+ * locking (a stale `version` yields HTTP 400 and the legacy client reverts).
+ *
+ * The caller is responsible for including `version` in `data` (read from the
+ * current user story) so the write is version-checked exactly as the legacy
+ * model transform did. The updated user-story object is returned (parsed JSON),
+ * carrying the server-incremented `version` and any recomputed fields
+ * (e.g. `total_points`) so the caller can replace the row in local state.
+ *
+ * Adding a typed adapter over the existing frozen `PATCH /userstories/{id}`
+ * endpoint is contract-preserving (no new/changed backend contract).
+ *
+ * @param usId - Id of the user story to update (path segment).
+ * @param data - The changed attributes plus `version` (e.g. `{ status, version }`
+ *               or `{ points, version }`).
+ * @returns The updated user-story JSON.
+ */
+export function save(
+  usId: number,
+  data: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return httpClient.patch(`userstories/${usId}`, data);
+}
+
 // ---------------------------------------------------------------------------
 // Export surface
 //
@@ -418,6 +591,8 @@ export const userstories = {
   editStatus,
   createUserStory,
   deleteUserStory,
+  save,
+  filtersData,
 };
 
 export default userstories;

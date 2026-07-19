@@ -422,6 +422,17 @@ export function SprintForm(props: SprintFormProps) {
   return (
     <div
       ref={containerRef}
+      /*
+       * PARITY (Gap 18): the AngularJS backlog.jade hosted this lightbox as
+       * `div.lightbox.lightbox-sprint-add-edit(tg-lb-create-edit-sprint)`
+       * (pre-migration backlog.jade). The `tg-lb-create-edit-sprint` directive
+       * attribute is part of the reproduced DOM contract - the e2e suite selects
+       * the sprint lightbox by `[tg-lb-create-edit-sprint].open`, exactly as it
+       * selects the bulk lightbox by `[tg-lb-create-bulk-userstories]`. AngularJS
+       * 1.x directives cannot `$compile` inside a React tree, so the attribute is
+       * rendered as an inert DOM marker for structural parity only.
+       */
+      {...{ 'tg-lb-create-edit-sprint': '' }}
       className={`lightbox lightbox-sprint-add-edit${open ? ' open' : ''}`}
       role="dialog"
       aria-modal="true"

@@ -342,22 +342,25 @@ describe('SprintList — closed-sprints toggle', () => {
     expect(container.querySelector('a.filter-closed-sprints')).toBeInTheDocument();
   });
 
-  it('labels the toggle "Show closed sprints" when showClosedSprints is false', () => {
+  // The label is driven by the RELOADED-array length (sprints.coffee:150-156),
+  // NOT by a separate visibility flag (F/Gap 22): when no closed sprints are
+  // loaded the label invites "Show"; when the array is populated it offers "Hide".
+  it('labels the toggle "Show closed sprints" when no closed sprints are loaded (empty array)', () => {
     const { container } = renderList({
       totalMilestones: 2,
       totalClosedMilestones: 1,
-      showClosedSprints: false,
+      closedSprints: [],
     });
 
     const toggle = container.querySelector('a.filter-closed-sprints') as HTMLElement;
     expect(toggle.querySelector('.text')).toHaveTextContent('Show closed sprints');
   });
 
-  it('labels the toggle "Hide closed sprints" when showClosedSprints is true', () => {
+  it('labels the toggle "Hide closed sprints" when closed sprints ARE loaded (non-empty array)', () => {
     const { container } = renderList({
       totalMilestones: 2,
       totalClosedMilestones: 1,
-      showClosedSprints: true,
+      closedSprints: [makeSprint({ id: 91, name: 'Old A', closed: true })],
     });
 
     const toggle = container.querySelector('a.filter-closed-sprints') as HTMLElement;
@@ -396,11 +399,13 @@ describe('SprintList — closed sprints', () => {
     });
   });
 
-  it('renders closed sprint wrappers based on the closedSprints length regardless of showClosedSprints', () => {
-    // adjusted per SprintList.tsx on disk — the closed list is NOT conditionally
-    // hidden by `showClosedSprints`; that prop only flips the toggle `.text`
-    // label. Rendering is gated solely by `closedSprints.length` (the container
-    // empties the array to hide the list).
+  it('gates the closed-sprint render on showClosedSprints — renders NOTHING when hidden, even with a non-empty closedSprints array (finding #15)', () => {
+    // Finding #15: hiding must actually hide. `SprintList` gates the closed list
+    // on `showClosedSprints` (SprintList.tsx: `(showClosedSprints ? closedSprints
+    // : []).map(...)`), so even if the `closedSprints` array is momentarily
+    // non-empty, NO `.sprint.sprint-closed` wrappers render while the toggle is
+    // OFF. (The container additionally empties the array via
+    // `unloadClosedSprints` on hide; this gate is defense-in-depth.)
     const closedSprints = [makeSprint({ id: 91, closed: true })];
     const { container } = renderList({
       totalMilestones: 2,
@@ -409,7 +414,24 @@ describe('SprintList — closed sprints', () => {
       closedSprints,
     });
 
-    expect(container.querySelectorAll('.sprint.sprint-closed')).toHaveLength(1);
+    expect(container.querySelectorAll('.sprint.sprint-closed')).toHaveLength(0);
+  });
+
+  it('renders the closed-sprint wrappers once showClosedSprints flips to true with the same closedSprints array (finding #15)', () => {
+    // The complement of the gate test above: with the toggle ON, the same
+    // non-empty array now renders its wrappers.
+    const closedSprints = [
+      makeSprint({ id: 91, closed: true }),
+      makeSprint({ id: 92, closed: true }),
+    ];
+    const { container } = renderList({
+      totalMilestones: 3,
+      totalClosedMilestones: 2,
+      showClosedSprints: true,
+      closedSprints,
+    });
+
+    expect(container.querySelectorAll('.sprint.sprint-closed')).toHaveLength(2);
   });
 
   it('renders no .sprint.sprint-closed wrappers when closedSprints is empty', () => {

@@ -237,9 +237,16 @@ describe('milestones.create — POST /milestones (repository.coffee:24-35)', () 
     const payload = {
       project: 7,
       name: 'Date Sprint',
-      // A concrete UTC-midday Date avoids any local-timezone day rollover.
-      estimated_start: new Date('2021-06-15T12:00:00Z'),
-      estimated_finish: new Date('2021-06-29T12:00:00Z'),
+      // TIMEZONE DETERMINISM (F-TZ-1). `serializeDates` formats with LOCAL moment
+      // (`moment(value).format('YYYY-MM-DD')`), so a Date must be pinned to the
+      // intended calendar day IN LOCAL TIME. A UTC instant such as
+      // `new Date('2021-06-15T12:00:00Z')` (noon UTC) day-rolls to Jun 16 under
+      // any UTC>=+12 zone (e.g. Pacific/Kiritimati, +13/+14), making the assertion
+      // below environment-dependent. `new Date(year, monthIndex, day)` instead
+      // constructs LOCAL midnight of that exact calendar day in EVERY timezone, so
+      // the formatted output is deterministic. Month index 5 == June.
+      estimated_start: new Date(2021, 5, 15),
+      estimated_finish: new Date(2021, 5, 29),
     } as unknown as MilestoneCreatePayload;
 
     await create(payload);

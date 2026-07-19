@@ -45,6 +45,15 @@ export interface EventsClient {
   subscribe(routingKey: string, callback: EventCallback, options?: SubscribeOptions): void;
   unsubscribe(routingKey: string): void;
   disconnect(): void;
+  /**
+   * Live socket state. `true` only between a successful `onOpen` and the next
+   * `onClose`/`disconnect()`. Mirrors the AngularJS `$tgEvents.connected` flag
+   * (events.coffee) that `moveUs` consulted (`if not @events.connected`,
+   * backlog/main.coffee:633) to decide whether to manually reload after a drag.
+   * Consumers gate a post-drag reconcile on `!isConnected()` so the reload runs
+   * only when the WebSocket is not carrying the change (parity: F/Gap 21).
+   */
+  isConnected(): boolean;
 }
 
 interface Subscription {
@@ -447,5 +456,10 @@ export function createEventsClient(): EventsClient {
     }
   };
 
-  return { connect, subscribe, unsubscribe, disconnect };
+  // Expose the live connection flag (read-only accessor over the internal
+  // `connected` latch maintained by onOpen/onClose/disconnect). Used by the
+  // backlog hook to reproduce moveUs's `if not @events.connected` reconcile.
+  const isConnected = (): boolean => connected;
+
+  return { connect, subscribe, unsubscribe, disconnect, isConnected };
 }

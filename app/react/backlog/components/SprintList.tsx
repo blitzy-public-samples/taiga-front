@@ -276,12 +276,19 @@ export function SprintList(props: SprintListProps) {
       {/* Closed-sprints toggle — `a.filter-closed-sprints(href=""
           tg-backlog-toggle-closed-sprints-visualization ng-if="totalClosedMilestones")`
           (sprints.jade:49-52). The icon stays `icon-folder`; only the `.text`
-          label flips (sprints.coffee:151-162). */}
+          label flips. Faithful to the AngularJS `closed-sprints:reloaded` handler
+          (sprints.coffee:150-156), which sets the label from the RELOADED ARRAY
+          length (`sprints.length > 0` -> "Hide", else "Show") — NOT from a separate
+          visibility flag. Deriving from `closedSprints.length` keeps the label in
+          sync after the post-drag reconcile (Gap 21) populates the array, matching
+          AngularJS which then shows "Hide" (F/Gap 22). The `showClosedSprints`
+          prop is retained (it mirrors the hook's independent toggle-direction
+          counter) but does not drive the label. */}
       {totalClosedMilestones > 0 ? (
         <a className="filter-closed-sprints" href="" onClick={handleToggleClosed}>
           <Svg icon="icon-folder" />
           <span className="text">
-            {showClosedSprints ? 'Hide closed sprints' : 'Show closed sprints'}
+            {closedSprints.length > 0 ? 'Hide closed sprints' : 'Show closed sprints'}
           </span>
         </a>
       ) : null}
@@ -290,8 +297,14 @@ export function SprintList(props: SprintListProps) {
           closedSprints track by sprint.id" …)` (sprints.jade:54-60). Same wrapper
           pattern as the open sprints; `closed` is passed to `<Sprint>` for API
           compatibility (Sprint treats it as informational — the `.sprint-closed`
-          wrapper class is applied HERE). */}
-      {closedSprints.map((sprint) => (
+          wrapper class is applied HERE).
+
+          Finding #15: the map is gated on `showClosedSprints` so hiding actually
+          hides. The container also unloads the closed sprints (empties the array)
+          on hide — legacy `unloadClosedSprints` parity — so this gate is
+          defense-in-depth: closed sprints never render while the toggle is OFF,
+          independent of whatever is currently in the `closedSprints` array. */}
+      {(showClosedSprints ? closedSprints : []).map((sprint) => (
         <div className="sprint sprint-closed" key={sprint.id}>
           <Sprint
             sprint={sprint}

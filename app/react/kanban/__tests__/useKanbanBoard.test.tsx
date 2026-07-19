@@ -94,6 +94,8 @@ jest.mock('../../shared/api/userstories', () => {
   // KB-5 single-story create + KB-4 single-story delete adapters.
   const createUserStory = jest.fn();
   const deleteUserStory = jest.fn();
+  // #8 single-story PATCH adapter behind the inline edit lightbox / assign popover.
+  const save = jest.fn();
   const aggregate = {
     bulkCreate,
     bulkUpdateBacklogOrder,
@@ -102,6 +104,7 @@ jest.mock('../../shared/api/userstories', () => {
     editStatus,
     createUserStory,
     deleteUserStory,
+    save,
   };
   return { __esModule: true, ...aggregate, default: aggregate };
 });
@@ -154,6 +157,7 @@ const bulkKanbanMock = userstories.bulkUpdateKanbanOrder as unknown as jest.Mock
 const bulkCreateMock = userstories.bulkCreate as unknown as jest.Mock;
 const createUsMock = userstories.createUserStory as unknown as jest.Mock;
 const deleteUsMock = userstories.deleteUserStory as unknown as jest.Mock;
+const saveMock = userstories.save as unknown as jest.Mock;
 const createEventsClientMock = createEventsClient as unknown as jest.Mock;
 const redirectToLoginMock = redirectToLogin as unknown as jest.Mock;
 
@@ -1013,9 +1017,38 @@ describe('useKanbanBoard', () => {
       });
 
       expect(createUsMock).toHaveBeenCalledTimes(1);
-      expect(createUsMock).toHaveBeenCalledWith(7, 1, 'A brand new story');
+      // The 4th `extra` arg is `undefined` for a subject-only create, so the
+      // adapter posts a body byte-identical to the prior subject-only create.
+      expect(createUsMock).toHaveBeenCalledWith(7, 1, 'A brand new story', undefined);
       expect(view.result.current.usMap[777]).toBeDefined();
       expect(view.result.current.writeError ?? null).toBeNull();
+    });
+
+    // #7: addUsStandard forwards the optional `extra` core fields to the adapter.
+    it('addUsStandard forwards the extra core fields (finding #7)', async () => {
+      const view = await loadHook();
+      createUsMock.mockResolvedValueOnce({
+        id: 778,
+        status: 1,
+        swimlane: null,
+        kanban_order: 100,
+        assigned_to: null,
+        assigned_users: [],
+      });
+
+      const extra = {
+        description: 'desc',
+        tags: ['a', 'b'],
+        is_blocked: true,
+        blocked_note: 'note',
+        due_date: '2026-08-15',
+      };
+      await act(async () => {
+        await view.result.current.addUsStandard(1, 'Rich', extra);
+      });
+
+      expect(createUsMock).toHaveBeenCalledWith(7, 1, 'Rich', extra);
+      expect(view.result.current.usMap[778]).toBeDefined();
     });
 
     // KB-5: a FAILED create surfaces writeError and adds nothing.
@@ -1029,6 +1062,61 @@ describe('useKanbanBoard', () => {
       });
 
       expect(createUsMock).toHaveBeenCalledTimes(1);
+      expect(view.result.current.writeError).toBe(err);
+    });
+  });
+
+  /* ---------------------------------------------------------------------- *
+   * saveUs (#8) - the single-story PATCH behind the inline edit lightbox and
+   * the inline assign popover. PATCHes `/userstories/{id}` with the changed
+   * attributes (incl. `version`) and reflects the server-returned model on the
+   * board via `editUs`; a failed save surfaces `writeError`.
+   * ---------------------------------------------------------------------- */
+  describe('saveUs (#8) — inline edit / assign PATCH', () => {
+    it('saveUs PATCHes the changed fields and reflects the server model on the board', async () => {
+      const view = await loadHook();
+      // A story that already exists on the board (seeded by the default load).
+      const existingId = Object.keys(view.result.current.usMap).map(Number)[0];
+      expect(existingId).toBeDefined();
+
+      saveMock.mockResolvedValueOnce({
+        id: existingId,
+        status: 1,
+        swimlane: null,
+        kanban_order: 5,
+        subject: 'Server subject',
+        assigned_to: 202,
+        assigned_users: [202],
+        version: 9,
+      });
+
+      await act(async () => {
+        await view.result.current.saveUs(existingId, {
+          subject: 'Renamed',
+          version: 8,
+        });
+      });
+
+      expect(saveMock).toHaveBeenCalledTimes(1);
+      expect(saveMock).toHaveBeenCalledWith(existingId, { subject: 'Renamed', version: 8 });
+      // The board reflects the SERVER-returned model (fresh version/subject).
+      const model = view.result.current.usMap[existingId]?.model as Record<string, unknown>;
+      expect(model.subject).toBe('Server subject');
+      expect(model.version).toBe(9);
+      expect(view.result.current.writeError ?? null).toBeNull();
+    });
+
+    it('saveUs surfaces writeError when the PATCH fails', async () => {
+      const view = await loadHook();
+      const existingId = Object.keys(view.result.current.usMap).map(Number)[0];
+      const err = new Error('save failed');
+      saveMock.mockRejectedValueOnce(err);
+
+      await act(async () => {
+        await view.result.current.saveUs(existingId, { subject: 'X', version: 1 });
+      });
+
+      expect(saveMock).toHaveBeenCalledTimes(1);
       expect(view.result.current.writeError).toBe(err);
     });
   });

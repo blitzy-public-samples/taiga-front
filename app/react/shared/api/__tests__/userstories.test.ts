@@ -38,6 +38,7 @@
 jest.mock('../httpClient', () => ({
   __esModule: true,
   default: {
+    get: jest.fn(),
     post: jest.fn(),
     patch: jest.fn(),
     delete: jest.fn(),
@@ -53,6 +54,8 @@ import {
   editStatus,
   createUserStory,
   deleteUserStory,
+  save,
+  filtersData,
   userstories,
 } from '../userstories';
 import type {
@@ -64,6 +67,8 @@ import type {
   CreatePayload,
 } from '../userstories';
 
+/** The mocked `httpClient.get`, typed for call inspection. */
+const getMock = (): jest.Mock => httpClient.get as unknown as jest.Mock;
 /** The mocked `httpClient.post`, typed for call inspection. */
 const postMock = (): jest.Mock => httpClient.post as unknown as jest.Mock;
 /** The mocked `httpClient.patch`, typed for call inspection. */
@@ -96,6 +101,7 @@ const IDS: number[] = [1, 2];
 beforeEach(() => {
   // `clearMocks: true` (jest.config.js) resets call data before each test; we
   // (re)install the resolved value here so delegation/return-passthrough holds.
+  getMock().mockResolvedValue(RESULT);
   postMock().mockResolvedValue(RESULT);
   patchMock().mockResolvedValue(RESULT);
   deleteMock().mockResolvedValue(null);
@@ -298,6 +304,46 @@ describe('userstories.createUserStory (KB-5, POST /userstories)', () => {
     expect(patchMock()).not.toHaveBeenCalled();
     expect(deleteMock()).not.toHaveBeenCalled();
   });
+
+  it('merges ONLY the supplied extra core fields into the POST body (finding #7)', async () => {
+    await createUserStory(7, 3, 'Rich story', {
+      description: 'A description',
+      tags: ['alpha', 'beta'],
+      is_blocked: true,
+      blocked_note: 'waiting',
+      due_date: '2026-08-15',
+    });
+
+    const [path, body] = postMock().mock.calls[0] as [string, CreatePayload];
+    expect(path).toBe('userstories');
+    expect(body).toEqual({
+      project: 7,
+      subject: 'Rich story',
+      status: 3,
+      description: 'A description',
+      tags: ['alpha', 'beta'],
+      is_blocked: true,
+      blocked_note: 'waiting',
+      due_date: '2026-08-15',
+    });
+  });
+
+  it('omits extra keys whose value is undefined, keeping the body minimal (finding #7)', async () => {
+    // Only `description` is supplied; the other extra keys are absent, so the
+    // body carries just the three FK fields plus description.
+    await createUserStory(7, 3, 'Partial', { description: 'only desc' });
+
+    const [, body] = postMock().mock.calls[0] as [string, CreatePayload];
+    expect(body).toEqual({
+      project: 7,
+      subject: 'Partial',
+      status: 3,
+      description: 'only desc',
+    });
+    expect('tags' in body).toBe(false);
+    expect('is_blocked' in body).toBe(false);
+    expect('due_date' in body).toBe(false);
+  });
 });
 
 describe('userstories.deleteUserStory (KB-4, DELETE /userstories/{id})', () => {
@@ -321,8 +367,83 @@ describe('userstories.deleteUserStory (KB-4, DELETE /userstories/{id})', () => {
   });
 });
 
+describe('userstories.save (BL-12, PATCH /userstories/{id} — $repo.save equivalent)', () => {
+  it('PATCHes userstories/{usId} with the partial body and returns the client promise', async () => {
+    // The status widget sends { status, version }; assert the exact path + body.
+    const result = await save(65, { status: 16, version: 4 });
+
+    expect(patchMock()).toHaveBeenCalledTimes(1);
+    const [path, body] = patchMock().mock.calls[0] as [string, Record<string, unknown>];
+    // Relative path (no leading slash; httpClient joins it onto the API base).
+    expect(path).toBe('userstories/65');
+    // Body forwarded verbatim — `version` MUST be present (optimistic locking:
+    // omitting it makes the server reject the PATCH with HTTP 400).
+    expect(body).toEqual({ status: 16, version: 4 });
+    // Returns the client promise (the updated story).
+    expect(result).toBe(RESULT);
+    // save must NOT touch post/delete.
+    expect(postMock()).not.toHaveBeenCalled();
+    expect(deleteMock()).not.toHaveBeenCalled();
+  });
+
+  it('forwards an arbitrary partial body (per-role points editor path)', async () => {
+    // The points editor sends { points, version }.
+    await save(65, { points: { '15': 29 }, version: 4 });
+    const [path, body] = patchMock().mock.calls[0] as [string, Record<string, unknown>];
+    expect(path).toBe('userstories/65');
+    expect(body).toEqual({ points: { '15': 29 }, version: 4 });
+  });
+
+  it('propagates a rejection (e.g. HTTP 400 stale version) so the caller can surface the error', async () => {
+    const err = new Error('400');
+    patchMock().mockRejectedValueOnce(err);
+    await expect(save(65, { status: 16, version: 1 })).rejects.toBe(err);
+  });
+});
+
+describe('userstories.filtersData (KB-3..KB-6 / BL-11 — generateFilters data source, main.coffee:591)', () => {
+  it('GETs userstories/filters_data with only { project } when no milestone is given', async () => {
+    const result = await filtersData(3);
+    // GET verb + exact path (frozen /api/v1/ contract).
+    expect(getMock()).toHaveBeenCalledTimes(1);
+    expect(getMock().mock.calls[0][0]).toBe('userstories/filters_data');
+    // Params: project only; NO milestone key when omitted.
+    expect(getMock().mock.calls[0][1]).toEqual({ project: 3 });
+    expect(Object.prototype.hasOwnProperty.call(getMock().mock.calls[0][1], 'milestone')).toBe(
+      false,
+    );
+    // Return-passthrough of the client promise.
+    expect(result).toBe(RESULT);
+    // Must not touch the write verbs.
+    expect(postMock()).not.toHaveBeenCalled();
+    expect(patchMock()).not.toHaveBeenCalled();
+    expect(deleteMock()).not.toHaveBeenCalled();
+  });
+
+  it('includes milestone in the params when a numeric milestone id is passed', async () => {
+    await filtersData(3, 7);
+    expect(getMock().mock.calls[0][1]).toEqual({ project: 3, milestone: 7 });
+  });
+
+  it('omits milestone when it is null (project-wide backlog sidebar — BL-11)', async () => {
+    await filtersData(3, null);
+    expect(getMock().mock.calls[0][1]).toEqual({ project: 3 });
+  });
+
+  it('omits milestone when it is 0 (falsy — project-wide, never milestone=0)', async () => {
+    await filtersData(3, 0);
+    expect(getMock().mock.calls[0][1]).toEqual({ project: 3 });
+  });
+
+  it('propagates a rejection so the caller can keep the last-known-good sidebar', async () => {
+    const err = new Error('500');
+    getMock().mockRejectedValueOnce(err);
+    await expect(filtersData(3)).rejects.toBe(err);
+  });
+});
+
 describe('userstories aggregate export', () => {
-  it('exposes all seven adapters on the default/named aggregate object', () => {
+  it('exposes all nine adapters on the default/named aggregate object', () => {
     expect(userstories.bulkCreate).toBe(bulkCreate);
     expect(userstories.bulkUpdateBacklogOrder).toBe(bulkUpdateBacklogOrder);
     expect(userstories.bulkUpdateMilestone).toBe(bulkUpdateMilestone);
@@ -330,5 +451,7 @@ describe('userstories aggregate export', () => {
     expect(userstories.editStatus).toBe(editStatus);
     expect(userstories.createUserStory).toBe(createUserStory);
     expect(userstories.deleteUserStory).toBe(deleteUserStory);
+    expect(userstories.save).toBe(save);
+    expect(userstories.filtersData).toBe(filtersData);
   });
 });

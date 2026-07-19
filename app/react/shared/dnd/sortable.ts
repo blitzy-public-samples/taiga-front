@@ -894,10 +894,18 @@ export function createBacklogDragEndHandler(
       adjacent = computeAdjacentIds(rowEl, '.row');
       index = indexAmong(rowEl, destEl, '.row');
     } else {
-      // DATA PATH (preferred for @dnd-kit).
-      const orderedIds = readOrderedIds(overData);
-      adjacent = computeAdjacentIdsFromOrder(orderedIds, activeId);
-      index = orderedIds.indexOf(activeId);
+      // DATA PATH (preferred for @dnd-kit): `over` is a sibling ROW. Read the
+      // destination container's CURRENT (pre-move) order, then SIMULATE the drop
+      // of `activeId` OVER `over.id` so adjacency + index reflect the DROP TARGET
+      // rather than the moved row's STALE original neighbors. This mirrors the
+      // Kanban handler's data path EXACTLY and fixes the same-container reorder
+      // defect (dragging a lower row to the top persisted its OLD neighbor, so a
+      // "move to top" landed the row one slot too low). See computeFinalOrder.
+      const currentOrder = readOrderedIds(overData);
+      const overId = Number(over.id);
+      const finalOrder = computeFinalOrder(currentOrder, activeId, overId);
+      adjacent = computeAdjacentIdsFromOrder(finalOrder, activeId);
+      index = finalOrder.indexOf(activeId);
     }
 
     // Source container + original index, attached at drag start by ../backlog.
@@ -941,13 +949,25 @@ export function createBacklogDragEndHandler(
     // API call — matching the AngularJS order ($scope.$applyAsync, then moveUs).
     deps.onMove(result);
 
-    await api.bulkUpdateBacklogOrder(
-      deps.projectId,
-      targetSprintId,
-      result.previousUs,
-      result.nextUs,
-      movedIds,
-    );
+    // BL-1 rollback: wrap the write so a rejection (e.g. a within-sprint reorder
+    // 400, offline, or 5xx) (a) never escapes as an unhandled promise rejection -
+    // the `run()` promise still RESOLVES, so the serialization queue is not
+    // wedged and the console shows no `Uncaught (in promise)` - and (b) notifies
+    // the consumer via `onMoveError`, which rolls back the optimistic `onMove`
+    // update and surfaces a save-failure alert (mirroring the Kanban drag path).
+    // EXACTLY ONE write is attempted (no retry), preserving the single-call
+    // invariant the QA verified for the backlog drag path.
+    try {
+      await api.bulkUpdateBacklogOrder(
+        deps.projectId,
+        targetSprintId,
+        result.previousUs,
+        result.nextUs,
+        movedIds,
+      );
+    } catch (err) {
+      deps.onMoveError?.(err, result);
+    }
   };
 
   // Per-handler promise chain: each invocation runs only after the previous one

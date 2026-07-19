@@ -195,6 +195,20 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
     SPRINTS: {
       DATE: 'DD MMM YYYY',
     },
+    // Burndown chart labels + per-series tooltips (finding #1). Verbatim from
+    // `app/locales/taiga/locale-en.json` BACKLOG.CHART, so the React burndown
+    // renders real English text even before/without a localized catalog fetch
+    // (the AngularJS Flot directive read these same keys, main.coffee:1272-1318).
+    CHART: {
+      XAXIS_LABEL: 'Sprints',
+      YAXIS_LABEL: 'Points',
+      OPTIMAL: 'Optimal pending points for sprint "{{sprintName}}" should be {{value}}',
+      REAL: 'Real pending points for sprint "{{sprintName}}" is {{value}}',
+      INCREMENT_TEAM:
+        'Incremented points by team requirements for sprint "{{sprintName}}" is {{value}}',
+      INCREMENT_CLIENT:
+        'Incremented points by client requirements for sprint "{{sprintName}}" is {{value}}',
+    },
   },
   LIGHTBOX: {
     ADD_EDIT_SPRINT: {

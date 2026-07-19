@@ -37,7 +37,8 @@
  * `app/modules`, `app/partials`, `app/styles`, or `elements.js`, and never
  * references `angular` / `dragula` / `dom-autoscroller` / `immutable` /
  * `checksley` / `jquery`. In-repo imports are limited to `./hooks/*`,
- * `./state/*`, `./components/*`, and `../shared/*`.
+ * `./state/*`, `./components/*`, and `../shared/*` (the latter includes the
+ * cross-feature `../shared/components/FilterBar`, shared verbatim with Kanban).
  *
  * TWO DISTINCT BULK PATHS (must NOT be conflated - AAP 0.6):
  *   - DRAG reorder  -> `bulkUpdateBacklogOrder(number[])`, owned by the drag-end
@@ -52,16 +53,49 @@ import type { ChangeEvent, DetailedHTMLProps, HTMLAttributes } from 'react';
 // The effectful data layer (data + WebSocket + optimistic move flows). Returns
 // `{ state, actions }`; the presentational layer renders `state` and calls
 // `actions`. Auto-loads on mount, so this container never triggers initial load.
-import { useBacklog } from './hooks/useBacklog';
+import {
+  useBacklog,
+  VALID_QUERY_PARAMS,
+  backlogFiltersStorageKey,
+} from './hooks/useBacklog';
 // Reducer model TYPES are type-only imports (isolatedModules): `Sprint` /
 // `UserStory` type the URL builders + sprint handlers, `SprintFormValues` types
 // the serialized-form -> hook mapping. `./state/*` is an allowed boundary import.
 import type { Sprint, UserStory, SprintFormValues } from './state/backlogReducer';
+// `selectLastSprint` (VALUE import) resolves the latest-finishing OPEN sprint so
+// the create-sprint form can default its start date to that sprint's finish
+// (finding #14 — reproduces `getLastSprint`, lightboxes.coffee:120-127).
+import { selectLastSprint } from './state/backlogReducer';
 // Presentational children (each owns its own DOM sub-tree + `SortableContext`).
 import { BacklogTable } from './components/BacklogTable';
+// Inline row-control reference-data TYPES (finding #12). `RowStatusOption` types
+// the per-row status dropdown option list; the estimation types shape the
+// per-role points editor + the header "view points per Role" popover. Type-only
+// imports (isolatedModules); the values are computed here from `state.project`.
+import type { RowStatusOption } from './components/UserStoryRow';
+import type { EstimationPoint, EstimationRole } from '../shared/estimation';
 import { SprintList } from './components/SprintList';
 import { SprintForm } from './components/SprintForm';
 import { ProgressBar } from './components/ProgressBar';
+// Burndown chart (finding #1): a pure inline-SVG port of the AngularJS Flot
+// burndown directive (`tgBurndownBacklogGraph`, main.coffee:1217-1338), bound to
+// `state.stats.milestones`. No charting dependency is introduced.
+import { Burndown } from './components/Burndown';
+// Shared filter sidebar (`tg-filter`), used VERBATIM by both migrated screens
+// (relocated to `../shared/components` — AAP 0.3.1 shared/ for cross-feature UI),
+// and the shared `filters_data` -> categories transform. BL-11.
+import FilterBar, {
+  type AppliedFilter,
+  type CustomFilter,
+  type FilterCategory,
+  type FilterCategoryOption,
+} from '../shared/components/FilterBar';
+import { buildFilterCategories } from '../shared/filters';
+import {
+  reconcileAppliedFilterNames,
+  writeFiltersToLocation,
+  type RestoredAppliedFilter,
+} from '../shared/filterUrl';
 // Drag context (supplies ONLY the `DndContext`; NOT a `SortableContext`).
 import { DndProvider } from '../shared/dnd/DndProvider';
 // Factory for the backlog drag-end handler; owns `bulkUpdateBacklogOrder` + the
@@ -94,6 +128,32 @@ declare global {
 /* ------------------------------------------------------------------ *
  * Local helpers
  * ------------------------------------------------------------------ */
+
+/**
+ * localStorage key for the burndown collapse flag (finding #1). The legacy
+ * `ToggleBurndownVisibility` directive persisted this under a hash of
+ * `"is-burndown-grpahs-collapsed"` (typo present in the AngularJS source,
+ * main.coffee:1183); the literal is preserved so the persisted preference is
+ * key-compatible across the coexistence boundary.
+ */
+const BURNDOWN_COLLAPSE_KEY = 'is-burndown-grpahs-collapsed';
+
+/**
+ * Persist a JSON value to `localStorage`, swallowing quota/private-mode errors.
+ * Used ONLY for the documented backlog filter UI-preference persistence (the
+ * `localStorage` half of the legacy "persist to both storage and the URL"
+ * behaviour; the URL half is handled by `writeFiltersToLocation`).
+ */
+function writeStored(key: string, value: unknown): void {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* UI-preference persistence only -- safe to ignore storage failures. */
+  }
+}
 
 /**
  * Renders a Taiga sprite icon, reproducing the rendered output of the AngularJS
@@ -150,10 +210,11 @@ export interface BacklogAppProps {
  * the full source mapping and the orchestrator contract.
  */
 export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
-  // Data + effects live in the hook; it returns { state, actions } and auto-loads
-  // the project, stats, sprints and first user-story page on mount
-  // (reproduces BacklogController.loadInitialData/loadBacklog, main.coffee:410-415).
-  const { state, actions } = useBacklog({ projectSlug, projectId });
+  // Data + effects live in the hook; it returns { state, actions, filtersData }
+  // and auto-loads the project, stats, sprints, first user-story page, and the
+  // filter sidebar data on mount (reproduces BacklogController.loadInitialData/
+  // loadBacklog, main.coffee:410-415).
+  const { state, actions, filtersData, writeError } = useBacklog({ projectSlug, projectId });
 
   /* ------------------------- derived: permissions ------------------------- */
 
@@ -233,6 +294,80 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
     [],
   );
 
+  /* ---------------- derived: inline row-control reference data (finding #12) ---------------- */
+
+  // The three per-row control lists are derived from the resolved project payload
+  // (the SAME project the AngularJS `tg-us-status` / `tg-backlog-us-points` /
+  // `tg-us-role-points-selector` directives read from `$scope.project`). They are
+  // passed to `BacklogTable` -> `UserStoryRow`, which only renders the inline
+  // popovers when these lists are supplied (so the presentational tests that omit
+  // them keep exercising the inert baseline). BL-12.
+
+  // Ordered user-story statuses -> each row's inline status dropdown
+  // (reproduces the `popover-us-status.jade` option list; the project returns the
+  // statuses already in their configured order).
+  const statuses = useMemo<RowStatusOption[]>(() => {
+    const list = state.project?.['us_statuses'];
+    if (!Array.isArray(list)) {
+      return [];
+    }
+    const out: RowStatusOption[] = [];
+    for (const raw of list as UsStatusLike[]) {
+      if (typeof raw.id === 'number') {
+        out.push({
+          id: raw.id,
+          name: typeof raw.name === 'string' ? raw.name : '',
+          color: typeof raw.color === 'string' ? raw.color : undefined,
+        });
+      }
+    }
+    return out;
+  }, [state.project]);
+
+  // Estimation points -> each row's inline per-role points editor
+  // (reproduces `us-estimation-points.jade`; a `value === null` entry is the "?"
+  // point that clears an estimate). `calculateTotalPoints` treats `null` as
+  // "unestimated" (estimation.coffee), so preserve `null` rather than coercing.
+  const points = useMemo<EstimationPoint[]>(() => {
+    const list = state.project?.['points'];
+    if (!Array.isArray(list)) {
+      return [];
+    }
+    const out: EstimationPoint[] = [];
+    for (const raw of list as Array<Record<string, unknown>>) {
+      if (typeof raw.id === 'number') {
+        out.push({
+          id: raw.id,
+          name: typeof raw.name === 'string' ? raw.name : '',
+          value: typeof raw.value === 'number' ? raw.value : null,
+        });
+      }
+    }
+    return out;
+  }, [state.project]);
+
+  // Project roles -> each row's points editor + the header "view points per Role"
+  // popover. Only `computable` roles participate in estimation
+  // (estimation.coffee:182 filters on `computable`); the flag is preserved so the
+  // row/header can filter identically.
+  const roles = useMemo<EstimationRole[]>(() => {
+    const list = state.project?.['roles'];
+    if (!Array.isArray(list)) {
+      return [];
+    }
+    const out: EstimationRole[] = [];
+    for (const raw of list as Array<Record<string, unknown>>) {
+      if (typeof raw.id === 'number') {
+        out.push({
+          id: raw.id,
+          name: typeof raw.name === 'string' ? raw.name : '',
+          computable: raw.computable === true,
+        });
+      }
+    }
+    return out;
+  }, [state.project]);
+
   /* ------------------------- derived: selection bridge ------------------------- */
 
   // BacklogTable consumes a ReadonlySet<number>; the reducer stores selectedIds as
@@ -262,6 +397,10 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
         projectId: state.project?.id ?? 0,
         getSelectedIds: () => state.selectedIds,
         onMove: (result) => actions.applyDrag(result),
+        // BL-1 rollback: on a rejected bulk-order write, undo the optimistic
+        // reorder (restore the pre-move snapshot) and surface the "changes were
+        // not saved" alert.
+        onMoveError: (err) => actions.onDragError(err),
       }),
     [state.project?.id, state.selectedIds, actions],
   );
@@ -323,6 +462,135 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
     [],
   );
 
+  /* ----------------------------- filter sidebar (BL-11) ----------------------------- */
+
+  // Build the sidebar categories from the server `filters_data` (all categories,
+  // real per-option counts, Unassigned / Not-in-an-epic pseudo-options, tags
+  // hidden when unused). Backlog shows EVERY category, so `excludeFilters` is
+  // empty (unlike Kanban, which hides `status`). Empty until the fetch resolves.
+  const filterCategories = useMemo<FilterCategory[]>(
+    () => (filtersData ? buildFilterCategories(filtersData, []) : []),
+    [filtersData],
+  );
+
+  // The reducer stores the applied and saved filters as `unknown[]`; narrow them
+  // to the FilterBar contract. These are the single source of truth for the
+  // sidebar's selected chips + saved custom filters (`state.filters.selected` /
+  // `state.filters.custom`).
+  // Reconcile any chips that were restored from the URL with placeholder (id)
+  // names against the resolved categories, so a bookmarked/reloaded filter shows
+  // its proper label once `filters_data` arrives (reproduces the legacy
+  // `formatSelectedFilters` id->chip resolution). This is display-only: the
+  // reducer keeps the raw `selected` (which serializes identically by id), so it
+  // triggers NO re-query. `reconcileAppliedFilterNames` returns the same
+  // reference once every label is resolved, keeping the memo stable.
+  const selectedFilters = useMemo<AppliedFilter[]>(
+    () =>
+      reconcileAppliedFilterNames(
+        ((state.filters.selected as AppliedFilter[]) ?? []) as RestoredAppliedFilter[],
+        filterCategories,
+      ) as AppliedFilter[],
+    [state.filters.selected, filterCategories],
+  );
+  const customFilters = useMemo<CustomFilter[]>(
+    () => (state.filters.custom as CustomFilter[]) ?? [],
+    [state.filters.custom],
+  );
+
+  // Persist the applied filters + free-text query to BOTH the URL query string
+  // (shareable / bookmarkable) AND per-project `localStorage` (survives reload),
+  // reproducing the legacy behaviour where `FiltersMixin` wrote `$location.search()`
+  // and mirrored it to storage. The URL write uses `history.replaceState` (no
+  // AngularJS route reload) -- see `writeFiltersToLocation`. Driven by the raw
+  // reducer `selected` (not the reconciled memo) so it stays byte-stable.
+  useEffect(() => {
+    const rawSelected = (state.filters.selected as RestoredAppliedFilter[]) ?? [];
+    writeFiltersToLocation(rawSelected, VALID_QUERY_PARAMS, state.filters.query);
+    writeStored(backlogFiltersStorageKey(resolvedSlug), rawSelected);
+  }, [state.filters.selected, state.filters.query, resolvedSlug]);
+
+  // Add an include/exclude filter chip (reproduces `addFilter`, main.coffee:705).
+  // Routing through `actions.setFilter({ selected })` re-queries `/userstories`
+  // with the serialized params AND refreshes the sidebar counts (BL-11).
+  const handleAddFilter = useCallback(
+    (payload: {
+      category: FilterCategory;
+      filter: FilterCategoryOption;
+      mode: 'include' | 'exclude';
+    }): void => {
+      const applied: AppliedFilter = {
+        id: payload.filter.id,
+        name: payload.filter.name,
+        dataType: payload.category.dataType,
+        mode: payload.mode,
+        color: payload.filter.color ?? null,
+      };
+      const exists = selectedFilters.some(
+        (f) =>
+          f.dataType === applied.dataType &&
+          String(f.id) === String(applied.id) &&
+          f.mode === applied.mode,
+      );
+      if (exists) {
+        return;
+      }
+      actions.setFilter({ selected: [...selectedFilters, applied] });
+    },
+    [actions, selectedFilters],
+  );
+
+  // Remove an applied filter chip (reproduces `removeFilter`, main.coffee:705).
+  const handleRemoveFilter = useCallback(
+    (filter: AppliedFilter): void => {
+      const next = selectedFilters.filter(
+        (f) =>
+          !(
+            f.dataType === filter.dataType &&
+            String(f.id) === String(filter.id) &&
+            f.mode === filter.mode
+          ),
+      );
+      actions.setFilter({ selected: next });
+    },
+    [actions, selectedFilters],
+  );
+
+  // Save the current applied filters as a named custom filter (reproduces the
+  // `tg-filter` save-filter flow). The snapshot rides `CustomFilter`'s index
+  // signature so selecting it later restores the exact chips.
+  const handleSaveCustomFilter = useCallback(
+    (name: string): void => {
+      const trimmed = name.trim();
+      if (!trimmed || customFilters.some((f) => f.name === trimmed)) {
+        return;
+      }
+      const custom: CustomFilter = { id: Date.now(), name: trimmed, filters: selectedFilters };
+      actions.setFilter({ custom: [...customFilters, custom] });
+    },
+    [actions, customFilters, selectedFilters],
+  );
+
+  // Apply a saved custom filter (restores its snapshot of applied chips).
+  const handleSelectCustomFilter = useCallback(
+    (filter: CustomFilter): void => {
+      const stored = (filter as Record<string, unknown>).filters;
+      if (Array.isArray(stored)) {
+        actions.setFilter({ selected: stored as AppliedFilter[] });
+      }
+    },
+    [actions],
+  );
+
+  // Delete a saved custom filter.
+  const handleRemoveCustomFilter = useCallback(
+    (filter: CustomFilter): void => {
+      actions.setFilter({
+        custom: customFilters.filter((f) => String(f.id) !== String(filter.id)),
+      });
+    },
+    [actions, customFilters],
+  );
+
   // #show-tags checkbox toggles the tags column (reproduces toggleShowTags +
   // showHideTags, main.coffee:872-877,896-908): flips `showTags`; the `.active`
   // class on `#show-tags` (and its inner `.check.js-check`) follows the flag, and
@@ -374,14 +642,164 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
     },
     [actions, state.sprintForm.mode, state.sprintForm.values.id, state.project],
   );
-  // Delete the sprint being edited (reproduces sprintform:remove:success,
-  // main.coffee:192-208).
+  // Sprint delete confirmation (finding #13). Reproduces the legacy blocking
+  // `$confirm.askOnDelete(title, sprintName)` gate (lightboxes.coffee:103-118):
+  // the edit lightbox's delete button does NOT delete directly — it opens a
+  // confirm dialog naming the sprint; only the dialog's confirm issues the
+  // DELETE. Cancel dismisses with no side effect (the edit form stays open).
+  const [sprintDeleteConfirm, setSprintDeleteConfirm] = useState<{
+    open: boolean;
+    id: number | null;
+    name: string | null;
+  }>({ open: false, id: null, name: null });
+
+  // Delete button in the edit lightbox -> OPEN the confirm dialog (was: delete
+  // immediately). Captures the sprint id + name from the open edit form.
   const handleDeleteSprint = useCallback((): void => {
     const editingId = state.sprintForm.values.id;
     if (editingId != null) {
-      void actions.removeSprint(editingId);
+      setSprintDeleteConfirm({
+        open: true,
+        id: editingId,
+        name: state.sprintForm.values.name ?? null,
+      });
     }
-  }, [actions, state.sprintForm.values.id]);
+  }, [state.sprintForm.values.id, state.sprintForm.values.name]);
+
+  // Confirm dialog "Cancel" -> dismiss only; the edit lightbox remains open
+  // (legacy askOnDelete rejection leaves `createEditOpen` untouched).
+  const handleCancelDeleteSprint = useCallback((): void => {
+    setSprintDeleteConfirm({ open: false, id: null, name: null });
+  }, []);
+
+  // Confirm dialog "Delete" -> dismiss the dialog and perform the delete. The
+  // hook's `removeSprint` issues DELETE /milestones/{id}, closes the edit form,
+  // and reloads sprints + stats + userstories (reproduces sprintform:remove:success,
+  // main.coffee:192-208).
+  const handleConfirmDeleteSprint = useCallback((): void => {
+    const id = sprintDeleteConfirm.id;
+    setSprintDeleteConfirm({ open: false, id: null, name: null });
+    if (id != null) {
+      void actions.removeSprint(id);
+    }
+  }, [actions, sprintDeleteConfirm.id]);
+
+  // Create-sprint default start date (finding #14). The last open sprint's
+  // finish date; `SprintForm` seeds the create-mode start to `moment(lastEnd)`
+  // (and finish to +2 weeks), or to today when there is no prior sprint —
+  // exactly the legacy `getLastSprint` -> `estimated_start = lastSprint.estimated_finish`
+  // rule (lightboxes.coffee:120-160). Passing this closes the "always today" gap.
+  const lastSprintEndDate = useMemo<string | null>(
+    () => selectLastSprint(state.sprints)?.estimated_finish ?? null,
+    [state.sprints],
+  );
+
+  /* --------------------- inline row: edit / delete (finding #12) --------------------- */
+
+  // Row ⋮ "Edit": the legacy `editUserStory` opened the generic edit lightbox by
+  // broadcasting `genericform:edit` (main.coffee:653-660) — an AngularJS-only
+  // surface OUTSIDE the React custom element. Per the coexistence boundary (AAP
+  // 0.4.2: React owns everything INSIDE the tag, AngularJS owns navigation +
+  // routing OUTSIDE it), the faithful bridge is to navigate to the story's
+  // AngularJS detail/edit route — the SAME destination the row subject link
+  // already targets (`/project/{slug}/us/{ref}`, via `buildUserStoryUrl`).
+  const handleEditStory = useCallback(
+    (us: UserStory): void => {
+      window.location.assign(buildUserStoryUrl(us));
+    },
+    [buildUserStoryUrl],
+  );
+
+  // Row ⋮ "Delete": the legacy `deleteUserStory` gated removal behind a BLOCKING
+  // confirm (`confirm.askOnDelete`, main.coffee:662-684) and only then optimistically
+  // removed the story + reloaded stats/sprints. Reproduce that gate with a
+  // lightbox confirm dialog; the actual removal (hook `deleteUserStory`, which
+  // dispatches the optimistic REMOVE_US then `DELETE /userstories/{id}` and
+  // reloads) fires ONLY on confirm.
+  const [usDeleteConfirm, setUsDeleteConfirm] = useState<{ open: boolean; us: UserStory | null }>({
+    open: false,
+    us: null,
+  });
+  const handleRequestDeleteStory = useCallback((us: UserStory): void => {
+    setUsDeleteConfirm({ open: true, us });
+  }, []);
+  const handleCancelDeleteStory = useCallback((): void => {
+    setUsDeleteConfirm({ open: false, us: null });
+  }, []);
+  const handleConfirmDeleteStory = useCallback((): void => {
+    const target = usDeleteConfirm.us;
+    // Dismiss the dialog immediately (parity: the confirm lightbox closes on
+    // click), then fire the hook's optimistic delete.
+    setUsDeleteConfirm({ open: false, us: null });
+    if (target != null) {
+      void actions.deleteUserStory(target);
+    }
+  }, [actions, usDeleteConfirm.us]);
+
+  // The subject shown in the delete-confirm message (reproduces the legacy
+  // `US.TITLE_DELETE_MESSAGE {subject}` interpolation, main.coffee:664).
+  const usDeleteConfirmSubject = useMemo<string>(() => {
+    const subject = usDeleteConfirm.us?.['subject'];
+    return typeof subject === 'string' ? subject : '';
+  }, [usDeleteConfirm.us]);
+
+  /* ------------------------------- add user story ------------------------------ */
+
+  // Finding #16: the "+ Add" toolbar button, the bulk-add icon button, and the
+  // empty-state "Create your first user story" button were inert (no handler).
+  // Reproduce the legacy `addNewUs('standard' | 'bulk')` flow (main.coffee:683-691)
+  // with a functional lightbox: 'standard' is a single-subject create input,
+  // 'bulk' is a one-subject-per-line textarea. Both POST through the frozen
+  // `/userstories` (single) and `/userstories/bulk_create` (bulk) endpoints via
+  // the hook's `addStoryStandard` / `addStoryBulk` actions, which reload the
+  // backlog + stats on success so the new stories appear.
+  const [addStoryLightbox, setAddStoryLightbox] = useState<{
+    open: boolean;
+    mode: 'standard' | 'bulk';
+  }>({ open: false, mode: 'standard' });
+  const [addStorySubject, setAddStorySubject] = useState<string>('');
+  const [addStoryBulkText, setAddStoryBulkText] = useState<string>('');
+  // Double-submit guard (parity with the create-form's in-flight lock): a second
+  // click while the create request is in flight is ignored, so one submit yields
+  // exactly one POST.
+  const addStorySubmittingRef = useRef<boolean>(false);
+
+  const handleOpenAddStandard = useCallback((): void => {
+    setAddStorySubject('');
+    setAddStoryLightbox({ open: true, mode: 'standard' });
+  }, []);
+  const handleOpenAddBulk = useCallback((): void => {
+    setAddStoryBulkText('');
+    setAddStoryLightbox({ open: true, mode: 'bulk' });
+  }, []);
+  const handleCloseAddStory = useCallback((): void => {
+    setAddStoryLightbox((prev) => ({ open: false, mode: prev.mode }));
+    setAddStorySubject('');
+    setAddStoryBulkText('');
+  }, []);
+  const handleSubmitAddStory = useCallback((): void => {
+    if (addStorySubmittingRef.current) {
+      return;
+    }
+    const mode = addStoryLightbox.mode;
+    const payload = mode === 'bulk' ? addStoryBulkText.trim() : addStorySubject.trim();
+    if (payload.length === 0) {
+      handleCloseAddStory();
+      return;
+    }
+    addStorySubmittingRef.current = true;
+    const create = mode === 'bulk' ? actions.addStoryBulk(payload) : actions.addStoryStandard(payload);
+    void create.finally(() => {
+      addStorySubmittingRef.current = false;
+      handleCloseAddStory();
+    });
+  }, [
+    addStoryLightbox.mode,
+    addStoryBulkText,
+    addStorySubject,
+    actions,
+    handleCloseAddStory,
+  ]);
 
   /* --------------------------- closed sprints / fold --------------------------- */
 
@@ -400,15 +818,81 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
   /* ------------------------------- derived view ------------------------------- */
 
   const permsCanModifyUs = can('modify_us');
+  // `delete_us` gates each backlog row's ⋮ "Delete" item (reproduces the
+  // `tg-check-permission="delete_us"` on `us-edit-popover.jade`). BL-12.
+  const permsCanDeleteUs = can('delete_us');
   const hasSelectedFilters = state.filters.selected.length > 0;
   const hasUserStories = state.userstories.length > 0;
   const hasQuery = queryInput.length > 0;
   // `project.i_am_admin` gates the empty-burndown "customize graph" placeholder
   // (backlog.jade:23).
   const isAdmin = state.project?.['i_am_admin'] === true;
+
+  /* --- Burndown chart visibility toggle (finding #1) --------------------- *
+   * Reproduces `ToggleBurndownVisibility` (main.coffee:1175-1210): the graph is
+   * shown by default and hidden when collapsed; the collapse flag is persisted
+   * in storage under the (typo-preserved) legacy key, and is forced collapsed
+   * whenever there is no graph to draw (`showGraphPlaceholder`). The container
+   * gets `.shown` on the FIRST reveal (instant, no CSS transition) and `.open`
+   * on every subsequent user toggle (animated), exactly like the directive's
+   * `show(firstLoad)`; the toggle button gets `.active` while the graph is open.
+   * -------------------------------------------------------------------------- */
+  const [burndownCollapsed, setBurndownCollapsed] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(BURNDOWN_COLLAPSE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const burndownFirstLoadRef = useRef<boolean>(true);
+  // Legacy `$watch "showGraphPlaceholder"`: once known, collapse if there is no
+  // graph to render (`isBurndownGraphCollapsed = isBurndownGraphCollapsed || showGraphPlaceholder`).
+  useEffect(() => {
+    if (state.showGraphPlaceholder === true) {
+      setBurndownCollapsed((prev) => prev || true);
+    }
+  }, [state.showGraphPlaceholder]);
+  const handleToggleBurndown = useCallback((): void => {
+    // After the first interaction, subsequent reveals animate (`.open`).
+    burndownFirstLoadRef.current = false;
+    setBurndownCollapsed((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(BURNDOWN_COLLAPSE_KEY, String(next));
+      } catch {
+        /* storage unavailable — visibility still toggles for this session */
+      }
+      return next;
+    });
+  }, []);
+  const burndownVisible = !burndownCollapsed;
+  // `.shown` (first reveal, instant) vs `.open` (subsequent, animated).
+  const graphicsContainerClass = `graphics-container js-burndown-graph${
+    burndownVisible ? (burndownFirstLoadRef.current ? ' shown' : ' open') : ''
+  }`;
+  const toggleButtonClass = `stats js-toggle-burndown-visibility-button${
+    burndownVisible ? ' active' : ''
+  }`;
   // The project name shown by the AngularJS `tg-main-title` directive.
   const projectNameRaw = state.project?.['name'];
   const projectName = typeof projectNameRaw === 'string' ? projectNameRaw : '';
+
+  // T1 fix: reproduce the AngularJS `appMetaService.setAll` browser-title
+  // behavior (backlog/main.coffee:105-110). The legacy BacklogController set the
+  // document title to `BACKLOG.PAGE_TITLE` ("Backlog - <projectName>") once the
+  // initial data resolved. React sets it when the project name is known and
+  // restores the prior title on unmount so leaving the route (an AngularJS
+  // navigation) does not leave a stale "Backlog - ..." title behind.
+  useEffect(() => {
+    if (!projectName) {
+      return undefined;
+    }
+    const previousTitle = document.title;
+    document.title = `Backlog - ${projectName}`;
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [projectName]);
 
   // Infinite-scroll next-page loader (reproduces ctrl.loadUserstories paging,
   // main.coffee:341-408); memoized so BacklogTable's scroll handler identity is
@@ -429,9 +913,23 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
       <main className="main scrum">
         <DndProvider mode="backlog" onDragEnd={onDragEnd}>
           <section className="backlog">
-            {/* mainTitle include (backlog.jade:18 -> mainTitle.jade): project heading. */}
+            {/* Surface a failed optimistic move WRITE (QA BL-1 drag reorder /
+                BL-2 toolbar move-to-sprint). The optimistic change has already
+                been rolled back by the hook; this alert tells the user the
+                reorder/move did not persist. Same copy + `.write-error`
+                role="alert" markup the Kanban board renders (KanbanApp), so the
+                existing SCSS applies and the two screens behave identically. */}
+            {writeError ? (
+              <div className="write-error" role="alert">
+                Your changes were not saved!
+              </div>
+            ) : null}
+            {/* mainTitle include (backlog.jade:18 -> mainTitle.jade). H1 fix: the
+                heading shows the SECTION name ("Scrum"), matching the AngularJS
+                `tg-main-title` directive (sectionName = BACKLOG.SECTION_NAME),
+                NOT the project name. */}
             <header>
-              <h1>{projectName}</h1>
+              <h1>Scrum</h1>
             </header>
 
             {/* backlog-summary (backlog.jade:20-30): project stats + burndown host. */}
@@ -464,9 +962,24 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                   <span className="description">Points per sprint</span>
                 </div>
 
-                {/* div.stats.js-toggle-burndown-visibility-button(ng-if="!showGraphPlaceholder"). */}
+                {/* div.stats.js-toggle-burndown-visibility-button(ng-if="!showGraphPlaceholder").
+                    Wired to toggle the burndown chart (finding #1) — reproduces the
+                    click handler in `ToggleBurndownVisibility` (main.coffee:1200-1203). */}
                 {!state.showGraphPlaceholder ? (
-                  <div className="stats js-toggle-burndown-visibility-button" title="Toggle backlog graph">
+                  <div
+                    className={toggleButtonClass}
+                    title="Toggle backlog graph"
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={burndownVisible}
+                    onClick={handleToggleBurndown}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        handleToggleBurndown();
+                      }
+                    }}
+                  >
                     <Svg icon="icon-graph" />
                   </div>
                 ) : null}
@@ -483,11 +996,15 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                 </div>
               ) : null}
 
-              {/* div.graphics-container.js-burndown-graph > div.burndown. The flot
-                  burndown chart (main.coffee:1217-1338) is REFERENCE-only and NOT
-                  ported; only the container + placeholder divs are reproduced. */}
-              <div className="graphics-container js-burndown-graph">
-                <div className="burndown" />
+              {/* div.graphics-container.js-burndown-graph > div.burndown. The Flot
+                  burndown chart (main.coffee:1217-1338) is reproduced as a pure
+                  inline-SVG <Burndown> bound to `state.stats.milestones` (finding
+                  #1). The container's `.shown`/`.open` classes (driven by the
+                  toggle) reveal it via the `slide` mixin (summary.scss:264-271). */}
+              <div className={graphicsContainerClass}>
+                <div className="burndown">
+                  <Burndown stats={state.stats} />
+                </div>
               </div>
             </div>
 
@@ -512,16 +1029,27 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                     <div className="backlog-header-options">
                       {/* addnewus include (addnewus.jade): the "add user story" controls.
                           The create-US lightbox is an AngularJS flow with no action on the
-                          `useBacklog` surface (BacklogApp's behavioral scope covers
-                          sprint/milestone CRUD, not US CRUD - AAP 0.7), so the chrome is
-                          reproduced for visual parity without a click handler. */}
+                          `useBacklog` surface. Finding #16: the "+ Add" and bulk
+                          buttons are now functional — they open the create /
+                          bulk-create lightbox, reproducing `addNewUs('standard' |
+                          'bulk')` (main.coffee:683-691). */}
                       {can('add_us') ? (
                         <div className="new-us">
-                          <button className="btn-small" type="button" aria-label="Add user story">
+                          <button
+                            className="btn-small"
+                            type="button"
+                            aria-label="Add user story"
+                            onClick={handleOpenAddStandard}
+                          >
                             <Svg icon="icon-add" />
                             <span className="text">Add</span>
                           </button>
-                          <button className="btn-icon" type="button" aria-label="Add user stories in bulk">
+                          <button
+                            className="btn-icon"
+                            type="button"
+                            aria-label="Add user stories in bulk"
+                            onClick={handleOpenAddBulk}
+                          >
                             <Svg icon="icon-bulk" />
                           </button>
                         </div>
@@ -647,9 +1175,24 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
             {/* backlog-manager (backlog.jade:124): `.expanded` when NOT activeFilters. */}
             <div className={state.activeFilters ? 'backlog-manager' : 'backlog-manager expanded'}>
               {/* #backlog-filter (backlog.jade:126-140, ng-if="activeFilters"): the sidebar
-                  filter host. The detailed filter widgets are backed by `state.filters`; a
-                  minimal, class-accurate container is reproduced here. */}
-              {state.activeFilters ? <div className="backlog-filter active" id="backlog-filter" /> : null}
+                  filter host. Hosts the shared `tg-filter` FilterBar, populated from the
+                  server `filters_data` (BL-11); the container keeps its `#backlog-filter`
+                  id + `.backlog-filter.active` classes so the existing SCSS applies. */}
+              {state.activeFilters ? (
+                <div className="backlog-filter active" id="backlog-filter">
+                  <FilterBar
+                    filters={filterCategories}
+                    customFilters={customFilters}
+                    selectedFilters={selectedFilters}
+                    excludeFilters={[]}
+                    onAddFilter={handleAddFilter}
+                    onRemoveFilter={handleRemoveFilter}
+                    onSaveCustomFilter={handleSaveCustomFilter}
+                    onSelectCustomFilter={handleSelectCustomFilter}
+                    onRemoveCustomFilter={handleRemoveCustomFilter}
+                  />
+                </div>
+              ) : null}
 
               {/* section.backlog-table (backlog.jade:142): the draggable backlog body,
                   `.hidden` when there are no stories. BacklogTable owns its own
@@ -672,6 +1215,21 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                   getStatusName={getStatusName}
                   getStatusColor={getStatusColor}
                   getPointsLabel={getPointsLabel}
+                  /* inline row controls (finding #12): reference data + handlers.
+                     Supplying these activates the per-row status dropdown, the
+                     per-role points editor, the ⋮ options menu, and the header
+                     "view points per Role" popover (all inert until now). */
+                  statuses={statuses}
+                  points={points}
+                  roles={roles}
+                  pointsViewRoleId={state.pointsViewRoleId}
+                  canDeleteUs={permsCanDeleteUs}
+                  onChangeStatus={actions.changeUsStatus}
+                  onChangePoints={actions.changeUsPoints}
+                  onEditStory={handleEditStory}
+                  onDeleteStory={handleRequestDeleteStory}
+                  onMoveToTop={actions.moveUsToTop}
+                  onSelectRoleView={actions.setPointsViewRole}
                 />
 
                 {/* .forecasting-add-sprint (backlog.jade:144-172): shown when velocity
@@ -717,7 +1275,12 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
               >
                 <p className="title">Your backlog is empty.</p>
                 {can('add_us') ? (
-                  <button className="btn-small" type="button" title="Create new user story">
+                  <button
+                    className="btn-small"
+                    type="button"
+                    title="Create new user story"
+                    onClick={handleOpenAddStandard}
+                  >
                     <Svg icon="icon-add" />
                     <span className="text">Create your first user story</span>
                   </button>
@@ -766,12 +1329,158 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
           estimated_finish: state.sprintForm.values.estimated_finish ?? undefined,
         }}
         sprintId={state.sprintForm.values.id}
+        lastSprintEndDate={lastSprintEndDate}
         lastSprintName={state.sprintForm.lastSprintName}
         canDelete={state.sprintForm.canDelete && can('delete_milestone')}
         onSubmit={handleSubmitSprintForm}
         onClose={handleCloseSprintForm}
         onDelete={handleDeleteSprint}
       />
+
+      {/* US delete-confirm lightbox (finding #12). Reproduces the blocking
+          `confirm.askOnDelete` gate the legacy `deleteUserStory` required
+          (main.coffee:662-684), using the SAME `.lightbox.lightbox-generic-form`
+          confirm DOM the Kanban screen uses for its delete gate so the shared
+          lightbox SCSS applies unchanged. The optimistic remove fires only from
+          `handleConfirmDeleteStory`; Cancel dismisses with no side effect. */}
+      {usDeleteConfirm.open ? (
+        <div className="lightbox lightbox-generic-form lightbox-confirm-delete-us open">
+          <div className="lightbox-header">
+            <h2 className="title">Delete user story</h2>
+          </div>
+          <div className="lightbox-body">
+            <p>
+              Are you sure you want to delete
+              {usDeleteConfirmSubject ? ` "${usDeleteConfirmSubject}"` : ' this user story'}?
+            </p>
+            <div className="lightbox-actions">
+              <button
+                type="button"
+                className="btn-cancel e2e-cancel"
+                onClick={handleCancelDeleteStory}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-delete e2e-delete"
+                onClick={handleConfirmDeleteStory}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Sprint delete-confirm lightbox (finding #13). Reproduces the blocking
+          `$confirm.askOnDelete(DELETE_SPRINT.TITLE, sprint.name)` the legacy
+          `.delete-sprint` click required (lightboxes.coffee:103-118, 225-227),
+          using the SAME `.lightbox.lightbox-generic-form` confirm DOM as the US
+          delete gate so the shared lightbox SCSS applies unchanged. The DELETE
+          fires only from `handleConfirmDeleteSprint`; Cancel dismisses with no
+          side effect and leaves the edit form open. */}
+      {sprintDeleteConfirm.open ? (
+        <div className="lightbox lightbox-generic-form lightbox-confirm-delete-sprint open">
+          <div className="lightbox-header">
+            <h2 className="title">Delete sprint</h2>
+          </div>
+          <div className="lightbox-body">
+            <p>
+              Are you sure you want to delete
+              {sprintDeleteConfirm.name ? ` "${sprintDeleteConfirm.name}"` : ' this sprint'}?
+            </p>
+            <div className="lightbox-actions">
+              <button
+                type="button"
+                className="btn-cancel e2e-cancel"
+                onClick={handleCancelDeleteSprint}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-delete e2e-delete"
+                onClick={handleConfirmDeleteSprint}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Add-user-story lightbox (finding #16). Reproduces the legacy
+          `addNewUs('standard' | 'bulk')` create surfaces (main.coffee:683-691):
+          'standard' is a single-subject input (`.lightbox-generic-form`), 'bulk'
+          is a one-subject-per-line textarea (`.lightbox-generic-bulk`), using the
+          same lightbox class names as the Kanban create/bulk lightboxes so the
+          shared SCSS applies. Submit fires the hook's create/bulk-create action
+          (guarded against double-submit); a blank payload just closes. */}
+      {addStoryLightbox.open ? (
+        <div
+          className={
+            addStoryLightbox.mode === 'bulk'
+              ? 'lightbox lightbox-generic-bulk lightbox-add-story-bulk open'
+              : 'lightbox lightbox-generic-form lightbox-add-story open'
+          }
+        >
+          <div className="lightbox-header">
+            <h2 className="title">
+              {addStoryLightbox.mode === 'bulk' ? 'Add user stories in bulk' : 'New user story'}
+            </h2>
+          </div>
+          <div className="lightbox-body">
+            {addStoryLightbox.mode === 'bulk' ? (
+              <textarea
+                className="bulk-textarea e2e-add-story-bulk"
+                aria-label="Add user stories in bulk"
+                placeholder="Enter one user story per line"
+                value={addStoryBulkText}
+                autoFocus
+                onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                  setAddStoryBulkText(event.target.value)
+                }
+              />
+            ) : (
+              <input
+                type="text"
+                className="create-us-subject e2e-add-story-subject"
+                name="create-us-subject"
+                aria-label="New user story"
+                placeholder="Type the user story subject"
+                value={addStorySubject}
+                autoFocus
+                onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                  setAddStorySubject(event.target.value)
+                }
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    handleSubmitAddStory();
+                  }
+                }}
+              />
+            )}
+            <div className="lightbox-actions">
+              <button
+                type="button"
+                className="btn-cancel e2e-cancel"
+                onClick={handleCloseAddStory}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-save e2e-create"
+                onClick={handleSubmitAddStory}
+              >
+                Create
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

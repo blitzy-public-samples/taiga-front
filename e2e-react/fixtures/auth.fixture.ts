@@ -64,8 +64,57 @@
  */
 
 import { test as base, expect } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { Page, Route } from '@playwright/test';
 import { closeCookies, closeJoyride } from './helpers';
+
+/**
+ * OPTIONAL locally-built React bundle path used to pin the bundle the browser
+ * loads, defeating a cross-agent clobber of the shared deployable client.
+ *
+ * WHY THIS EXISTS. The React screens ship as a single `react.js` bundle served
+ * by the ONE shared Docker `taiga-front` container at a fixed, version-stamped
+ * path (`/v-<stamp>/js/react.js`). During parallel CI the container is shared
+ * across independent agent workspaces, each of which `docker cp`s ITS OWN
+ * `react.js` to that same path — so at any instant the served file may belong to
+ * a different workspace, and the browser non-deterministically loads a foreign
+ * bundle (the two migrated screens then appear unwired). That is a HARNESS
+ * artifact, not a product defect, and it directly undermines the deterministic
+ * before/after evidence this project mandates (AAP 0.6.2 "Determinism and
+ * isolation").
+ *
+ * WHAT IT DOES. When `REACT_BUNDLE_OVERRIDE` points at a locally-built
+ * `react.js`, every page fulfils the version-stamped `react.js` request from THAT file via
+ * `page.route` — so the browser ALWAYS executes this workspace's real, freshly
+ * built artifact regardless of what currently sits in the shared container. The
+ * bundle is still THIS workspace's genuine build output (identical bytes to what
+ * `docker cp` deploys), so fidelity is preserved; only the delivery is pinned.
+ *
+ * PORTABILITY. The variable is OPT-IN: unset (the default, and the only mode in
+ * a non-contended/single-tenant environment) the fixture registers no route and
+ * the browser loads the container-served bundle exactly as in production. No
+ * path is hard-coded, so the committed suite stays environment-agnostic.
+ */
+const REACT_BUNDLE_OVERRIDE = process.env.REACT_BUNDLE_OVERRIDE || '';
+
+/**
+ * Register a `react.js` route override on `page` when {@link REACT_BUNDLE_OVERRIDE}
+ * is set. Matches the version-stamped bundle URL (`.../js/react.js`, with an
+ * optional cache-busting query) but NOT its `.map` sibling, and fulfils it from
+ * the local file. A no-op when the override is unset.
+ *
+ * @param page - The Playwright page to install the route on (before navigation).
+ */
+async function pinReactBundle(page: Page): Promise<void> {
+  if (!REACT_BUNDLE_OVERRIDE) {
+    return;
+  }
+  await page.route(/\/react\.js(\?.*)?$/, (route: Route) =>
+    route.fulfill({
+      path: REACT_BUNDLE_OVERRIDE,
+      headers: { 'content-type': 'application/javascript; charset=utf-8' },
+    }),
+  );
+}
 
 /**
  * Admin username used to authenticate the E2E session.
@@ -174,6 +223,11 @@ export async function login(
  */
 export const test = base.extend({
   page: async ({ page }, use) => {
+    // Pin this workspace's freshly built react.js BEFORE the first navigation so
+    // the login page and every subsequent screen execute our real bundle even
+    // when a parallel agent has clobbered the shared container (opt-in via
+    // REACT_BUNDLE_OVERRIDE; a no-op otherwise). See pinReactBundle above.
+    await pinReactBundle(page);
     await login(page);
     await use(page);
   },

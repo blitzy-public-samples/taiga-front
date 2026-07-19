@@ -50,6 +50,11 @@ jest.mock('@dnd-kit/core', () => {
   return {
     __esModule: true,
     ...actual,
+    // Spy collision-detection strategies so the backlog pointer-first strategy
+    // (`pointerWithin` -> `rectIntersection` fallback) can be exercised
+    // deterministically without real jsdom geometry.
+    pointerWithin: jest.fn(() => []),
+    rectIntersection: jest.fn(() => []),
     DndContext: jest.fn((props: Record<string, unknown>) =>
       react.createElement('div', { 'data-testid': 'dnd-context' }, props.children as React.ReactNode),
     ),
@@ -63,17 +68,22 @@ jest.mock('@dnd-kit/core', () => {
   };
 });
 
-import { DndContext } from '@dnd-kit/core';
+import { DndContext, pointerWithin, rectIntersection } from '@dnd-kit/core';
 import DndProvider, { type DndProviderProps } from '../DndProvider';
 import { getAutoScrollOptions } from '../autoScroll';
 import { DND_CLASS } from '../types';
 
 const DndContextMock = DndContext as unknown as jest.Mock;
+const pointerWithinMock = pointerWithin as unknown as jest.Mock;
+const rectIntersectionMock = rectIntersection as unknown as jest.Mock;
 
 /** Props of the MOST RECENT `<DndContext>` render (handlers + sensors + autoScroll). */
 interface CapturedProps {
   sensors: unknown;
   autoScroll: unknown;
+  // Per-mode collision detection: a function in `'backlog'` mode (pointer-first),
+  // `undefined` in `'kanban'` mode (the @dnd-kit default `rectIntersection`).
+  collisionDetection?: (args: unknown) => unknown;
   // KB-8: the accessibility bundle overriding @dnd-kit's misleading keyboard-drag
   // screen-reader text (only a PointerSensor is wired). `draggable` should be an
   // empty string and every announcement handler should return `undefined`.
@@ -197,6 +207,83 @@ describe('DndProvider — mount + prop forwarding', () => {
       expect(typeof handler).toBe('function');
       expect(handler?.(fakeArg)).toBeUndefined();
     }
+  });
+});
+
+// Gap 15 — per-mode collision detection. The backlog reorder-to-top gesture is a
+// LONG, window-auto-scroll-assisted drag; the @dnd-kit default `rectIntersection`
+// resolves `over` from the ACTIVE draggable's TRANSLATED rect, which after that
+// long travel can latch onto a stale-measured right-hand sprint droppable and
+// (now that each sprint row carries its container identity) wrongly route a pure
+// backlog REORDER into a sprint. The provider therefore hands the backlog screen
+// a pointer-first strategy (`pointerWithin` -> `rectIntersection` fallback),
+// faithful to the legacy dragula `document.elementFromPoint` container test
+// (backlog/sortable.coffee:42), while kanban keeps the default so its short,
+// side-by-side column drags are unaffected.
+describe('DndProvider — collision detection strategy (Gap 15, backlog reorder routing)', () => {
+  beforeEach(() => {
+    // `clearMocks: true` resets call data before each test; re-establish the
+    // "no collision" base return so every test controls the outcome explicitly
+    // via `mockReturnValueOnce`, and no persistent return value leaks between them.
+    pointerWithinMock.mockReturnValue([]);
+    rectIntersectionMock.mockReturnValue([]);
+  });
+
+  it('passes NO collisionDetection prop in kanban mode (keeps the @dnd-kit rectIntersection default)', () => {
+    renderProvider({ mode: 'kanban' });
+    expect(lastProps().collisionDetection).toBeUndefined();
+    // A render never invokes either strategy.
+    expect(pointerWithinMock).not.toHaveBeenCalled();
+    expect(rectIntersectionMock).not.toHaveBeenCalled();
+  });
+
+  it('passes a pointer-first collisionDetection function in backlog mode', () => {
+    renderProvider({ mode: 'backlog' });
+    expect(typeof lastProps().collisionDetection).toBe('function');
+  });
+
+  it('returns the pointerWithin hits when the pointer is over a droppable (no rectIntersection fallback)', () => {
+    renderProvider({ mode: 'backlog' });
+    const { collisionDetection } = lastProps();
+    if (typeof collisionDetection !== 'function') {
+      throw new Error('expected a backlog collisionDetection function');
+    }
+
+    // Pointer sits over the intended BACKLOG row -> pointerWithin resolves it.
+    const pointerHits = [{ id: 'backlog-row-59' }];
+    pointerWithinMock.mockReturnValueOnce(pointerHits);
+
+    const args = { pointerCoordinates: { x: 10, y: 20 } } as unknown;
+    const result = collisionDetection(args);
+
+    expect(pointerWithinMock).toHaveBeenCalledTimes(1);
+    expect(pointerWithinMock).toHaveBeenCalledWith(args);
+    // Pointer resolved a droppable, so the returned hits are the pointer hits
+    // verbatim and the rect fallback must NOT run.
+    expect(result).toBe(pointerHits);
+    expect(rectIntersectionMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to rectIntersection when the pointer is over NO droppable (1px-gap frame)', () => {
+    renderProvider({ mode: 'backlog' });
+    const { collisionDetection } = lastProps();
+    if (typeof collisionDetection !== 'function') {
+      throw new Error('expected a backlog collisionDetection function');
+    }
+
+    // Pointer sits in a 1px gap between droppables -> pointerWithin returns [],
+    // so the strategy falls back to rectIntersection so `over` is never lost.
+    const rectHits = [{ id: 'sprint-16' }];
+    pointerWithinMock.mockReturnValueOnce([]);
+    rectIntersectionMock.mockReturnValueOnce(rectHits);
+
+    const args = { pointerCoordinates: { x: 0, y: 0 } } as unknown;
+    const result = collisionDetection(args);
+
+    expect(pointerWithinMock).toHaveBeenCalledTimes(1);
+    expect(rectIntersectionMock).toHaveBeenCalledTimes(1);
+    expect(rectIntersectionMock).toHaveBeenCalledWith(args);
+    expect(result).toBe(rectHits);
   });
 });
 

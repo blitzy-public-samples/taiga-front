@@ -69,10 +69,17 @@ import {
 // `Accept-Language` internally, so `../../shared/session` is intentionally NOT
 // imported here.
 import httpClient from '../../shared/api/httpClient';
-import userstories from '../../shared/api/userstories';
+import userstories, { type FiltersDataResponse } from '../../shared/api/userstories';
 import milestones from '../../shared/api/milestones';
 import { createEventsClient, routingKeys } from '../../shared/events/eventsClient';
 import { getEventsUrl } from '../../shared/config';
+import { serializeAppliedFilters, type SerializableAppliedFilter } from '../../shared/filters';
+import {
+  locationHasManagedParams,
+  parseAppliedFiltersFromSearch,
+  readLocationSearch,
+  extractQueryText,
+} from '../../shared/filterUrl';
 
 import moment from 'moment';
 
@@ -83,8 +90,9 @@ import moment from 'moment';
 /**
  * The whitelist of URL query params the backlog user-story list honours.
  * Reproduces `BacklogController.validQueryParams` (main.coffee:55-68) EXACTLY.
+ * Exported so `BacklogApp` can persist the same key set to the URL / storage.
  */
-const VALID_QUERY_PARAMS = [
+export const VALID_QUERY_PARAMS = [
   'exclude_status',
   'status',
   'exclude_tags',
@@ -98,6 +106,60 @@ const VALID_QUERY_PARAMS = [
   'exclude_owner',
   'owner',
 ] as const;
+
+/**
+ * Per-project-slug `localStorage` key for the backlog applied filters. Mirrors
+ * the sibling Kanban's `${projectSlug}:kanban-filters` convention (a simple,
+ * readable per-project key rather than the legacy hashed key -- reproducing the
+ * exact `generateHash` key is outside the coexistence boundary, AAP 0.7).
+ */
+export function backlogFiltersStorageKey(projectSlug: string | undefined): string {
+  return `${projectSlug ?? ''}:backlog-filters`;
+}
+
+/**
+ * Read a JSON value from `localStorage`, returning `fallback` on a missing key,
+ * malformed JSON, or a private-mode/quota error. Used ONLY for the documented
+ * backlog filter UI-preference persistence.
+ */
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return fallback;
+    }
+    const raw = window.localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw) as T;
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Compute the initial backlog filter model by restoring from the URL first and
+ * falling back to `localStorage` ONLY when the URL carries no managed params --
+ * reproducing the legacy "URL wins on load" precedence of `applyStoredFilters`
+ * (controllerMixins.coffee:106-118). Runs once, inside the `useReducer` lazy
+ * initializer, so the very first `loadBacklog` already issues the restored,
+ * filtered `/userstories` query. Restored chip ids carry placeholder (id) names
+ * that `BacklogApp` reconciles to labels once `filters_data` resolves.
+ */
+function hydrateInitialFilters(
+  projectSlug: string | undefined,
+): { selected: unknown[]; query: string } {
+  if (locationHasManagedParams(VALID_QUERY_PARAMS)) {
+    const search = readLocationSearch();
+    return {
+      selected: parseAppliedFiltersFromSearch(search, VALID_QUERY_PARAMS),
+      query: extractQueryText(search),
+    };
+  }
+  const stored = readStored<unknown[]>(backlogFiltersStorageKey(projectSlug), []);
+  return { selected: Array.isArray(stored) ? stored : [], query: '' };
+}
 
 /**
  * Minimal object-key picker (lodash-free). Reproduces `_.pick(obj, keys)`:
@@ -124,13 +186,18 @@ function pick(source: Record<string, unknown>, keys: readonly string[]): Record<
  * read from the reducer's filter model instead. The CONCRETE serialization of
  * categorical filters (status / tags / assigned_users / ... -> comma-joined id
  * strings) is owned by the Backlog FilterBar / filter service that populates
- * this model; here we simply surface whatever query params the model already
- * carries so `loadUserstories` can `pick` the `VALID_QUERY_PARAMS` out of it.
- * The free-text query is mapped to `q` SEPARATELY by `loadUserstories`
- * (`params.q = @.filterQ`, main.coffee:353).
+ * this model; the CONCRETE serialization of the applied categorical selections
+ * (`selected`) into comma-joined id strings per `VALID_QUERY_PARAMS` is done by
+ * the shared `serializeAppliedFilters` helper (BL-11). The free-text query is
+ * mapped to `q` SEPARATELY by `loadUserstories` (`params.q = @.filterQ`,
+ * main.coffee:353), so it is NOT emitted here.
  */
 function mapFiltersToQuery(filters: BacklogFilters): Record<string, unknown> {
-  return { ...(filters as unknown as Record<string, unknown>) };
+  // BL-11: `selected` holds the applied include/exclude filter chips (populated
+  // by the Backlog `FilterBar`). Serialize them into `status` / `tags` /
+  // `assigned_users` / `role` / `owner` / `epic` (+ their `exclude_` forms).
+  const selected = (filters.selected ?? []) as SerializableAppliedFilter[];
+  return serializeAppliedFilters(selected, VALID_QUERY_PARAMS);
 }
 
 /**
@@ -200,6 +267,14 @@ export interface BacklogActions {
   loadMoreUserstories(): Promise<void>;
   // --- drag move (optimistic onMove; drag API owned by shared/dnd/sortable) ---
   applyDrag(result: BacklogDragResult): void;
+  /**
+   * Drag WRITE-failure callback (QA BL-1): wired into the shared drag-end
+   * handler's `onMoveError`. Rolls back the optimistic `applyDrag` update and
+   * surfaces `writeError`.
+   */
+  onDragError(err: unknown): void;
+  /** Dismiss the save-failure surface (`writeError`) - BL-1/BL-2. */
+  clearWriteError(): void;
   reconcileAfterMove(): Promise<void>;
   // --- toolbar move to sprint ---
   moveToCurrentSprint(usIds?: number[]): Promise<void>;
@@ -209,6 +284,51 @@ export interface BacklogActions {
   closeSprintForm(): void;
   submitSprintForm(values: SprintFormValues, mode: 'create' | 'edit', editingId?: number): Promise<void>;
   removeSprint(id: number): Promise<void>;
+  // --- inline row controls (finding #12) ---
+  /**
+   * Change a story's status inline (status-dropdown widget). PATCHes
+   * `{ status, version }`, replaces the row with the server copy, then refreshes
+   * stats + filters (legacy `updateUserStoryStatus`, `backlog/main.coffee:646`).
+   */
+  changeUsStatus(us: UserStory, statusId: number): Promise<void>;
+  /**
+   * Set a story's per-role points inline (points widget). Clones `us.points`,
+   * assigns `points[roleId] = pointId`, PATCHes `{ points, version }`, replaces
+   * the row, then refreshes stats (legacy `onSelectedPointForRole` ->
+   * `$repo.save`, `estimation.coffee:154-166`).
+   */
+  changeUsPoints(us: UserStory, roleId: number, pointId: number): Promise<void>;
+  /**
+   * Delete a story inline (⋮ options "Delete"). DELETEs `userstories/{id}`,
+   * removes the row, then refreshes stats + sprints + first-story indicator
+   * (legacy `deleteUserStory`, `backlog/main.coffee:662`). The blocking
+   * confirmation is owned by the caller (BacklogApp) — this performs the write.
+   */
+  deleteUserStory(us: UserStory): Promise<void>;
+  /**
+   * Move a story to the TOP of the backlog (⋮ options "Move to top"). Reuses the
+   * bulk backlog-order move (legacy `moveUsToTopOfBacklog` -> `moveUs`,
+   * `backlog/main.coffee:511-517`).
+   */
+  moveUsToTop(us: UserStory): Promise<void>;
+  // --- add user story (finding #16) ---
+  /**
+   * Create a SINGLE user story from the backlog "+ Add" toolbar button or the
+   * empty-state "Create your first user story" button. POSTs
+   * `{ project, subject, status }` with `status = project.default_us_status`
+   * (legacy `addNewUs('standard')` -> generic form -> `POST /userstories`,
+   * `backlog/main.coffee:683-691`), then reloads the backlog list + project
+   * stats so the new story appears in the backlog. A blank subject is a no-op.
+   */
+  addStoryStandard(subject: string): Promise<void>;
+  /**
+   * Bulk-create user stories from the backlog bulk-add lightbox — one subject
+   * per line. POSTs the raw multiline text to `bulk_create` with
+   * `status = project.default_us_status` (legacy `addNewUs('bulk')` ->
+   * `POST /userstories/bulk_create`, `backlog/main.coffee:683-691`), then reloads
+   * the backlog list + project stats. Blank text is a no-op.
+   */
+  addStoryBulk(bulkText: string): Promise<void>;
   // --- filters & view toggles ---
   setFilter(next: Partial<BacklogFilters>): void;
   toggleShowTags(): void;
@@ -217,12 +337,31 @@ export interface BacklogActions {
   toggleSprintFold(sprintId: number): void;
   toggleActiveFilters(): void;
   toggleVelocityForecasting(): void;
+  /**
+   * Set the "view points per Role" header selection (`null` = All roles / totals;
+   * a role id = that role's per-role label). Legacy `uspoints:select` /
+   * `uspoints:clear-selection` (`backlog/main.coffee:995-1021`).
+   */
+  setPointsViewRole(roleId: number | null): void;
 }
 
 /** Return shape of {@link useBacklog}. */
 export interface UseBacklogResult {
   state: BacklogState;
   actions: BacklogActions;
+  /**
+   * BL-11: raw `filters_data` response used to build the Backlog filter sidebar
+   * (all categories, per-option counts, and the Unassigned / Not-in-an-epic
+   * pseudo-options). `null` until the first fetch resolves.
+   */
+  filtersData: FiltersDataResponse | null;
+  /**
+   * A failed optimistic move WRITE (drag `bulkUpdateBacklogOrder` - BL-1 - or
+   * toolbar `bulkUpdateMilestone` - BL-2), AFTER the board has been rolled back;
+   * `null` when clear. Mirrors the Kanban hook's `writeError`. `BacklogApp`
+   * renders the "changes were not saved" alert when this is non-null.
+   */
+  writeError: Error | null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -235,8 +374,17 @@ export interface UseBacklogResult {
  */
 export function useBacklog(params: UseBacklogParams): UseBacklogResult {
   // The pure reducer holds ALL board state; `createInitialState()` is the
-  // canonical factory (NOT `initialBacklogState()`).
-  const [state, dispatch] = useReducer(backlogReducer, createInitialState());
+  // canonical factory (NOT `initialBacklogState()`). A lazy initializer overlays
+  // the filter model restored from the URL / `localStorage` (see
+  // `hydrateInitialFilters`) so the FIRST `loadBacklog` already issues the
+  // restored, filtered query -- reproducing `applyStoredFilters` running before
+  // `loadInitialData` on the AngularJS side.
+  const [state, dispatch] = useReducer(backlogReducer, undefined, () => {
+    const base = createInitialState();
+    const hydrated = hydrateInitialFilters(params.projectSlug);
+    base.filters = { ...base.filters, selected: hydrated.selected, query: hydrated.query };
+    return base;
+  });
 
   // Async callbacks must read the LATEST state, not a stale render closure.
   // `stateRef` is re-synced after every render; async actions read
@@ -252,6 +400,30 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
   // resolved (a ref change alone would not trigger the effect).
   const projectIdRef = useRef<number | null>(params.projectId ?? null);
   const [resolvedProjectId, setResolvedProjectId] = useState<number | null>(params.projectId ?? null);
+
+  // BL-11: the `filters_data` response (GET /userstories/filters_data), the
+  // authoritative source for the Backlog filter sidebar's categories and
+  // per-option story counts (`generateFilters` <- `rs.userstories.filtersData`,
+  // main.coffee). Backlog shows ALL categories (no `excludeFilters`). Held as
+  // hook state (not reducer state) so the sidebar rebuilds as counts change,
+  // mirroring the sibling Kanban hook.
+  const [filtersData, setFiltersData] = useState<FiltersDataResponse | null>(null);
+
+  /* --------------- optimistic-move rollback + save-failure (QA BL-1/BL-2) --------------- */
+
+  // `writeError` mirrors the Kanban hook's `writeError` (useKanbanBoard.ts): a
+  // failed optimistic move WRITE - the drag `bulkUpdateBacklogOrder` (BL-1) or
+  // the toolbar `bulkUpdateMilestone` (BL-2) - sets it AFTER the board has been
+  // rolled back, so `BacklogApp` can render the "changes were not saved" alert.
+  // `null` when clear. It is kept OUT of the reducer state (as in Kanban) so it
+  // is never captured in a rollback snapshot.
+  const [writeError, setWriteError] = useState<Error | null>(null);
+
+  // Pre-drag snapshot captured by `applyDrag` BEFORE its optimistic dispatch, so
+  // the paired `onDragError` can restore it if the drag write rejects. A single
+  // ref suffices because the drag-end handler serializes drops (each `run()`
+  // settles before the next), so at most one drag's snapshot is ever pending.
+  const dragSnapshotRef = useRef<BacklogState | null>(null);
 
   /* ---------------------------- data loading ---------------------------- */
 
@@ -405,6 +577,31 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
   }, [loadUserstories]);
 
   /**
+   * `generateFilters` data source (main.coffee): fetches
+   * `GET /userstories/filters_data?project={id}` (PROJECT-WIDE — no `milestone`,
+   * so the sidebar reflects the whole backlog) and stores the response so the
+   * consumer can build the filter sidebar with real per-option counts and the
+   * server-provided Unassigned / Not-in-an-epic pseudo-options (BL-11).
+   *
+   * NON-FATAL (see the sibling Kanban hook): the sidebar is a presentational
+   * enhancement; a `filters_data` failure must never blank the backlog or escape
+   * as an uncaught rejection, so the error is swallowed after leaving the
+   * last-known-good `filtersData` in place.
+   */
+  const loadFiltersData = useCallback(async (): Promise<void> => {
+    const pid = projectIdRef.current;
+    if (pid == null) {
+      return;
+    }
+    try {
+      const data = await userstories.filtersData(pid);
+      setFiltersData(data);
+    } catch {
+      // Non-fatal (see doc comment): keep the prior sidebar rather than crash.
+    }
+  }, []);
+
+  /**
    * Reproduces `loadBacklog` (main.coffee:410-415): parallel load of project
    * stats, sprints, and the first user-story page. The source calls
    * `loadUserstories()` without reset, but this is the first load (page already
@@ -414,10 +611,18 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
    * producer) and only affects the velocity-forecast view - hidden while
    * `displayVelocity` is false (the default) - so the recompute is intentionally
    * omitted to stay within the reducer's action surface.
+   *
+   * BL-11: also loads the filter sidebar data (`generateFilters`, main.coffee)
+   * so the `#backlog-filter` sidebar is populated on the initial backlog load.
    */
   const loadBacklog = useCallback(async (): Promise<void> => {
-    await Promise.all([loadProjectStats(), loadSprints(), loadUserstories(true)]);
-  }, [loadProjectStats, loadSprints, loadUserstories]);
+    await Promise.all([
+      loadProjectStats(),
+      loadSprints(),
+      loadUserstories(true),
+      loadFiltersData(),
+    ]);
+  }, [loadProjectStats, loadSprints, loadUserstories, loadFiltersData]);
 
 
   /* ------------------------- drag move & reconcile ------------------------- */
@@ -436,7 +641,41 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
    * is intentionally ignored on this path (the dnd handler computes its own).
    */
   const applyDrag = useCallback((result: BacklogDragResult): void => {
+    // BL-1 rollback prep: snapshot the pre-move state BEFORE the optimistic
+    // dispatch so the paired `onDragError` can restore it if the write rejects.
+    // The ref read is synchronous and reflects the latest committed state.
+    // Clearing any stale write error mirrors Kanban's `setWriteError(null)` on a
+    // fresh move.
+    dragSnapshotRef.current = stateRef.current;
+    setWriteError(null);
     dispatch({ type: 'APPLY_DRAG', result });
+  }, []);
+
+  /**
+   * Failure callback for the DRAG path (QA BL-1), wired by `../BacklogApp.tsx`
+   * into the shared drag-end handler's `onMoveError`. When
+   * `bulkUpdateBacklogOrder` rejects, restore the exact pre-move snapshot
+   * captured by `applyDrag` (undoing the optimistic reorder so the board
+   * reconverges with the unchanged server state) and surface the error so the
+   * "changes were not saved" alert renders. Never throws - the handler invokes
+   * it fire-and-forget.
+   */
+  const onDragError = useCallback((err: unknown): void => {
+    const snapshot = dragSnapshotRef.current;
+    if (snapshot) {
+      dispatch({ type: 'RESTORE_STATE', state: snapshot });
+      dragSnapshotRef.current = null;
+    }
+    setWriteError(err instanceof Error ? err : new Error(String(err)));
+  }, []);
+
+  /**
+   * Clears the save-failure surface (BL-1/BL-2). Exposed so `BacklogApp` can
+   * dismiss the alert; the surface is ALSO cleared automatically at the start of
+   * the next optimistic move (`applyDrag`).
+   */
+  const clearWriteError = useCallback((): void => {
+    setWriteError(null);
   }, []);
 
   /**
@@ -623,6 +862,163 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
   );
 
 
+  /* --------------------------- inline row controls (finding #12) --------------------------- */
+
+  /**
+   * Change a story's status inline. Reproduces the `tgUsStatus` widget's save
+   * path (`common/popovers.coffee:59-67`): set `us.status`, `$repo.save(us)`
+   * (PATCH `{ status, version }`), then run the `on-update` callback which for
+   * the backlog is `updateUserStoryStatus` (`main.coffee:646-651`) — regenerate
+   * filters + reload project stats. The server returns the updated story (new
+   * version, recomputed fields); we swap it into the list via `UPDATE_US`.
+   */
+  const changeUsStatus = useCallback(
+    async (us: UserStory, statusId: number): Promise<void> => {
+      const version = (us as Record<string, unknown>).version;
+      const updated = await userstories.save(us.id, { status: statusId, version });
+      dispatch({ type: 'UPDATE_US', us: updated as unknown as UserStory });
+      // updateUserStoryStatus: refresh the sidebar counts + the project stats.
+      await Promise.all([loadProjectStats(), loadFiltersData()]);
+    },
+    [loadProjectStats, loadFiltersData],
+  );
+
+  /**
+   * Set a story's per-role points inline. Reproduces the estimation service's
+   * point-selection save (`estimation.coffee:198-213` + `154-166`): clone
+   * `us.points`, assign `points[roleId] = pointId`, `$repo.save(@us)` (PATCH
+   * `{ points, version }`), then reload project stats on success
+   * (`main.coffee:1100`). The server recomputes `total_points`; we swap the
+   * returned story into the list.
+   */
+  const changeUsPoints = useCallback(
+    async (us: UserStory, roleId: number, pointId: number): Promise<void> => {
+      const prior = (us as Record<string, unknown>).points;
+      const points: Record<string, number> =
+        prior && typeof prior === 'object'
+          ? { ...(prior as Record<string, number>) }
+          : {};
+      points[String(roleId)] = pointId;
+      const version = (us as Record<string, unknown>).version;
+      const updated = await userstories.save(us.id, { points, version });
+      dispatch({ type: 'UPDATE_US', us: updated as unknown as UserStory });
+      await loadProjectStats();
+    },
+    [loadProjectStats],
+  );
+
+  /**
+   * Delete a story inline (the actual write; the caller owns the confirm dialog).
+   * Reproduces `deleteUserStory`'s server call + on-success reloads
+   * (`main.coffee:662-676`): optimistically drop the row (`REMOVE_US`, mirroring
+   * `@scope.userstories = _.without(...)`), DELETE the story, then reload project
+   * stats + sprints + the backlog list (which rebuilds `first_us_in_backlog`,
+   * i.e. `resetFirstStoryIndicator`).
+   */
+  const deleteUserStoryAction = useCallback(
+    async (us: UserStory): Promise<void> => {
+      dispatch({ type: 'REMOVE_US', usId: us.id });
+      await userstories.deleteUserStory(us.id);
+      await Promise.all([loadProjectStats(), loadSprints(), loadUserstories(true)]);
+    },
+    [loadProjectStats, loadSprints, loadUserstories],
+  );
+
+  /**
+   * Move a story to the TOP of the backlog. Reproduces `moveUsToTopOfBacklog` ->
+   * `moveUs("sprint:us:move", [us], 0, null, null, nextUs)` where
+   * `nextUs = userstories[0].id` (`main.coffee:511-517`): the frozen
+   * `bulk_update_backlog_order` endpoint is called with `before_userstory_id`
+   * set to the current first story so the moved story is inserted BEFORE it. The
+   * story stays in the backlog (milestone omitted). Re-query the list to pick up
+   * the server-assigned `backlog_order`.
+   */
+  const moveUsToTop = useCallback(
+    async (us: UserStory): Promise<void> => {
+      const pid = projectIdRef.current;
+      const list = stateRef.current.userstories;
+      if (pid == null || list.length === 0) {
+        return;
+      }
+      const firstId = list[0].id;
+      if (firstId === us.id) {
+        return; // already at the top -> no-op (matches "nextUs === self")
+      }
+      await userstories.bulkUpdateBacklogOrder(pid, null, null, firstId, [us.id]);
+      await loadUserstories(true);
+    },
+    [loadUserstories],
+  );
+
+  /* ------------------------------ add user story ------------------------------ */
+
+  /**
+   * Resolve the status id assigned to newly-created backlog stories: the
+   * project's `default_us_status` (legacy new stories inherit the project
+   * default), falling back to the first configured status if the field is unset.
+   * Reads `stateRef` so the value is current inside async create actions.
+   */
+  const resolveDefaultUsStatus = useCallback((): number | null => {
+    const project = stateRef.current.project as Record<string, unknown> | null;
+    if (project == null) {
+      return null;
+    }
+    const dflt = project['default_us_status'];
+    if (typeof dflt === 'number') {
+      return dflt;
+    }
+    const list = project['us_statuses'];
+    if (
+      Array.isArray(list) &&
+      list.length > 0 &&
+      typeof (list[0] as Record<string, unknown>).id === 'number'
+    ) {
+      return (list[0] as Record<string, unknown>).id as number;
+    }
+    return null;
+  }, []);
+
+  const addStoryStandard = useCallback(
+    async (subject: string): Promise<void> => {
+      const pid = projectIdRef.current;
+      const statusId = resolveDefaultUsStatus();
+      const trimmed = subject.trim();
+      if (pid == null || statusId == null || trimmed.length === 0) {
+        return;
+      }
+      await userstories.createUserStory(pid, statusId, trimmed);
+      // On-success reload (legacy `usform:new:success` -> reload backlog + stats):
+      // resets pagination so the newly-created story is included in the list.
+      await Promise.all([loadUserstories(true), loadProjectStats()]);
+    },
+    [resolveDefaultUsStatus, loadUserstories, loadProjectStats],
+  );
+
+  const addStoryBulk = useCallback(
+    async (bulkText: string): Promise<void> => {
+      const pid = projectIdRef.current;
+      const statusId = resolveDefaultUsStatus();
+      const trimmed = bulkText.trim();
+      if (pid == null || statusId == null || trimmed.length === 0) {
+        return;
+      }
+      await userstories.bulkCreate(pid, statusId, trimmed, null);
+      await Promise.all([loadUserstories(true), loadProjectStats()]);
+    },
+    [resolveDefaultUsStatus, loadUserstories, loadProjectStats],
+  );
+
+  /**
+   * Set the "view points per Role" header selection (`null` = All roles / totals;
+   * a role id selects that role). Dispatch-only reducer flag consumed by every
+   * row's points widget (legacy `uspoints:select` / `uspoints:clear-selection`
+   * broadcast, `main.coffee:995-1021`).
+   */
+  const setPointsViewRole = useCallback((roleId: number | null): void => {
+    dispatch({ type: 'SET_POINTS_VIEW_ROLE', roleId });
+  }, []);
+
+
   /* --------------------------- filters & view toggles --------------------------- */
 
   /**
@@ -647,8 +1043,11 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
         filters: { ...stateRef.current.filters, ...next },
       };
       void loadUserstories(true);
+      // BL-11: refresh the sidebar counts so they track the applied query
+      // (generateFilters re-runs after a filter change on the coffee side).
+      void loadFiltersData();
     },
-    [loadUserstories],
+    [loadUserstories, loadFiltersData],
   );
 
   /**
@@ -674,10 +1073,22 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
   const toggleClosedSprints = useCallback(async (): Promise<void> => {
     const willBeVisible = !stateRef.current.closedSprintsVisible;
     dispatch({ type: 'TOGGLE_CLOSED_SPRINTS_VISIBLE' });
-    if (willBeVisible && stateRef.current.closedSprints.length === 0) {
+    if (willBeVisible) {
+      // Showing: (re)load the closed sprints from the API. Legacy
+      // `loadClosedSprints` (main.coffee:281-296) fires on every "show" click via
+      // the `backlog:load-closed-sprints` broadcast (sprints.coffee:145-146), so we
+      // reload each time the section becomes visible.
       await loadClosedSprints();
+    } else {
+      // Hiding: clear the loaded closed sprints. Legacy `unloadClosedSprints`
+      // (main.coffee:276-279) sets `closedSprints = []` via the
+      // `backlog:unload-closed-sprints` broadcast (sprints.coffee:143-144) so the
+      // ng-repeat renders nothing. This is the finding #15 fix — hide must actually
+      // hide (previously the flag flipped but the loaded array was never cleared and
+      // `SprintList` rendered it unconditionally, so closed sprints stayed visible).
+      unloadClosedSprints();
     }
-  }, [loadClosedSprints]);
+  }, [loadClosedSprints, unloadClosedSprints]);
 
   /** Sets the multi-select set (reproduces the checkbox selection, main.coffee:822-831). */
   const setSelectedIds = useCallback((ids: number[]): void => {
@@ -698,10 +1109,10 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
    * Toggles velocity forecasting (reproduces `toggleVelocityForecasting`,
    * main.coffee:244-254): the reducer flips `displayVelocity` and recomputes
    * `visibleUserStories` from `userstories` (off) or `forecastedStories` (on).
-   * The velocity accumulation math (`calculateForecasting`, main.coffee:444-467)
-   * populates `forecastedStories` via the reducer's non-dispatched
-   * `setForecastedStories` producer (no action in the reducer union), so it is
-   * not driven from here; the toggle itself is fully reproduced.
+   * On toggle-ON the reducer's `TOGGLE_VELOCITY` handler runs the velocity
+   * accumulation math (`calculateForecasting`, main.coffee:444-467) itself, so
+   * `forecastedStories` / `forecastNewSprint` are refreshed fresh from current
+   * stats/sprints/userstories — dispatching the action is all that is needed.
    */
   const toggleVelocityForecasting = useCallback((): void => {
     dispatch({ type: 'TOGGLE_VELOCITY' });
@@ -818,6 +1229,8 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       loadUserstories,
       loadMoreUserstories,
       applyDrag,
+      onDragError,
+      clearWriteError,
       reconcileAfterMove,
       moveToCurrentSprint,
       moveToLatestSprint,
@@ -825,6 +1238,12 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       closeSprintForm,
       submitSprintForm,
       removeSprint,
+      changeUsStatus,
+      changeUsPoints,
+      deleteUserStory: deleteUserStoryAction,
+      moveUsToTop,
+      addStoryStandard,
+      addStoryBulk,
       setFilter,
       toggleShowTags,
       toggleClosedSprints,
@@ -832,6 +1251,7 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       toggleSprintFold,
       toggleActiveFilters,
       toggleVelocityForecasting,
+      setPointsViewRole,
     }),
     [
       loadBacklog,
@@ -842,6 +1262,8 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       loadUserstories,
       loadMoreUserstories,
       applyDrag,
+      onDragError,
+      clearWriteError,
       reconcileAfterMove,
       moveToCurrentSprint,
       moveToLatestSprint,
@@ -849,6 +1271,12 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       closeSprintForm,
       submitSprintForm,
       removeSprint,
+      changeUsStatus,
+      changeUsPoints,
+      deleteUserStoryAction,
+      moveUsToTop,
+      addStoryStandard,
+      addStoryBulk,
       setFilter,
       toggleShowTags,
       toggleClosedSprints,
@@ -856,9 +1284,13 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
       toggleSprintFold,
       toggleActiveFilters,
       toggleVelocityForecasting,
+      setPointsViewRole,
     ],
   );
 
-  return useMemo<UseBacklogResult>(() => ({ state, actions }), [state, actions]);
+  return useMemo<UseBacklogResult>(
+    () => ({ state, actions, filtersData, writeError }),
+    [state, actions, filtersData, writeError],
+  );
 }
 

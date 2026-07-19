@@ -61,7 +61,8 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import type { MouseEvent as ReactMouseEvent } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import { createPortal } from 'react-dom';
 import moment from 'moment';
 
 import { useSortableCard } from '../../shared/dnd/sortable';
@@ -218,6 +219,89 @@ const Svg = ({
 );
 
 /* ------------------------------------------------------------------------- *
+ * CardSlideshow — attachment image carousel (finding #10)
+ * ------------------------------------------------------------------------- *
+ * Reproduces the AngularJS `tg-card-slideshow` component
+ * (`app/modules/components/card-slideshow/*`), replacing the previously-inert
+ * `<tg-card-slideshow/>` host. Behaviour parity with `CardSlideshowController`:
+ *   - `index` starts at 0;
+ *   - `next()`     : index++, wrapping to 0 once it passes the last image;
+ *   - `previous()` : index--, wrapping to the last image below 0;
+ *   - the prev/next arrows render ONLY when there is more than one image
+ *     (`ng-if="vm.images.size > 1"`);
+ *   - only the image at the current index is shown
+ *     (`ng-if="$index == vm.index"`).
+ * DOM parity with `card-slideshow.jade`: the `<tg-card-slideshow>` host wraps
+ * `.card-slideshow` > (`.slideshow-icon.slideshow-left/right` + a
+ * `.card-slideshow-wrapper` holding the `<img>`), so the existing
+ * `app/modules/components/card/card.scss` `.card-slideshow*` rules apply
+ * unchanged. The arrow SVG markup matches the local `Svg` helper but carries the
+ * icon classes + click handler on the `<tg-svg>` wrapper exactly as the legacy
+ * `tg-svg.slideshow-icon.slideshow-left(ng-click="vm.previous()")` did.
+ *
+ * This is a LATENT fix: no seeded story currently has image attachments, so the
+ * carousel is not user-visible today, but it now functions the moment a story
+ * gains one (finding #10). Rendering is gated by the caller on `slidesVisible`
+ * (zoom `attachments` + at least one image) AND the `view_tasks` permission.
+ */
+interface SlideshowImage {
+  thumbnail_card_url?: string | null;
+  [k: string]: unknown;
+}
+
+const CardSlideshow = ({ images }: { images: SlideshowImage[] }): JSX.Element | null => {
+  const size = images.length;
+  const [index, setIndex] = useState(0);
+  // Keep the index in range if the image set shrinks (e.g. an attachment is
+  // removed via a WS update) so we never point past the end.
+  useEffect(() => {
+    if (index > size - 1) {
+      setIndex(0);
+    }
+  }, [size, index]);
+
+  if (size === 0) {
+    return null;
+  }
+
+  const previous = (): void => setIndex((i) => (i - 1 < 0 ? size - 1 : i - 1));
+  const next = (): void => setIndex((i) => (i + 1 >= size ? 0 : i + 1));
+  const safeIndex = index > size - 1 ? 0 : index;
+  const current = images[safeIndex];
+  const src = current && current.thumbnail_card_url ? String(current.thumbnail_card_url) : '';
+
+  return (
+    <TgCardSlideshow>
+      <div className="card-slideshow">
+        {size > 1 ? (
+          <>
+            <TgSvg class="slideshow-icon slideshow-left" onClick={previous}>
+              <svg className="icon icon-arrow-left">
+                <use
+                  xlinkHref="#icon-arrow-left"
+                  {...({ 'attr-href': '#icon-arrow-left' } as Record<string, unknown>)}
+                />
+              </svg>
+            </TgSvg>
+            <TgSvg class="slideshow-icon slideshow-right" onClick={next}>
+              <svg className="icon icon-arrow-right">
+                <use
+                  xlinkHref="#icon-arrow-right"
+                  {...({ 'attr-href': '#icon-arrow-right' } as Record<string, unknown>)}
+                />
+              </svg>
+            </TgSvg>
+          </>
+        ) : null}
+        <div className="card-slideshow-wrapper">
+          <img src={src} alt="" />
+        </div>
+      </div>
+    </TgCardSlideshow>
+  );
+};
+
+/* ------------------------------------------------------------------------- *
  * getAvatar — reproduces `avatarService.getAvatar(user, 'avatar')`
  * ------------------------------------------------------------------------- *
  * Every field is read defensively off the opaque `User` (all card-relevant user
@@ -343,12 +427,25 @@ export interface CardProps {
  * CardActionsPopover — reproduces `tgCardActions` (main.coffee:1018) + card-actions.jade
  * ------------------------------------------------------------------------- *
  * The legacy directive rendered `.card-actions > button.js-popup-button` and, on
- * click, opened `taiga.globalPopover(...)` with a gated action list, adding the
- * `popover-open` class to the button while open. Here the popover is a small
- * React-controlled menu rendered inside `.card-actions`; it closes on outside
- * pointer-down or Escape. The action gating (EDIT/ASSIGN_TO when `canModify`,
- * DELETE when `canDelete`, MOVE_TO_TOP when `canModify && !isFirst`) is applied
- * by the caller, which passes the already-filtered `actions` list.
+ * click, opened `taiga.globalPopover(event.currentTarget, actions, ...)`
+ * (`popovers.coffee:256`), which BUILDS a `<div class="popover global-popover">`,
+ * APPENDS it to `document.body`, positions it under/right-aligned to the trigger
+ * (`elementPosition`: top = rect.bottom, left = rect.right - width, width = 170)
+ * and reveals it by adding the `active` class (`$(wrapper).popover().open()` ->
+ * `addClass('active')` at `popovers.coffee:229`, whose jQuery `fadeIn` sets an
+ * inline `display`). Each entry is a `<li><button><tg-svg .../>text</button></li>`.
+ *
+ * This REPRODUCES that DOM exactly: a body-portaled `div.popover.global-popover
+ * .active` (matching the E2E `openCardAction` selector and the compiled
+ * `popover.scss`/`global-popover` styling), positioned from the trigger's rect in
+ * page coordinates (the sibling `DatePicker` portal uses the identical rect +
+ * scroll-offset convention), with an inline `display: block` because the shared
+ * `popover` mixin defaults to `display: none` and provides no `.active { display }`
+ * reveal rule (the legacy reveal was the jQuery `fadeIn`, reproduced here as the
+ * inline style). The `popover-open` class is added to the trigger while open,
+ * exactly as the directive did. The action gating (EDIT/ASSIGN_TO when
+ * `canModify`, DELETE when `canDelete`, MOVE_TO_TOP when `canModify && !isFirst`)
+ * is applied by the caller, which passes the already-filtered `actions` list.
  */
 interface CardAction {
   key: string;
@@ -357,20 +454,54 @@ interface CardAction {
   run: () => void;
 }
 
+/** Right-aligned-under-the-trigger placement, in page coordinates. Mirrors
+ * `globalPopover.elementPosition` (`popovers.coffee`): the 170px-wide menu hangs
+ * from the trigger's bottom edge, right-aligned to the trigger's right edge. */
+const GLOBAL_POPOVER_WIDTH = 170;
+
+interface PopoverPosition {
+  top: number;
+  left: number;
+}
+
 const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [position, setPosition] = useState<PopoverPosition>({ top: 0, left: 0 });
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+
+  // `elementPosition` (globalPopover): compute from the trigger's rect. Viewport
+  // rect + scroll offset == page coordinates for the body-portaled menu.
+  const computePosition = (): PopoverPosition => {
+    const trigger = buttonRef.current;
+    if (!trigger) {
+      return { top: 0, left: 0 };
+    }
+    const rect = trigger.getBoundingClientRect();
+    const scrollX = window.pageXOffset || document.documentElement.scrollLeft;
+    const scrollY = window.pageYOffset || document.documentElement.scrollTop;
+    return {
+      top: rect.bottom + scrollY,
+      left: rect.right - GLOBAL_POPOVER_WIDTH + scrollX,
+    };
+  };
 
   // Close on outside pointer-down or Escape while the menu is open (reproduces
-  // the dismiss behaviour of the global popover). Listeners are attached in the
+  // the dismiss behaviour of the global popover, which also closes on `scroll`).
+  // The trigger AND the body-portaled popover both count as "inside" so clicking
+  // an action runs it before the menu unmounts. Listeners are attached in the
   // capture phase and torn down as soon as the menu closes / unmounts.
   useEffect(() => {
     if (!open) {
       return undefined;
     }
 
+    const isInside = (node: Node | null): boolean =>
+      !!node &&
+      ((buttonRef.current?.contains(node) ?? false) || (popoverRef.current?.contains(node) ?? false));
+
     const onPointerDown = (event: Event) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+      if (!isInside(event.target as Node)) {
         setOpen(false);
       }
     };
@@ -389,9 +520,21 @@ const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
     };
   }, [open]);
 
+  const popoverStyle: CSSProperties = {
+    // The shared `popover` mixin defaults to `display: none` with no
+    // `.active { display }` reveal; the legacy reveal was jQuery `fadeIn`. Set
+    // the inline display so `.global-popover.active` is actually visible, and
+    // pin it to the computed page coordinates (mixin sets `position: absolute`).
+    display: 'block',
+    top: position.top,
+    left: position.left,
+    width: GLOBAL_POPOVER_WIDTH,
+  };
+
   return (
-    <div className="card-actions" ref={rootRef}>
+    <div className="card-actions">
       <button
+        ref={buttonRef}
         type="button"
         className={open ? 'js-popup-button popover-open' : 'js-popup-button'}
         aria-haspopup="true"
@@ -399,34 +542,46 @@ const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
+          if (!open) {
+            setPosition(computePosition());
+          }
           setOpen((prev) => !prev);
         }}
       >
         <Svg icon="icon-more-vertical" />
       </button>
 
-      {open ? (
-        <ul className="popover card-actions-popover" role="menu">
-          {actions.map((action) => (
-            <li key={action.key} role="none">
-              <button
-                type="button"
-                role="menuitem"
-                className="popover-action"
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  action.run();
-                  setOpen(false);
-                }}
-              >
-                <Svg icon={action.icon} />
-                <span>{action.label}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      {open
+        ? createPortal(
+            <div
+              ref={popoverRef}
+              className="popover global-popover active"
+              role="menu"
+              style={popoverStyle}
+            >
+              <ul>
+                {actions.map((action) => (
+                  <li key={action.key} role="none">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        action.run();
+                        setOpen(false);
+                      }}
+                    >
+                      <Svg icon={action.icon} />
+                      {action.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 };
@@ -849,12 +1004,13 @@ const Card = ({
             ) : null}
           </div>
 
-          {/* 6. card-slideshow (tg-card-slideshow). NOTE: the attachment carousel
-              is a heavy sub-feature that is intentionally NOT reproduced beyond the
-              host-tag hook — it only appears at zoom 3 with attachments, and no
-              React slideshow component is in scope. The element is emitted so any
-              SCSS targeting it applies; its image body is deliberately empty. */}
-          {slidesVisible && canViewTasks ? <TgCardSlideshow /> : null}
+          {/* 6. card-slideshow (tg-card-slideshow) — the attachment carousel is
+              now a FUNCTIONAL React component (finding #10): prev/next cycle the
+              story's attachment thumbnails with the legacy wrap-around semantics.
+              Gated exactly as the legacy `ng-if="vm.isSlideshowVisible()"` +
+              `tg-check-permission="view_tasks"`: `slidesVisible` (zoom
+              `attachments` + ≥1 image) AND `canViewTasks`. */}
+          {slidesVisible && canViewTasks ? <CardSlideshow images={images} /> : null}
 
           {/* 7. card-tasks (card-tasks.jade): gated by view_tasks permission */}
           {canViewTasks && relatedVisible ? (

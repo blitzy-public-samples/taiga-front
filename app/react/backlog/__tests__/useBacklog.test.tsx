@@ -106,12 +106,35 @@ jest.mock('../../shared/api/userstories', () => {
   const bulkCreate = jest.fn(() => Promise.resolve({}));
   const bulkUpdateKanbanOrder = jest.fn(() => Promise.resolve({}));
   const editStatus = jest.fn(() => Promise.resolve({}));
+  // Inline row-control adapters (finding #12): `save` (PATCH), `deleteUserStory`
+  // (DELETE), and `filtersData` (GET) so the status/points/delete/filter-reload
+  // paths resolve deterministically without a real network.
+  const save = jest.fn(() => Promise.resolve({}));
+  const deleteUserStory = jest.fn(() => Promise.resolve(null));
+  const filtersData = jest.fn(() =>
+    Promise.resolve({
+      statuses: [],
+      tags: [],
+      assigned_to: [],
+      assigned_users: [],
+      owners: [],
+      epics: [],
+      roles: [],
+    }),
+  );
+  // Add-story adapter (finding #16): `createUserStory` (single POST) resolves to a
+  // created story so the create-then-reload path settles deterministically.
+  const createUserStory = jest.fn(() => Promise.resolve({ id: 900, ref: 900, subject: '' }));
   const api = {
     bulkUpdateMilestone,
     bulkUpdateBacklogOrder,
     bulkCreate,
     bulkUpdateKanbanOrder,
     editStatus,
+    save,
+    deleteUserStory,
+    filtersData,
+    createUserStory,
   };
   return { __esModule: true, ...api, userstories: api, default: api };
 });
@@ -180,6 +203,10 @@ const us = userstories as unknown as {
   bulkUpdateMilestone: jest.Mock;
   bulkUpdateBacklogOrder: jest.Mock;
   bulkCreate: jest.Mock;
+  save: jest.Mock;
+  deleteUserStory: jest.Mock;
+  filtersData: jest.Mock;
+  createUserStory: jest.Mock;
 };
 const ms = milestones as unknown as {
   list: jest.Mock;
@@ -421,6 +448,21 @@ beforeEach(() => {
 
   us.bulkUpdateMilestone.mockResolvedValue(null);
   us.bulkUpdateBacklogOrder.mockResolvedValue({ data: [] });
+  // Inline row-control adapters (finding #12): resolve by default.
+  us.save.mockResolvedValue({});
+  us.deleteUserStory.mockResolvedValue(null);
+  us.filtersData.mockResolvedValue({
+    statuses: [],
+    tags: [],
+    assigned_to: [],
+    assigned_users: [],
+    owners: [],
+    epics: [],
+    roles: [],
+  });
+  // Add-story adapters (finding #16): resolve by default.
+  us.createUserStory.mockResolvedValue({ id: 900, ref: 900, subject: '' });
+  us.bulkCreate.mockResolvedValue([]);
 
   // Fresh fake events client per test (connect/subscribe/unsubscribe/disconnect).
   mockEventsClient = {
@@ -1079,5 +1121,248 @@ describe('useBacklog - toggles, filters & selection dispatchers', () => {
       result.current.actions.unloadClosedSprints();
     });
     expect(result.current.state.closedSprints).toHaveLength(0);
+  });
+
+  it('toggleClosedSprints HIDE auto-unloads the closed sprints (no manual call) and re-SHOW re-fetches them (finding #15)', async () => {
+    const { result } = await renderReady();
+    expect(result.current.state.closedSprintsVisible).toBe(false);
+    expect(result.current.state.closedSprints).toHaveLength(0);
+
+    // First toggle -> SHOW: loads the closed sprints from the API.
+    await act(async () => {
+      await result.current.actions.toggleClosedSprints();
+    });
+    await waitFor(() => expect(result.current.state.closedSprints).toHaveLength(1));
+    expect(result.current.state.closedSprintsVisible).toBe(true);
+    expect(ms.list).toHaveBeenLastCalledWith(7, { closed: true });
+
+    const callsAfterFirstShow = ms.list.mock.calls.length;
+
+    // Second toggle -> HIDE: must auto-clear the loaded closed sprints WITHOUT any
+    // manual unloadClosedSprints() call (this is the finding #15 fix) and WITHOUT
+    // an extra API call (unload is synchronous, client-side).
+    await act(async () => {
+      await result.current.actions.toggleClosedSprints();
+    });
+    expect(result.current.state.closedSprintsVisible).toBe(false);
+    expect(result.current.state.closedSprints).toHaveLength(0);
+    expect(ms.list.mock.calls.length).toBe(callsAfterFirstShow);
+
+    // Third toggle -> SHOW again: re-fetches (legacy loadClosedSprints fires on
+    // every show), so the closed sprints reappear and ms.list is called again.
+    await act(async () => {
+      await result.current.actions.toggleClosedSprints();
+    });
+    await waitFor(() => expect(result.current.state.closedSprints).toHaveLength(1));
+    expect(result.current.state.closedSprintsVisible).toBe(true);
+    expect(ms.list.mock.calls.length).toBe(callsAfterFirstShow + 1);
+    expect(ms.list).toHaveBeenLastCalledWith(7, { closed: true });
+  });
+});
+
+/* ========================================================================== *
+ * Inline row-control actions (finding #12): changeUsStatus, changeUsPoints,
+ * deleteUserStory, moveUsToTop, setPointsViewRole. These reproduce the legacy
+ * status widget save, the per-role points save, the confirmed delete + reloads,
+ * the move-to-top bulk-order call, and the header "view per role" selection.
+ * ========================================================================== */
+
+describe('useBacklog — inline row-control actions (finding #12)', () => {
+  it('changeUsStatus PATCHes { status, version } and swaps the returned story', async () => {
+    const { result } = await renderReady();
+    expect(result.current.state.userstories.map((u) => u.id)).toContain(101);
+    const target = result.current.state.userstories.find((u) => u.id === 101)!;
+    // The server returns the updated story (new status + bumped version).
+    us.save.mockResolvedValueOnce({ ...target, status: 3, version: 5 });
+    us.filtersData.mockClear();
+
+    await act(async () => {
+      await result.current.actions.changeUsStatus(
+        { ...target, version: 4 } as unknown as never,
+        3,
+      );
+    });
+
+    // PATCH /userstories/101 with the new status + the CURRENT version
+    // (optimistic locking — the server rejects a stale/absent version).
+    expect(us.save).toHaveBeenCalledWith(101, { status: 3, version: 4 });
+    // UPDATE_US swapped the returned story into the list.
+    const row = result.current.state.userstories.find((u) => u.id === 101)!;
+    expect((row as Record<string, unknown>).status).toBe(3);
+    // updateUserStoryStatus side effect: the filter sidebar is regenerated.
+    expect(us.filtersData).toHaveBeenCalled();
+  });
+
+  it('changeUsPoints clones us.points, sets the role, and PATCHes { points, version }', async () => {
+    const { result } = await renderReady();
+    const base = result.current.state.userstories.find((u) => u.id === 101)!;
+    const target = { ...base, points: { 13: 28 }, version: 4 };
+    us.save.mockResolvedValueOnce({ ...target, total_points: 3 });
+
+    await act(async () => {
+      await result.current.actions.changeUsPoints(target as unknown as never, 15, 29);
+    });
+
+    // The prior { 13: 28 } is preserved and role 15 is set to point 29.
+    expect(us.save).toHaveBeenCalledWith(101, {
+      points: { '13': 28, '15': 29 },
+      version: 4,
+    });
+  });
+
+  it('deleteUserStory optimistically removes the row, DELETEs it, then reloads', async () => {
+    const { result } = await renderReady();
+    expect(result.current.state.userstories.map((u) => u.id)).toContain(101);
+    const target = result.current.state.userstories.find((u) => u.id === 101)!;
+    // The post-delete reload returns the list WITHOUT story 101.
+    http.getWithHeaders.mockResolvedValueOnce(usResponse([makeUs(102, { backlog_order: 1 })]));
+
+    await act(async () => {
+      await result.current.actions.deleteUserStory(target);
+    });
+
+    // DELETE /userstories/101.
+    expect(us.deleteUserStory).toHaveBeenCalledWith(101);
+    // After the reload the row is gone.
+    expect(result.current.state.userstories.map((u) => u.id)).not.toContain(101);
+  });
+
+  it('moveUsToTop calls bulk_update_backlog_order with before = the current first story', async () => {
+    const { result } = await renderReady();
+    const list = result.current.state.userstories;
+    const firstId = list[0].id;
+    const mover = list.find((u) => u.id !== firstId)!;
+    us.bulkUpdateBacklogOrder.mockClear();
+
+    await act(async () => {
+      await result.current.actions.moveUsToTop(mover);
+    });
+
+    // moveUs(...,nextUs=firstId): project, milestone=null, after=null,
+    // before=firstId, bulkStories=[mover.id].
+    expect(us.bulkUpdateBacklogOrder).toHaveBeenCalledWith(7, null, null, firstId, [mover.id]);
+  });
+
+  it('moveUsToTop is a no-op when the story is already the first', async () => {
+    const { result } = await renderReady();
+    const firstStory = result.current.state.userstories[0];
+    us.bulkUpdateBacklogOrder.mockClear();
+
+    await act(async () => {
+      await result.current.actions.moveUsToTop(firstStory);
+    });
+
+    expect(us.bulkUpdateBacklogOrder).not.toHaveBeenCalled();
+  });
+
+  it('setPointsViewRole stores the header role selection and clears it', async () => {
+    const { result } = await renderReady();
+    expect(result.current.state.pointsViewRoleId).toBeNull();
+    act(() => {
+      result.current.actions.setPointsViewRole(15);
+    });
+    expect(result.current.state.pointsViewRoleId).toBe(15);
+    act(() => {
+      result.current.actions.setPointsViewRole(null);
+    });
+    expect(result.current.state.pointsViewRoleId).toBeNull();
+  });
+});
+
+/* ==========================================================================
+ * Add-user-story actions (finding #16): addStoryStandard, addStoryBulk.
+ * The backlog "+ Add" / bulk / empty-state buttons create stories through the
+ * frozen `/userstories` (single) and `/userstories/bulk_create` (bulk)
+ * endpoints, assigning the project's `default_us_status`, then reload the
+ * backlog list + project stats so the new stories appear.
+ * ========================================================================== */
+
+describe('useBacklog — add-user-story actions (finding #16)', () => {
+  // Resolve the FULL project (with default_us_status) via the by_slug path so
+  // `resolveDefaultUsStatus` has a value to read (the projectId path stores only
+  // a minimal { id } record).
+  function withProject(project: Record<string, unknown>): void {
+    http.get.mockImplementation((path: string) => {
+      if (path === 'projects/by_slug') {
+        return Promise.resolve(project);
+      }
+      if (/^projects\/\d+\/stats$/.test(path)) {
+        return Promise.resolve(makeStats());
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  it('addStoryStandard POSTs a single subject at default_us_status, then reloads the backlog + stats', async () => {
+    withProject({ id: PROJECT_ID, slug: 'p', default_us_status: 13 });
+    const { result } = await renderReady({ projectSlug: 'p' });
+    us.createUserStory.mockClear();
+    const statsBefore = countGet('projects/7/stats');
+    const listBefore = http.getWithHeaders.mock.calls.filter((c: unknown[]) => c[0] === 'userstories').length;
+
+    await act(async () => {
+      await result.current.actions.addStoryStandard('  Brand new story  ');
+    });
+
+    // POST /userstories { project: 7, subject (trimmed), status: default_us_status }.
+    expect(us.createUserStory).toHaveBeenCalledWith(7, 13, 'Brand new story');
+    // On-success reload: a fresh stats GET and a fresh (reset) userstories page.
+    expect(countGet('projects/7/stats')).toBeGreaterThan(statsBefore);
+    const listAfter = http.getWithHeaders.mock.calls.filter((c: unknown[]) => c[0] === 'userstories').length;
+    expect(listAfter).toBeGreaterThan(listBefore);
+  });
+
+  it('addStoryBulk POSTs the raw multiline text at default_us_status with swimlane null', async () => {
+    withProject({ id: PROJECT_ID, slug: 'p', default_us_status: 13 });
+    const { result } = await renderReady({ projectSlug: 'p' });
+    us.bulkCreate.mockClear();
+
+    await act(async () => {
+      await result.current.actions.addStoryBulk('Story A\nStory B\nStory C');
+    });
+
+    // POST /userstories/bulk_create { status_id: default, bulk_stories: raw text }.
+    expect(us.bulkCreate).toHaveBeenCalledWith(7, 13, 'Story A\nStory B\nStory C', null);
+  });
+
+  it('addStoryStandard is a no-op for a blank subject (no POST)', async () => {
+    withProject({ id: PROJECT_ID, slug: 'p', default_us_status: 13 });
+    const { result } = await renderReady({ projectSlug: 'p' });
+    us.createUserStory.mockClear();
+
+    await act(async () => {
+      await result.current.actions.addStoryStandard('    ');
+    });
+
+    expect(us.createUserStory).not.toHaveBeenCalled();
+  });
+
+  it('addStoryBulk is a no-op for blank text (no bulk POST)', async () => {
+    withProject({ id: PROJECT_ID, slug: 'p', default_us_status: 13 });
+    const { result } = await renderReady({ projectSlug: 'p' });
+    us.bulkCreate.mockClear();
+
+    await act(async () => {
+      await result.current.actions.addStoryBulk('\n  \n');
+    });
+
+    expect(us.bulkCreate).not.toHaveBeenCalled();
+  });
+
+  it('addStoryStandard falls back to the first configured status when default_us_status is unset', async () => {
+    withProject({
+      id: PROJECT_ID,
+      slug: 'p',
+      us_statuses: [{ id: 99, name: 'Backlog' }, { id: 100, name: 'Ready' }],
+    });
+    const { result } = await renderReady({ projectSlug: 'p' });
+    us.createUserStory.mockClear();
+
+    await act(async () => {
+      await result.current.actions.addStoryStandard('Fallback story');
+    });
+
+    // No default_us_status -> first us_statuses[0].id (99).
+    expect(us.createUserStory).toHaveBeenCalledWith(7, 99, 'Fallback story');
   });
 });

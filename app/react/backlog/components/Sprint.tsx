@@ -112,6 +112,23 @@ const TgDueDate = 'tg-due-date' as unknown as any;
 interface MilestoneRowProps {
   /** The assigned user story (milestone row). */
   us: UserStory;
+  /**
+   * Id of the sprint this row belongs to. Threaded into the row's
+   * `useSortableRow` drag `data` as `sprintId` so the shared backlog drag-end
+   * handler resolves the DESTINATION sprint even when a drop lands on THIS row
+   * (a sibling) rather than the sprint's container droppable — the same reason
+   * the Kanban `Card` carries `statusId`/`swimlaneId` (Card.tsx:590). Without
+   * it, `overData` carried only `{ usId }`, `targetSprintId` resolved to
+   * `null`, and the `bulk_update_backlog_order` write omitted `milestone_id`
+   * -> backend 400 (QA BL-1).
+   */
+  sprintId: number;
+  /**
+   * Zero-based position within this sprint's ordered story list -> drag
+   * `data.oldIndex` (source index for the handler's same-container no-op guard,
+   * `backlog/sortable.coffee:120-121`).
+   */
+  index: number;
   /** `modify_us` permission -> row `readonly` class (and enables row dragging). */
   canModifyUs: boolean;
   /** Pre-resolved user-story detail URL for the row anchor. */
@@ -128,14 +145,28 @@ interface MilestoneRowProps {
  * grip: the WHOLE row is the drag handle (`sortable.coffee:43-47`), so both
  * `attributes` and `listeners` are spread onto the row element itself.
  */
-function MilestoneRow({ us, canModifyUs, detailUrl }: MilestoneRowProps) {
+function MilestoneRow({ us, sprintId, index, canModifyUs, detailUrl }: MilestoneRowProps) {
   // Whole-row drag: `setNodeRef`/`style` mark the sortable node and `attributes`/
   // `listeners` are spread onto the same row element (no `.draggable-us-row`
   // grip). `className` carries `gu-transit` while the row is being dragged so the
-  // existing placeholder SCSS applies. `data` carries the moved id for the shared
-  // drag-end handler (`event.active.data.current.usId`).
+  // existing placeholder SCSS applies. `data` carries the FULL container identity
+  // (not just `usId`): the shared drag-end handler reads it off BOTH `event.active`
+  // AND `event.over` (when a drop lands on this row instead of the sprint's
+  // container droppable), so `sprintId`/`isBacklog` here are what let a within-sprint
+  // reorder that drops onto a sibling STORY still resolve `targetSprintId` (from
+  // `overData['sprintId']`) -> `milestone_id` is included in
+  // `bulk_update_backlog_order` and the backend returns 200 (BL-1), rather than
+  // collapsing to the backlog. `oldIndex` is the source index for the
+  // same-container no-op guard. Mirrors the Kanban `Card` (Card.tsx:590).
   const { setNodeRef, attributes, listeners, style, className: dndClassName } =
-    useSortableRow(us.id, { usId: us.id });
+    useSortableRow(
+      us.id,
+      { usId: us.id, sprintId, isBacklog: false, oldIndex: index },
+      // BL-3: gate dragging by `modify_us` (mirrors `BacklogTable.tsx` and the
+      // Angular `sortable.coffee:29-31` permission gate), so a readonly user can
+      // NEVER initiate a drag or fire `bulk_update_backlog_order`.
+      { disabled: !canModifyUs },
+    );
 
   // Field coercion: `UserStory` types only a handful of fields explicitly;
   // everything else arrives through the reducer's `[key: string]: unknown` index
@@ -300,7 +331,11 @@ export function Sprint(props: SprintProps) {
   // target (see shared/dnd/types `BacklogDragResult`).
   const { setNodeRef: setDroppableRef } = useDroppable({
     id: `sprint-${sprint.id}`,
-    data: { sprintId: sprint.id, isBacklog: false },
+    // `orderedIds` lets the drag-end handler compute adjacency when a drop lands
+    // on the sprint's EMPTY SPACE (the container itself) rather than a sibling
+    // row — the moved story is then appended after the existing rows, matching
+    // dragula dropping into empty container space (backlog/sortable.coffee).
+    data: { sprintId: sprint.id, isBacklog: false, orderedIds: itemIds },
   });
 
   // `.sprint-table` class list: base `sprint-table`, plus `sprint-empty-wrapper`
@@ -367,10 +402,12 @@ export function Sprint(props: SprintProps) {
               </span>
             </div>
           ) : (
-            userStories.map((us) => (
+            userStories.map((us, index) => (
               <MilestoneRow
                 key={us.id}
                 us={us}
+                sprintId={sprint.id}
+                index={index}
                 canModifyUs={canModifyUs}
                 detailUrl={buildUserStoryUrl(us)}
               />

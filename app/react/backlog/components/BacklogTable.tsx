@@ -58,10 +58,11 @@
  * NOT imported as a value; `useRef` is the only value import.
  */
 
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, MouseEvent, UIEvent } from 'react';
 import type { UserStory } from '../state/backlogReducer';
-import { UserStoryRow } from './UserStoryRow';
+import { UserStoryRow, type RowStatusOption } from './UserStoryRow';
+import type { EstimationPoint, EstimationRole } from '../../shared/estimation';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useDroppable } from '@dnd-kit/core';
 
@@ -170,6 +171,34 @@ export interface BacklogTableProps {
   onRolePointsFilterClick?: (
     event?: MouseEvent<HTMLElement> | KeyboardEvent<HTMLElement>,
   ) => void;
+
+  /* ------------------- inline controls (finding #12) ------------------- */
+  /** All project user-story statuses -> each row's inline status dropdown. */
+  statuses?: RowStatusOption[];
+  /** Project estimation points -> each row's inline points editor. */
+  points?: EstimationPoint[];
+  /** Project roles -> each row's points editor + the header role-view popover. */
+  roles?: EstimationRole[];
+  /** Current "view points per Role" selection (`null` = totals). */
+  pointsViewRoleId?: number | null;
+  /** `delete_us` permission -> gates each row's ⋮ "Delete" item. */
+  canDeleteUs?: boolean;
+  /** Row status selected -> PATCH status (owned by BacklogApp). */
+  onChangeStatus?: (us: UserStory, statusId: number) => void;
+  /** Row per-role point selected -> PATCH points (owned by BacklogApp). */
+  onChangePoints?: (us: UserStory, roleId: number, pointId: number) => void;
+  /** Row ⋮ "Edit" -> open/navigate to the story editor. */
+  onEditStory?: (us: UserStory) => void;
+  /** Row ⋮ "Delete" -> confirm + delete. */
+  onDeleteStory?: (us: UserStory) => void;
+  /** Row ⋮ "Move to top" -> bulk backlog-order move. */
+  onMoveToTop?: (us: UserStory) => void;
+  /**
+   * Header "view points per Role" selection changed (`null` = All roles). Drives
+   * the reducer `pointsViewRoleId`; reproduces the legacy `uspoints:select` /
+   * `uspoints:clear-selection` broadcast the header directive fired.
+   */
+  onSelectRoleView?: (roleId: number | null) => void;
 }
 
 /**
@@ -197,7 +226,27 @@ export function BacklogTable(props: BacklogTableProps) {
     onStatusClick,
     onOptionsClick,
     onRolePointsFilterClick,
+    statuses,
+    points,
+    roles,
+    pointsViewRoleId = null,
+    canDeleteUs = false,
+    onChangeStatus,
+    onChangePoints,
+    onEditStory,
+    onDeleteStory,
+    onMoveToTop,
+    onSelectRoleView,
   } = props;
+
+  // Local open/close state for the header "view points per Role" popover
+  // (reproduces the `UsRolePointsSelectorDirective` open/close on the header
+  // control, main.coffee:1024-1030). Only the header popover lives here; each
+  // row owns its own status/points/options popovers.
+  const [roleViewOpen, setRoleViewOpen] = useState(false);
+  // Computable roles for the header popover (the header only lists roles that
+  // participate in estimation — filter mirrors estimation.coffee:182).
+  const computableRolesForHeader = (roles ?? []).filter((r) => Boolean(r.computable));
 
   // Anchor index for an inclusive shift-range selection: the index of the last
   // row whose checkbox was toggled. Reproduces `lastChecked` (main.coffee:820-861).
@@ -296,14 +345,33 @@ export function BacklogTable(props: BacklogTableProps) {
    * scrolling on activation.
    */
   const handleRolePointsKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    if (!onRolePointsFilterClick) {
-      return;
-    }
     if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
       event.preventDefault();
-      onRolePointsFilterClick(event);
+      handleRolePointsActivate(event);
     }
   };
+
+  /**
+   * Activate the header "view points per Role" control (finding #12). Fires the
+   * legacy "activated" signal (kept for parity/telemetry) AND toggles the
+   * role-view popover when the role list + selection handler are supplied.
+   */
+  const handleRolePointsActivate = (
+    event?: MouseEvent<HTMLElement> | KeyboardEvent<HTMLElement>,
+  ) => {
+    onRolePointsFilterClick?.(event);
+    if (onSelectRoleView && computableRolesForHeader.length > 0) {
+      setRoleViewOpen((cur) => !cur);
+    }
+  };
+
+  // Header label: "Points" when no role is selected, else the selected role name
+  // (reproduces `header-points` text set by uspoints:select/clear-selection,
+  // main.coffee:1013-1020).
+  const selectedRoleName =
+    pointsViewRoleId != null
+      ? (computableRolesForHeader.find((r) => r.id === pointsViewRoleId)?.name ?? 'Points')
+      : 'Points';
 
   return (
     <>
@@ -335,13 +403,57 @@ export function BacklogTable(props: BacklogTableProps) {
               role="button"
               tabIndex={0}
               aria-haspopup="dialog"
+              aria-expanded={roleViewOpen}
               aria-label="Select view per Role"
-              onClick={onRolePointsFilterClick}
+              onClick={handleRolePointsActivate}
               onKeyDown={handleRolePointsKeyDown}
             >
-              <span className="header-points">Points</span>
+              <span className="header-points">{selectedRoleName}</span>
               <Svg icon="icon-filter" />
             </div>
+            {/* Role-view popover (`us-role-points-popover.jade` -> `.pop-role`):
+                "All roles" (clear) + one entry per computable role. Selecting an
+                entry drives the reducer `pointsViewRoleId` via `onSelectRoleView`
+                so every row's points cell switches display together. */}
+            {roleViewOpen && onSelectRoleView && (
+              <ul className="popover pop-role" style={{ display: 'block' }}>
+                <li>
+                  <a
+                    className={
+                      pointsViewRoleId == null
+                        ? 'clear-selection active-popover'
+                        : 'clear-selection'
+                    }
+                    href=""
+                    title="All roles"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setRoleViewOpen(false);
+                      onSelectRoleView(null);
+                    }}
+                  >
+                    <span className="item-text">All roles</span>
+                  </a>
+                </li>
+                {computableRolesForHeader.map((role) => (
+                  <li key={role.id}>
+                    <a
+                      className={pointsViewRoleId === role.id ? 'role active-popover' : 'role'}
+                      href=""
+                      title={role.name}
+                      data-role-id={role.id}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setRoleViewOpen(false);
+                        onSelectRoleView(role.id);
+                      }}
+                    >
+                      <span className="item-text">{role.name}</span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <div className="us-header-options" />
         </div>
@@ -369,6 +481,19 @@ export function BacklogTable(props: BacklogTableProps) {
               // when the outer handler is absent preserves the row's no-op path.
               onStatusClick={onStatusClick ? () => onStatusClick(us) : undefined}
               onOptionsClick={onOptionsClick ? () => onOptionsClick(us) : undefined}
+              // Inline controls (finding #12): pass the project reference data +
+              // the (us)-based action handlers straight through. The row owns its
+              // own popover open/close state; these handlers perform the writes.
+              statuses={statuses}
+              points={points}
+              roles={roles}
+              pointsViewRoleId={pointsViewRoleId}
+              canDelete={canDeleteUs}
+              onChangeStatus={onChangeStatus}
+              onChangePoints={onChangePoints}
+              onEditStory={onEditStory}
+              onDeleteStory={onDeleteStory}
+              onMoveToTop={onMoveToTop}
             />
           ))}
         </SortableContext>

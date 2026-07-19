@@ -177,6 +177,17 @@ export type OnKanbanMove = (result: KanbanDragResult) => void;
 /** Consumer callback: apply the optimistic immer state update in the `backlog` feature. */
 export type OnBacklogMove = (result: BacklogDragResult) => void;
 
+/**
+ * Consumer callback fired when the Backlog drag WRITE fails - i.e.
+ * `bulkUpdateBacklogOrder` rejects (4xx/5xx/offline). It lets the `backlog`
+ * feature ROLL BACK the optimistic `onMove` update and surface a save-failure
+ * notification, reproducing the Kanban rollback parity (useKanbanBoard.moveUs
+ * "F-WRITE-2") on the Backlog drag path (QA BL-1). The rejected `result` is the
+ * exact object previously passed to `onMove`, so the consumer can correlate the
+ * failure with the optimistic change it must undo.
+ */
+export type OnBacklogMoveError = (err: unknown, result: BacklogDragResult) => void;
+
 /** Dependencies injected into the Kanban drag-end handler factory in `sortable.ts`. */
 export interface KanbanDragEndDeps {
   /** Current project id (route param), forwarded to the bulk-ordering endpoint. */
@@ -197,6 +208,14 @@ export interface BacklogDragEndDeps {
   getSelectedIds?: GetSelectedIds;
   /** Optimistic state update applied in the `backlog` feature. */
   onMove: OnBacklogMove;
+  /**
+   * Optional failure callback (QA BL-1): invoked if `bulkUpdateBacklogOrder`
+   * rejects, so the consumer can roll back the optimistic `onMove` update and
+   * surface a save-failure notification (matching the Kanban drag path). When
+   * omitted, a failed write is swallowed (the pre-existing behavior) rather than
+   * escaping as an unhandled promise rejection.
+   */
+  onMoveError?: OnBacklogMoveError;
   /** Optional API override for tests; defaults to the real `api/userstories` adapter in `sortable.ts`. */
   api?: BacklogOrderApi;
 }

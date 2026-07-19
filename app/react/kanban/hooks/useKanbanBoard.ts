@@ -80,7 +80,7 @@ import {
 // Shared adapters (globals-only interop layer over the frozen /api/v1/ + WS).
 import httpClient from '../../shared/api/httpClient';
 import type { HttpError } from '../../shared/api/httpClient';
-import userstories from '../../shared/api/userstories';
+import userstories, { type FiltersDataResponse, type CreateExtra } from '../../shared/api/userstories';
 import { createEventsClient, routingKeys } from '../../shared/events/eventsClient';
 // `config` and most of `session` are read indirectly by httpClient/eventsClient
 // (Bearer token, X-Session-Id, Accept-Language, API/events URLs). The one direct
@@ -327,6 +327,12 @@ export interface UseKanbanBoardResult {
   projectId: number | null;
   usersById: Record<number, User>;
   foldedSwimlane: Record<string, boolean>;
+  /**
+   * KB-3..KB-6: raw `filters_data` response used to build the filter sidebar
+   * (categories, per-option counts, and the Unassigned / Not-in-an-epic
+   * pseudo-options). `null` until the first fetch resolves.
+   */
+  filtersData: FiltersDataResponse | null;
   // --- flags ---
   isFirstLoad: boolean;
   loading: boolean;
@@ -355,12 +361,27 @@ export interface UseKanbanBoardResult {
     position?: 'top' | 'bottom',
   ) => Promise<void>;
   /**
-   * Standard single-story create (KB-5): POST /userstories with the subject in
-   * the given column, then add the created story to the board. Resolves once the
-   * board reflects the new story; surfaces a `writeError` on failure.
+   * Standard single-story create (KB-5, expanded per finding #7): POST
+   * /userstories with the subject (and OPTIONAL core fields via `extra`:
+   * description/tags/is_blocked/blocked_note/due_date) in the given column, then
+   * add the created story to the board. Resolves once the board reflects the new
+   * story; surfaces a `writeError` on failure.
    */
-  addUsStandard: (statusId: number, subject: string, position?: 'top' | 'bottom') => Promise<void>;
+  addUsStandard: (
+    statusId: number,
+    subject: string,
+    extra?: CreateExtra,
+    position?: 'top' | 'bottom',
+  ) => Promise<void>;
   editUs: (us: UserStory) => void;
+  /**
+   * Single-story PATCH write behind the inline edit lightbox and inline assign
+   * popover (finding #8). PATCHes `/userstories/{id}` with `changed` (which MUST
+   * include the concurrency `version`), then updates the board from the
+   * server-returned model. The user stays on the board; surfaces a `writeError`
+   * on failure.
+   */
+  saveUs: (usId: number, changed: Record<string, unknown>) => Promise<void>;
   /**
    * Delete a single story (KB-4). Performs the frozen `DELETE /userstories/{id}`
    * FIRST and removes the story from the board ONLY on success (pessimistic), so
@@ -423,6 +444,13 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
   const [project, setProject] = useState<Project | null>(null);
   const [statuses, setStatuses] = useState<UsStatus[]>([]); // sorted usStatusList
   const [usersById, setUsersById] = useState<Record<number, User>>({});
+  // KB-3..KB-6: the `filters_data` response (GET /userstories/filters_data),
+  // the single authoritative source for the filter sidebar's categories,
+  // per-option story counts, and the Unassigned / Not-in-an-epic pseudo-options
+  // (main.coffee:591 `generateFilters` <- `rs.userstories.filtersData`). Held as
+  // board state so KanbanApp can rebuild the sidebar (via `buildFilterCategories`)
+  // whenever the counts change (initial load, filter reload, and post-move).
+  const [filtersData, setFiltersData] = useState<FiltersDataResponse | null>(null);
 
   // --- Coordination refs (read synchronously inside async callbacks) -------
   const projectRef = useRef<ProjectDetail | null>(null);
@@ -664,6 +692,37 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
   }, []);
 
   /**
+   * `generateFilters` data source (main.coffee:591). Fetches
+   * `GET /userstories/filters_data?project={id}` and stores the response so the
+   * consumer can build the filter sidebar with real per-option counts and the
+   * server-provided Unassigned / Not-in-an-epic pseudo-options (KB-3..KB-6).
+   *
+   * Intentionally NON-FATAL: the sidebar is a presentational enhancement layered
+   * on top of the board. A `filters_data` failure must not blank the board or
+   * escape as an uncaught rejection, so the error is swallowed after leaving the
+   * last-known-good `filtersData` in place (the board itself already surfaces
+   * genuine load failures via `loadError`).
+   */
+  const loadFiltersData = useCallback(async (): Promise<void> => {
+    const pid = projectIdRef.current;
+    if (pid == null) {
+      return;
+    }
+    try {
+      const data = await userstories.filtersData(pid);
+      setFiltersData(data);
+    } catch {
+      // Non-fatal (see doc comment): keep the prior sidebar rather than crash.
+    }
+  }, []);
+
+  // Ref mirror so the post-move tail (inside the `moveUs` callback, which is
+  // memoized on `[applyState]` only) can refresh the counts without widening its
+  // dependency array or being re-created on every `loadFiltersData` identity.
+  const loadFiltersDataRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  loadFiltersDataRef.current = loadFiltersData;
+
+  /**
    * `loadInitialData` (main.coffee:582-594) -> `loadKanban` (546-550). Loads the
    * project, reads the folded-swimlane preference, then loads the board. The WS
    * subscription is set up by the Phase-6 effect (keyed on projectId), NOT here,
@@ -711,6 +770,10 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       // foldedSwimlane from localStorage (main.coffee:584).
       setFoldedSwimlane(readSwimlanesModes(proj.id));
       await loadUserstories();
+      // generateFilters (main.coffee:591): fetch the filter sidebar data. Fired
+      // fire-and-forget so a slow/failed filters_data call never delays the
+      // board render; `loadFiltersData` is itself non-fatal.
+      void loadFiltersData();
       setIsFirstLoad(false); // firstLoad().then(() => isFirstLoad = false) (main.coffee:112-125)
     } catch (err) {
       // F-READ-1: a failed initial load (401/500 read, or the fail-closed
@@ -720,12 +783,17 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     } finally {
       setLoading(false);
     }
-  }, [loadProject, loadUserstories, handleLoadError]);
+  }, [loadProject, loadUserstories, loadFiltersData, handleLoadError]);
 
-  /** Public reload = re-run `loadUserstories` (used by KanbanApp after filter changes). */
+  /**
+   * Public reload = re-run `loadUserstories` (used by KanbanApp after filter
+   * changes). Also refreshes `filters_data` so the per-option counts track the
+   * currently-applied query (generateFilters re-runs on the coffee side too).
+   */
   const reload = useCallback(async (): Promise<void> => {
     await loadUserstories();
-  }, [loadUserstories]);
+    void loadFiltersData();
+  }, [loadUserstories, loadFiltersData]);
 
   /**
    * `refreshAfterSwimlanesOrUserstoryStatusesHaveChanged` (main.coffee:239-243):
@@ -885,6 +953,9 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       // regenerated by KanbanApp via the injected callback. Only runs on a
       // SUCCESSFUL write.
       callbacksRef.current.onFiltersChanged?.();
+      // Refresh the filter sidebar counts too (generateFilters re-runs after a
+      // move on the coffee side, main.coffee:627-632). Fire-and-forget + non-fatal.
+      void loadFiltersDataRef.current();
     },
     [applyState],
   );
@@ -978,14 +1049,22 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
    * fire-and-forget.
    */
   const addUsStandard = useCallback(
-    async (statusId: number, subject: string, position: 'top' | 'bottom' = 'bottom'): Promise<void> => {
+    async (
+      statusId: number,
+      subject: string,
+      extra?: CreateExtra,
+      position: 'top' | 'bottom' = 'bottom',
+    ): Promise<void> => {
       const pid = projectIdRef.current;
       if (pid == null) {
         return;
       }
       try {
         setWriteError(null);
-        const created = await userstories.createUserStory(pid, statusId, subject);
+        // `extra` carries the optional core fields (description/tags/is_blocked/
+        // blocked_note/due_date) from the expanded create form (finding #7); when
+        // omitted this is byte-identical to the prior subject-only create.
+        const created = await userstories.createUserStory(pid, statusId, subject, extra);
         addUs(created as UserStory, position);
       } catch (err) {
         setWriteError(err instanceof Error ? err : new Error(String(err)));
@@ -1024,6 +1103,39 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
       });
     },
     [applyState],
+  );
+
+  /**
+   * `saveUs` - the single-story PATCH write behind the inline edit lightbox and
+   * the inline assign popover (finding #8). Reproduces the AngularJS
+   * `$repo.save(model)` the generic edit form and the assign lightbox `onClose`
+   * ultimately performed (`common/lightboxes.coffee`, `kanban/main.coffee:339`):
+   * PATCH `/userstories/{id}` with the CHANGED attributes plus the concurrency
+   * `version` (the caller reads `version` off the current model and includes it),
+   * then reproduce the board reaction via `editUs(updated)` using the
+   * server-returned model (fresh `version`/`total_points`/reordering). The user
+   * stays on the board - NO navigation (this replaces `window.location.assign`).
+   *
+   * F-WRITE parity: a failed save is caught and surfaced via `writeError` (the
+   * same "changes were not saved" channel the failed-move path uses) and never
+   * escapes as an uncaught rejection - callers invoke this fire-and-forget.
+   *
+   * @param usId    - Id of the user story to update (path segment).
+   * @param changed - The changed attributes PLUS `version` (e.g.
+   *                  `{ subject, status, version }` or
+   *                  `{ assigned_users, assigned_to, version }`).
+   */
+  const saveUs = useCallback(
+    async (usId: number, changed: Record<string, unknown>): Promise<void> => {
+      try {
+        setWriteError(null);
+        const updated = await userstories.save(usId, changed);
+        editUs(updated as unknown as UserStory);
+      } catch (err) {
+        setWriteError(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+    [editUs],
   );
 
   /**
@@ -1263,6 +1375,8 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     projectId,
     usersById,
     foldedSwimlane,
+    // KB-3..KB-6: raw filters_data for building the filter sidebar categories.
+    filtersData,
     // flags
     isFirstLoad,
     loading,
@@ -1278,6 +1392,7 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     addUsBulk,
     addUsStandard,
     editUs,
+    saveUs,
     deleteUs,
     toggleFold,
     toggleSwimlane,

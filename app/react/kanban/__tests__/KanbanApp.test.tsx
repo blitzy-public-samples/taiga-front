@@ -150,7 +150,31 @@ jest.mock('../components/FilterBar', () => {
   const react = require('react');
   return {
     __esModule: true,
-    default: (_props: any) => react.createElement('div', { className: 'mock-filter' }),
+    // Echoes `selectedFilters` (count + JSON) so the URL-restore path can be
+    // asserted, and exposes a `.mock-add-filter` button that invokes
+    // `onAddFilter` with a fixed `tags`/`bug` include payload so the URL-write
+    // path can be exercised without a real FilterBar. Still renders the
+    // `.mock-filter` marker the pre-existing presence/absence assertions rely on.
+    default: (props: any) =>
+      react.createElement(
+        'div',
+        {
+          className: 'mock-filter',
+          'data-selected-count': String((props.selectedFilters ?? []).length),
+          'data-selected-json': JSON.stringify(props.selectedFilters ?? []),
+        },
+        react.createElement('button', {
+          type: 'button',
+          className: 'mock-add-filter',
+          onClick: () =>
+            props.onAddFilter &&
+            props.onAddFilter({
+              category: { dataType: 'tags', title: 'Tags', content: [] },
+              filter: { id: 'bug', name: 'bug', color: '#f00' },
+              mode: 'include',
+            }),
+        }),
+      ),
   };
 });
 
@@ -287,6 +311,7 @@ function makeHookResult(overrides: Partial<UseKanbanBoardResult> = {}): UseKanba
     addUsBulk: jest.fn(() => Promise.resolve()),
     addUsStandard: jest.fn(() => Promise.resolve()),
     editUs: jest.fn(),
+    saveUs: jest.fn(() => Promise.resolve()),
     deleteUs: jest.fn(() => Promise.resolve()),
     toggleFold: jest.fn(),
     toggleSwimlane: jest.fn(),
@@ -332,6 +357,13 @@ beforeEach(() => {
     localStorage.clear();
   } catch {
     /* jsdom localStorage - safe to ignore */
+  }
+  // Reset the jsdom URL so KanbanApp's URL-filter restore (Phase 10) starts from
+  // a clean query on every test and does not leak filter state between specs.
+  try {
+    window.history.replaceState(null, '', '/');
+  } catch {
+    /* ignore */
   }
 });
 
@@ -692,19 +724,22 @@ describe('KanbanApp - error-state rendering', () => {
 /* ================================================================== *
  * Group A -- single-story card operations (KB-1..KB-5)
  * ------------------------------------------------------------------
- * KB-5: the standard "+" opens a FUNCTIONAL subject input that POSTs via the
- *       hook's addUsStandard (the container never calls the raw endpoint).
- * KB-2/KB-3: the card Edit / Assign actions NAVIGATE to the AngularJS US detail
- *       route via window.location (URL interop, AAP 0.4.2) - no inert shell.
+ * KB-5 / #7: the standard "+" opens a FUNCTIONAL create form (subject + core
+ *       card fields) that POSTs via the hook's addUsStandard (the container
+ *       never calls the raw endpoint).
+ * KB-2 (#8): the card Edit action opens the INLINE edit lightbox seeded from the
+ *       model and PATCHes via the hook's saveUs - the user stays on the board
+ *       (this replaces the previous window.location navigation).
+ * KB-3 (#8): the card Assign action opens the INLINE assign-users popover and
+ *       PATCHes assigned_users/assigned_to via saveUs - again, no navigation.
  * KB-4: the card Delete action opens a confirm; confirming fires the pessimistic
  *       hook deleteUs (the server DELETE + remove-on-success live in the hook).
  * ================================================================== */
 
 describe('KanbanApp - Group A: single-story card operations', () => {
   // A resolvable board state so the real `getUsModel(state, 11)` returns a story
-  // whose ref (42) drives the detail-route navigation. Only `userstoriesRaw`
-  // matters here; cast to the state type (the container reads nothing else off it
-  // in these flows).
+  // the inline edit/assign forms can seed from. Carries the core editable fields
+  // plus the concurrency `version` and current assignees.
   const stateWithUs11 = {
     userstoriesRaw: [
       {
@@ -713,30 +748,38 @@ describe('KanbanApp - Group A: single-story card operations', () => {
         status: 1,
         swimlane: null,
         kanban_order: 1,
-        assigned_to: null,
-        assigned_users: [],
+        subject: 'Existing subject',
+        description: 'Existing description',
+        tags: [
+          ['red', '#ff0000'],
+          ['blue', null],
+        ],
+        is_blocked: false,
+        blocked_note: '',
+        due_date: null,
+        version: 7,
+        assigned_to: 101,
+        assigned_users: [101, 102],
       },
     ],
   } as unknown as UseKanbanBoardResult['state'];
   const emptyState = { userstoriesRaw: [] } as unknown as UseKanbanBoardResult['state'];
 
-  // Swap window.location for one with a spy `assign`, restoring it afterwards.
-  function withLocationAssign(run: (assign: jest.Mock) => void): void {
-    const assign = jest.fn();
-    const original = window.location;
-    Object.defineProperty(window, 'location', {
-      configurable: true,
-      value: { ...original, assign },
-    });
-    try {
-      run(assign);
-    } finally {
-      Object.defineProperty(window, 'location', { configurable: true, value: original });
-    }
-  }
+  // A project carrying members so the inline assign popover has rows to render.
+  const projectWithMembers = {
+    id: 7,
+    slug: 'proj',
+    name: 'Proj',
+    my_permissions: ['modify_us', 'delete_us', 'add_us'],
+    members: [
+      { id: 101, full_name_display: 'Alice' },
+      { id: 102, full_name_display: 'Bob' },
+      { id: 103, full_name_display: 'Carol' },
+    ],
+  } as unknown as UseKanbanBoardResult['project'];
 
   // ---- KB-5: functional single-story create ----
-  it('KB-5: submitting the create subject calls addUsStandard(statusId, subject) once and closes', async () => {
+  it('KB-5: submitting the create subject calls addUsStandard(statusId, subject, extra) once and closes', async () => {
     const { container, hookResult } = renderApp();
 
     fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
@@ -752,10 +795,51 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     expect(hookResult.addUsStandard).toHaveBeenCalledTimes(1);
     // statusId 1 from the Board stub's onAddNewUs('standard', 1); subject trimmed.
     // The container delegates to the hook (which owns the frozen POST); it never
-    // builds the request itself.
-    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'New story');
+    // builds the request itself. With only the subject filled, the `extra`
+    // payload is an empty object (the adapter then posts a subject-only body,
+    // byte-identical to the legacy quick add).
+    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'New story', {});
     // The lightbox closes after a successful create.
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+  });
+
+  // ---- #7: the create form carries the core card fields; a fully-filled create
+  //          passes the `extra` payload through to addUsStandard ----
+  it('#7: a create with description/tags/blocked/due passes the extra payload to addUsStandard', async () => {
+    const { container, hookResult } = renderApp();
+
+    fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
+    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
+      target: { value: 'Rich story' },
+    });
+    fireEvent.change(container.querySelector('.create-us-description') as HTMLTextAreaElement, {
+      target: { value: 'A description' },
+    });
+    fireEvent.change(container.querySelector('.create-us-tags') as HTMLInputElement, {
+      target: { value: 'alpha, beta ,, alpha' },
+    });
+    fireEvent.change(container.querySelector('.create-us-due-date') as HTMLInputElement, {
+      target: { value: '2026-08-15' },
+    });
+    fireEvent.click(container.querySelector('.create-us-blocked') as HTMLInputElement);
+    fireEvent.change(container.querySelector('.create-us-blocked-note') as HTMLTextAreaElement, {
+      target: { value: 'waiting' },
+    });
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+    });
+
+    expect(hookResult.addUsStandard).toHaveBeenCalledTimes(1);
+    // Tags are trimmed + de-duplicated to names; the blocked note only rides
+    // along because the story is blocked; due_date is the ISO string.
+    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'Rich story', {
+      description: 'A description',
+      tags: ['alpha', 'beta'],
+      is_blocked: true,
+      blocked_note: 'waiting',
+      due_date: '2026-08-15',
+    });
   });
 
   it('KB-5: an empty create subject does NOT call addUsStandard and closes the shell', () => {
@@ -770,41 +854,178 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
-  // ---- KB-2: edit navigates to the US detail route ----
-  it('KB-2: card Edit navigates to /project/:slug/us/:ref instead of an inert shell', () => {
-    withLocationAssign((assign) => {
-      const { container } = renderApp({}, { state: stateWithUs11 });
+  // ---- KB-2 (#8): edit opens the INLINE edit lightbox (no navigation) ----
+  it('KB-2 (#8): card Edit opens the inline edit lightbox seeded from the model - the user stays on the board', () => {
+    const { container } = renderApp({}, { state: stateWithUs11 });
 
-      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
 
-      expect(assign).toHaveBeenCalledTimes(1);
-      expect(assign).toHaveBeenCalledWith('/project/proj/us/42');
-      // No edit shell lightbox is opened.
-      expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
-    });
+    // The inline edit lightbox opens with the edit title, seeded from us 11.
+    const lb = container.querySelector('.lightbox-create-edit');
+    expect(lb).toBeInTheDocument();
+    expect(lb?.querySelector('.title')?.textContent).toBe('Edit user story');
+    const subject = container.querySelector('.create-us-subject') as HTMLInputElement;
+    expect(subject.value).toBe('Existing subject');
+    expect((container.querySelector('.create-us-description') as HTMLTextAreaElement).value).toBe(
+      'Existing description',
+    );
+    // Tag NAMES are joined into the comma-separated field (colours dropped).
+    expect((container.querySelector('.create-us-tags') as HTMLInputElement).value).toBe('red, blue');
   });
 
-  // ---- KB-3: assign navigates to the US detail route ----
-  it('KB-3: card Assign navigates to /project/:slug/us/:ref instead of an inert shell', () => {
-    withLocationAssign((assign) => {
-      const { container } = renderApp({}, { state: stateWithUs11 });
+  it('KB-2 (#8): editing and saving calls saveUs with the changed fields + version (no navigation)', async () => {
+    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
 
-      fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
-
-      expect(assign).toHaveBeenCalledTimes(1);
-      expect(assign).toHaveBeenCalledWith('/project/proj/us/42');
-      expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
+      target: { value: 'Renamed' },
     });
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+    });
+
+    expect(hookResult.saveUs).toHaveBeenCalledTimes(1);
+    const [usId, changed] = (hookResult.saveUs as jest.Mock).mock.calls[0];
+    expect(usId).toBe(11);
+    // The PATCH body carries the changed subject + the current status + the
+    // concurrency version read off the model.
+    expect(changed).toEqual(
+      expect.objectContaining({ subject: 'Renamed', status: 1, version: 7 }),
+    );
+    // addUsStandard (create path) is NOT used for an edit.
+    expect(hookResult.addUsStandard).not.toHaveBeenCalled();
+    // The lightbox closes after a successful save.
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
-  it('KB-2/KB-3: navigation is a no-op when the story id cannot be resolved', () => {
-    withLocationAssign((assign) => {
-      // Empty userstoriesRaw -> getUsModel returns undefined -> no navigation.
-      const { container } = renderApp({}, { state: emptyState });
+  it('KB-2 (#8): an empty subject on edit keeps the form open and does NOT call saveUs', () => {
+    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
 
-      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
+      target: { value: '   ' },
+    });
+    fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
 
-      expect(assign).not.toHaveBeenCalled();
+    expect(hookResult.saveUs).not.toHaveBeenCalled();
+    // Subject is required on edit, so the form stays open (unlike create, which
+    // closes on an empty subject).
+    expect(container.querySelector('.lightbox-create-edit')).toBeInTheDocument();
+  });
+
+  // ---- KB-3 (#8): assign opens the INLINE assign popover (no navigation) ----
+  it('KB-3 (#8): card Assign opens the inline assign popover seeded with the current assignees', () => {
+    const { container } = renderApp({}, { state: stateWithUs11, project: projectWithMembers });
+
+    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+
+    const popover = container.querySelector('.lightbox-select-user');
+    expect(popover).toBeInTheDocument();
+    // One row per project member.
+    const rows = popover?.querySelectorAll('.assign-user-row') ?? [];
+    expect(rows.length).toBe(3);
+    // The seeded checked set is compact(union(assigned_users=[101,102],
+    // [assigned_to=101])) = {101, 102}; member 103 is unchecked.
+    const checkboxes = popover?.querySelectorAll(
+      '.assign-user-checkbox',
+    ) as NodeListOf<HTMLInputElement>;
+    expect(checkboxes[0].checked).toBe(true); // 101 Alice
+    expect(checkboxes[1].checked).toBe(true); // 102 Bob
+    expect(checkboxes[2].checked).toBe(false); // 103 Carol
+    // No edit lightbox and no create call.
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+  });
+
+  it('KB-3 (#8): unchecking the primary assignee recomputes assigned_to and calls saveUs', async () => {
+    const { container, hookResult } = renderApp(
+      {},
+      { state: stateWithUs11, project: projectWithMembers },
+    );
+
+    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+    const checkboxes = container.querySelectorAll(
+      '.assign-user-checkbox',
+    ) as NodeListOf<HTMLInputElement>;
+    // Uncheck 101 (the current primary) -> selected becomes [102].
+    fireEvent.click(checkboxes[0]);
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-select-user .btn-save') as HTMLElement);
+    });
+
+    expect(hookResult.saveUs).toHaveBeenCalledTimes(1);
+    const [usId, changed] = (hookResult.saveUs as jest.Mock).mock.calls[0];
+    expect(usId).toBe(11);
+    // assigned_to was 101; 101 is no longer selected, so it becomes the first of
+    // the remaining set (102). assigned_users is the new set. version rides along.
+    expect(changed).toEqual({ assigned_users: [102], assigned_to: 102, version: 7 });
+    expect(container.querySelector('.lightbox-select-user')).not.toBeInTheDocument();
+  });
+
+  it('KB-3 (#8): clearing all assignees sets assigned_to to null', async () => {
+    const { container, hookResult } = renderApp(
+      {},
+      { state: stateWithUs11, project: projectWithMembers },
+    );
+
+    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+    const checkboxes = container.querySelectorAll(
+      '.assign-user-checkbox',
+    ) as NodeListOf<HTMLInputElement>;
+    // Uncheck both seeded members -> empty set.
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.lightbox-select-user .btn-save') as HTMLElement);
+    });
+
+    const [, changed] = (hookResult.saveUs as jest.Mock).mock.calls[0];
+    expect(changed).toEqual({ assigned_users: [], assigned_to: null, version: 7 });
+  });
+
+  it('#8: card Edit is a no-op (no lightbox) when the story id cannot be resolved', () => {
+    // Empty userstoriesRaw -> getUsModel returns undefined -> nothing opens.
+    const { container } = renderApp({}, { state: emptyState });
+
+    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+    expect(container.querySelector('.lightbox-select-user')).not.toBeInTheDocument();
+  });
+
+  // ---- #9: double-submit guard on the create form ----
+  it('#9: two rapid Save clicks on the create form call addUsStandard exactly once', async () => {
+    // A deferred addUsStandard keeps the first write in flight so the second
+    // click hits the in-flight guard.
+    let resolveCreate: () => void = () => undefined;
+    const pending = new Promise<void>((res) => {
+      resolveCreate = res;
+    });
+    const addUsStandard = jest.fn(() => pending);
+
+    const { container } = renderApp({}, { addUsStandard });
+
+    fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
+    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
+      target: { value: 'Once only' },
+    });
+
+    const saveBtn = container.querySelector('.lightbox-create-edit .btn-save') as HTMLButtonElement;
+    // Two rapid clicks BEFORE the first create resolves.
+    fireEvent.click(saveBtn);
+    fireEvent.click(saveBtn);
+
+    expect(addUsStandard).toHaveBeenCalledTimes(1);
+    // The Save button is disabled while the write is in flight.
+    expect(saveBtn.disabled).toBe(true);
+
+    // Let the write settle so the pending promise does not leak between tests.
+    await act(async () => {
+      resolveCreate();
+      await pending;
     });
   });
 
@@ -841,3 +1062,73 @@ describe('KanbanApp - Group A: single-story card operations', () => {
   });
 });
 
+
+/* ------------------------------------------------------------------ *
+ * Phase 10 — filter persistence to the URL (location.search)
+ * ------------------------------------------------------------------ *
+ * Proves KanbanApp wires the shared `filterUrl` helpers: it RESTORES the applied
+ * filters + free-text `q` from `window.location.search` on mount (URL wins over
+ * localStorage) and WRITES them back to the URL (via history.replaceState) when
+ * they change — fixing the tracked MINOR deviation (filters were localStorage-only).
+ */
+describe('Phase 10: filter persistence to the URL', () => {
+  it('restores applied filters from the URL query on mount (chips + preserved URL)', () => {
+    window.history.replaceState(null, '', '/project/proj/kanban?tags=bug&q=hi');
+    const { container } = renderApp();
+
+    // Open the sidebar so the (mocked) FilterBar is rendered.
+    fireEvent.click(container.querySelector('button.btn-filter.e2e-open-filter') as HTMLElement);
+    const filterEl = container.querySelector('.mock-filter') as HTMLElement | null;
+    // FilterBar receives the restored filter derived from ?tags=bug.
+    expect(filterEl).not.toBeNull();
+    expect(filterEl?.getAttribute('data-selected-count')).toBe('1');
+    expect(filterEl?.getAttribute('data-selected-json')).toContain('"dataType":"tags"');
+    expect(filterEl?.getAttribute('data-selected-json')).toContain('"id":"bug"');
+
+    // The search input is seeded from ?q=hi and the URL is preserved.
+    const search = container.querySelector('#kanban-filter-search') as HTMLInputElement;
+    expect(search.value).toBe('hi');
+    expect(window.location.search).toContain('tags=bug');
+    expect(window.location.search).toContain('q=hi');
+  });
+
+  it('writes the free-text q to the URL when the search box changes', () => {
+    window.history.replaceState(null, '', '/project/proj/kanban');
+    const { container } = renderApp();
+    const search = container.querySelector('#kanban-filter-search') as HTMLInputElement;
+
+    act(() => {
+      fireEvent.change(search, { target: { value: 'needle' } });
+    });
+
+    expect(window.location.search).toBe('?q=needle');
+  });
+
+  it('writes an applied filter to the URL when a chip is added', () => {
+    window.history.replaceState(null, '', '/project/proj/kanban');
+    const { container } = renderApp();
+    fireEvent.click(container.querySelector('button.btn-filter.e2e-open-filter') as HTMLElement);
+
+    act(() => {
+      fireEvent.click(container.querySelector('.mock-add-filter') as HTMLElement);
+    });
+
+    // addFilter appends { dataType: 'tags', id: 'bug', mode: 'include' }.
+    expect(window.location.search).toBe('?tags=bug');
+  });
+
+  it('falls back to localStorage when the URL has no managed params', () => {
+    // Seed the per-project localStorage key the way a prior session would have.
+    const stored = [{ id: 'foo', name: 'foo', dataType: 'tags', mode: 'include', color: null }];
+    localStorage.setItem('proj:kanban-filters', JSON.stringify(stored));
+    window.history.replaceState(null, '', '/project/proj/kanban');
+
+    const { container } = renderApp();
+    fireEvent.click(container.querySelector('button.btn-filter.e2e-open-filter') as HTMLElement);
+    const filterEl = container.querySelector('.mock-filter') as HTMLElement;
+    expect(filterEl.getAttribute('data-selected-count')).toBe('1');
+    expect(filterEl.getAttribute('data-selected-json')).toContain('"id":"foo"');
+    // The restored localStorage filter is ALSO mirrored to the URL by the effect.
+    expect(window.location.search).toBe('?tags=foo');
+  });
+});

@@ -15,8 +15,10 @@
  * DOM structure and CSS class names the compiled global SCSS keys off, plus the
  * behavioral-parity math for both variants:
  *
- *  - variant="sprint": round + clamp of `100 * closed / total`, the `.full`
- *    class at 100% (AAP §0.3.3), and the `total`-falsy → 0% degenerate.
+ *  - variant="sprint": CLAMP-ONLY of `100 * closed / total` (finding #2 — the
+ *    legacy `tgProgressBar` does NOT round the width and never toggles a `.full`
+ *    class; both were removed to restore exact parity), and the `total`-falsy
+ *    → 0% degenerate.
  *  - variant="backlog-summary": the `adjustPercentaje` (round∘clamp) pipeline,
  *    the `total_points || defined_points` fallback, the `definedPoints >
  *    totalPoints` branch, the literal `-3` applied BEFORE clamp+round, and the
@@ -60,7 +62,7 @@ describe('ProgressBar — variant="sprint"', () => {
     expect(current!.tagName).toBe('DIV');
   });
 
-  it('computes width = round(100 * closed / total): (3,10) -> 30%', () => {
+  it('computes width = 100 * closed / total exactly: (3,10) -> 30%', () => {
     const { container } = render(
       <ProgressBar variant="sprint" closedPoints={3} totalPoints={10} />,
     );
@@ -69,30 +71,50 @@ describe('ProgressBar — variant="sprint"', () => {
     expect(current).not.toHaveClass('full');
   });
 
-  it('rounds a fractional percentage: (1,3) -> 33% (33.33… rounded)', () => {
+  it('does NOT round a fractional percentage — clamp-only (finding #2): (1,3) -> 33.33…%', () => {
+    // Legacy `tgProgressBar` (components.coffee:436-445) emits the RAW clamped
+    // ratio with no Math.round. 100 * 1 / 3 = 33.3333…%, so the inline width must
+    // be the full-precision value, NOT the previously-ported rounded "33%".
     const { container } = render(
       <ProgressBar variant="sprint" closedPoints={1} totalPoints={3} />,
     );
     const current = container.querySelector('.current-progress') as HTMLElement;
-    expect(current.style.width).toBe('33%');
+    expect(current.style.width).toBe(`${(100 * 1) / 3}%`);
+    expect(current.style.width).not.toBe('33%');
+    expect(current).not.toHaveClass('full');
   });
 
-  it('adds the .full class and renders 100% when closed === total: (10,10)', () => {
+  it('does NOT round the live P3 case (finding #2): (35,170.5) -> 20.5278…%', () => {
+    // Real seeded sprint "Sprint 2026-7-9": 35 / 170.5 pts. The earlier port
+    // rounded this to 21%; clamp-only must emit the unrounded 20.5278…%.
+    const { container } = render(
+      <ProgressBar variant="sprint" closedPoints={35} totalPoints={170.5} />,
+    );
+    const current = container.querySelector('.current-progress') as HTMLElement;
+    expect(current.style.width).toBe(`${(100 * 35) / 170.5}%`);
+    expect(current.style.width).not.toBe('21%');
+  });
+
+  it('renders 100% and NEVER adds .full when closed === total (finding #2): (10,10)', () => {
     const { container } = render(
       <ProgressBar variant="sprint" closedPoints={10} totalPoints={10} />,
     );
     const current = container.querySelector('.current-progress') as HTMLElement;
     expect(current).toHaveStyle({ width: '100%' });
-    expect(current).toHaveClass('current-progress', 'full');
+    // Class is EXACTLY 'current-progress' — the legacy directive never set `.full`.
+    expect(current).toHaveClass('current-progress');
+    expect(current).not.toHaveClass('full');
+    expect(current.className).toBe('current-progress');
   });
 
-  it('clamps above 100% to 100% and keeps .full: (15,10)', () => {
+  it('clamps above 100% to 100% and STILL never adds .full (finding #2): (15,10)', () => {
     const { container } = render(
       <ProgressBar variant="sprint" closedPoints={15} totalPoints={10} />,
     );
     const current = container.querySelector('.current-progress') as HTMLElement;
     expect(current.style.width).toBe('100%');
-    expect(current).toHaveClass('full');
+    expect(current).not.toHaveClass('full');
+    expect(current.className).toBe('current-progress');
   });
 
   it('clamps a negative ratio up to 0%: (-5,10)', () => {

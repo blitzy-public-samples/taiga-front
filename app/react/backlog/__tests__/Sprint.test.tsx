@@ -328,14 +328,17 @@ describe('Sprint — fragment structure', () => {
     expect(sprintTable(container)).not.toHaveClass('sprint-empty-wrapper');
   });
 
-  it('registers the droppable with the `sprint-<id>` id + { sprintId, isBacklog:false } data', () => {
+  it('registers the droppable with the `sprint-<id>` id + { sprintId, isBacklog:false, orderedIds } data', () => {
     // This locks the drop-target contract the shared drag-end handler relies on to
     // route a drop into a SPRINT (isBacklog:false) vs the backlog list
     // (see shared/dnd/types `BacklogDragResult` + backlog/sortable.coffee isContainer).
+    // `orderedIds` (the sprint's current story order, empty here) lets the handler
+    // compute adjacency when a drop lands on the sprint's EMPTY SPACE rather than a
+    // sibling row.
     renderSprint({ sprint: makeSprint({ id: 7 }) });
     const arg = mockUseDroppable.mock.calls[0][0];
     expect(arg.id).toBe('sprint-7');
-    expect(arg.data).toEqual({ sprintId: 7, isBacklog: false });
+    expect(arg.data).toEqual({ sprintId: 7, isBacklog: false, orderedIds: [] });
   });
 });
 
@@ -396,9 +399,46 @@ describe('MilestoneRow — row element + state modifiers', () => {
     expect(row.querySelector('.draggable-us-row')).not.toBeInTheDocument();
   });
 
-  it('calls useSortableRow with the story id and the { usId } data bag', () => {
+  it('calls useSortableRow with the story id, the FULL container-identity data bag, and the modify-us drag gate (BL-1 + BL-3)', () => {
+    // BL-1: the enclosing sprint id + full container identity is carried in the
+    // sortable data bag so a within-sprint reorder dropped over a sibling STORY
+    // still resolves `targetSprintId` -> `milestone_id`. The data bag mirrors the
+    // Kanban Card's `{ statusId, swimlaneId, oldIndex }` (Card.tsx): `sprintId` =
+    // the owning sprint (default makeSprint id 1), `isBacklog:false` (a sprint
+    // row, not a backlog row), `oldIndex:0` (first/only row).
+    // BL-3: dragging is gated by `{ disabled: !canModifyUs }`; `canModifyUs`
+    // defaults to true here, so `disabled` is false.
     renderSingleRow({ id: 909 });
-    expect(mockUseSortableRow).toHaveBeenCalledWith(909, { usId: 909 });
+    expect(mockUseSortableRow).toHaveBeenCalledWith(
+      909,
+      { usId: 909, sprintId: 1, isBacklog: false, oldIndex: 0 },
+      { disabled: false },
+    );
+  });
+
+  it('carries the ENCLOSING sprint id in the sortable data bag (BL-1)', () => {
+    // A non-default sprint id proves the id threads from the enclosing <Sprint>
+    // rather than being a constant. The full container-identity bag is still
+    // carried, and the default (modifiable) user leaves the drag gate open.
+    renderSprint({ sprint: makeSprint({ id: 77, user_stories: [makeUs({ id: 5 })] }) });
+    expect(mockUseSortableRow).toHaveBeenCalledWith(
+      5,
+      { usId: 5, sprintId: 77, isBacklog: false, oldIndex: 0 },
+      { disabled: false },
+    );
+  });
+
+  it('DISABLES sprint-row dragging for a readonly user (BL-3 client-side gate)', () => {
+    // Mirrors the Angular `sortable.coffee:29-31` gate: a user lacking
+    // `modify_us` can NEVER initiate a drag (so no `bulk_update_backlog_order`
+    // request ever leaves the client). The data bag is unchanged; only the
+    // `disabled` option flips to true.
+    renderSingleRow({ id: 909 }, { canModifyUs: false });
+    expect(mockUseSortableRow).toHaveBeenCalledWith(
+      909,
+      { usId: 909, sprintId: 1, isBacklog: false, oldIndex: 0 },
+      { disabled: true },
+    );
   });
 });
 

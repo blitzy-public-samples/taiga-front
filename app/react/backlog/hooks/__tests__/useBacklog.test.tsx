@@ -156,6 +156,16 @@ beforeEach(() => {
     disconnect: jest.fn(),
   };
   createEvents.mockReturnValue(eventsClientMock);
+
+  // Reset the jsdom URL + storage so the Phase 10 URL/localStorage filter
+  // hydration starts clean on every spec (the hook now restores filters from
+  // `window.location.search` / `localStorage` in its useReducer initializer).
+  try {
+    window.history.replaceState(null, '', '/');
+    window.localStorage.clear();
+  } catch {
+    /* jsdom - safe to ignore */
+  }
 });
 
 /** Render the hook and wait for the initial `loadBacklog` to resolve the project. */
@@ -546,5 +556,134 @@ describe('useBacklog — filters, toggles, selection, closed sprints', () => {
     const first = result.current.actions;
     rerender({ projectSlug: 'proj', projectId: 7 });
     expect(result.current.actions).toBe(first);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 10 — filter restore from the URL / localStorage on mount
+ * ------------------------------------------------------------------ *
+ * The hook hydrates its filter model in the `useReducer` initializer, so the
+ * FIRST `loadBacklog` already issues the restored, filtered `/userstories`
+ * query — reproducing `applyStoredFilters` running before `loadInitialData` on
+ * the AngularJS side. URL wins over localStorage (the legacy "if
+ * _.isEmpty(location.search())" guard).
+ */
+describe('Phase 10: filter restore on mount', () => {
+  it('restores applied filters + q from window.location.search into the initial query', async () => {
+    window.history.replaceState(null, '', '/project/proj/backlog?status=13,14&exclude_tags=foo&q=needle');
+    const { result } = await renderReady();
+
+    // The initial user-story load carries the hydrated filter params + q.
+    expect(http.getWithHeaders).toHaveBeenCalledWith(
+      'userstories',
+      expect.objectContaining({
+        project: 7,
+        milestone: 'null',
+        status: '13,14',
+        exclude_tags: 'foo',
+        q: 'needle',
+      }),
+    );
+    // The reducer filter model reflects the restored chips + query.
+    const selected = result.current.state.filters.selected as Array<Record<string, unknown>>;
+    expect(selected).toEqual([
+      { id: '13', name: '13', dataType: 'status', mode: 'include', color: null },
+      { id: '14', name: '14', dataType: 'status', mode: 'include', color: null },
+      { id: 'foo', name: 'foo', dataType: 'tags', mode: 'exclude', color: null },
+    ]);
+    expect(result.current.state.filters.query).toBe('needle');
+  });
+
+  it('falls back to localStorage when the URL has no managed params', async () => {
+    window.localStorage.setItem(
+      'proj:backlog-filters',
+      JSON.stringify([{ id: '13', name: 'New', dataType: 'status', mode: 'include', color: null }]),
+    );
+    window.history.replaceState(null, '', '/project/proj/backlog');
+    const { result } = await renderReady();
+
+    expect(http.getWithHeaders).toHaveBeenCalledWith(
+      'userstories',
+      expect.objectContaining({ project: 7, status: '13' }),
+    );
+    const selected = result.current.state.filters.selected as Array<Record<string, unknown>>;
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toMatchObject({ id: '13', dataType: 'status', mode: 'include' });
+  });
+
+  it('starts with empty filters when neither the URL nor localStorage carry any', async () => {
+    window.history.replaceState(null, '', '/project/proj/backlog');
+    const { result } = await renderReady();
+    expect(result.current.state.filters.selected).toEqual([]);
+    expect(result.current.state.filters.query).toBe('');
+    expect(http.getWithHeaders).toHaveBeenCalledWith(
+      'userstories',
+      expect.objectContaining({ project: 7, q: '' }),
+    );
+  });
+});
+
+describe('useBacklog — optimistic-move rollback + save-failure (QA BL-1/BL-2)', () => {
+  const drag: BacklogDragResult = {
+    movedIds: [10],
+    targetSprintId: null,
+    index: 0,
+    previousUs: null,
+    nextUs: null,
+    isBacklog: true,
+  };
+
+  it('starts with a null writeError', async () => {
+    const { result } = await renderReady();
+    expect(result.current.writeError).toBeNull();
+  });
+
+  it('onDragError surfaces the failure and clearWriteError dismisses it', async () => {
+    const { result } = await renderReady();
+    act(() => {
+      result.current.actions.onDragError(new Error('save failed'));
+    });
+    expect(result.current.writeError).toBeInstanceOf(Error);
+    expect(result.current.writeError?.message).toBe('save failed');
+    act(() => {
+      result.current.actions.clearWriteError();
+    });
+    expect(result.current.writeError).toBeNull();
+  });
+
+  it('onDragError wraps a non-Error rejection value in an Error', async () => {
+    const { result } = await renderReady();
+    act(() => {
+      result.current.actions.onDragError('boom');
+    });
+    expect(result.current.writeError).toBeInstanceOf(Error);
+    expect(result.current.writeError?.message).toBe('boom');
+  });
+
+  it('applyDrag clears a stale writeError at the start of a fresh move', async () => {
+    const { result } = await renderReady();
+    act(() => {
+      result.current.actions.onDragError(new Error('previous failure'));
+    });
+    expect(result.current.writeError).not.toBeNull();
+    act(() => {
+      result.current.actions.applyDrag(drag);
+    });
+    expect(result.current.writeError).toBeNull();
+  });
+
+  it('onDragError after applyDrag restores the pre-move snapshot (rollback)', async () => {
+    const { result } = await renderReady();
+    const before = result.current.state;
+    act(() => {
+      result.current.actions.applyDrag(drag);
+    });
+    act(() => {
+      result.current.actions.onDragError(new Error('bulk_update_backlog_order 400'));
+    });
+    // RESTORE_STATE returns the exact pre-move snapshot captured by applyDrag,
+    // so the board reconverges with the unchanged server state.
+    expect(result.current.state).toEqual(before);
+    expect(result.current.writeError).toBeInstanceOf(Error);
   });
 });

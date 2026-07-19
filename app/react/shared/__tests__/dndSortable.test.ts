@@ -749,11 +749,15 @@ describe('createBacklogDragEndHandler (deterministic, injected mock api)', () =>
       getSelectedIds: () => [],
     });
 
-    // DATA PATH: moved id 3 lands at index 1 of [10, 3, 30] in sprint 9.
+    // DATA PATH (cross-container): moved id 3 comes from sprint 5 and is dropped
+    // OVER card 30 in sprint 9, whose current order is [10, 30] (the moved card is
+    // NOT yet part of the destination). Simulating the drop splices 3 in at 30's
+    // slot -> FINAL order [10, 3, 30], so 3 lands at index 1 with previous 10.
     const event = makeEvent(
       3,
       { sprintId: 5, isBacklog: false, oldIndex: 0 },
-      { isBacklog: false, sprintId: 9, orderedIds: [10, 3, 30] },
+      { isBacklog: false, sprintId: 9, orderedIds: [10, 30] },
+      30,
     );
 
     await handler(event);
@@ -787,11 +791,15 @@ describe('createBacklogDragEndHandler (deterministic, injected mock api)', () =>
       getSelectedIds: () => [],
     });
 
-    // Moved id 3 is FIRST in the backlog list order -> no previous, next = 20.
+    // Cross-container into the backlog: moved id 3 comes from sprint 9 and is
+    // dropped OVER backlog card 20 (the current first row), whose container holds
+    // [20, 30]. Simulating the drop splices 3 in at 20's slot -> FINAL order
+    // [3, 20, 30], so 3 lands FIRST -> no previous, next = 20 (after-precedence).
     const event = makeEvent(
       3,
       { sprintId: 9, isBacklog: false, oldIndex: 5 },
-      { isBacklog: true, orderedIds: [3, 20, 30] },
+      { isBacklog: true, orderedIds: [20, 30] },
+      20,
     );
 
     await handler(event);
