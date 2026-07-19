@@ -32,8 +32,8 @@
  *
  * HOW THIS MAPS TO REACT
  *   - The permission-ordered action list is rebuilt on every render from the
- *     `can(...)` gates (see `../../shared/permissions`), byte-for-byte in the
- *     same order the directive pushed them.
+ *     archive-aware `canMutate(...)` gates (see `../../shared/permissions`;
+ *     F-REG-03), byte-for-byte in the same order the directive pushed them.
  *   - The `document.body`-appended popover is reproduced with `createPortal`, so
  *     it likewise escapes the card's overflow clipping.
  *   - Positioning mirrors `elementPosition()` exactly: `top = rect.top + height`,
@@ -63,24 +63,9 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import type { BoardCard, Project } from '../../shared/types';
-import { can } from '../../shared/permissions';
-
-/*
- * `<tg-svg>` is the AngularJS icon custom element registered globally by the
- * still-running AngularJS shell; the SVG sprite it references is already loaded
- * into the document, so `<use xlinkHref="#icon-...">` resolves at runtime. It
- * has no React type, so it is declared here as an intrinsic JSX element. The
- * declaration is `any` (identical to the sibling components' declaration), so
- * merging with any other module's identical augmentation is conflict-free.
- */
-declare global {
-    // eslint-disable-next-line @typescript-eslint/no-namespace
-    namespace JSX {
-        interface IntrinsicElements {
-            'tg-svg': any;
-        }
-    }
-}
+import { canMutate } from '../../shared/permissions';
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * The default popover width, in CSS pixels. Mirrors `options.width || 170` in
@@ -146,36 +131,18 @@ interface PopoverPosition {
     width: number;
 }
 
-/**
- * Render an inline sprite icon, reproducing the repo's `<tg-svg>` markup.
- *
- * Two shapes are produced, matching the two legacy sources EXACTLY:
- *   - The card-actions button uses `CardSvgTemplate`, whose `<svg>` carries both
- *     the base `icon` class AND the icon-name class (`icon icon-more-vertical`).
- *     Call with `{ withNameClass: true }`.
- *   - The popover menu items use `globalPopover`'s `createSvg`, whose `<svg>`
- *     carries ONLY the base `icon` class (no icon-name class). Call with no opts.
- *
- * The non-standard `attr-href` attribute (kept for DOM parity with the original
- * sprite markup, which set both `xlink:href` and `attr-href`) is applied through
- * a `Record<string, string>` cast spread because React's SVG prop types have no
- * string index signature.
- *
- * @param icon The sprite icon name (without the leading `#`).
- * @param opts `withNameClass: true` appends the icon-name class to `icon`.
- * @returns The `<tg-svg>` icon element.
+/*
+ * Icons render through the ONE shared `<TgSvg>` sprite primitive
+ * (`app/react/shared/icon.tsx`, F-UI-02), replacing this component's former
+ * module-local `svgIcon` helper + `declare global { 'tg-svg' }` block. Every
+ * icon here sits INSIDE a text-labelled control (the trigger carries an
+ * `aria-label`; each menu item carries visible text), so all icons are
+ * decorative — `TgSvg` renders them `aria-hidden` with no `<title>` (F-UI-04).
+ * The shared primitive always emits `class="icon <name>"`; the legacy popover
+ * `createSvg` emitted only `class="icon"` on menu items, so the icon-name class
+ * is a harmless additive class here (the glyph itself is selected by the
+ * `<use href="#name">` reference, unchanged).
  */
-function svgIcon(icon: string, opts?: { withNameClass?: boolean }): JSX.Element {
-    const cls = opts?.withNameClass ? `icon ${icon}` : 'icon';
-    const extraUseAttrs = { 'attr-href': `#${icon}` } as Record<string, string>;
-    return (
-        <tg-svg>
-            <svg className={cls}>
-                <use xlinkHref={`#${icon}`} {...extraUseAttrs} />
-            </svg>
-        </tg-svg>
-    );
-}
 
 /**
  * The Kanban card actions button plus its popover menu.
@@ -210,8 +177,12 @@ export function CardActions({
 
     // Permission gates, evaluated through the shared helper so the rule is
     // identical to `kanban/sortable.coffee` and the AngularJS card template.
-    const canModify = can(project, 'modify_us');
-    const canDelete = can(project, 'delete_us');
+    // F-REG-03: these are MUTATION affordances (edit / delete a story), so they
+    // use the ARCHIVE-AWARE `canMutate` gate — an archived project hides them
+    // even when the user holds `modify_us` / `delete_us`, matching the legacy
+    // `isEditable = !archived_code && <permission>` pairing.
+    const canModify = canMutate(project, 'modify_us');
+    const canDelete = canMutate(project, 'delete_us');
 
     // Outside-click + scroll dismissal, registered ONLY while the menu is open.
     // Registering inside the effect (which runs after the opening click has fully
@@ -266,33 +237,32 @@ export function CardActions({
     const actions: PopoverAction[] = [];
 
     if (canModify) {
-        // COMMON.CARD.EDIT
         actions.push({
-            text: 'Edit card',
+            // F-UI-06: resolves through the shell locale (angular-translate); the
+            // English value is passed as the fallback so the control is still
+            // correctly named when the shell service is unavailable (unit tests).
+            text: translate('COMMON.CARD.EDIT', undefined, 'Edit card'),
             icon: 'icon-edit',
             event: () => onClickEdit?.(item.id),
         });
-        // COMMON.CARD.ASSIGN_TO
         actions.push({
-            text: 'Assign To',
+            text: translate('COMMON.CARD.ASSIGN_TO', undefined, 'Assign To'),
             icon: 'icon-assign-to',
             event: () => onClickAssignedTo?.(item.id),
         });
     }
 
     if (canDelete) {
-        // COMMON.CARD.DELETE
         actions.push({
-            text: 'Delete card',
+            text: translate('COMMON.CARD.DELETE', undefined, 'Delete card'),
             icon: 'icon-trash',
             event: () => onClickDelete?.(item.id),
         });
     }
 
     if (canModify && !isFirst) {
-        // COMMON.CARD.MOVE_TO_TOP
         actions.push({
-            text: 'Move to top',
+            text: translate('COMMON.CARD.MOVE_TO_TOP', undefined, 'Move to top'),
             icon: 'icon-move-to-top',
             event: () => onClickMoveToTop?.(item.id),
         });
@@ -331,9 +301,16 @@ export function CardActions({
                 // The directive added/removed `popover-open` on the button as the
                 // menu opened/closed; the class tracks `open` here 1:1.
                 className={open ? 'js-popup-button popover-open' : 'js-popup-button'}
+                // F-UI-04: the trigger was an icon-only button with NO accessible
+                // name and no disclosure state. It now carries a localised
+                // `aria-label`, `aria-haspopup="menu"` and `aria-expanded` so
+                // assistive tech announces it as a menu button and its state.
+                aria-label={translate('COMMON.CARD.OPTIONS', undefined, 'Card options')}
+                aria-haspopup="menu"
+                aria-expanded={open}
                 onClick={toggleOpen}
             >
-                {svgIcon('icon-more-vertical', { withNameClass: true })}
+                <TgSvg icon="icon-more-vertical" />
             </button>
 
             {open
@@ -350,17 +327,20 @@ export function CardActions({
                               width: `${position ? position.width : POPOVER_WIDTH}px`,
                           }}
                       >
-                          <ul>
+                          {/* F-UI-04: proper menu semantics (role="menu" +
+                              role="menuitem") so the popover is an accessible menu. */}
+                          <ul role="menu">
                               {actions.map((action) => (
-                                  <li key={action.text}>
+                                  <li key={action.text} role="none">
                                       <button
                                           type="button"
+                                          role="menuitem"
                                           onClick={() => {
                                               action.event();
                                               setOpen(false);
                                           }}
                                       >
-                                          {svgIcon(action.icon)}
+                                          <TgSvg icon={action.icon} />
                                           {action.text}
                                       </button>
                                   </li>

@@ -200,12 +200,14 @@ function makeBoard(overrides: Partial<UseKanbanBoardResult> = {}): UseKanbanBoar
     swimlanesStatuses: {},
     initialLoad: false,
     loading: false,
+    loadError: false,
     notFoundUserstories: false,
     move: jest.fn(() => Promise.resolve()),
     toggleFold: jest.fn(),
     showArchivedStatus: jest.fn(),
     hideArchivedStatus: jest.fn(),
     reload: jest.fn(),
+    deleteUserStory: jest.fn(() => Promise.resolve()),
     ...overrides,
   };
 }
@@ -374,6 +376,27 @@ describe('KanbanApp', () => {
       expect(
         container.querySelector('[data-tg-react-kanban="invalid-project"]'),
       ).not.toBeNull();
+      expect(screen.queryByTestId('dnd-context')).toBeNull();
+    });
+
+    // F-REG-01: the guard must reject blank / non-positive / non-integer ids, not
+    // just NaN. `Number("")` is 0 and `Number("-1")` is -1 (both FINITE), so the
+    // stricter `Number.isInteger(id) && id > 0` rule is what rejects them, and it
+    // also rejects the literal `"{{project.id}}"` snapshot AngularJS emits before
+    // its first digest resolves the interpolation.
+    it.each([
+      ['a blank string (Number("") === 0)', ''],
+      ['zero', '0'],
+      ['a negative id', '-1'],
+      ['a fractional id', '1.5'],
+      ['the unresolved AngularJS interpolation literal', '{{project.id}}'],
+    ])('rejects %s as an invalid project-id', async (_label, value) => {
+      const { container } = await renderApp(value);
+
+      expect(
+        container.querySelector('[data-tg-react-kanban="invalid-project"]'),
+      ).not.toBeNull();
+      expect(container.querySelector('section.main.kanban')).toBeNull();
       expect(screen.queryByTestId('dnd-context')).toBeNull();
     });
   });
@@ -622,8 +645,11 @@ describe('KanbanApp', () => {
           await Promise.resolve();
         });
 
+        // F-UI-01: the search host is the `<tg-input-search>` custom-element TAG
+        // (was a `<div class="tg-input-search">`) so the retained SCSS TAG
+        // selector matches; query by tag accordingly.
         const input = container.querySelector(
-          '.tg-input-search input[type="search"]',
+          'tg-input-search input[type="search"]',
         ) as HTMLInputElement;
         expect(input).not.toBeNull();
 
@@ -644,6 +670,48 @@ describe('KanbanApp', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('renders the search box as a `<tg-input-search>` host element (F-UI-01)', async () => {
+      primeLoadedNoSwimlane();
+      const { container } = await renderApp();
+
+      // The retained stylesheet targets the search box by TAG
+      // (`app/styles/layout/kanban.scss:84`,
+      // `.kanban-table-options-start tg-input-search`). Emitting a plain
+      // `<div class="tg-input-search">` would never match, so the host must be
+      // the custom-element tag.
+      const host = container.querySelector('tg-input-search');
+      expect(host).not.toBeNull();
+      // The search <input> lives inside the host, labelled for a11y (F-UI-04).
+      const input = host?.querySelector('input[type="search"]');
+      expect(input).not.toBeNull();
+      expect(input?.getAttribute('aria-label')).toBeTruthy();
+    });
+  });
+
+  describe('F-UI-01 filter host element', () => {
+    it('wraps the FiltersSidebar in a `<tg-filter>` host inside `.kanban-filter`', async () => {
+      primeLoadedNoSwimlane();
+      const { container } = await renderApp();
+
+      // Closed initially: neither the panel nor the host is mounted.
+      expect(container.querySelector('.kanban-filter')).toBeNull();
+      expect(container.querySelector('tg-filter')).toBeNull();
+
+      fireEvent.click(
+        container.querySelector('.btn-filter.e2e-open-filter') as HTMLElement,
+      );
+
+      // Open: the retained selector `.kanban-filter tg-filter`
+      // (`app/styles/layout/kanban.scss:50`) requires the `<tg-filter>` TAG to
+      // live inside the `.kanban-filter` container.
+      const panel = container.querySelector('.kanban-filter');
+      expect(panel).not.toBeNull();
+      const filterHost = panel?.querySelector('tg-filter');
+      expect(filterHost).not.toBeNull();
+      // The FiltersSidebar body renders inside the host.
+      expect(filterHost?.querySelector('[data-testid="filters-sidebar"]')).not.toBeNull();
     });
   });
 
@@ -852,35 +920,49 @@ describe('KanbanApp', () => {
     });
   });
 
-  describe('card action callbacks (delegated, gated no-ops)', () => {
-    it('safely delegates edit / delete / assigned-to with NO board side effects when GRANTED', async () => {
-      // GRANT the relevant per-US permissions so each handler PASSES its gate and
-      // reaches its delegation branch — the strongest path to exercise.
+  /*
+   * F-CQ-02 — the five card/board controls split into TWO groups by what the
+   * legacy `KanbanController` OWNED:
+   *   - DELETE is OWNED: the controller called `@repo.remove(model)` directly
+   *     after `@confirm.askOnDelete` (SOURCE 289-304). The React port owns it too
+   *     (confirm -> `board.deleteUserStory` -> `api.del` + optimistic `REMOVE`).
+   *   - EDIT / ASSIGN / NEW / BULK are DELEGATED: the controller only
+   *     `$rootscope.$broadcast(...)` to open a COMMON-module lightbox
+   *     (`genericform:edit|new`, `usform:bulk`, `tg-lb-select-user`) that owned
+   *     the save, then REACTED to `usform:*:success` (SOURCE 187-224). The AAP
+   *     lists the common module OUT OF SCOPE (§0.2.2) with NO Kanban lightbox in
+   *     the file manifest (§0.4.1), so these stay permission-gated no-ops and the
+   *     board reflects their outcome only through the events bridge.
+   */
+  describe('card action callbacks — DELETE owned; EDIT / ASSIGN delegated', () => {
+    let confirmSpy: jest.SpyInstance;
+    afterEach(() => {
+      confirmSpy?.mockRestore();
+    });
+
+    it('EDIT / ASSIGNED-TO delegate as no-ops when GRANTED (board reflects only via events bridge)', async () => {
+      // GRANT modify_us + delete_us so each handler PASSES its gate and reaches
+      // its delegation branch — the strongest path to exercise.
       const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us', 'delete_us'] });
       await renderApp();
 
       const col = mockCaptured.column[0];
       expect(typeof col.onClickEdit).toBe('function');
-      expect(typeof col.onClickDelete).toBe('function');
       expect(typeof col.onClickAssignedTo).toBe('function');
       expect(typeof col.onToggleFold).toBe('function');
 
-      // AUTHORITATIVE CONTRACT (stronger than "does not throw"): edit / delete /
-      // assigned-to open the COMMON module's `genericform` / `askOnDelete` /
-      // `tg-lb-select-user` dialogs, which the AAP lists OUT OF SCOPE (§0.2.2
-      // common module) with NO Kanban React lightbox in the file manifest (§0.4.1);
-      // the SOURCE `KanbanController` only REACTED to their success via the events
-      // bridge. So even with the permissions GRANTED the handlers SAFELY DELEGATE —
-      // they neither throw NOR mutate the board themselves (no move / reload / fold
-      // / archived toggle). The board changes only in response to a lightbox
-      // SUCCESS event arriving through the bridge, never from the click itself.
+      // EDIT / ASSIGN open the COMMON module's `genericform:edit` /
+      // `tg-lb-select-user` dialogs (AAP §0.2.2 OOS; §0.4.1 defines no Kanban
+      // edit/assignee component). Even with permissions GRANTED they SAFELY
+      // DELEGATE — they neither throw NOR mutate the board themselves; the board
+      // changes only when a lightbox SUCCESS event arrives through the bridge.
       expect(() => {
         act(() => {
           col.onClickEdit(1);
-          col.onClickDelete(1);
           col.onClickAssignedTo(1);
         });
       }).not.toThrow();
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
       expect(board.move).not.toHaveBeenCalled();
       expect(board.reload).not.toHaveBeenCalled();
       expect(board.toggleFold).not.toHaveBeenCalled();
@@ -888,32 +970,94 @@ describe('KanbanApp', () => {
       expect(board.hideArchivedStatus).not.toHaveBeenCalled();
     });
 
-    it('safely delegates edit / delete / assigned-to with NO board side effects when DENIED', async () => {
-      // DENY: the default project grants only `view_us` (no modify_us / delete_us),
-      // so every handler is short-circuited by its permission gate. The columns
-      // still RECEIVE the handlers (the gate lives INSIDE the container handler,
-      // reproducing the SOURCE `canModifyUs` / `delete_us` checks), so this asserts
-      // the gate holds AND that denial is likewise side-effect-free.
+    it('EDIT / ASSIGNED-TO stay side-effect-free when DENIED (permission gate holds)', async () => {
+      // DENY: the default project grants only `view_us` (no modify_us), so both
+      // handlers short-circuit at their gate. The columns still RECEIVE the
+      // handlers (the gate lives INSIDE the container handler, reproducing the
+      // SOURCE `canModifyUs` check), so this asserts the gate holds AND denial is
+      // side-effect-free.
       const board = primeLoadedNoSwimlane(); // my_permissions === ['view_us']
       await renderApp();
 
       const col = mockCaptured.column[0];
       expect(typeof col.onClickEdit).toBe('function');
-      expect(typeof col.onClickDelete).toBe('function');
       expect(typeof col.onClickAssignedTo).toBe('function');
 
       expect(() => {
         act(() => {
           col.onClickEdit(1);
-          col.onClickDelete(1);
           col.onClickAssignedTo(1);
         });
       }).not.toThrow();
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
       expect(board.move).not.toHaveBeenCalled();
       expect(board.reload).not.toHaveBeenCalled();
-      expect(board.toggleFold).not.toHaveBeenCalled();
-      expect(board.showArchivedStatus).not.toHaveBeenCalled();
-      expect(board.hideArchivedStatus).not.toHaveBeenCalled();
+    });
+
+    it('DELETE (owned): GRANTED + confirm ACCEPTED persists via board.deleteUserStory', async () => {
+      // SOURCE 289-304: confirm -> remove. `window.confirm` is the established
+      // React stand-in for `$confirm.askOnDelete`.
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'delete_us'] });
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      act(() => {
+        col.onClickDelete(1);
+      });
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(board.deleteUserStory).toHaveBeenCalledTimes(1);
+      expect(board.deleteUserStory).toHaveBeenCalledWith(1);
+    });
+
+    it('DELETE (owned): GRANTED + confirm CANCELLED is a no-op', async () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(false);
+      const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'delete_us'] });
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      act(() => {
+        col.onClickDelete(1);
+      });
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
+    });
+
+    it('DELETE (owned): DENIED (no delete_us) is gated BEFORE the confirm prompt', async () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us'] });
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      act(() => {
+        col.onClickDelete(1);
+      });
+
+      // The permission gate short-circuits: neither the confirm dialog nor the
+      // delete ever fires.
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
+    });
+
+    it('DELETE (owned): ARCHIVED project blocks deletion even with delete_us (F-REG-03)', async () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      const board = primeLoadedNoSwimlane({
+        my_permissions: ['view_us', 'delete_us'],
+        archived_code: 'archived',
+      });
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      act(() => {
+        col.onClickDelete(1);
+      });
+
+      // `canMutate` is archive-aware, so an archived project denies deletion even
+      // though the user holds `delete_us` — gated before the confirm prompt.
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
     });
   });
 

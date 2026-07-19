@@ -45,46 +45,27 @@
  * Toolchain: TypeScript 5.4.5 under `strict`, React 18.2.0, Node v16.19.1.
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useId } from 'react';
 
-import moment from 'moment';
+// F-PERF-01: use the shell's already-loaded global Moment (see shared/moment.ts) so
+// esbuild does not bundle a second ~60 KB copy of Moment into react.js.
+import moment from '../../shared/moment';
 
 import type { Milestone, UserStory, SprintFormValues } from '../../shared/types';
 import { validateSprintForm, formatSprintDate } from '../../shared/validation';
 import { createMilestone, saveMilestone } from '../../shared/api/milestones';
-
-/*
- * The lightbox markup uses Taiga's `<tg-svg>` web component to render inline
- * SVG sprites (so CSS selectors such as `tg-svg svg.icon` keep matching). It is
- * not a standard HTML element, so we widen the JSX intrinsic-element table
- * locally. Typed `any` because the element is opaque to React/TS and is
- * resolved by the existing sprite runtime at render time. (The same local
- * declaration exists in the sibling components; duplicate ambient merges are
- * harmless.)
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup. The inner `<svg>` carries the `icon <name>`
- * classes the SCSS targets, and `<use>` references the sprite by id.
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
+import { ApiError } from '../../shared/api/client';
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration — icons used here: `icon-close`,
+// `icon-trash`). F-UI-06: the shared translation bridge for the dialog title,
+// placeholders and action labels (`LIGHTBOX.ADD_EDIT_SPRINT.*`, `COMMON.*`,
+// `BACKLOG.EDIT_SPRINT`).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
+// F-UI-05: shared modal-dialog behaviour (focus trap, Escape-to-close, restore
+// focus) applied to the lightbox so it is announced as a modal dialog and is
+// fully keyboard-operable — see `useModalDialog`.
+import { useModalDialog } from '../../shared/useModalDialog';
 
 /**
  * The localised picker display format, equivalent to the legacy
@@ -175,6 +156,17 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
   const [hasErrors, setHasErrors] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+
+  // F-UI-05: turn the lightbox into a real accessible modal dialog. The
+  // returned ref is spread onto the `.lightbox` shell (which also carries
+  // `role="dialog"` + `aria-modal="true"`), giving it a focus trap,
+  // Escape-to-close and focus restoration to the opener. It is inert while
+  // `open` is false. This hook is intentionally called BEFORE the name-focus
+  // effect below so that, on open, the component's own field focus runs LAST
+  // and wins over the hook's generic first-focusable fallback.
+  const dialogRef = useModalDialog<HTMLDivElement>(open, onClose);
+  // Stable id linking the dialog to its heading via `aria-labelledby`.
+  const titleId = useId();
 
   /*
    * Prefill on open, reproducing the directive's `sprintform:create` /
@@ -287,26 +279,52 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
         onCreated(milestone, ussToMove);
         onClose();
       } else if (sprint) {
-        // Spread the existing sprint first (mirrors `newSprint =
-        // $scope.newSprint.realClone()` so version + other fields ride along),
-        // then override id + name + the formatted dates.
-        const milestone = await saveMilestone({
-          ...sprint,
-          id: sprint.id,
-          name,
-          estimated_start: start,
-          estimated_finish: finish,
-        });
+        // PATCH parity with `$repo.save` (repository.coffee:53-64): send ONLY
+        // the attributes that actually CHANGED versus the original sprint, plus
+        // the concurrency `version` — mirroring `getAttrs(patch=true)` =
+        // `_modifiedAttrs` + `version`, where a field counts as modified only
+        // when its new value differs from the original (model.coffee:84-90).
+        // The whole model is deliberately NOT spread, so read-only / computed
+        // fields (slug, closed, total_points, created_date, …) are never
+        // PATCHed back (regression fix F-REG-05).
+        const changes: Partial<Milestone> = {};
+        if (name !== sprint.name) {
+          changes.name = name;
+        }
+        if (start !== sprint.estimated_start) {
+          changes.estimated_start = start;
+        }
+        if (finish !== sprint.estimated_finish) {
+          changes.estimated_finish = finish;
+        }
+
+        // `version` lives under the Milestone index signature (typed unknown);
+        // forward it only when it is a real number.
+        const version =
+          typeof sprint.version === 'number' ? sprint.version : undefined;
+
+        const milestone = await saveMilestone(sprint.id, changes, version);
         onSaved(milestone);
         onClose();
       }
     } catch (err) {
       // Reproduce `form.setErrors(data)` + the `_error_message`/`__all__`
-      // notifications INLINE (React has no `$confirm.notify` toast). Backend
-      // error fields are not on the Milestone type, so access them defensively
-      // via a `Record<string, unknown>` view guarded for non-object errors.
+      // notifications INLINE (React has no `$confirm.notify` toast).
+      //
+      // REGRESSION FIX (F-REG-04): the backend field errors live in the PARSED
+      // RESPONSE BODY, which the transport surfaces as `ApiError.body` — NOT on
+      // the error object itself. Reading `err` directly picked up the Error's
+      // own members instead (e.g. `err.name` === 'ApiError', the class name),
+      // so a "name" field error was fabricated on EVERY failure and the real
+      // Django `{ name: [...], _error_message, __all__ }` payload was ignored.
+      // We therefore read `err.body` when `err` is an ApiError, and fall back to
+      // the raw object only for a non-ApiError throw (defensive).
       const data: Record<string, unknown> =
-        err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
+        err instanceof ApiError && err.body && typeof err.body === 'object'
+          ? (err.body as Record<string, unknown>)
+          : err && typeof err === 'object' && !(err instanceof ApiError)
+            ? (err as Record<string, unknown>)
+            : {};
 
       // Backend field errors are typically string[]; accept a bare string too.
       const pick = (value: unknown): string | undefined => {
@@ -349,8 +367,14 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
     if (!sprint) {
       return;
     }
-    // i18n: LIGHTBOX.DELETE_SPRINT.TITLE = 'Delete sprint' ; message = sprint.name
-    const confirmed = window.confirm(`Delete sprint: ${sprint.name}`);
+    // Reproduces the directive's `$confirm.askOnDelete(title, message)` with
+    // title = LIGHTBOX.DELETE_SPRINT.TITLE and message = sprint.name. React has
+    // no `$confirm` service, so a native `window.confirm` stands in (the
+    // closest 1:1 confirm-gate). The title is localised via the shared bridge;
+    // the English fallback ('Delete sprint') keeps the rendered prompt
+    // byte-identical to the prior hard-coded string under `npm test`.
+    const confirmTitle = translate('LIGHTBOX.DELETE_SPRINT.TITLE', undefined, 'Delete sprint');
+    const confirmed = window.confirm(`${confirmTitle}: ${sprint.name}`);
     if (confirmed) {
       onRemoved(sprint);
       onClose();
@@ -374,18 +398,34 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
   // execution). See the `.last-sprint-name` label in the JSX below.
 
   return (
-    <div className={`lightbox lightbox-sprint-add-edit${open ? ' open' : ''}`}>
+    <div
+      ref={dialogRef}
+      className={`lightbox lightbox-sprint-add-edit${open ? ' open' : ''}`}
+      /*
+        F-UI-05: dialog semantics. `.lightbox` is `display:none` until the
+        `open` class is applied (see the `lightbox` SCSS mixin), so assistive
+        tech only sees the dialog while it is actually open; `aria-labelledby`
+        names it from the `<h2 .title>` heading and `aria-busy` reflects the
+        in-flight submit.
+      */
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      aria-busy={submitting}
+    >
       {/* Close control — replaces the `tg-lightbox-close` directive. */}
       <a
         className="close"
         href=""
-        title="Close" /* i18n: COMMON.CLOSE */
+        title={translate('COMMON.CLOSE', undefined, 'close')}
+        /* F-UI-04: the control is icon-only, so it needs an accessible name. */
+        aria-label={translate('COMMON.CLOSE', undefined, 'close')}
         onClick={(e) => {
           e.preventDefault();
           onClose();
         }}
       >
-        {svgIcon('icon-close')}
+        <TgSvg icon="icon-close" />
       </a>
 
       {/*
@@ -406,10 +446,22 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
             i18n: LIGHTBOX.ADD_EDIT_SPRINT.TITLE = 'New sprint'
             i18n: BACKLOG.EDIT_SPRINT = 'Edit Sprint'
           */}
-          <h2 className="title">{mode === 'create' ? 'New sprint' : 'Edit Sprint'}</h2>
+          <h2 className="title" id={titleId}>
+            {mode === 'create'
+              ? translate('LIGHTBOX.ADD_EDIT_SPRINT.TITLE', undefined, 'New sprint')
+              : translate('BACKLOG.EDIT_SPRINT', undefined, 'Edit Sprint')}
+          </h2>
 
-          {/* General (non-field) error, from `_error_message` / `__all__`. */}
-          {generalError && <div className="checksley-error-list">{generalError}</div>}
+          {/*
+            General (non-field) error, from `_error_message` / `__all__`.
+            F-UI-05: `role="alert"` (implicit `aria-live="assertive"`) so the
+            failure is announced to screen-reader users the moment it appears.
+          */}
+          {generalError && (
+            <div className="checksley-error-list" role="alert">
+              {generalError}
+            </div>
+          )}
 
           <fieldset>
             <input
@@ -417,13 +469,17 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
               type="text"
               name="name"
               maxLength={500}
-              placeholder="sprint name" /* i18n: LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_NAME */
+              placeholder={translate(
+                'LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_NAME',
+                undefined,
+                'sprint name',
+              )}
               value={name}
               ref={nameInputRef}
               onChange={(e) => setName(e.target.value)}
             />
             {errors.name && (
-              <ul className="checksley-error-list">
+              <ul className="checksley-error-list" role="alert">
                 <li>{errors.name}</li>
               </ul>
             )}
@@ -459,12 +515,16 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
                 className={`date-start${errors.estimated_start ? ' checksley-error' : ''}`}
                 type="text"
                 name="estimated_start"
-                placeholder="Estimated Start" /* i18n: LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START */
+                placeholder={translate(
+                  'LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START',
+                  undefined,
+                  'Estimated Start',
+                )}
                 value={estimatedStart}
                 onChange={(e) => setEstimatedStart(e.target.value)}
               />
               {errors.estimated_start && (
-                <ul className="checksley-error-list">
+                <ul className="checksley-error-list" role="alert">
                   <li>{errors.estimated_start}</li>
                 </ul>
               )}
@@ -474,12 +534,16 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
                 className={`date-end${errors.estimated_finish ? ' checksley-error' : ''}`}
                 type="text"
                 name="estimated_finish"
-                placeholder="Estimated End" /* i18n: LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END */
+                placeholder={translate(
+                  'LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END',
+                  undefined,
+                  'Estimated End',
+                )}
                 value={estimatedFinish}
                 onChange={(e) => setEstimatedFinish(e.target.value)}
               />
               {errors.estimated_finish && (
-                <ul className="checksley-error-list">
+                <ul className="checksley-error-list" role="alert">
                   <li>{errors.estimated_finish}</li>
                 </ul>
               )}
@@ -499,10 +563,10 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
             <button
               className="btn-big button-large button-block"
               type="submit"
-              title="Save" /* i18n: COMMON.SAVE */
+              title={translate('COMMON.SAVE', undefined, 'Save')}
               disabled={submitting}
             >
-              Save
+              {translate('COMMON.SAVE', undefined, 'Save')}
             </button>
 
             {/* Delete — edit mode only, gated on the delete_milestone permission. */}
@@ -510,15 +574,24 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
               <button
                 className="btn-link delete-sprint"
                 type="button"
-                title="delete sprint" /* i18n: LIGHTBOX.ADD_EDIT_SPRINT.TITLE_ACTION_DELETE_SPRINT */
+                title={translate(
+                  'LIGHTBOX.ADD_EDIT_SPRINT.TITLE_ACTION_DELETE_SPRINT',
+                  undefined,
+                  'delete sprint',
+                )}
                 onClick={(e) => {
                   e.preventDefault();
                   handleRemove();
                 }}
               >
-                {svgIcon('icon-trash')}
-                <span className="delete-sprint-text">Do you want to delete this sprint?</span>
-                {/* i18n: LIGHTBOX.ADD_EDIT_SPRINT.ACTION_DELETE_SPRINT */}
+                <TgSvg icon="icon-trash" />
+                <span className="delete-sprint-text">
+                  {translate(
+                    'LIGHTBOX.ADD_EDIT_SPRINT.ACTION_DELETE_SPRINT',
+                    undefined,
+                    'Do you want to delete this sprint?',
+                  )}
+                </span>
               </button>
             )}
           </div>

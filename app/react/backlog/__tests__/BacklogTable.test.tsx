@@ -128,8 +128,11 @@ interface Handlers {
   onMoveUsToTop?: (us: UserStory) => void;
   onToggleCheck?: (us: UserStory, checked: boolean, shiftKey: boolean) => void;
   onUpdateStatus?: (us: UserStory, newStatusId: number) => void;
-  /** Optional points-cell click → the container opens the points editor. */
-  onEditPoints?: (us: UserStory, roleId: number | null) => void;
+  /**
+   * Optional points-estimate save: the popover resolves a role + point value
+   * and emits `(us, roleId, pointId)` (F-CQ-03).
+   */
+  onUpdatePoints?: (us: UserStory, roleId: number, pointId: number) => void;
 }
 
 /** Optional data / flag overrides for {@link renderTable}. */
@@ -184,7 +187,7 @@ function renderTable(config: RenderConfig = {}) {
       onMoveUsToTop={handlers.onMoveUsToTop ?? jest.fn()}
       onToggleCheck={handlers.onToggleCheck ?? jest.fn()}
       onUpdateStatus={handlers.onUpdateStatus ?? jest.fn()}
-      onEditPoints={handlers.onEditPoints}
+      onUpdatePoints={handlers.onUpdatePoints}
     />,
   );
 }
@@ -558,20 +561,136 @@ describe('BacklogTable', () => {
       expect(getRow(container, 1).querySelector('.tag')).toBeNull();
     });
 
-    it('invokes onEditPoints with (us, selectedRoleId) when the points cell is clicked', () => {
-      const onEditPoints = jest.fn();
+    it('opens the role picker first when >1 computable role and none is filtered', () => {
       const us = makeUserStory({ id: 1, ref: 1 });
       const { container } = renderTable({
         userstories: [us],
-        project: makeModifyProject(), // has computable roles → points cell editable
-        handlers: { onEditPoints },
+        // Default fixture has TWO computable roles (Back, Front) and no header
+        // filter → the two-step flow starts at the role picker.
+        project: makeModifyProject(),
+        handlers: { onUpdatePoints: jest.fn() },
       });
 
-      // With no role filtered yet, the selected role id is `null`.
-      fireEvent.click(mustQuery(getRow(container, 1), 'button.us-points'));
+      const row = getRow(container, 1);
+      fireEvent.click(mustQuery(row, 'button.us-points'));
 
-      expect(onEditPoints).toHaveBeenCalledTimes(1);
-      expect(onEditPoints).toHaveBeenCalledWith(us, null);
+      // Step 1 — the role picker (`pop-role`), NOT the point list, is shown.
+      const rolePicker = mustQuery(row, '.pop-role');
+      expect(rolePicker).toBeInTheDocument();
+      expect(row.querySelector('.pop-points')).toBeNull();
+      // One entry per COMPUTABLE role (2 of the 3 fixture roles).
+      expect(rolePicker.querySelectorAll('a.role')).toHaveLength(2);
+    });
+
+    it('emits onUpdatePoints(us, roleId, pointId) after picking a role then a point value', () => {
+      const onUpdatePoints = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeModifyProject(),
+        handlers: { onUpdatePoints },
+      });
+
+      const row = getRow(container, 1);
+      fireEvent.click(mustQuery(row, 'button.us-points'));
+
+      // Pick the "Back" role (id 1).
+      fireEvent.click(mustQuery(row, 'a.role[data-role-id="1"]'));
+
+      // Step 2 — the point-value list is now shown, ordered by `order`.
+      const pointList = mustQuery(row, '.pop-points');
+      expect(pointList).toBeInTheDocument();
+      const options = pointList.querySelectorAll('a.point');
+      expect(options).toHaveLength(2);
+
+      // Pick point id 11 ("1"): emits (us, roleId=1, pointId=11) and closes.
+      fireEvent.click(mustQuery(row, 'a.point[data-point-id="11"]'));
+
+      expect(onUpdatePoints).toHaveBeenCalledTimes(1);
+      expect(onUpdatePoints).toHaveBeenCalledWith(us, 1, 11);
+      expect(row.querySelector('.pop-points')).toBeNull();
+    });
+
+    it('skips the role picker and shows point values directly when a header role is filtered', () => {
+      const onUpdatePoints = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeModifyProject(),
+        handlers: { onUpdatePoints },
+      });
+
+      const row = getRow(container, 1);
+
+      // Filter the header role selector to "Front" (id 2): the row's
+      // `selectedRoleId` prop becomes 2, so the points popover resolves that
+      // role immediately (no role-picker step).
+      fireEvent.click(mustQuery(container, `${HEADER_TITLE} .points .header-points`));
+      fireEvent.click(
+        mustQuery(container, `${HEADER_TITLE} .points a.role[data-role-id="2"]`),
+      );
+
+      fireEvent.click(mustQuery(row, 'button.us-points'));
+      expect(row.querySelector('.pop-role')).toBeNull();
+      expect(mustQuery(row, '.pop-points')).toBeInTheDocument();
+
+      fireEvent.click(mustQuery(row, 'a.point[data-point-id="10"]'));
+      expect(onUpdatePoints).toHaveBeenCalledWith(us, 2, 10);
+    });
+
+    it('goes straight to point values when there is exactly one computable role', () => {
+      const onUpdatePoints = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        // A project with a single computable role → the popover pre-resolves it.
+        project: makeProject({
+          my_permissions: ['view_project', 'view_us', 'modify_us'],
+          roles: [{ id: 5, name: 'Only', slug: 'only', computable: true, order: 1 }],
+        }),
+        handlers: { onUpdatePoints },
+      });
+
+      const row = getRow(container, 1);
+      fireEvent.click(mustQuery(row, 'button.us-points'));
+
+      expect(row.querySelector('.pop-role')).toBeNull();
+      expect(mustQuery(row, '.pop-points')).toBeInTheDocument();
+
+      fireEvent.click(mustQuery(row, 'a.point[data-point-id="11"]'));
+      expect(onUpdatePoints).toHaveBeenCalledWith(us, 5, 11);
+    });
+
+    it('does not open the points popover when the project is view-only', () => {
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeProject(), // view-only → no `modify_us`
+        handlers: { onUpdatePoints: jest.fn() },
+      });
+
+      const row = getRow(container, 1);
+      const button = mustQuery(row, 'button.us-points');
+      expect(button).toHaveClass('not-clickable');
+      fireEvent.click(button);
+      expect(row.querySelector('.pop-role')).toBeNull();
+      expect(row.querySelector('.pop-points')).toBeNull();
+    });
+
+    it('closes an open points popover on an outside mousedown', () => {
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeModifyProject(),
+        handlers: { onUpdatePoints: jest.fn() },
+      });
+
+      const row = getRow(container, 1);
+      fireEvent.click(mustQuery(row, 'button.us-points'));
+      expect(row.querySelector('.pop-role')).toBeInTheDocument();
+
+      fireEvent.mouseDown(document.body);
+      expect(row.querySelector('.pop-role')).toBeNull();
     });
   });
 
@@ -666,6 +785,104 @@ describe('BacklogTable', () => {
       } finally {
         globalScope.IntersectionObserver = original;
       }
+    });
+  });
+
+  /* ------------------------------------------------------------------ *
+   * F-UI-02 / F-UI-04 / F-UI-06 / F-UI-07 — icons, a11y, i18n, emoji
+   * ------------------------------------------------------------------ */
+  describe('F-UI-02 sprite icons (shared TgSvg)', () => {
+    it('renders the row drag handle, due-date and status icons as <tg-svg> hosts', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1, due_date: '2025-02-01' })],
+      });
+      const row = getRow(container, 1);
+
+      expect(
+        row.querySelector('.draggable-us-row tg-svg svg.icon.icon-draggable use'),
+      ).not.toBeNull();
+      expect(
+        row.querySelector('.due-date tg-svg svg.icon.icon-clock use'),
+      ).not.toBeNull();
+      expect(
+        row.querySelector('a.us-status tg-svg svg.icon.icon-arrow-down use'),
+      ).not.toBeNull();
+    });
+  });
+
+  describe('F-UI-04 accessibility', () => {
+    it('gives the bulk-select checkbox an accessible name', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 42 })],
+      });
+      const checkbox = mustQuery(getRow(container, 1), 'input[type="checkbox"]');
+      expect(checkbox).toHaveAttribute('aria-label', 'Select user story #42');
+    });
+
+    it('exposes the status disclosure state and menu semantics', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1 })],
+      });
+      const row = getRow(container, 1);
+      const statusLink = mustQuery(row, US_STATUS);
+      expect(statusLink).toHaveAttribute('aria-haspopup', 'menu');
+      expect(statusLink).toHaveAttribute('aria-expanded', 'false');
+
+      fireEvent.click(statusLink);
+      expect(mustQuery(row, US_STATUS)).toHaveAttribute('aria-expanded', 'true');
+      const popover = mustQuery(row, STATUS_POPOVER);
+      expect(popover).toHaveAttribute('role', 'menu');
+      expect(popover.querySelectorAll('[role="menuitem"]').length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('F-UI-06 localized headers and status tooltip', () => {
+    it('renders the localized column headers', () => {
+      const { container } = renderTable();
+      const header = mustQuery(container, HEADER_TITLE);
+
+      expect(mustQuery(header, '.user-stories')).toHaveTextContent('User Story');
+      expect(mustQuery(header, '.status')).toHaveTextContent('Status');
+      expect(mustQuery(header, '.points')).toHaveAttribute(
+        'title',
+        'Select view per Role',
+      );
+    });
+
+    it('localizes the row status tooltip', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1 })],
+      });
+      expect(mustQuery(getRow(container, 1), US_STATUS)).toHaveAttribute(
+        'title',
+        'Status Name',
+      );
+    });
+  });
+
+  describe('F-UI-07 emojified story subject', () => {
+    /** Publish a stub shell emoji table + version (as `app.coffee` does). */
+    function installEmojiTable(): void {
+      (window as unknown as { taiga?: unknown }).taiga = {
+        emojis: [{ id: 'smile', name: 'smile', image: 'smile.png' }],
+      };
+      (window as unknown as { _version?: string })._version = 'v9';
+    }
+
+    afterEach(() => {
+      delete (window as unknown as { taiga?: unknown }).taiga;
+      delete (window as unknown as { _version?: string })._version;
+    });
+
+    it('renders `:shortcode:` tokens in the subject as <img class="emoji">', () => {
+      installEmojiTable();
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1, subject: 'Do :smile: it' })],
+      });
+      const name = mustQuery(getRow(container, 1), '.user-story-name');
+      const img = name.querySelector('img.emoji');
+      expect(img).not.toBeNull();
+      expect(img?.getAttribute('src')).toBe('/v9/emojis/smile.png');
     });
   });
 });

@@ -54,7 +54,9 @@
  */
 
 import { useReducer, useEffect, useRef, useCallback, useMemo } from 'react';
-import moment from 'moment';
+// F-PERF-01: use the shell's already-loaded global Moment (see shared/moment.ts) so
+// esbuild does not bundle a second ~60 KB copy of Moment into react.js.
+import moment from '../../shared/moment';
 
 import {
     backlogReducer,
@@ -63,7 +65,7 @@ import {
     BacklogStats,
 } from './backlogReducer';
 import type { Project, UserStory, Milestone } from '../../shared/types';
-import { api } from '../../shared/api/client';
+import { api, ApiError } from '../../shared/api/client';
 import {
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
@@ -76,8 +78,7 @@ import {
     saveMilestone,
     MilestoneCreatePayload,
 } from '../../shared/api/milestones';
-import { subscribeProjectChanges } from '../../shared/events';
-import { getEventsUrl } from '../../shared/session';
+import { subscribeProjectChanges, isEventsConnected } from '../../shared/events';
 
 /* ========================================================================== *
  * Phase 1 — Module constants & helpers
@@ -156,17 +157,123 @@ function computeStats(raw: Record<string, unknown>): BacklogStats {
 }
 
 /**
- * Proxy for the AngularJS `@events.connected` flag consulted after a drag
- * settles (`main.coffee:634` — `if !@events.connected` → hard-reload). The
- * shared `../../shared/events` bridge exposes no connection flag, so we treat
- * "events are configured" (`getEventsUrl()` truthy) as "live pushes will keep
- * the board fresh" and therefore SKIP the post-drag fallback reload. When events
- * are NOT configured (the disabled-safe path) this returns `false`, so the
- * fallback reload runs instead — exactly matching the source's intent that the
- * board is refreshed one way or the other.
+ * The AngularJS `@events.connected` flag consulted after a drag settles
+ * (`main.coffee:634` — `if !@events.connected` → hard-reload).
+ *
+ * F-AAP-03: this now reports the REAL socket state via
+ * {@link isEventsConnected}, not merely whether an events URL is CONFIGURED.
+ * The previous implementation returned `!!getEventsUrl()`, so a configured-but-
+ * disconnected socket (still connecting, in reconnect backoff, errored, or torn
+ * down) was wrongly treated as "connected", causing the post-drag reconcile
+ * reload to be skipped and leaving the board stale. Reading the live flag means
+ * the fallback reload runs whenever pushes will NOT actually refresh the board:
+ *   - events disabled (bridge never created) → `false` → reload (unchanged);
+ *   - configured but socket not open        → `false` → reload (the fix);
+ *   - socket genuinely open                  → `true`  → skip (pushes refresh).
  */
 function eventsConnected(): boolean {
-    return !!getEventsUrl();
+    return isEventsConnected();
+}
+
+/**
+ * Build a user-facing message for a rejected reorder write (F-AAP-03).
+ *
+ * Prefers a server-supplied message — `ApiError.body._error_message` or
+ * `__all__` (the same Django error envelope `CreateEditSprintLightbox` reads),
+ * then a plain `Error.message` — and otherwise falls back to a clear generic
+ * sentence. The board is reconciled to server truth regardless; this string
+ * only tells the user WHY their move did not stick.
+ */
+/**
+ * Extract a human-readable message from a rejected `/api/v1/` call. Parses the
+ * Django REST error envelope (`_error_message` / `__all__`, string or array)
+ * carried on {@link ApiError.body}, then falls back to a plain `Error.message`,
+ * and finally returns `null` so the caller can supply its own default.
+ */
+function parseApiErrorMessage(err: unknown): string | null {
+    if (err instanceof ApiError && err.body !== null && typeof err.body === 'object') {
+        const body = err.body as Record<string, unknown>;
+        const detail = body._error_message ?? body.__all__;
+        if (typeof detail === 'string' && detail.trim() !== '') {
+            return detail;
+        }
+        if (Array.isArray(detail) && typeof detail[0] === 'string' && detail[0].trim() !== '') {
+            return detail[0];
+        }
+    }
+
+    if (err instanceof Error && err.message.trim() !== '') {
+        return err.message;
+    }
+
+    return null;
+}
+
+function describeReorderError(err: unknown): string {
+    const fallback = 'The story order could not be saved. The board has been refreshed to the latest server state.';
+    return parseApiErrorMessage(err) ?? fallback;
+}
+
+/**
+ * F-CQ-03 — describe a failed single-story mutation (delete / status / points).
+ * Surfaces the backend field error when present, otherwise the supplied
+ * operation-specific fallback.
+ */
+function describeUsMutationError(err: unknown, fallback: string): string {
+    return parseApiErrorMessage(err) ?? fallback;
+}
+
+/* ========================================================================== *
+ * F-CQ-09 — project-scoped "show tags" persistence
+ *
+ * The AngularJS Backlog persisted the tag-visibility preference PER PROJECT via
+ * `rs.userstories.storeShowTags(projectId, value)` and rehydrated it on load
+ * via `getShowTags(projectId)` (`main.coffee:236-239,501-502`,
+ * `resources/userstories.coffee:169-177`, which wrote `$storage` keyed by a
+ * per-project hash). The first React cut left a reducer comment claiming the
+ * hook persisted this, but the hook did NOT — an ownership/behaviour mismatch
+ * (F-CQ-09). These helpers make the claim TRUE: the hook now writes on every
+ * toggle and reads back on mount per `projectId`.
+ *
+ * The legacy AngularJS Backlog screen is REMOVED, so sharing its exact
+ * `hex_sha1` storage key is unnecessary (nothing else reads it); a clear,
+ * stable, project-scoped key is used instead. All access is wrapped so a
+ * storage-less / privacy-mode environment (or jsdom without a backing store)
+ * degrades gracefully to "not persisted" rather than throwing.
+ * ========================================================================== */
+
+const SHOW_TAGS_STORAGE_PREFIX = 'taiga.react.backlog.show-tags.';
+
+/**
+ * Read the persisted show-tags preference for a project, or `null` when none
+ * was stored (or storage is unavailable). Reproduces `getShowTags`.
+ */
+function readStoredShowTags(projectId: number): boolean | null {
+    try {
+        const raw = window.localStorage.getItem(`${SHOW_TAGS_STORAGE_PREFIX}${projectId}`);
+        if (raw === null) {
+            return null;
+        }
+        return raw === 'true';
+    } catch {
+        // Storage unavailable (privacy mode / sandbox) — treat as "not stored".
+        return null;
+    }
+}
+
+/**
+ * Persist the show-tags preference for a project. Reproduces `storeShowTags`.
+ * Failures are swallowed (persistence is a convenience, never load-critical).
+ */
+function writeStoredShowTags(projectId: number, value: boolean): void {
+    try {
+        window.localStorage.setItem(
+            `${SHOW_TAGS_STORAGE_PREFIX}${projectId}`,
+            value ? 'true' : 'false',
+        );
+    } catch {
+        /* storage unavailable — non-critical, silently skip persistence */
+    }
 }
 
 /* ========================================================================== *
@@ -208,6 +315,26 @@ export function useBacklog(projectId: number) {
     // synchronously mutable and must NOT trigger re-renders, exactly mirroring
     // the AngularJS `@scope.pendingDrag` array (`main.coffee:75, 540-642`).
     const pendingDragRef = useRef<PendingDrag[]>([]);
+
+    // F-AAP-03: latch set by the queue processor whenever ANY reorder write in
+    // the current batch is rejected. When the queue drains, a truthy latch
+    // forces a reconcile reload to server truth EVEN IF live events are
+    // connected — a failed write emits no change event, so pushes would never
+    // correct the rejected optimistic state. Reset each time the queue drains.
+    const moveFailedRef = useRef<boolean>(false);
+
+    // F-CQ-05: synchronous in-flight guard for the "load more" page fetch. A
+    // ref (not reducer state) so a burst of IntersectionObserver callbacks
+    // cannot fire two overlapping page requests before the first re-render.
+    const loadingMoreRef = useRef<boolean>(false);
+
+    // F-AAP-10: monotonic load "generation". Every full/initial (re)load bumps
+    // it and captures its own `myGen`; a dispatch is applied only while
+    // `myGen === loadGenRef.current`, so a late-resolving await from a
+    // superseded load (unmount, projectId change, or a newer retry) can never
+    // clobber current state. Replaces the per-effect `cancelled` boolean so the
+    // SAME guard protects both the mount effect and the `reload` retry action.
+    const loadGenRef = useRef<number>(0);
 
     // Stable indirection used to break the `moveUs` ⇄ queue-processor cycle
     // without a use-before-declaration in a `useCallback` dependency array. The
@@ -407,18 +534,18 @@ export function useBacklog(projectId: number) {
              * The AngularJS source calls:
              *   rs.userstories.bulkUpdateBacklogOrder(project, currentSprintId, previousUs, nextUs, bulkUserstories)
              * where bulkUserstories = usList.map(it => it.id)  → an ARRAY OF USER-STORY ID NUMBERS (main.coffee:535-537),
-             * passed through unchanged to POST /userstories/bulk_update_backlog_order as `bulk_userstories`
-             * (resources/userstories.coffee:92-105). The shared helper DECLARES this parameter as BulkUserStoryOrder[],
-             * which is a TYPE/WIRE DISCREPANCY. We MUST preserve the original number[] payload byte-for-byte, so we pass
-             * `bulkUserstories as unknown as BulkUserStoryOrder[]`. DO NOT rewrite the payload to [{us_id, order}] objects —
-             * that would change the request body the backend receives and break parity. Flagged for review.
+             * passed through unchanged to POST /userstories/bulk_update_backlog_order as `bulk_userstories`.
+             * The backend validator declares `bulk_userstories = ListField(child=IntegerField(min_value=1))`
+             * (taiga-back userstories/validators.py), i.e. a plain number[]. The shared helper's
+             * `bulkUpdateBacklogOrder` now types this parameter as `number[]`, so the id array is passed
+             * DIRECTLY with no cast — the request body is byte-for-byte identical to AngularJS.
              */
             const result = await bulkUpdateBacklogOrder(
                 projectIdForCall,
                 currentSprintId,
                 head.previousUs,
                 head.nextUs,
-                bulkUserstories as unknown as BulkUserStoryOrder[],
+                bulkUserstories,
             );
 
             // `result` is the response BODY directly (an array of updated rows) —
@@ -433,11 +560,17 @@ export function useBacklog(projectId: number) {
                 backlog_order: r.backlog_order,
             }));
             dispatch({ type: 'reconcileMoveResult', updatedRows });
-        } catch {
-            // A rejected reorder leaves the optimistic state in place; the drain
-            // below (and, when events are disabled, the fallback reload) brings
-            // the board back to server truth. Swallowed so the fire-and-forget
-            // queue never surfaces an unhandled rejection.
+        } catch (err) {
+            // F-AAP-03: a rejected reorder must NOT be silently swallowed.
+            //   1. SURFACE it — record a user-facing message in state so the UI
+            //      can report that the move did not persist.
+            //   2. FORCE reconciliation — latch `moveFailedRef` so the drain
+            //      below reloads server truth even when live events are
+            //      connected. A failed write emits no change event, so pushes
+            //      would otherwise never correct the rejected optimistic state,
+            //      leaving the board stale (the exact defect flagged).
+            moveFailedRef.current = true;
+            dispatch({ type: 'setMoveError', message: describeReorderError(err) });
         } finally {
             // main.coffee:618 — pendingDrag.shift() once the round-trip settles.
             pendingDragRef.current.shift();
@@ -446,12 +579,21 @@ export function useBacklog(projectId: number) {
                 // main.coffee:620-629 — recurse for the next queued drag (via the
                 // stable ref to avoid a self-referential useCallback dependency).
                 void processRef.current();
-            } else if (!eventsConnected()) {
-                // main.coffee:633-637 — when the queue drains AND events are NOT
-                // connected, hard-refresh so the UI reflects server truth.
-                void reloadSprints();
-                void reloadClosedSprints();
-                void reloadStats();
+            } else {
+                // Queue drained. Reconcile to server truth when EITHER a write in
+                // this batch failed (F-AAP-03 — a failed write emits no live
+                // event, so the optimistic state must be reloaded) OR live events
+                // are not actually connected (main.coffee:633-637, now using the
+                // REAL socket state via `eventsConnected()`). Reset the failure
+                // latch for the next batch before deciding.
+                const reconcileNeeded = moveFailedRef.current || !eventsConnected();
+                moveFailedRef.current = false;
+
+                if (reconcileNeeded) {
+                    void reloadSprints();
+                    void reloadClosedSprints();
+                    void reloadStats();
+                }
             }
         }
     }, [projectId, reloadSprints, reloadClosedSprints, reloadStats]);
@@ -539,6 +681,10 @@ export function useBacklog(projectId: number) {
      */
     const moveToSprint = useCallback(
         async (usList: UserStory[], targetSprintId: number): Promise<void> => {
+            // Clear any stale reorder error before starting a fresh move.
+            dispatch({ type: 'setMoveError', message: null });
+
+            // Optimistically remove the chosen stories from the backlog list.
             usList.forEach((u) => dispatch({ type: 'removeUsOptimistic', usId: u.id }));
 
             const data: BulkUserStoryOrder[] = usList.map((u) => ({
@@ -546,11 +692,254 @@ export function useBacklog(projectId: number) {
                 order: u.sprint_order ?? 0,
             }));
 
-            await bulkUpdateMilestone(projectId, targetSprintId, data);
-            // main.coffee:800-801 — refresh sprints and stats after the move.
-            await Promise.all([reloadSprints(), reloadStats()]);
+            try {
+                await bulkUpdateMilestone(projectId, targetSprintId, data);
+                // main.coffee:800-801 — refresh sprints and stats after the move.
+                await Promise.all([reloadSprints(), reloadStats()]);
+            } catch (err) {
+                // F-REG-06: the previous version had NO catch, so a rejected
+                // `bulk_update_milestone` left the stories optimistically REMOVED
+                // from the backlog forever (they vanished) while the promise
+                // rejection was discarded by the fire-and-forget caller. Now:
+                //   1. surface WHY the move failed (same envelope parser as the
+                //      drag reorder path, F-AAP-03);
+                //   2. reconcile to SERVER TRUTH by reloading the backlog, sprints
+                //      and stats — this re-materialises the stories that were
+                //      optimistically removed (a "reload" rollback, which the
+                //      finding explicitly sanctions);
+                //   3. rethrow so the toolbar caller keeps the selection intact
+                //      and can let the user retry (it clears the selection ONLY
+                //      on success).
+                dispatch({ type: 'setMoveError', message: describeReorderError(err) });
+                await Promise.all([
+                    reloadUserstories({ reset: true }),
+                    reloadSprints(),
+                    reloadStats(),
+                ]);
+                throw err;
+            }
         },
-        [projectId, reloadSprints, reloadStats],
+        [projectId, reloadSprints, reloadStats, reloadUserstories],
+    );
+
+    /**
+     * F-CQ-03 — delete a single user story.
+     *
+     * Reproduces `deleteUserStory` (`main.coffee:662-681`): the AngularJS
+     * controller OWNED this mutation — after `@confirm.askOnDelete` it removed
+     * the story from the backlog list optimistically
+     * (`@scope.userstories = _.without(...)`), issued `@repo.remove(us)`
+     * (a `DELETE /userstories/{id}`), and on success reloaded stats + sprints;
+     * on failure it notified an error. The confirm dialog is owned by the
+     * CONTAINER (`window.confirm`, the established stand-in); this action owns the
+     * optimistic removal, the persistence and the reconcile.
+     *
+     * The previous React cut only dispatched `removeUsOptimistic` (a LOCAL list
+     * removal with NO backend DELETE) — the "delete is local-only" bug. This
+     * action adds the real `api.del` persistence and reload-on-error rollback.
+     */
+    const deleteUs = useCallback(
+        async (us: UserStory): Promise<void> => {
+            dispatch({ type: 'setMoveError', message: null });
+            // Optimistic removal (main.coffee:669 `_.without`).
+            dispatch({ type: 'removeUsOptimistic', usId: us.id });
+            try {
+                await api.del(`/userstories/${us.id}`);
+                // main.coffee:674-678 — refresh sprints + stats after removal.
+                await Promise.all([reloadSprints(), reloadStats()]);
+            } catch (err) {
+                // Reconcile to server truth: reload the backlog (re-materialising
+                // the optimistically-removed story), sprints and stats, and
+                // surface why the delete failed. Does NOT rethrow — the row
+                // affordance has no selection to preserve.
+                dispatch({
+                    type: 'setMoveError',
+                    message: describeUsMutationError(
+                        err,
+                        'The user story could not be deleted. The backlog has been refreshed to the latest server state.',
+                    ),
+                });
+                await Promise.all([
+                    reloadUserstories({ reset: true }),
+                    reloadSprints(),
+                    reloadStats(),
+                ]);
+            }
+        },
+        [reloadSprints, reloadStats, reloadUserstories],
+    );
+
+    /**
+     * F-CQ-03 — persist an inline single-story STATUS change.
+     *
+     * The backlog row's status popover reproduces the common `tgUsStatus`
+     * directive; selecting a status mutated `us.status` and `@repo.save(us)`
+     * (a `PATCH /userstories/{id}` carrying the changed field + `version`), then
+     * regenerated filters and reloaded stats (`updateUserStoryStatus`,
+     * `main.coffee:646-651`). This action optimistically replaces the story in
+     * place, PATCHes the minimal `{ status, version }` body, then refreshes
+     * stats + filter facets; on failure it reconciles to server truth.
+     */
+    const updateUsStatus = useCallback(
+        async (us: UserStory, newStatusId: number): Promise<void> => {
+            if (us.status === newStatusId) {
+                return;
+            }
+            dispatch({ type: 'setMoveError', message: null });
+            // Optimistic in-place replacement.
+            dispatch({ type: 'replaceUs', us: { ...us, status: newStatusId } });
+            try {
+                // Minimal PATCH body (parity with F-REG-05: send only the changed
+                // field plus the optimistic-concurrency `version`).
+                await api.patch(`/userstories/${us.id}`, {
+                    status: newStatusId,
+                    version: us.version,
+                });
+                // main.coffee:646-651 — reload stats + regenerate filter facets.
+                await Promise.all([reloadStats(), reloadFiltersData()]);
+            } catch (err) {
+                dispatch({
+                    type: 'setMoveError',
+                    message: describeUsMutationError(
+                        err,
+                        'The status could not be saved. The backlog has been refreshed to the latest server state.',
+                    ),
+                });
+                await Promise.all([reloadUserstories({ reset: true }), reloadStats()]);
+            }
+        },
+        [reloadStats, reloadFiltersData, reloadUserstories],
+    );
+
+    /**
+     * F-CQ-03 — persist an inline single-story POINTS change for one role.
+     *
+     * Reproduces the estimation edit (`tgBacklogUsPoints` →
+     * `estimationProcess.onSelectedPointForRole`, `main.coffee:1094-1099`): it set
+     * `us.points[roleId] = pointId` and `@repo.save(us)` (a
+     * `PATCH /userstories/{id}` carrying the changed `points` map + `version`),
+     * then `loadProjectStats()`. This action optimistically replaces the story
+     * with the merged `points` map, PATCHes the minimal `{ points, version }`
+     * body and reloads stats; on failure it reconciles to server truth. The
+     * point VALUES come from in-scope `project.points`, so no estimation service
+     * is required.
+     */
+    const updateUsPoints = useCallback(
+        async (us: UserStory, roleId: number, pointId: number): Promise<void> => {
+            const nextPoints = { ...(us.points ?? {}), [roleId]: pointId };
+            dispatch({ type: 'setMoveError', message: null });
+            dispatch({ type: 'replaceUs', us: { ...us, points: nextPoints } });
+            try {
+                await api.patch(`/userstories/${us.id}`, {
+                    points: nextPoints,
+                    version: us.version,
+                });
+                // main.coffee:1098 — refresh project stats after an estimate change.
+                await reloadStats();
+            } catch (err) {
+                dispatch({
+                    type: 'setMoveError',
+                    message: describeUsMutationError(
+                        err,
+                        'The points could not be saved. The backlog has been refreshed to the latest server state.',
+                    ),
+                });
+                await Promise.all([reloadUserstories({ reset: true }), reloadStats()]);
+            }
+        },
+        [reloadStats, reloadUserstories],
+    );
+
+    /**
+     * F-CQ-05 — the guarded "load more" (next page) action.
+     *
+     * The pagination machinery already existed end-to-end (the loader appends
+     * when called with `{ reset: false }` and advances the cursor; `BacklogTable`
+     * renders an `IntersectionObserver` sentinel when handed an `onLoadMore`),
+     * but NOTHING wired it: production only ever called the loader with
+     * `{ reset: true }`, the container never supplied `onLoadMore`, and
+     * `loadingUserstories` was write-only-`false` (never a real in-flight flag).
+     *
+     * This action closes the gap. It is GUARDED twice:
+     *   - `disablePagination` — the last page's response had no
+     *     `x-pagination-next`, so there is nothing more to fetch (mirrors the
+     *     AngularJS `@.disablePagination` gate on `loadUserstories`);
+     *   - `loadingMoreRef` — a synchronous in-flight latch so a burst of
+     *     sentinel-intersection callbacks cannot fire overlapping requests.
+     * On success `appendUserstories` clears the spinner; on failure the spinner
+     * is cleared here so a later scroll can retry (a failed APPEND is additive,
+     * not a full-load failure, so it deliberately does NOT trip `loadError`).
+     */
+    const loadMore = useCallback(async (): Promise<void> => {
+        const s = stateRef.current;
+        if (s.disablePagination || loadingMoreRef.current) {
+            return;
+        }
+        loadingMoreRef.current = true;
+        dispatch({ type: 'setLoadingUserstories', loading: true });
+        try {
+            await reloadUserstories({ reset: false });
+        } catch {
+            // The append never landed; clear the spinner so the sentinel can
+            // retry on the next scroll. (loadError is reserved for full/initial
+            // + live-refresh failures — F-AAP-10.)
+            dispatch({ type: 'setLoadingUserstories', loading: false });
+        } finally {
+            loadingMoreRef.current = false;
+        }
+    }, [reloadUserstories]);
+
+    /**
+     * F-REG-07 — finish a sprint creation FAITHFULLY.
+     *
+     * The sibling `CreateEditSprintLightbox` has ALREADY persisted the new
+     * milestone; this thunk reproduces `sprintform:create:success`
+     * (`main.coffee:170-176`) + `sprintform:create:success:callback` →
+     * `moveToCurrentSprint` (`main.coffee:807-817`): reload the OPEN sprints
+     * FIRST, then — only if the user chose stories to move into the new sprint —
+     * move them into `currentSprint || sprints[0]` computed from the REFRESHED
+     * sprint list.
+     *
+     * The first React cut fired `reloadSprints()` WITHOUT awaiting it and then
+     * computed the target from STALE pre-create props (`currentSprint ??
+     * sprints[0]` captured at creation time), so the stories were sent to the
+     * OLD sprint and the just-created milestone was ignored. Awaiting the reload
+     * and deriving the target from the fresh fetch result restores exact parity.
+     * Errors are surfaced (loadError) rather than rejected, so the container's
+     * fire-and-forget call never produces an unhandled rejection.
+     */
+    const finishSprintCreation = useCallback(
+        async (ussToMove?: UserStory[]): Promise<void> => {
+            try {
+                const res = await listMilestones(projectId, { closed: false });
+                dispatch({
+                    type: 'setSprints',
+                    sprints: res.milestones,
+                    open: res.open,
+                    closed: res.closed,
+                });
+                const current = findCurrentSprint(res.milestones);
+                dispatch({ type: 'setCurrentSprint', sprint: current });
+                await reloadStats();
+
+                if (ussToMove && ussToMove.length > 0) {
+                    const target = current ?? res.milestones[0];
+                    if (target) {
+                        try {
+                            await moveToSprint(ussToMove, target.id);
+                        } catch {
+                            // moveToSprint already surfaced `moveError` and
+                            // reconciled the board; swallow so this thunk never
+                            // rejects into the fire-and-forget container caller.
+                        }
+                    }
+                }
+            } catch {
+                // A failed sprint reload after create must not vanish silently.
+                dispatch({ type: 'setLoadError', error: true });
+            }
+        },
+        [projectId, reloadStats, moveToSprint],
     );
 
     /**
@@ -585,10 +974,19 @@ export function useBacklog(projectId: number) {
      * Save edits to an existing sprint. Source `$repo.save(newSprint)`
      * (`lightboxes.coffee:69`). Reload open AND closed sprints so an edit that
      * flips the closed flag is reflected in both lists.
+     *
+     * Mirrors the `saveMilestone(id, changes, version?)` contract (F-REG-05):
+     * the caller supplies the milestone `id`, the MINIMAL set of changed
+     * attributes, and the optimistic-concurrency `version`, so the PATCH body is
+     * exactly the modified attributes + version — never the whole model.
      */
     const saveSprint = useCallback(
-        async (payload: Partial<Milestone> & { id: number }): Promise<void> => {
-            await saveMilestone(payload);
+        async (
+            id: number,
+            changes: Partial<Milestone>,
+            version?: number,
+        ): Promise<void> => {
+            await saveMilestone(id, changes, version);
             await reloadSprints();
             await reloadClosedSprints();
         },
@@ -639,10 +1037,21 @@ export function useBacklog(projectId: number) {
         [reloadUserstories, reloadFiltersData],
     );
 
-    /** Toggle (or explicitly set) tag visibility. Reducer owns the flag flip. */
-    const toggleTags = useCallback((showTags?: boolean): void => {
-        dispatch({ type: 'toggleTags', showTags });
-    }, []);
+    /**
+     * Toggle (or explicitly set) tag visibility. The reducer owns the in-memory
+     * flag flip; the hook owns PERSISTENCE (F-CQ-09). We resolve the NEXT value
+     * here (from `stateRef` when toggling) so we can both dispatch it explicitly
+     * AND write it to project-scoped storage, reproducing the AngularJS
+     * `storeShowTags(projectId, value)` call (`main.coffee:501-502`).
+     */
+    const toggleTags = useCallback(
+        (showTags?: boolean): void => {
+            const next = showTags !== undefined ? showTags : !stateRef.current.showTags;
+            dispatch({ type: 'toggleTags', showTags: next });
+            writeStoredShowTags(projectId, next);
+        },
+        [projectId],
+    );
 
     /**
      * Toggle (or explicitly set) the velocity-forecasting view. The velocity
@@ -698,101 +1107,151 @@ export function useBacklog(projectId: number) {
      * `loadBacklog` (`main.coffee:410-415`):
      *   loadProject → initializeSubscription → $q.all(stats, sprints,
      *   userstories) → generateFilters → emit backlog:loaded.
-     * The subscription is established BEFORE the parallel loads, exactly as the
-     * source calls `initializeSubscription` before its `$q.all`.
      * ---------------------------------------------------------------------- */
+
+    /**
+     * F-AAP-10 — the CENTRALIZED full/initial data load, shared by the mount
+     * effect AND the `reload` retry action so there is a single, awaited entry
+     * point for (re)loading the backlog.
+     *
+     * Behavioural change vs the first React cut: that version buried the load in
+     * the effect closure and its `catch` merely cleared the spinner, so a failed
+     * initial load rendered as a SUCCESSFUL EMPTY backlog. This version SURFACES
+     * the failure by setting `loadError` (distinct from "loaded but empty"), and
+     * a monotonic `loadGenRef` "generation" prevents a superseded load (unmount,
+     * projectId change, or a newer retry) from clobbering current state with a
+     * late-resolving await.
+     *
+     * The subscription is NOT established here (it belongs to the effect, once
+     * per projectId); this thunk owns only the DATA (project + stats + sprints +
+     * userstories + filters), so a `reload()` retry never double-subscribes.
+     */
+    const loadBacklogData = useCallback(async (): Promise<void> => {
+        const myGen = ++loadGenRef.current;
+        dispatch({ type: 'setLoading', loading: true });
+        dispatch({ type: 'setLoadError', error: false });
+
+        try {
+            // 1. Load the project (low-level client; main.coffee:469-486). The
+            //    reducer's `setProject` derives `isBacklogActivated`; an inactive
+            //    backlog surfaces the flag (BacklogApp renders the empty state).
+            const project = await api.get<Project>(`/projects/${projectId}`);
+            if (myGen !== loadGenRef.current) {
+                return;
+            }
+            dispatch({ type: 'setProject', project });
+
+            // 2. Parallel loads — $q.all([loadProjectStats, loadSprints,
+            //    loadUserstories]) (main.coffee:411-414).
+            await Promise.all([
+                reloadStats(),
+                reloadSprints(),
+                reloadUserstories({ reset: true }),
+            ]);
+            if (myGen !== loadGenRef.current) {
+                return;
+            }
+
+            // 3. Filters data — `generateFilters` after load (main.coffee:498).
+            await reloadFiltersData();
+            if (myGen !== loadGenRef.current) {
+                return;
+            }
+
+            // 4. Done — source emits `backlog:loaded` (main.coffee:499).
+            dispatch({ type: 'setLoading', loading: false });
+        } catch {
+            // F-AAP-10: SURFACE the failure instead of rendering a successful
+            // empty screen. Generation-guarded so a superseded load cannot flip
+            // the flags of a newer one.
+            if (myGen === loadGenRef.current) {
+                dispatch({ type: 'setLoading', loading: false });
+                dispatch({ type: 'setLoadError', error: true });
+            }
+        }
+    }, [projectId, reloadStats, reloadSprints, reloadUserstories, reloadFiltersData]);
+
     useEffect(() => {
         if (!projectId) {
             return;
         }
 
-        // Guard so late-resolving awaits never dispatch after unmount /
-        // projectId change; the cleanup sets this true and unsubscribes.
-        let cancelled = false;
-        let unsubscribe: (() => void) | undefined;
+        // Subscribe to live changes using the IDENTICAL routing keys
+        // `changes.project.{id}.userstories|milestones` (main.coffee:223-234).
+        // Established once per projectId; a `reload()` retry re-runs only the
+        // DATA load, never re-subscribes. `subscribeProjectChanges` is a
+        // disabled-safe no-op (returns a no-op unsubscribe) when no events URL is
+        // configured — in that case the post-drag fallback reload refreshes.
+        //
+        // F-AAP-10: the handlers now AWAIT + `catch` so a failed LIVE refresh is
+        // SURFACED via `loadError` rather than swallowed as an unhandled
+        // rejection (the source's `$q` refreshes could not fail silently the way
+        // a bare `void promise` does).
+        const unsubscribe = subscribeProjectChanges(projectId, {
+            onUserstories: () => {
+                // changes.project.{id}.userstories (main.coffee:224-226).
+                void (async () => {
+                    try {
+                        await reloadAllPaginatedUserstories();
+                        await reloadSprints();
+                    } catch {
+                        dispatch({ type: 'setLoadError', error: true });
+                    }
+                })();
+            },
+            onMilestones: () => {
+                // changes.project.{id}.milestones, {selfNotification:true}
+                // handled inside the shared bridge (main.coffee:228-234).
+                void (async () => {
+                    try {
+                        await Promise.all([reloadSprints(), reloadClosedSprints(), reloadStats()]);
+                    } catch {
+                        dispatch({ type: 'setLoadError', error: true });
+                    }
+                })();
+            },
+        });
 
-        const run = async (): Promise<void> => {
-            try {
-                // 1. Load the project. There is no shared projects API, so use
-                //    the low-level client (main.coffee:469-486). The reducer's
-                //    `setProject` derives `isBacklogActivated` and seeds
-                //    `swimlanesList`; when the backlog is inactive it simply
-                //    surfaces the flag (BacklogApp renders the empty state) —
-                //    we do NOT throw/redirect (the AngularJS `permissionDenied`
-                //    behaviour is out of scope for the in-place React host).
-                const project = await api.get<Project>(`/projects/${projectId}`);
-                if (cancelled) {
-                    return;
-                }
-                dispatch({ type: 'setProject', project });
-
-                // 2. Subscribe to live changes BEFORE the parallel loads, using
-                //    the IDENTICAL routing keys `changes.project.{id}.userstories`
-                //    and `changes.project.{id}.milestones` (main.coffee:223-234).
-                //    `subscribeProjectChanges` is a disabled-safe no-op (returns
-                //    a no-op unsubscribe) when no events URL is configured — in
-                //    that case the post-drag fallback reload does the refreshing.
-                unsubscribe = subscribeProjectChanges(projectId, {
-                    onUserstories: () => {
-                        // changes.project.{id}.userstories (main.coffee:224-226).
-                        void reloadAllPaginatedUserstories();
-                        void reloadSprints();
-                    },
-                    onMilestones: () => {
-                        // changes.project.{id}.milestones, {selfNotification:true}
-                        // handled inside the shared bridge (main.coffee:228-234).
-                        void reloadSprints();
-                        void reloadClosedSprints();
-                        void reloadStats();
-                    },
-                });
-
-                // 3. Parallel loads — mirrors $q.all([loadProjectStats,
-                //    loadSprints, loadUserstories]) (main.coffee:411-414).
-                await Promise.all([
-                    reloadStats(),
-                    reloadSprints(),
-                    reloadUserstories({ reset: true }),
-                ]);
-                if (cancelled) {
-                    return;
-                }
-
-                // 4. Filters data — source `generateFilters` after load
-                //    (main.coffee:498).
-                await reloadFiltersData();
-                if (cancelled) {
-                    return;
-                }
-
-                // 5. Done — source emits `backlog:loaded` (main.coffee:499).
-                dispatch({ type: 'setLoading', loading: false });
-            } catch {
-                // On any load error still clear the spinner so the screen does
-                // not hang. No retry/backoff (Minimal Change Clause).
-                if (!cancelled) {
-                    dispatch({ type: 'setLoading', loading: false });
-                }
-            }
-        };
-
-        void run();
+        void loadBacklogData();
 
         return () => {
-            cancelled = true;
-            if (unsubscribe) {
-                unsubscribe();
-            }
+            // Invalidate any in-flight load (F-AAP-10 generation guard) and
+            // detach the subscription.
+            loadGenRef.current += 1;
+            unsubscribe();
         };
     }, [
         projectId,
-        reloadStats,
+        loadBacklogData,
+        reloadAllPaginatedUserstories,
         reloadSprints,
         reloadClosedSprints,
-        reloadUserstories,
-        reloadAllPaginatedUserstories,
-        reloadFiltersData,
+        reloadStats,
     ]);
+
+    /**
+     * F-CQ-09 — rehydrate the project-scoped show-tags preference on mount /
+     * projectId change, reproducing the AngularJS `getShowTags(projectId)` read
+     * (`main.coffee:501-502`, `resources/userstories.coffee:174-177`). When a
+     * value was persisted we apply it; otherwise the reducer default (`true`)
+     * stands. Kept in its OWN effect so it is independent of the data load.
+     */
+    useEffect(() => {
+        if (!projectId) {
+            return;
+        }
+        const stored = readStoredShowTags(projectId);
+        if (stored !== null) {
+            dispatch({ type: 'toggleTags', showTags: stored });
+        }
+    }, [projectId]);
+
+    /**
+     * F-AAP-10 — the centralized, awaitable RETRY. Re-runs the full data load
+     * (resetting `loadError`), so the container's error state can offer a "try
+     * again" affordance that genuinely re-fetches. Does NOT re-subscribe.
+     */
+    const reload = useCallback((): Promise<void> => loadBacklogData(), [loadBacklogData]);
 
     /* ---------------------------------------------------------------------- *
      * Phase 6c — The memoized `actions` object
@@ -807,6 +1266,9 @@ export function useBacklog(projectId: number) {
             moveUs,
             moveUsToTopOfBacklog,
             moveToSprint,
+            loadMore,
+            finishSprintCreation,
+            reload,
             bulkCreateUs,
             createSprint,
             saveSprint,
@@ -820,11 +1282,17 @@ export function useBacklog(projectId: number) {
             reloadStats: reloadStatsAction,
             addUsOptimistic,
             removeUsOptimistic,
+            deleteUs,
+            updateUsStatus,
+            updateUsPoints,
         }),
         [
             moveUs,
             moveUsToTopOfBacklog,
             moveToSprint,
+            loadMore,
+            finishSprintCreation,
+            reload,
             bulkCreateUs,
             createSprint,
             saveSprint,
@@ -838,6 +1306,9 @@ export function useBacklog(projectId: number) {
             reloadStatsAction,
             addUsOptimistic,
             removeUsOptimistic,
+            deleteUs,
+            updateUsStatus,
+            updateUsPoints,
         ],
     );
 

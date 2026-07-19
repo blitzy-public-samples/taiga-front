@@ -249,4 +249,30 @@ describe('avatar click guard', () => {
     fireEvent.click(avatar!, { metaKey: true });
     expect(onClick).not.toHaveBeenCalled();
   });
+
+  it('renders each assignee avatar as a NATIVE button with an accessible name (F-UI-04)', () => {
+    const users = [makeAssignedUser({ id: 1, full_name_display: 'Ada Lovelace' })];
+    const card = makeBoardCard({
+      model: makeUserStory({ id: 42 }),
+      assigned_users: users,
+      assigned_users_preview: users,
+    });
+
+    const { container } = render(
+      <CardAssignedTo
+        item={card}
+        project={makeProject()}
+        zoom={['assigned_to']}
+        zoomLevel={1}
+        onClickAssignedTo={jest.fn()}
+      />,
+    );
+
+    const avatar = container.querySelector('.card-user-avatar') as HTMLElement;
+    // Was a clickable `<div>`; now a keyboard-operable <button> named after the
+    // assignee so assistive tech announces "Ada Lovelace, button".
+    expect(avatar.tagName).toBe('BUTTON');
+    expect(avatar.getAttribute('type')).toBe('button');
+    expect(avatar.getAttribute('aria-label')).toBe('Ada Lovelace');
+  });
 });

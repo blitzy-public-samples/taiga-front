@@ -215,18 +215,47 @@ export function createMilestone(sprint: MilestoneCreatePayload): Promise<Milesto
 
 /**
  * Persist edits to an existing milestone (sprint). Reproduces
- * `lightboxes.coffee:69` (`$repo.save(newSprint)`), which PATCHes only the
- * changed attributes to `/milestones/{id}` (`repository.coffee:54-85`).
+ * `lightboxes.coffee:69` (`$repo.save(newSprint)`) → `repository.coffee:53-64`,
+ * which PATCHes to `/milestones/{id}` a body of EXACTLY the modified attributes
+ * plus `version` — `getAttrs(patch=true)` returns `_modifiedAttrs` extended with
+ * `_attrs.version` (`model.coffee:48-53`), where an attribute is "modified" only
+ * when its new value DIFFERS from the original (`model.coffee:84-90`).
  *
- * The caller passes the sprint `id` plus whatever fields changed (e.g. `name`,
- * `estimated_start`, `estimated_finish`); everything EXCEPT `id` becomes the
- * PATCH body. Dates must already be `YYYY-MM-DD`
- * (`shared/validation.formatSprintDate`, `lightboxes.coffee:66-67`).
+ * REGRESSION FIX (F-REG-05)
+ *   The previous signature accepted a whole `Milestone` and PATCHed every
+ *   remaining field, so read-only / server-computed attributes (`slug`,
+ *   `closed`, `total_points`, `created_date`, `owner`, …) were sent back on
+ *   every edit — an overbroad payload that diverged from the AngularJS
+ *   "changed attributes only" contract and risked the backend rejecting or
+ *   mis-handling read-only fields. This signature now takes ONLY the caller's
+ *   computed minimal diff plus the concurrency `version`, so the PATCH body is
+ *   byte-for-byte what `$repo.save` sent.
  *
- * @param sprint The sprint carrying its `id` and the attributes to update.
+ * @param id      The milestone id (the `{id}` path segment; never in the body).
+ * @param changes The minimal set of CHANGED attributes to persist (e.g. any of
+ *                `name` / `estimated_start` / `estimated_finish`). An empty diff
+ *                yields a body of just `version` (a harmless backend no-op),
+ *                mirroring that `$repo.save` still rides `version` on a PATCH.
+ *                Dates must already be `YYYY-MM-DD`
+ *                (`shared/validation.formatSprintDate`, `lightboxes.coffee:66-67`).
+ * @param version The optimistic-concurrency token from the original milestone
+ *                (`model.getAttrs(patch).version`). Included in the body when
+ *                provided so a stale edit is rejected exactly as under AngularJS;
+ *                omitted only when the caller has no version to send.
  */
-export function saveMilestone(sprint: Partial<Milestone> & { id: number }): Promise<Milestone> {
-    const { id, ...attrs } = sprint;
+export function saveMilestone(
+    id: number,
+    changes: Partial<Milestone>,
+    version?: number,
+): Promise<Milestone> {
+    // Only the changed attributes ride in the body (never the whole model).
+    const body: Record<string, unknown> = { ...changes };
 
-    return api.patch<Milestone>(`/milestones/${id}`, attrs);
+    // Optimistic-concurrency parity: getAttrs(patch=true) always extends the
+    // modified attributes with `version` (model.coffee:49-53).
+    if (version !== undefined) {
+        body.version = version;
+    }
+
+    return api.patch<Milestone>(`/milestones/${id}`, body);
 }

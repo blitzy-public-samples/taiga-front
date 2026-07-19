@@ -61,6 +61,7 @@ import {
     getEventsUrl,
     getAuthToken,
     getSessionId,
+    getLanguage,
 } from '../session';
 
 /*
@@ -75,6 +76,9 @@ afterEach(() => {
     localStorage.clear();
     delete (window as any).taiga;
     delete (window as any).taigaConfig;
+    // `getLanguage()` reads `<html lang>`, which jsdom persists across tests in
+    // this file; clear it so each language spec starts from a pristine state.
+    document.documentElement.removeAttribute('lang');
     jest.clearAllMocks();
 });
 
@@ -177,3 +181,78 @@ describe('session bridge — getConfig / getApiUrl / getEventsUrl', () => {
         expect(getEventsUrl()).toBeNull();
     });
 });
+
+describe('session bridge — getLanguage (Accept-Language source, resolution order)', () => {
+    it('prefers the live <html lang> stamped by i18nInit on $translateChangeEnd', () => {
+        // i18nInit sets document.querySelector('html').setAttribute('lang', lang)
+        // on every language change (app.coffee:859), so <html lang> reflects the
+        // language the user is CURRENTLY viewing and wins over every other source.
+        document.documentElement.setAttribute('lang', 'fr');
+        localStorage.setItem('userInfo', JSON.stringify({ lang: 'de' }));
+        (window as any).taigaConfig = { api: '/api/v1/', eventsUrl: null, defaultLanguage: 'es' };
+
+        expect(getLanguage()).toBe('fr');
+    });
+
+    it('falls back to userInfo.lang when <html lang> is absent', () => {
+        // Before the first $translateChangeEnd stamps <html lang>, the persisted
+        // per-user preference that SEEDS preferredLanguage() is used
+        // (app.coffee:793-796).
+        document.documentElement.removeAttribute('lang');
+        localStorage.setItem('userInfo', JSON.stringify({ lang: 'de' }));
+        (window as any).taigaConfig = { api: '/api/v1/', eventsUrl: null, defaultLanguage: 'es' };
+
+        expect(getLanguage()).toBe('de');
+    });
+
+    it('falls back to taigaConfig.defaultLanguage when neither <html lang> nor userInfo.lang is set', () => {
+        // The next term of the coffee expression: userInfo?.lang ||
+        // window.taigaConfig.defaultLanguage (app.coffee:796).
+        document.documentElement.removeAttribute('lang');
+        localStorage.clear();
+        (window as any).taigaConfig = { api: '/api/v1/', eventsUrl: null, defaultLanguage: 'es' };
+
+        expect(getLanguage()).toBe('es');
+    });
+
+    it('falls back to "en" (angular-translate fallbackLanguage) when nothing is resolvable', () => {
+        // fallbackLanguage("en") (app.coffee:808) is the final backstop so the
+        // header is always well-formed.
+        document.documentElement.removeAttribute('lang');
+        localStorage.clear();
+        delete (window as any).taigaConfig;
+
+        expect(getLanguage()).toBe('en');
+    });
+
+    it('ignores a corrupt localStorage.userInfo and continues down the chain', () => {
+        // A non-JSON userInfo must not throw; the accessor behaves as the coffee
+        // `userInfo?.lang` would (undefined) and falls through to the default.
+        document.documentElement.removeAttribute('lang');
+        localStorage.setItem('userInfo', '{not-valid-json');
+        (window as any).taigaConfig = { api: '/api/v1/', eventsUrl: null, defaultLanguage: 'pt' };
+
+        expect(getLanguage()).toBe('pt');
+    });
+
+    it('ignores a userInfo without a lang field and continues down the chain', () => {
+        // userInfo present but no `lang` key => coffee `userInfo?.lang` is
+        // undefined => fall through to defaultLanguage.
+        document.documentElement.removeAttribute('lang');
+        localStorage.setItem('userInfo', JSON.stringify({ id: 7 }));
+        (window as any).taigaConfig = { api: '/api/v1/', eventsUrl: null, defaultLanguage: 'it' };
+
+        expect(getLanguage()).toBe('it');
+    });
+
+    it('reads the value fresh on every call (tracks a live language switch)', () => {
+        // Prove no caching: flipping <html lang> between calls is reflected
+        // immediately, mirroring how the shell tracks runtime language changes.
+        document.documentElement.setAttribute('lang', 'en');
+        expect(getLanguage()).toBe('en');
+
+        document.documentElement.setAttribute('lang', 'ja');
+        expect(getLanguage()).toBe('ja');
+    });
+});
+

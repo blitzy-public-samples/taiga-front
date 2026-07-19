@@ -41,7 +41,9 @@
  *   of a *required* field.
  */
 
-import moment from 'moment';
+// F-PERF-01: use the shell's already-loaded global Moment (see ./moment) so esbuild
+// does not bundle a second ~60 KB copy of Moment into react.js.
+import moment from './moment';
 
 import type { SprintFormValues } from './types';
 

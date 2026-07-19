@@ -262,6 +262,48 @@ describe('MOVE — cross status', () => {
 });
 
 /* ========================================================================== *
+ * MOVE — NaN swimlane normalization (F-AAP-09, data integrity)
+ *
+ * On a swimlane-less board a missing `data-swimlane` becomes `Number(undefined)`
+ * === NaN upstream. Even though the DnD boundary and the hook now normalize it,
+ * the reducer is the LAST gate before `usModel.swimlane` is written, so a MOVE
+ * carrying a NaN swimlane must persist `null` — never NaN — into the model.
+ * ========================================================================== */
+
+describe('MOVE — NaN swimlane normalization (F-AAP-09)', () => {
+    it('coerces a NaN swimlane to null in the moved story model (never persists NaN)', () => {
+        const base = reducer(initialState(), {
+            type: 'SET',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, swimlane: null, kanban_order: 1 }),
+                makeUserStory({ id: 2, status: 200, swimlane: null, kanban_order: 2 }),
+            ],
+        });
+
+        const state = reducer(base, {
+            type: 'MOVE',
+            usIds: [1],
+            statusId: 200,
+            // A NaN swimlane — the exact value a missing lane produced pre-fix.
+            swimlaneId: Number.NaN,
+            index: 0,
+            previousCard: null,
+            nextCard: 2,
+        });
+
+        const moved = state.userstoriesRaw.find((u) => u.id === 1);
+        expect(moved).toBeDefined();
+        // The model's swimlane is a real null, NOT NaN.
+        expect(moved?.swimlane).toBeNull();
+        expect(Number.isNaN(moved?.swimlane as unknown as number)).toBe(false);
+        // The card mirror stays consistent with the model.
+        expect(state.usMap[1]?.swimlane ?? null).toBeNull();
+        // The status still applied normally, so the move itself worked.
+        expect(moved?.status).toBe(200);
+    });
+});
+
+/* ========================================================================== *
  * MOVE_TO_END + getMoveToEndPayload (SOURCE 192-202)
  * ========================================================================== */
 
@@ -314,6 +356,33 @@ describe('getMovePayload (pure echo)', () => {
         // bulkUserstories is the plain number array (not wrapped objects).
         expect(Array.isArray(p.bulkUserstories)).toBe(true);
         expect(p.bulkUserstories).toEqual([9]);
+    });
+
+    // F-AAP-09 (data integrity): a NaN swimlane — the value `Number(undefined)`
+    // yields for a missing `data-swimlane` on a swimlane-less board — must NEVER
+    // reach the `/userstories/bulk_update_kanban_order` body. getMovePayload is
+    // the last builder before the wire, so it defensively coerces NaN -> null.
+    it('coerces a NaN swimlane to null in the wire payload (F-AAP-09)', () => {
+        const p = getMovePayload([9], 300, Number.NaN, null, 4);
+
+        expect(p.swimlaneId).toBeNull();
+        // The coerced value is a real null (not NaN), so it serializes cleanly.
+        expect(Number.isNaN(p.swimlaneId as unknown as number)).toBe(false);
+        expect(p).toEqual({
+            statusId: 300,
+            swimlaneId: null,
+            afterUserstoryId: null,
+            beforeUserstoryId: 4,
+            bulkUserstories: [9],
+        });
+    });
+
+    it('passes a real swimlane id (including the synthetic -1) through unchanged (F-AAP-09)', () => {
+        // The `-1` "Unclassified" sentinel is a legitimate value the reducer does
+        // NOT touch — only the hook maps it to the API `null`. getMovePayload must
+        // leave it intact so the sentinel is not confused with the NaN guard.
+        expect(getMovePayload([9], 300, -1, null, null).swimlaneId).toBe(-1);
+        expect(getMovePayload([9], 300, 42, null, null).swimlaneId).toBe(42);
     });
 });
 

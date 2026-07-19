@@ -242,6 +242,114 @@ export async function dragTo(page: Page, source: string, target: string): Promis
   await page.mouse.up();
 }
 
+/**
+ * Perform a NET-ZERO drag for evidence capture (F-AAP-06).
+ *
+ * The seed-once database MUST NOT be mutated by a committed capture run: the
+ * baseline (AngularJS) and post-migration (React) passes have to observe
+ * byte-for-byte identical data so the before/after artifacts are comparable
+ * (AAP 0.6.3). A normal `dragTo` that drops onto a DIFFERENT column/row/sprint
+ * would emit a `bulk_update_*` request and permanently reorder the seeded data,
+ * so it must never be used for a committed capture.
+ *
+ * This helper presses over the source, moves far enough to cross the @dnd-kit
+ * `PointerSensor` activation distance so the drag actually STARTS (the drag
+ * mirror/overlay appears — the visual evidence of the interaction), glides the
+ * mirror over the target so the optional `onMirror` callback can screenshot the
+ * drag-in-progress, then RETURNS the pointer to the ORIGIN and releases there.
+ * Dropping at the same position short-circuits on BOTH engines — dragula treats
+ * a same-index drop as a no-op and @dnd-kit reports `over === active` with no
+ * reorder — so NO `bulk_update_*` request is emitted and the DB is untouched.
+ * This is exactly the net-zero gesture proven byte-identical in the committed
+ * baseline fingerprint methodology (artifacts/baseline recheck).
+ *
+ * @param onMirror optional async callback invoked while the drag is held over
+ *   the target (typically a `screenshot(...)` capturing the drag mirror).
+ * @throws if the source or target has no bounding box (not laid out / visible).
+ */
+export async function dragNetZero(
+  page: Page,
+  source: string,
+  target: string,
+  onMirror?: () => Promise<unknown>,
+): Promise<void> {
+  const src = page.locator(source).first();
+  const dst = page.locator(target).first();
+
+  await src.scrollIntoViewIfNeeded();
+
+  const s = await src.boundingBox();
+  if (!s) {
+    throw new Error(`dragNetZero: no bounding box for source "${source}"`);
+  }
+
+  const d = await dst.boundingBox();
+  if (!d) {
+    throw new Error(`dragNetZero: no bounding box for target "${target}"`);
+  }
+
+  const sx = s.x + s.width / 2;
+  const sy = s.y + s.height / 2;
+  const tx = d.x + d.width / 2;
+  const ty = d.y + d.height / 2;
+
+  await page.mouse.move(sx, sy);
+  await page.mouse.down();
+  await page.mouse.move(sx + 8, sy + 8, { steps: 5 }); // exceed the @dnd-kit activation distance
+  await page.mouse.move(tx, ty, { steps: 12 }); // glide the mirror over the target
+  await page.mouse.move(tx, ty, { steps: 3 }); // settle so the mirror is visible for capture
+
+  if (onMirror) {
+    await onMirror(); // capture the drag-in-progress mirror over the target
+  }
+
+  // Return to the ORIGIN and release there: a same-position drop is a no-op on
+  // both dragula and @dnd-kit, so no reorder request is emitted (net-zero).
+  await page.mouse.move(sx, sy, { steps: 12 });
+  await page.mouse.up();
+}
+
+/* ------------------------------------------------------------------ *
+ * Capture-phase helpers (F-CQ-08 — phase-aware selectors)
+ *
+ * The React screens reproduce most existing SCSS class names for visual
+ * fidelity (AAP 0.3.4), but a handful of AngularJS *directive* selectors are
+ * not emitted by React (e.g. the board column wraps in
+ * `.kanban-uses-box.taskboard-column` rather than `.task-column`, the sprint
+ * lightbox is a `[role="dialog"]` rather than `div[tg-lb-create-edit-sprint]`,
+ * and deletes use a native `window.confirm` rather than `.lightbox-generic-ask`).
+ * `phaseSelector` lets a spec pick the DOM-accurate selector for the active
+ * capture phase, so the baseline pass targets the AngularJS DOM and the React
+ * pass targets the React DOM — instead of a single Angular-only selector that
+ * silently matches nothing on the migrated screen.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the active capture phase from `process.env.CAPTURE_PHASE`. Anything
+ * other than the exact string `'react'` resolves to `'baseline'`, so an unset
+ * or malformed value defaults to the (safe, non-destructive) baseline pass.
+ * The `'baseline' | 'react'` union is inlined here to avoid re-exporting a
+ * `CapturePhase` type name that `capture.ts` already exports through the barrel.
+ */
+export function capturePhase(): 'baseline' | 'react' {
+  return process.env.CAPTURE_PHASE === 'react' ? 'react' : 'baseline';
+}
+
+/** True when the post-migration React screen is under capture. */
+export function isReactPhase(): boolean {
+  return capturePhase() === 'react';
+}
+
+/**
+ * Pick the selector appropriate to the active capture phase. Use ONLY for the
+ * genuinely-divergent selectors documented above; selectors that React
+ * reproduces verbatim (e.g. `tg-card`, `.milestone-us-item-row`, `.us-status`)
+ * need no phase split and should be used directly.
+ */
+export function phaseSelector(baseline: string, react: string): string {
+  return isReactPhase() ? react : baseline;
+}
+
 /* ------------------------------------------------------------------ *
  * Selector reference (do NOT invent new selectors)
  *
@@ -282,4 +390,27 @@ export async function dragTo(page: Page, source: string, target: string): Promis
  *   div[tg-lb-create-bulk-userstories]  — bulk-create user-stories lightbox
  *
  * Drag handle: .icon-drag is the grab handle used on rows / cards.
+ *
+ * PHASE-DIVERGENT selectors (use `phaseSelector(baseline, react)`), verified
+ * against the migrated React source (app/react/**):
+ *   board column      baseline `.task-column`
+ *                     react    `.taskboard-column`  (`.kanban-uses-box.taskboard-column`,
+ *                              `id="column-<statusId>"`, TaskboardColumn.tsx)
+ *   sprint lightbox   baseline `div[tg-lb-create-edit-sprint]`
+ *                     react    `[role="dialog"]`     (CreateEditSprintLightbox.tsx)
+ *   bulk-US lightbox  baseline `div[tg-lb-create-bulk-userstories]`
+ *                     react    `.lightbox-generic-bulk` (BulkCreateUsLightbox.tsx)
+ *   delete confirm    baseline `.lightbox-generic-ask .button-green`
+ *                     react    native `window.confirm` (dialog handler; useBacklog.ts,
+ *                              KanbanApp.tsx — dismiss to stay non-mutating)
+ *   swimlane row      react    `.kanban-swimlane` / `button.kanban-swimlane-title` (Swimlane.tsx)
+ *
+ * REACT-DEFERRED interactions (present in the AngularJS baseline, intentionally
+ * NOT reimplemented in React per F-CQ-02 / the AAP 0.4.1 manifest — a shared
+ * common-module lightbox or an out-of-scope control): the create/edit user-story
+ * detail lightbox (`div[tg-lb-create-edit-userstory]`), the kanban bulk-create
+ * lightbox trigger, the assign-to lightbox (`div[tg-lb-assignedto]`,
+ * `.e2e-assign`, `.card-owner-actions`), and the board zoom control
+ * (`tg-board-zoom`). Specs gate these to the baseline phase and document the
+ * React deferral rather than targeting a selector React never emits.
  * ------------------------------------------------------------------ */

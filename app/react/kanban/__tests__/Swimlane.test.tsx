@@ -274,6 +274,48 @@ describe('default-swimlane star', () => {
 });
 
 /* ========================================================================== *
+ * 2b. F-UI-02 — icons render through the shared `<tg-svg>` sprite primitive
+ * ========================================================================== */
+
+describe('F-UI-02 sprite icons (shared TgSvg)', () => {
+    it('unfolded row renders the unfold icon as `<tg-svg class="unfold-action"><svg class="icon icon-unfolded-swimlane"><use/></svg>`', () => {
+        const { root } = renderSwimlane({
+            swimlane: makeSwimlane({ id: 10 }),
+            folded: false,
+        });
+
+        // The retained SCSS targets `tg-svg.unfold-action` + `svg.icon`
+        // (`app/styles/modules/kanban/kanban-table.scss`), so the host must be the
+        // real `tg-svg` TAG carrying a `class` attribute (NOT a `classname`), and
+        // the sprite must be referenced via `<use href="#…">` — an empty span
+        // would paint nothing.
+        const host = root.querySelector('tg-svg.unfold-action');
+        expect(host).not.toBeNull();
+        const svg = host?.querySelector('svg.icon.icon-unfolded-swimlane');
+        expect(svg).not.toBeNull();
+        const use = svg?.querySelector('use');
+        expect(use).not.toBeNull();
+        expect(use?.getAttribute('href') ?? use?.getAttribute('xlink:href')).toBe(
+            '#icon-unfolded-swimlane',
+        );
+    });
+
+    it('folded row swaps to the folded icon via the same shared primitive', () => {
+        const { root } = renderSwimlane({
+            swimlane: makeSwimlane({ id: 10 }),
+            folded: true,
+        });
+
+        expect(root.querySelector('tg-svg.unfold-action')).toBeNull();
+        const host = root.querySelector('tg-svg.fold-action');
+        expect(host).not.toBeNull();
+        expect(
+            host?.querySelector('svg.icon.icon-folded-swimlane'),
+        ).not.toBeNull();
+    });
+});
+
+/* ========================================================================== *
  * 3. columns mapping — one <TaskboardColumn> per status, only when unfolded
  * ========================================================================== */
 

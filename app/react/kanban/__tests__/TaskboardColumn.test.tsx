@@ -62,26 +62,36 @@
  * the component under test so ts-jest hoists it above that import.
  */
 
-jest.mock('../components/Card', () => ({
+jest.mock('../components/Card', () => {
+    // The real `Card` is a `forwardRef` component (`../components/Card.tsx`) so the
+    // DnD wrapper can attach `setNodeRef` to the card's DOM node. The stub MUST
+    // mirror that `forwardRef` contract, otherwise React logs "Function components
+    // cannot be given refs" when `TaskboardColumn` passes the drag ref down. Using
+    // `jest.requireActual('react')` keeps the factory hoistable (no top-level React
+    // import needed under the automatic JSX runtime).
+    const { forwardRef } = jest.requireActual('react') as typeof import('react');
+
     // A minimal stub standing in for the real `Card`. It surfaces exactly the
     // three prop facets this column spec asserts, as string data-* attributes:
     //   • data-card-id       — `props.item.id` (the ordered card id)
     //   • data-moved         — `props.moved` boolean (swimlane-only `kanban-moved`)
     //   • data-has-movetotop — whether `props.onClickMoveToTop` was supplied
     //                          (swimlane-only wiring)
-    Card: (props: {
-        item?: { id?: number };
-        moved?: boolean;
-        onClickMoveToTop?: unknown;
-    }) => (
-        <div
-            data-testid="card"
-            data-card-id={String(props.item?.id)}
-            data-moved={String(!!props.moved)}
-            data-has-movetotop={String(!!props.onClickMoveToTop)}
-        />
-    ),
-}));
+    return {
+        Card: forwardRef<
+            HTMLDivElement,
+            { item?: { id?: number }; moved?: boolean; onClickMoveToTop?: unknown }
+        >((props, ref) => (
+            <div
+                ref={ref}
+                data-testid="card"
+                data-card-id={String(props.item?.id)}
+                data-moved={String(!!props.moved)}
+                data-has-movetotop={String(!!props.onClickMoveToTop)}
+            />
+        )),
+    };
+});
 
 import { render, within } from '@testing-library/react';
 
@@ -216,6 +226,22 @@ describe('counter vs placeholder', () => {
         expect(root.querySelector('.placeholder-collapsed')).toBeInTheDocument();
         expect(root.querySelector('.kanban-task-counter')).not.toBeInTheDocument();
     });
+
+    /*
+     * F-UI-01 — folded-column visibility contract. The retained SCSS hides the
+     * cards of a folded column with the composed TAG selector
+     * `.vfold tg-card { display: none }`. That only works if the column root
+     * carries the `vfold` class when folded (asserted here) AND the cards
+     * render as `<tg-card>` hosts (asserted in Card.test.tsx). Together they
+     * fix "folded cards remain visible".
+     */
+    it('F-UI-01: applies the `vfold` class to the column root when folded (and omits it otherwise)', () => {
+        const foldedRoot = renderColumn({ folded: true }).root;
+        expect(foldedRoot).toHaveClass('vfold');
+
+        const openRoot = renderColumn({ folded: false }).root;
+        expect(openRoot).not.toHaveClass('vfold');
+    });
 });
 
 /* ========================================================================== *
@@ -243,6 +269,35 @@ describe('card placeholder', () => {
         const { root } = renderColumn({ showPlaceholder: false });
 
         expect(root.querySelector('.card-placeholder')).not.toBeInTheDocument();
+    });
+
+    it('F-UI-06: empty-board placeholder shows the localized card title/text copy', () => {
+        const { root } = renderColumn({ showPlaceholder: true, notFoundUserstories: false });
+
+        // Rendered through the i18n bridge (English fallback in the shell-less
+        // unit env) — NOT a hardcoded literal.
+        expect(root.querySelector('.card-placeholder .title')).toHaveTextContent(
+            'This could be a user story',
+        );
+        expect(root.querySelector('.card-placeholder')).toHaveTextContent(
+            'Create user stories here and change their status to track their progress.',
+        );
+    });
+
+    it('F-UI-06: not-found placeholder localizes copy and renders the trusted `<strong>` markup', () => {
+        const { root } = renderColumn({ showPlaceholder: true, notFoundUserstories: true });
+
+        const placeholder = root.querySelector('.card-placeholder.not-found') as HTMLElement;
+        expect(placeholder).toHaveTextContent('No matching results found');
+        expect(placeholder).toHaveTextContent(
+            'Try again using more general search terms or disabled some filters.',
+        );
+        // `KANBAN.US_NOT_FOUND_TEXT_P2` carries trusted `<strong>` markup from the
+        // locale bundle; the legacy `translate="…"` directive rendered it as HTML,
+        // so the bold element must be a real DOM node.
+        const strong = placeholder.querySelector('strong');
+        expect(strong).not.toBeNull();
+        expect(strong).toHaveTextContent('Archived stories');
     });
 });
 

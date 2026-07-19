@@ -58,7 +58,7 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 
 import { useBacklog } from '../state/useBacklog';
-import { api } from '../../shared/api/client';
+import { api, ApiError } from '../../shared/api/client';
 import {
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
@@ -66,7 +66,7 @@ import {
     filtersData,
 } from '../../shared/api/userstories';
 import { listMilestones, createMilestone, saveMilestone } from '../../shared/api/milestones';
-import { subscribeProjectChanges } from '../../shared/events';
+import { subscribeProjectChanges, isEventsConnected } from '../../shared/events';
 import { getEventsUrl } from '../../shared/session';
 import type { Project, UserStory, Milestone, FiltersData } from '../../shared/types';
 import { makeProject, makeUserStory, makeMilestone, makeFiltersData } from './factories';
@@ -89,7 +89,19 @@ jest.mock('../../shared/api/client', () => ({
         put: jest.fn(),
         del: jest.fn(),
     },
-    ApiError: class ApiError extends Error {},
+    // Faithful to the real `ApiError` (client.ts) so the hook's
+    // `describeReorderError` body-parsing path (F-AAP-03) is genuinely
+    // exercised: it sets `status`/`body` and the `ApiError` name.
+    ApiError: class ApiError extends Error {
+        status: number;
+        body: unknown;
+        constructor(status: number, body: unknown, message?: string) {
+            super(message ?? `Request failed with status ${status}`);
+            this.name = 'ApiError';
+            this.status = status;
+            this.body = body;
+        }
+    },
 }));
 
 // User-story bulk wrappers: mocked resolved fns. `bulkCreate` is mocked too
@@ -111,10 +123,13 @@ jest.mock('../../shared/api/milestones', () => ({
     saveMilestone: jest.fn(),
 }));
 
-// Events bridge: `subscribeProjectChanges` returns an unsubscribe spy.
+// Events bridge: `subscribeProjectChanges` returns an unsubscribe spy, and
+// `isEventsConnected` reports the REAL socket state consulted by the hook's
+// post-drag `eventsConnected()` gate (F-AAP-03).
 jest.mock('../../shared/events', () => ({
     __esModule: true,
     subscribeProjectChanges: jest.fn(),
+    isEventsConnected: jest.fn(),
 }));
 
 // Session accessors. Only `getEventsUrl` is consumed by the hook (it gates the
@@ -151,6 +166,7 @@ const saveMilestoneMock = saveMilestone as unknown as jest.Mock;
 
 const subscribeMock = subscribeProjectChanges as unknown as jest.Mock;
 const getEventsUrlMock = getEventsUrl as unknown as jest.Mock;
+const isEventsConnectedMock = isEventsConnected as unknown as jest.Mock;
 
 /** The numeric project id under test (the hook receives a NUMBER). */
 const PID = 7;
@@ -232,7 +248,17 @@ beforeEach(() => {
         saveMilestoneMock,
         subscribeMock,
         getEventsUrlMock,
+        isEventsConnectedMock,
     ].forEach((m) => m.mockReset());
+
+    // F-CQ-09: the hook now persists/rehydrates show-tags in localStorage.
+    // Clear it before every test so a persisted value from one test cannot leak
+    // into another (which would flip the default `showTags` on mount).
+    try {
+        window.localStorage.clear();
+    } catch {
+        /* jsdom storage always present; guard for safety */
+    }
 
     projectFixture = makeProject({ id: PID });
     // total_points || defined_points = 100 basis; completedPercentage =
@@ -303,18 +329,22 @@ beforeEach(() => {
     createMilestoneMock.mockImplementation((payload: Record<string, unknown>) =>
         Promise.resolve(makeMilestone({ id: 100, ...(payload as Partial<Milestone>) })),
     );
-    saveMilestoneMock.mockImplementation((payload: { id: number }) =>
-        Promise.resolve(makeMilestone({ ...(payload as Partial<Milestone>), id: payload.id })),
+    // saveMilestone(id, changes, version?) — the F-REG-05 minimal-diff contract.
+    saveMilestoneMock.mockImplementation(
+        (id: number, changes: Partial<Milestone>) =>
+            Promise.resolve(makeMilestone({ ...changes, id })),
     );
     bulkBacklogOrderMock.mockResolvedValue([] as MoveRow[]);
     bulkMilestoneMock.mockResolvedValue([]);
     bulkCreateMock.mockResolvedValue([]);
 
     subscribeMock.mockReturnValue(unsubscribeSpy);
-    // Default: events "connected" (a truthy URL) so the post-drag fallback
-    // reload is SUPPRESSED and per-test call counts stay focused. The dedicated
-    // 'events-disconnected reload' block overrides this to null.
+    // Default: a truthy events URL (the bridge is configured for subscriptions).
     getEventsUrlMock.mockReturnValue('ws://localhost:9000/events');
+    // Default: the socket is genuinely CONNECTED (F-AAP-03), so the post-drag
+    // fallback reload is SUPPRESSED and per-test call counts stay focused. The
+    // dedicated 'events-disconnected reload' block overrides this to false.
+    isEventsConnectedMock.mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -713,21 +743,22 @@ describe('useBacklog', () => {
             expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
         });
 
-        it('saveSprint calls saveMilestone then reloads open + closed sprints', async () => {
+        it('saveSprint forwards (id, changes, version) to saveMilestone then reloads open + closed sprints', async () => {
             const { result } = await renderLoaded();
             clearApiCalls();
 
-            const payload = {
-                id: 10,
+            // F-REG-05: only the CHANGED attributes + version, never a whole model.
+            const changes = {
                 name: 'Renamed Sprint',
                 estimated_start: '2021-03-01',
                 estimated_finish: '2021-03-14',
             };
             await act(async () => {
-                await result.current.actions.saveSprint(payload);
+                await result.current.actions.saveSprint(10, changes, 7);
             });
 
-            expect(saveMilestoneMock).toHaveBeenCalledWith(payload);
+            // The id is the path segment; the body is the minimal diff + version.
+            expect(saveMilestoneMock).toHaveBeenCalledWith(10, changes, 7);
             expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
             expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
         });
@@ -931,7 +962,7 @@ describe('useBacklog', () => {
      * ---------------------------------------------------------------------- */
     describe('events-disconnected reload', () => {
         it('hard-refreshes sprints/closed/stats after the queue drains when events are disconnected', async () => {
-            getEventsUrlMock.mockReturnValue(null); // eventsConnected() → false
+            isEventsConnectedMock.mockReturnValue(false); // eventsConnected() → false
 
             const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
             userstoriesFixture = [us20];
@@ -951,7 +982,7 @@ describe('useBacklog', () => {
         });
 
         it('does NOT hard-refresh after a drag when events are connected', async () => {
-            getEventsUrlMock.mockReturnValue('ws://localhost:9000/events'); // connected
+            isEventsConnectedMock.mockReturnValue(true); // connected
 
             const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
             userstoriesFixture = [us20];
@@ -970,6 +1001,518 @@ describe('useBacklog', () => {
             // No fallback reload while events keep the board fresh.
             expect(listMilestonesMock).not.toHaveBeenCalled();
             expect(getMock).not.toHaveBeenCalled();
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-AAP-03: failed-write reconciliation + surfacing
+     * ---------------------------------------------------------------------- */
+    describe('failed-write reconciliation (F-AAP-03)', () => {
+        it('reconciles to server truth after a FAILED reorder even when events are connected', async () => {
+            // Connected: pushes would normally keep the board fresh — but a
+            // rejected write emits NO live event, so a reload is mandatory.
+            isEventsConnectedMock.mockReturnValue(true);
+            bulkBacklogOrderMock.mockRejectedValueOnce(new Error('network down'));
+
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us20];
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, null, null, null);
+            });
+            await waitFor(() => expect(bulkBacklogOrderMock).toHaveBeenCalledTimes(1));
+
+            // The failed write forces the fallback reload despite being connected.
+            await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false }));
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+        });
+
+        it('surfaces a moveError from the server envelope on a failed reorder, then clears it on the next success', async () => {
+            isEventsConnectedMock.mockReturnValue(true);
+
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, backlog_order: 2 });
+            userstoriesFixture = [us20];
+
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            // 1) A rejected reorder surfaces the server `_error_message` (not
+            //    swallowed, and NOT the raw Error/class name).
+            bulkBacklogOrderMock.mockRejectedValueOnce(
+                new ApiError(400, { _error_message: 'Server rejected the reorder' }, 'Bad Request'),
+            );
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, null, null, null);
+            });
+            await waitFor(() => expect(result.current.state.moveError).toBe('Server rejected the reorder'));
+
+            // 2) A subsequent successful reorder clears the surfaced error
+            //    (fresh optimistic move clears it; the reconcile confirms it).
+            bulkBacklogOrderMock.mockResolvedValueOnce([{ id: 20, milestone: null, backlog_order: 1 }]);
+            await act(async () => {
+                result.current.actions.moveUs([us20], 0, null, null, null);
+            });
+            await waitFor(() => expect(result.current.state.moveError).toBeNull());
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-CQ-05 — guarded load-more pagination
+     * ---------------------------------------------------------------------- */
+    describe('pagination — guarded load-more (F-CQ-05)', () => {
+        const usA = makeUserStory({ id: 1, ref: 1, project: PID, milestone: null, backlog_order: 1 });
+        const usB = makeUserStory({ id: 2, ref: 2, project: PID, milestone: null, backlog_order: 2 });
+
+        /**
+         * Route `/userstories` by the `page` query param: page 1 optionally
+         * carries `x-pagination-next` (more pages remain); page 2 carries no
+         * next header (last page → `disablePagination`).
+         */
+        function wirePages(firstHasNext: boolean): void {
+            requestMock.mockImplementation(
+                (_m: string, path: string, o?: { params?: Record<string, unknown> }) => {
+                    if (path !== '/userstories') {
+                        return Promise.reject(new Error(`unexpected path ${path}`));
+                    }
+                    const page = o?.params?.page;
+                    if (page === 1) {
+                        return Promise.resolve({
+                            data: [usA],
+                            status: 200,
+                            headers: makeHeaders(firstHasNext ? { 'x-pagination-next': 'true' } : {}),
+                        });
+                    }
+                    if (page === 2) {
+                        return Promise.resolve({ data: [usB], status: 200, headers: makeHeaders({}) });
+                    }
+                    return Promise.resolve({ data: [], status: 200, headers: makeHeaders({}) });
+                },
+            );
+        }
+
+        it('appends the next page, advances the cursor, then locks at the end', async () => {
+            wirePages(true);
+            const { result } = await renderLoaded();
+
+            // Initial page 1 loaded; more pages remain → pagination NOT disabled.
+            expect(result.current.state.userstories.map((u) => u.id)).toEqual([1]);
+            expect(result.current.state.disablePagination).toBe(false);
+
+            await act(async () => {
+                await result.current.actions.loadMore();
+            });
+
+            // Page 2 APPENDED (not reset); no further next → pagination locked;
+            // the in-flight spinner is cleared.
+            expect(result.current.state.userstories.map((u) => u.id)).toEqual([1, 2]);
+            expect(result.current.state.disablePagination).toBe(true);
+            expect(result.current.state.loadingUserstories).toBe(false);
+        });
+
+        it('is a no-op once the last page is reached (disablePagination guard)', async () => {
+            wirePages(false);
+            const { result } = await renderLoaded();
+            expect(result.current.state.disablePagination).toBe(true);
+            clearApiCalls();
+
+            await act(async () => {
+                await result.current.actions.loadMore();
+            });
+
+            // Guarded out — no further page request fired.
+            expect(requestMock).not.toHaveBeenCalled();
+        });
+
+        it('guards overlapping load-more calls to a SINGLE in-flight request', async () => {
+            wirePages(true);
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            // Hold the next-page request open so both calls overlap.
+            const d = deferred<{ data: UserStory[]; status: number; headers: Headers }>();
+            requestMock.mockImplementationOnce(() => d.promise);
+
+            await act(async () => {
+                const p1 = result.current.actions.loadMore();
+                const p2 = result.current.actions.loadMore();
+                // The second call is guarded out synchronously by the in-flight ref.
+                expect(requestMock).toHaveBeenCalledTimes(1);
+                d.resolve({ data: [usB], status: 200, headers: makeHeaders({}) });
+                await Promise.all([p1, p2]);
+            });
+
+            expect(requestMock).toHaveBeenCalledTimes(1);
+            // No DUPLICATE append — the page landed exactly once.
+            expect(result.current.state.userstories.map((u) => u.id)).toEqual([1, 2]);
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-REG-06 — moveToSprint rollback + error surfacing
+     * ---------------------------------------------------------------------- */
+    describe('moveToSprint rollback + error surfacing (F-REG-06)', () => {
+        it('on a FAILED move: reconciles to server truth (reload), surfaces moveError, and rethrows', async () => {
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, sprint_order: 3 });
+            userstoriesFixture = [us20];
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            bulkMilestoneMock.mockRejectedValueOnce(
+                new ApiError(400, { _error_message: 'Cannot move to sprint' }, 'Bad Request'),
+            );
+
+            // The thunk REJECTS so the caller can restore the selection.
+            await act(async () => {
+                await expect(result.current.actions.moveToSprint([us20], 10)).rejects.toBeDefined();
+            });
+
+            // moveError surfaced from the server envelope (not swallowed).
+            await waitFor(() => expect(result.current.state.moveError).toBe('Cannot move to sprint'));
+
+            // Reconciled to server truth: backlog list + open sprints + stats reloaded.
+            expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+            // Rollback proof: the optimistically-removed story is back (the reload
+            // re-materialised it from the server).
+            expect(result.current.state.userstories.some((u) => u.id === 20)).toBe(true);
+        });
+
+        it('on a SUCCESSFUL move: clears moveError and does NOT reload the backlog list', async () => {
+            const us20 = makeUserStory({ id: 20, ref: 20, project: PID, milestone: null, sprint_order: 3 });
+            userstoriesFixture = [us20];
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            await act(async () => {
+                await result.current.actions.moveToSprint([us20], 10);
+            });
+
+            expect(result.current.state.moveError).toBeNull();
+            expect(bulkMilestoneMock).toHaveBeenCalledWith(PID, 10, [{ us_id: 20, order: 3 }]);
+            // Success path reloads sprints + stats but NOT the backlog userstories list.
+            expect(requestMock).not.toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            // The story stays removed from the backlog (it now lives in the sprint).
+            expect(result.current.state.userstories.some((u) => u.id === 20)).toBe(false);
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-REG-07 — finish sprint creation using the REFRESHED sprint state
+     * ---------------------------------------------------------------------- */
+    describe('finishSprintCreation uses refreshed sprint state (F-REG-07)', () => {
+        it('reloads OPEN sprints FIRST, then moves stories into the refreshed currentSprint || sprints[0]', async () => {
+            // Pre-create: the initial open sprint is id 10 (openSprintsFixture default).
+            const usToMove = makeUserStory({ id: 30, ref: 30, project: PID, milestone: null, sprint_order: 1 });
+            userstoriesFixture = [usToMove];
+            const { result } = await renderLoaded();
+            clearApiCalls();
+
+            // Simulate the just-created sprint (id 200) entering the REFRESHED list.
+            // A stale implementation would move into the pre-create sprint (10);
+            // the faithful one moves into the refreshed sprints[0] = 200.
+            openSprintsFixture = [makeMilestone({ id: 200, name: 'Brand New Sprint' })];
+
+            await act(async () => {
+                await result.current.actions.finishSprintCreation([usToMove]);
+            });
+
+            // Reloaded the open sprints BEFORE moving (refreshed state).
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            // Moved into the REFRESHED sprints[0] (id 200) — NOT the stale id 10.
+            expect(bulkMilestoneMock).toHaveBeenCalledWith(PID, 200, [{ us_id: 30, order: 1 }]);
+        });
+
+        it('with no stories: reloads sprints + stats but moves nothing', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            openSprintsFixture = [makeMilestone({ id: 200 })];
+
+            await act(async () => {
+                await result.current.actions.finishSprintCreation();
+            });
+
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+            expect(bulkMilestoneMock).not.toHaveBeenCalled();
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-AAP-10 — surface load failures (error distinct from empty)
+     * ---------------------------------------------------------------------- */
+    describe('load-error surfacing (F-AAP-10)', () => {
+        it('sets loadError (distinct from empty) when the initial load fails', async () => {
+            getMock.mockImplementation((path: string) => {
+                if (path === `/projects/${PID}`) {
+                    return Promise.reject(new Error('boom'));
+                }
+                return Promise.resolve(statsFixture);
+            });
+
+            const { result } = renderHook(() => useBacklog(PID));
+            await waitFor(() => expect(result.current.state.loading).toBe(false));
+
+            // A FAILED load is now reported — NOT rendered as a successful empty
+            // backlog. Both flags are observable and DISTINCT.
+            expect(result.current.state.loadError).toBe(true);
+            expect(result.current.state.userstories).toEqual([]);
+            expect(result.current.state.project).toBeNull();
+        });
+
+        it('reload() clears loadError and succeeds on retry', async () => {
+            let failProject = true;
+            getMock.mockImplementation((path: string) => {
+                if (path === `/projects/${PID}`) {
+                    return failProject
+                        ? Promise.reject(new Error('boom'))
+                        : Promise.resolve(projectFixture);
+                }
+                if (path === `/projects/${PID}/stats`) {
+                    return Promise.resolve(statsFixture);
+                }
+                return Promise.reject(new Error(`unexpected api.get path: ${path}`));
+            });
+
+            const { result } = renderHook(() => useBacklog(PID));
+            await waitFor(() => expect(result.current.state.loading).toBe(false));
+            expect(result.current.state.loadError).toBe(true);
+
+            // Repair the backend and retry via the centralized, awaited reload.
+            failProject = false;
+            await act(async () => {
+                await result.current.actions.reload();
+            });
+
+            expect(result.current.state.loadError).toBe(false);
+            expect(result.current.state.project).not.toBeNull();
+        });
+
+        it('surfaces loadError when a live onUserstories refresh fails (not swallowed)', async () => {
+            const { result } = await renderLoaded();
+            // The handlers passed to subscribeProjectChanges(projectId, handlers).
+            const handlers = subscribeMock.mock.calls[0][1] as {
+                onUserstories: () => void;
+                onMilestones: () => void;
+            };
+            clearApiCalls();
+
+            // The next paginated reload (inside onUserstories) fails.
+            requestMock.mockRejectedValueOnce(new Error('live refresh boom'));
+
+            await act(async () => {
+                handlers.onUserstories();
+                await Promise.resolve();
+            });
+
+            await waitFor(() => expect(result.current.state.loadError).toBe(true));
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-CQ-09 — project-scoped show-tags persistence + rehydration
+     * ---------------------------------------------------------------------- */
+    describe('show-tags persistence + rehydration (F-CQ-09)', () => {
+        const STORAGE_KEY = `taiga.react.backlog.show-tags.${PID}`;
+
+        it('persists the resolved show-tags value per project on toggle', async () => {
+            const { result } = await renderLoaded();
+            expect(result.current.state.showTags).toBe(true);
+
+            act(() => {
+                result.current.actions.toggleTags();
+            });
+            expect(result.current.state.showTags).toBe(false);
+            expect(window.localStorage.getItem(STORAGE_KEY)).toBe('false');
+
+            act(() => {
+                result.current.actions.toggleTags(true);
+            });
+            expect(result.current.state.showTags).toBe(true);
+            expect(window.localStorage.getItem(STORAGE_KEY)).toBe('true');
+        });
+
+        it('rehydrates a persisted (false) preference on mount', async () => {
+            window.localStorage.setItem(STORAGE_KEY, 'false');
+            const { result } = await renderLoaded();
+            expect(result.current.state.showTags).toBe(false);
+        });
+
+        it('defaults to showing tags when nothing is persisted', async () => {
+            const { result } = await renderLoaded();
+            expect(result.current.state.showTags).toBe(true);
+        });
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * F-CQ-03 — single-story CRUD: delete / status / points
+     *
+     * The AngularJS backlog owned these three mutations directly (delete via
+     * `@repo.remove`, status/points via `@repo.save` = PATCH `/userstories/{id}`
+     * with `{ field, version }`), each followed by a stats/sprints reload
+     * [orig backlog/main.coffee:646,662-681,1094-1099]. Each React action is
+     * optimistic-then-reconcile, mirroring `moveToSprint` (F-REG-06): a
+     * successful write keeps the optimistic state and refreshes derived data; a
+     * FAILED write surfaces `moveError` and reloads to server truth.
+     * ---------------------------------------------------------------------- */
+    describe('single-story delete / status / points (F-CQ-03)', () => {
+        it('deleteUs: DELETEs /userstories/{id}, prunes optimistically, then reloads sprints + stats', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            await act(async () => {
+                await result.current.actions.deleteUs(us);
+            });
+
+            // Persisted through the low-level DELETE verb.
+            expect(delMock).toHaveBeenCalledWith(`/userstories/${us.id}`);
+            // Optimistically pruned from the list.
+            expect(result.current.state.userstories.some((u) => u.id === us.id)).toBe(false);
+            // Derived data refreshed (sprints + stats), NOT a full backlog re-list.
+            expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+            expect(requestMock).not.toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            // A clean delete surfaces no error.
+            expect(result.current.state.moveError).toBeNull();
+        });
+
+        it('deleteUs: on a FAILED delete surfaces moveError and reconciles to server truth', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            delMock.mockRejectedValueOnce(
+                new ApiError(400, { _error_message: 'Cannot delete story' }, 'Bad Request'),
+            );
+
+            await act(async () => {
+                await result.current.actions.deleteUs(us);
+            });
+
+            // The server envelope message is surfaced, not swallowed.
+            await waitFor(() =>
+                expect(result.current.state.moveError).toBe('Cannot delete story'),
+            );
+            // Reconciled: the backlog list was re-fetched from the server, which
+            // re-materialised the optimistically-removed story.
+            expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            expect(result.current.state.userstories.some((u) => u.id === us.id)).toBe(true);
+        });
+
+        it('updateUsStatus: PATCHes { status, version }, updates in place, then reloads stats + facets', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0]; // status 1, version 1
+
+            await act(async () => {
+                await result.current.actions.updateUsStatus(us, 2);
+            });
+
+            // Minimal PATCH body: the changed field + optimistic-concurrency version.
+            expect(patchMock).toHaveBeenCalledWith(`/userstories/${us.id}`, {
+                status: 2,
+                version: us.version,
+            });
+            // Updated in place (same list position, new status).
+            const updated = result.current.state.userstories.find((u) => u.id === us.id);
+            expect(updated?.status).toBe(2);
+            // Stats + filter facets refreshed (status affects both).
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+            expect(filtersDataMock).toHaveBeenCalled();
+            expect(result.current.state.moveError).toBeNull();
+        });
+
+        it('updateUsStatus: is a no-op when the status is unchanged', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0]; // status 1
+
+            await act(async () => {
+                await result.current.actions.updateUsStatus(us, us.status);
+            });
+
+            expect(patchMock).not.toHaveBeenCalled();
+        });
+
+        it('updateUsStatus: on a FAILED save surfaces moveError and reconciles to server truth', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            patchMock.mockRejectedValueOnce(
+                new ApiError(412, { _error_message: 'stale version' }, 'Precondition Failed'),
+            );
+
+            await act(async () => {
+                await result.current.actions.updateUsStatus(us, 2);
+            });
+
+            await waitFor(() => expect(result.current.state.moveError).toBe('stale version'));
+            // Reconciled: the backlog list was re-fetched, restoring the server status.
+            expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything());
+            const restored = result.current.state.userstories.find((u) => u.id === us.id);
+            expect(restored?.status).toBe(1);
+        });
+
+        it('updateUsPoints: PATCHes merged { points, version }, updates in place, then reloads stats', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            await act(async () => {
+                await result.current.actions.updateUsPoints(us, 1, 11);
+            });
+
+            // The points map is MERGED (role 1 → point 11) and sent with the version.
+            expect(patchMock).toHaveBeenCalledWith(`/userstories/${us.id}`, {
+                points: { '1': 11 },
+                version: us.version,
+            });
+            const updated = result.current.state.userstories.find((u) => u.id === us.id);
+            expect(updated?.points).toEqual({ '1': 11 });
+            expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+            expect(result.current.state.moveError).toBeNull();
+        });
+
+        it('updateUsPoints: preserves other roles when setting one role point', async () => {
+            userstoriesFixture = [
+                makeUserStory({ id: 1, ref: 1, project: PID, milestone: null, points: { '2': 10 } }),
+            ];
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            await act(async () => {
+                await result.current.actions.updateUsPoints(us, 1, 11);
+            });
+
+            // Role 2's existing point is preserved; role 1 is added.
+            expect(patchMock).toHaveBeenCalledWith(`/userstories/${us.id}`, {
+                points: { '2': 10, '1': 11 },
+                version: us.version,
+            });
+        });
+
+        it('updateUsPoints: on a FAILED save surfaces moveError and reconciles to server truth', async () => {
+            const { result } = await renderLoaded();
+            clearApiCalls();
+            const us = result.current.state.userstories[0];
+
+            patchMock.mockRejectedValueOnce(
+                new ApiError(400, { _error_message: 'points rejected' }, 'Bad Request'),
+            );
+
+            await act(async () => {
+                await result.current.actions.updateUsPoints(us, 1, 11);
+            });
+
+            await waitFor(() => expect(result.current.state.moveError).toBe('points rejected'));
+            expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything());
         });
     });
 });

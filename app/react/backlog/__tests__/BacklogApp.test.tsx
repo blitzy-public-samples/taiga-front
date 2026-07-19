@@ -75,11 +75,18 @@
  *     be asserted without importing the real children.
  */
 
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, within, fireEvent } from '@testing-library/react';
 
 import { BacklogApp } from '../BacklogApp';
 import { useBacklog } from '../state/useBacklog';
-import { makeProject, makeUserStory, makeUserStories, makeMilestone } from './factories';
+import {
+  makeProject,
+  makeUserStory,
+  makeUserStories,
+  makeMilestone,
+  makeFiltersData,
+  makeFilterOption,
+} from './factories';
 
 import type { BacklogState } from '../state/backlogReducer';
 
@@ -98,12 +105,14 @@ const mockCaptured: {
   backlogTable: any;
   createEditSprintLightbox: any;
   bulkCreateUsLightbox: any;
+  filtersSidebar: any;
   sprint: any[];
 } = {
   dnd: null,
   backlogTable: null,
   createEditSprintLightbox: null,
   bulkCreateUsLightbox: null,
+  filtersSidebar: null,
   sprint: [],
 };
 
@@ -175,6 +184,18 @@ jest.mock('../components/BulkCreateUsLightbox', () => ({
   },
 }));
 
+// F-CQ-06: the reused shared filter panel. Stubbed as a LEAF that records its
+// props (filters/customFilters/selectedFilters + the five `on*` callbacks) so
+// the container's filter WIRING is asserted here without re-testing the
+// presentational component (covered by the Kanban `FiltersSidebar` spec).
+jest.mock('../../kanban/components/FiltersSidebar', () => ({
+  __esModule: true,
+  FiltersSidebar: (props: any) => {
+    mockCaptured.filtersSidebar = props;
+    return <div data-testid="filters-sidebar" />;
+  },
+}));
+
 /**
  * Strongly-typed handle onto the auto-mocked hook. `jest.MockedFunction`
  * preserves the original signature so `.mockReturnValue(...)` and the
@@ -224,7 +245,9 @@ function makeState(overrides: Partial<BacklogState> = {}): BacklogState {
     milestonesOrder: {},
     newUs: [],
     loading: true,
+    loadError: false,
     loadingUserstories: false,
+    moveError: null,
     ...overrides,
   };
 }
@@ -238,7 +261,12 @@ function makeActions() {
   return {
     moveUs: jest.fn(),
     moveUsToTopOfBacklog: jest.fn(),
-    moveToSprint: jest.fn(),
+    // Promise-returning thunks honour their real `Promise<void>` contract so the
+    // container's `.then()/.catch()` (F-REG-06) resolve cleanly under test.
+    moveToSprint: jest.fn(() => Promise.resolve()),
+    loadMore: jest.fn(() => Promise.resolve()),
+    finishSprintCreation: jest.fn(() => Promise.resolve()),
+    reload: jest.fn(() => Promise.resolve()),
     bulkCreateUs: jest.fn(),
     createSprint: jest.fn(),
     saveSprint: jest.fn(),
@@ -252,6 +280,9 @@ function makeActions() {
     reloadStats: jest.fn(),
     addUsOptimistic: jest.fn(),
     removeUsOptimistic: jest.fn(),
+    deleteUs: jest.fn(() => Promise.resolve()),
+    updateUsStatus: jest.fn(() => Promise.resolve()),
+    updateUsPoints: jest.fn(() => Promise.resolve()),
   };
 }
 
@@ -293,6 +324,7 @@ beforeEach(() => {
   mockCaptured.backlogTable = null;
   mockCaptured.createEditSprintLightbox = null;
   mockCaptured.bulkCreateUsLightbox = null;
+  mockCaptured.filtersSidebar = null;
   mockCaptured.sprint = [];
   // Default: the project has NOT loaded yet (project === null).
   primeHook();
@@ -346,6 +378,27 @@ describe('BacklogApp', () => {
 
       // The hook is invoked before the guard returns, so it is always called.
       expect(mockUseBacklog).toHaveBeenCalled();
+    });
+
+    // F-REG-01: the guard must reject blank / non-positive / non-integer ids, not
+    // just NaN. `Number("")` is 0 and `Number("-1")` is -1 (both FINITE), so the
+    // stricter `Number.isInteger(id) && id > 0` rule is what rejects them, and it
+    // also rejects the literal `"{{project.id}}"` snapshot AngularJS emits before
+    // its first digest resolves the interpolation.
+    it.each([
+      ['a blank string (Number("") === 0)', ''],
+      ['zero', '0'],
+      ['a negative id', '-1'],
+      ['a fractional id', '1.5'],
+      ['the unresolved AngularJS interpolation literal', '{{project.id}}'],
+    ])('rejects %s as an invalid project-id', (_label, value) => {
+      const { container } = renderApp(value);
+
+      expect(
+        container.querySelector('[data-tg-react-backlog="invalid-project"]'),
+      ).not.toBeNull();
+      expect(screen.queryByTestId('dnd-context')).toBeNull();
+      expect(screen.queryByTestId('backlog-table')).toBeNull();
     });
   });
 
@@ -473,14 +526,10 @@ describe('BacklogApp', () => {
       expect(mockCaptured.backlogTable).not.toBeNull();
       expect(typeof mockCaptured.backlogTable.onToggleCheck).toBe('function');
       expect(typeof mockCaptured.backlogTable.onUpdateStatus).toBe('function');
+      expect(typeof mockCaptured.backlogTable.onUpdatePoints).toBe('function');
       expect(typeof mockCaptured.backlogTable.onEditUs).toBe('function');
       expect(typeof mockCaptured.backlogTable.onDeleteUs).toBe('function');
       expect(typeof mockCaptured.backlogTable.onMoveUsToTop).toBe('function');
-    });
-
-    it('routes onDeleteUs to actions.removeUsOptimistic(us.id)', () => {
-      mockCaptured.backlogTable.onDeleteUs(makeUserStory({ id: 42 }));
-      expect(stubActions.removeUsOptimistic).toHaveBeenCalledWith(42);
     });
 
     it('routes onMoveUsToTop to actions.moveUsToTopOfBacklog(us)', () => {
@@ -492,6 +541,424 @@ describe('BacklogApp', () => {
     it('passes an onMove callback to the BacklogDndContext child', () => {
       expect(mockCaptured.dnd).not.toBeNull();
       expect(typeof mockCaptured.dnd.onMove).toBe('function');
+    });
+  });
+
+  /* ------------------------------------------------------------------------ *
+   * F-CQ-03 — single-story CRUD wiring (delete / status / points) + the
+   * corrected create routing. The legacy backlog OWNED delete + status + points
+   * and DELEGATED standard-create/edit to the common `genericform` dialog. These
+   * specs assert the container gates every mutation on an archive-aware
+   * permission (`canMutate`) and delegates the persistence to the hook thunk,
+   * while standard-create stays an OOS no-op and only bulk opens the lightbox.
+   * ------------------------------------------------------------------------ */
+  describe('single-story CRUD wiring (F-CQ-03)', () => {
+    /** A project that grants both mutation gates the controls require. */
+    function editableProject() {
+      return makeProject({
+        is_backlog_activated: true,
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'delete_us'],
+      });
+    }
+
+    /** Prime a LOADED, editable board and render, capturing child props. */
+    function renderEditable(projectOverrides: Record<string, unknown> = {}): void {
+      primeHook({
+        project: { ...editableProject(), ...projectOverrides },
+        isBacklogActivated: true,
+        userstories: makeUserStories(2),
+        sprints: [makeMilestone()],
+      });
+      renderApp();
+    }
+
+    let confirmSpy: jest.SpyInstance;
+    afterEach(() => {
+      confirmSpy?.mockRestore();
+    });
+
+    it('onUpdateStatus (granted): delegates to actions.updateUsStatus(us, statusId)', () => {
+      renderEditable();
+      const us = makeUserStory({ id: 5, status: 1 });
+      mockCaptured.backlogTable.onUpdateStatus(us, 2);
+      expect(stubActions.updateUsStatus).toHaveBeenCalledWith(us, 2);
+    });
+
+    it('onUpdateStatus (denied — view-only): is a gated no-op', () => {
+      renderEditable({ my_permissions: ['view_project', 'view_us'] });
+      mockCaptured.backlogTable.onUpdateStatus(makeUserStory({ id: 5 }), 2);
+      expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
+    });
+
+    it('onUpdateStatus (denied — archived project): is a gated no-op even with modify_us', () => {
+      renderEditable({ archived_code: 'archived' });
+      mockCaptured.backlogTable.onUpdateStatus(makeUserStory({ id: 5 }), 2);
+      expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
+    });
+
+    it('onUpdatePoints (granted): delegates to actions.updateUsPoints(us, roleId, pointId)', () => {
+      renderEditable();
+      const us = makeUserStory({ id: 6 });
+      mockCaptured.backlogTable.onUpdatePoints(us, 1, 11);
+      expect(stubActions.updateUsPoints).toHaveBeenCalledWith(us, 1, 11);
+    });
+
+    it('onUpdatePoints (denied — view-only): is a gated no-op', () => {
+      renderEditable({ my_permissions: ['view_project', 'view_us'] });
+      mockCaptured.backlogTable.onUpdatePoints(makeUserStory({ id: 6 }), 1, 11);
+      expect(stubActions.updateUsPoints).not.toHaveBeenCalled();
+    });
+
+    it('onDeleteUs (granted + confirm ACCEPTED): delegates to actions.deleteUs(us)', () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      renderEditable();
+      const us = makeUserStory({ id: 42 });
+      mockCaptured.backlogTable.onDeleteUs(us);
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(stubActions.deleteUs).toHaveBeenCalledWith(us);
+      // The obsolete local-only path is NOT taken.
+      expect(stubActions.removeUsOptimistic).not.toHaveBeenCalled();
+    });
+
+    it('onDeleteUs (granted + confirm CANCELLED): asks but does not delete', () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(false);
+      renderEditable();
+      mockCaptured.backlogTable.onDeleteUs(makeUserStory({ id: 42 }));
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(stubActions.deleteUs).not.toHaveBeenCalled();
+    });
+
+    it('onDeleteUs (denied — no delete_us): gated BEFORE the confirm prompt', () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      renderEditable({ my_permissions: ['view_project', 'view_us', 'modify_us'] });
+      mockCaptured.backlogTable.onDeleteUs(makeUserStory({ id: 42 }));
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(stubActions.deleteUs).not.toHaveBeenCalled();
+    });
+
+    it('onDeleteUs (denied — archived project): gated even with delete_us', () => {
+      confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
+      renderEditable({ archived_code: 'archived' });
+      mockCaptured.backlogTable.onDeleteUs(makeUserStory({ id: 42 }));
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(stubActions.deleteUs).not.toHaveBeenCalled();
+    });
+
+    it('onEditUs: is a DEFERRED no-op (common genericform, AAP §0.2.2 OOS)', () => {
+      renderEditable();
+      // No throw and no mutation action fired — the still-AngularJS US detail
+      // screen owns editing.
+      expect(() =>
+        mockCaptured.backlogTable.onEditUs(makeUserStory({ id: 9 })),
+      ).not.toThrow();
+      expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
+      expect(stubActions.deleteUs).not.toHaveBeenCalled();
+    });
+
+    it('the bulk "Add" button opens the BulkCreateUsLightbox', () => {
+      renderEditable({
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
+      });
+      // Starts closed.
+      expect(
+        screen.getByTestId('bulk-create-us-lightbox'),
+      ).toHaveAttribute('data-open', 'false');
+
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Add user stories in bulk' }),
+      );
+
+      // The bulk lightbox is now open — the ONLY migrated create surface.
+      expect(
+        screen.getByTestId('bulk-create-us-lightbox'),
+      ).toHaveAttribute('data-open', 'true');
+    });
+
+    it('the standard "Add" button is a deferred no-op (does NOT open the bulk lightbox)', () => {
+      renderEditable({
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
+      });
+
+      // The first `.new-us` button is the standard "Add" (genericform:new, OOS).
+      const addButton = within(
+        document.querySelector('.new-us') as HTMLElement,
+      ).getAllByRole('button')[0];
+      fireEvent.click(addButton);
+
+      // Standard create must NOT hijack the bulk lightbox (the prior-cut bug).
+      expect(
+        screen.getByTestId('bulk-create-us-lightbox'),
+      ).toHaveAttribute('data-open', 'false');
+    });
+  });
+
+  /* ------------------------------------------------------------------------ *
+   * F-CQ-04 — backlog-summary progress meter integration + loading / error /
+   * collapse states. The `ProgressBar` component (the real port of
+   * `tgBacklogProgressBar`) was implemented but never mounted — the container
+   * rendered an empty `.summary-progress-bar` placeholder. These specs prove the
+   * real meter now renders with the live stats, that the loading/error classes
+   * track the stats lifecycle, and that the burndown collapse toggle works.
+   * NOTE: `ProgressBar` is deliberately NOT mocked, so the real DOM is asserted.
+   * ------------------------------------------------------------------------ */
+  describe('summary progress meter + burndown states (F-CQ-04)', () => {
+    /** A `BacklogStats`-shaped fixture (structurally a ProgressBarStats too). */
+    function makeStats(
+      overrides: Partial<BacklogState['stats']> = {},
+    ): NonNullable<BacklogState['stats']> {
+      return {
+        completedPercentage: 25,
+        showGraphPlaceholder: false,
+        speed: 3,
+        total_points: 100,
+        defined_points: 80,
+        closed_points: 25,
+        ...(overrides as object),
+      };
+    }
+
+    it('mounts the REAL ProgressBar (three sub-bars) inside the summary once stats load', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats(),
+      });
+      const { container } = renderApp();
+
+      // The real meter — its three characteristic sub-bars — is present, NOT the
+      // old empty placeholder.
+      const meter = container.querySelector('.summary-progress-bar');
+      expect(meter).not.toBeNull();
+      expect(meter?.querySelector('.defined-points')).not.toBeNull();
+      expect(meter?.querySelector('.project-points-progress')).not.toBeNull();
+      expect(meter?.querySelector('.closed-points-progress')).not.toBeNull();
+    });
+
+    it('drives the closed-points sub-bar width from the live stats formula', () => {
+      // definedPoints(80) <= totalPoints(100) → projectPct=100; closedPct =
+      // 25*100/100 = 25; each has the -3 inset then clamp/round → 97% and 22%.
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats({ total_points: 100, defined_points: 80, closed_points: 25 }),
+      });
+      const { container } = renderApp();
+
+      const project = container.querySelector(
+        '.summary-progress-bar .project-points-progress',
+      ) as HTMLElement;
+      const closed = container.querySelector(
+        '.summary-progress-bar .closed-points-progress',
+      ) as HTMLElement;
+      expect(project.style.width).toBe('97%');
+      expect(closed.style.width).toBe('22%');
+    });
+
+    it('marks the summary region loading (aria-busy) before stats first arrive', () => {
+      // A loaded PROJECT but stats still null, and no load error → loading window.
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: null,
+      });
+      const { container } = renderApp();
+
+      const summary = container.querySelector('.backlog-summary') as HTMLElement;
+      expect(summary).toHaveClass('loading');
+      expect(summary).toHaveAttribute('aria-busy', 'true');
+      // The meter still renders (0%-width bars) rather than vanishing.
+      expect(container.querySelector('.summary-progress-bar')).not.toBeNull();
+    });
+
+    it('clears the loading class once stats are present', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats(),
+      });
+      const { container } = renderApp();
+
+      const summary = container.querySelector('.backlog-summary') as HTMLElement;
+      expect(summary).not.toHaveClass('loading');
+      expect(summary).toHaveAttribute('aria-busy', 'false');
+    });
+
+    it('toggles the burndown graph collapse via the summary graph button', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats({ showGraphPlaceholder: false }),
+      });
+      const { container } = renderApp();
+
+      const graph = container.querySelector('.js-burndown-graph') as HTMLElement;
+      const toggle = container.querySelector(
+        '.js-toggle-burndown-visibility-button',
+      ) as HTMLElement;
+      // Starts expanded (`shown open`).
+      expect(graph).toHaveClass('shown');
+      expect(graph).toHaveClass('open');
+
+      fireEvent.click(toggle);
+      // Collapsed after one click.
+      expect(graph).not.toHaveClass('shown');
+      expect(graph).not.toHaveClass('open');
+    });
+
+    it('renders the admin empty-burndown hint when the graph placeholder is active', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true, i_am_admin: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats({ showGraphPlaceholder: true }),
+      });
+      const { container } = renderApp();
+
+      expect(container.querySelector('.empty-burndown')).not.toBeNull();
+    });
+  });
+
+  /* ------------------------------------------------------------------------ *
+   * F-CQ-06 — sidebar filters. The legacy backlog hosted the shared
+   * `<tg-filter>` panel with NO facet exclusions (unlike Kanban, which hid the
+   * `status` facet). These specs assert the container (a) shapes the raw
+   * `filtersData` into the sidebar's category + applied-filter props via the
+   * shared `UsFiltersMixin` port, (b) offers the status facet, (c) delegates
+   * add/remove intent to the hook's `setFilters` thunk with the correct
+   * selections map, and (d) treats saved custom filters as an AAP-scoped
+   * deferral (empty list + no-op handlers). The presentational panel itself is
+   * stubbed (covered by the Kanban `FiltersSidebar` spec).
+   * ------------------------------------------------------------------------ */
+  describe('sidebar filters (F-CQ-06)', () => {
+    /**
+     * Prime a LOADED board carrying a representative `filtersData`, render, then
+     * OPEN the filter drawer (the sidebar mounts only while open) so the stubbed
+     * `FiltersSidebar` captures its props.
+     */
+    function renderWithFilters(stateOverrides: Partial<BacklogState> = {}): void {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(2),
+        filtersData: makeFiltersData({
+          statuses: [
+            makeFilterOption({ id: 1, name: 'New', color: '#111', count: 3 }),
+            makeFilterOption({ id: 2, name: 'Done', color: '#222', count: 5 }),
+          ],
+          tags: [makeFilterOption({ id: null, name: 'urgent', count: 4 })],
+        }),
+        ...stateOverrides,
+      });
+      renderApp();
+      // Open the drawer via the header toggle (`#show-filters-button`).
+      fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+    }
+
+    it('does not mount the sidebar until the drawer is opened', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        filtersData: makeFiltersData(),
+      });
+      renderApp();
+      expect(mockCaptured.filtersSidebar).toBeNull();
+      expect(screen.queryByTestId('filters-sidebar')).toBeNull();
+    });
+
+    it('offers every facet INCLUDING status (Backlog excludes none)', () => {
+      renderWithFilters();
+      expect(mockCaptured.filtersSidebar).not.toBeNull();
+      const dataTypes = mockCaptured.filtersSidebar.filters.map((c: any) => c.dataType);
+      expect(dataTypes).toContain('status');
+      expect(dataTypes).toEqual([
+        'status',
+        'tags',
+        'assigned_users',
+        'role',
+        'owner',
+        'epic',
+      ]);
+    });
+
+    it('passes an empty saved-custom-filter list (AAP-scoped deferral)', () => {
+      renderWithFilters();
+      expect(mockCaptured.filtersSidebar.customFilters).toEqual([]);
+    });
+
+    it('reflects the applied selections as resolved SelectedFilter entries', () => {
+      renderWithFilters({ selectedFilters: { status: '1' } });
+      const applied = mockCaptured.filtersSidebar.selectedFilters;
+      expect(applied).toHaveLength(1);
+      expect(applied[0]).toMatchObject({
+        id: 1,
+        name: 'New',
+        dataType: 'status',
+        mode: 'include',
+      });
+    });
+
+    it('surfaces the applied-filter count on the header toggle', () => {
+      renderWithFilters({ selectedFilters: { status: '1,2' } });
+      // Two applied status options -> the `.selected-filters` badge reads "2".
+      const badge = document.querySelector('.selected-filters');
+      expect(badge).not.toBeNull();
+      expect(badge?.textContent).toBe('2');
+    });
+
+    it('onAddFilter delegates to setFilters with the option added to the include bucket', () => {
+      renderWithFilters();
+      const category = mockCaptured.filtersSidebar.filters.find(
+        (c: any) => c.dataType === 'status',
+      );
+      mockCaptured.filtersSidebar.onAddFilter({
+        category,
+        filter: makeFilterOption({ id: 2, name: 'Done', count: 5 }),
+        mode: 'include',
+      });
+      expect(stubActions.setFilters).toHaveBeenCalledTimes(1);
+      expect(stubActions.setFilters).toHaveBeenCalledWith({ status: '2' });
+    });
+
+    it('onAddFilter routes an exclude-mode add to the prefixed bucket', () => {
+      renderWithFilters();
+      const category = mockCaptured.filtersSidebar.filters.find(
+        (c: any) => c.dataType === 'status',
+      );
+      mockCaptured.filtersSidebar.onAddFilter({
+        category,
+        filter: makeFilterOption({ id: 2, name: 'Done', count: 5 }),
+        mode: 'exclude',
+      });
+      expect(stubActions.setFilters).toHaveBeenCalledWith({ exclude_status: '2' });
+    });
+
+    it('onRemoveFilter delegates to setFilters, dropping the emptied bucket', () => {
+      renderWithFilters({ selectedFilters: { status: '1' } });
+      mockCaptured.filtersSidebar.onRemoveFilter({
+        id: 1,
+        key: 'status:1',
+        name: 'New',
+        mode: 'include',
+        dataType: 'status',
+      });
+      expect(stubActions.setFilters).toHaveBeenCalledTimes(1);
+      expect(stubActions.setFilters).toHaveBeenCalledWith({});
+    });
+
+    it('treats the three custom-filter handlers as no-ops (never calls setFilters)', () => {
+      renderWithFilters();
+      expect(() => {
+        mockCaptured.filtersSidebar.onSelectCustomFilter({ id: 9, name: 'Saved' });
+        mockCaptured.filtersSidebar.onRemoveCustomFilter({ id: 9, name: 'Saved' });
+        mockCaptured.filtersSidebar.onSaveCustomFilter('Saved');
+      }).not.toThrow();
+      expect(stubActions.setFilters).not.toHaveBeenCalled();
     });
   });
 });

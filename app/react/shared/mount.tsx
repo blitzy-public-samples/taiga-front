@@ -89,17 +89,37 @@ function attrsToProps(el: HTMLElement): Record<string, string> {
  *  - `connectedCallback` creates a React root bound to the element — once; the
  *    guard tolerates the element being moved within the DOM without spawning a
  *    second root — and renders `<Component {...props} />`, where `props` are the
- *    element's camelCased attributes.
+ *    element's camelCased attributes. Every connect also bumps a monotonic
+ *    `_generation` counter (see `disconnectedCallback`).
+ *  - `attributeChangedCallback` re-renders the (already mounted) root with the
+ *    latest attributes. This is REQUIRED for AngularJS coexistence (F-REG-01):
+ *    the host partials interpolate the project context with `{{project.id}}` /
+ *    `{{project.slug}}`, but the browser upgrades the custom element and fires
+ *    `connectedCallback` BEFORE AngularJS runs its first `$digest`, so the very
+ *    first render snapshots the *literal* `"{{project.id}}"` string. When the
+ *    digest resolves the interpolation AngularJS writes the concrete value back
+ *    onto the DOM attribute (e.g. `project-id="42"`), which fires this callback
+ *    and re-renders React with the authoritative project id. Before the root
+ *    exists (attributes observed at upgrade time, pre-connect) it is a no-op —
+ *    `connectedCallback` performs the initial render. The set of attributes that
+ *    trigger this is declared by `observedAttributes`, supplied by the caller
+ *    (`../index.tsx`) so each screen observes exactly its own context attributes.
  *  - `disconnectedCallback` unmounts the root so the React tree is released when
  *    AngularJS removes the host. The unmount is deferred to a microtask because
  *    AngularJS may synchronously detach the node during a React render pass, and
  *    unmounting synchronously in that window triggers React 18's "unmount during
- *    render" warning. `this._root` is nulled *before* scheduling the unmount to
- *    prevent re-entrancy if the element is reconnected.
- *
- * `observedAttributes` / `attributeChangedCallback` are intentionally omitted:
- * the AngularJS router recreates the element on navigation, so connect/disconnect
- * is sufficient and honours the minimal-change directive.
+ *    render" warning. The deferred unmount is guarded three ways (F-MILESTONE-04)
+ *    so a fast disconnect->reconnect (which AngularJS can perform synchronously,
+ *    before the microtask runs) never tears down the freshly reconnected root:
+ *      1. GENERATION — the microtask captures the `_generation` value current at
+ *         disconnect; a subsequent connect/disconnect bumps `_generation`, so a
+ *         superseded unmount detects the mismatch and aborts.
+ *      2. isConnected — if the element is back in the document, keep the root.
+ *      3. ROOT IDENTITY — only the exact `Root` scheduled for teardown is
+ *         unmounted; a reconnect that reused/replaced `_root` is left intact.
+ *    Because `_root` is NOT nulled at disconnect time, a synchronous reconnect
+ *    reuses the same live root (no second `createRoot` on the same container,
+ *    which React 18 would warn about) and simply re-renders.
  *
  * `Component` is typed `ComponentType<any>` because every prop originates as a
  * string attribute; each screen container declares its own precise props and
@@ -107,14 +127,41 @@ function attrsToProps(el: HTMLElement): Record<string, string> {
  * returned value is strongly typed as `CustomElementConstructor`.
  *
  * @param Component The React component to mount inside the custom element.
+ * @param observedAttributes The lower-kebab attribute names whose changes should
+ *   re-render the mounted root (see `attributeChangedCallback`). Defaults to an
+ *   empty list, which preserves the original connect/disconnect-only behaviour
+ *   for any caller that does not need attribute reactivity.
  * @returns A `CustomElementConstructor` suitable for `customElements.define`.
  */
-export function mountElement(Component: ComponentType<any>): CustomElementConstructor {
+export function mountElement(
+    Component: ComponentType<any>,
+    observedAttributes: readonly string[] = [],
+): CustomElementConstructor {
     return class extends HTMLElement {
+        /**
+         * The attributes the browser reports to `attributeChangedCallback`. The
+         * Custom Elements spec reads this static getter ONCE at element-definition
+         * time, so it returns a fresh copy of the caller-supplied list.
+         */
+        static get observedAttributes(): string[] {
+            return [...observedAttributes];
+        }
+
         /** The React root bound to this host, or `null` while unmounted. */
         private _root: Root | null = null;
 
+        /**
+         * Monotonic lifecycle counter bumped by every connect and disconnect. A
+         * deferred unmount captures its value and aborts if it later changes,
+         * which is how a fast disconnect->reconnect is detected (F-MILESTONE-04).
+         */
+        private _generation = 0;
+
         connectedCallback(): void {
+            // Invalidate any deferred unmount scheduled by a preceding disconnect
+            // in this same synchronous window (fast reconnect).
+            this._generation += 1;
+
             // Guard against double-connect: the AngularJS router may relocate the
             // element within the DOM, which fires connectedCallback again. Reuse
             // the existing root instead of creating a second one. A local binding
@@ -126,21 +173,54 @@ export function mountElement(Component: ComponentType<any>): CustomElementConstr
                 this._root = root;
             }
 
-            // Attribute values arrive as strings; containers coerce as needed.
-            const props = attrsToProps(this);
-            root.render(<Component {...props} />);
+            this.renderRoot(root);
+        }
+
+        attributeChangedCallback(): void {
+            // F-REG-01: re-render with the freshly resolved attributes when they
+            // change AFTER mount (e.g. AngularJS resolving `{{project.id}}` to a
+            // concrete id in its first digest). Before the root exists this is a
+            // no-op; connectedCallback owns the initial render.
+            const root = this._root;
+            if (root) {
+                this.renderRoot(root);
+            }
         }
 
         disconnectedCallback(): void {
-            // Detach the reference first to guard against re-entrancy, then defer
-            // the actual unmount to a microtask. Deferring avoids React 18's
+            // Bump the generation and capture it: a synchronous reconnect (which
+            // also bumps it) makes this captured value stale, so the deferred
+            // unmount below aborts and leaves the reconnected root untouched.
+            const generation = (this._generation += 1);
+            const root = this._root;
+            if (!root) {
+                return;
+            }
+
+            // Defer the actual unmount to a microtask. Deferring avoids React 18's
             // "unmount during render" warning when AngularJS synchronously removes
             // the host mid-render; it is also safe under jsdom.
-            const root = this._root;
-            this._root = null;
-            if (root) {
-                queueMicrotask(() => root.unmount());
-            }
+            //
+            // NOTE: `this._root` is deliberately NOT nulled here so a synchronous
+            // reconnect reuses this exact live root (no second createRoot on the
+            // same container). The three guards below (generation, isConnected,
+            // root identity) ensure only a genuinely-abandoned root is torn down.
+            queueMicrotask(() => {
+                if (generation !== this._generation || this.isConnected) {
+                    return;
+                }
+                if (this._root === root) {
+                    root.unmount();
+                    this._root = null;
+                }
+            });
+        }
+
+        /** Read the host's current attributes as props and (re)render the root. */
+        private renderRoot(root: Root): void {
+            // Attribute values arrive as strings; containers coerce as needed.
+            const props = attrsToProps(this);
+            root.render(<Component {...props} />);
         }
     };
 }

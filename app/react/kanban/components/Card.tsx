@@ -48,12 +48,17 @@
  *   is why `CardProps` extends `HTMLAttributes<HTMLDivElement>` and why the
  *   component is wrapped in `forwardRef`.
  *
- * i18n / emojify
+ * i18n / emojify (F-UI-06 / F-UI-07)
  *   The AngularJS template piped subjects/titles through the `| emojify` filter
- *   (which returned HTML and was bound with `ng-bind-html`). Here those strings
- *   are rendered as PLAIN TEXT (`{model.subject}`), NOT via
- *   `dangerouslySetInnerHTML`: emojify is intentionally simplified to plain text
- *   to avoid unsafe HTML injection. The migration preserves the visible text.
+ *   (which returned HTML and was bound with `ng-bind-html`). That behaviour is
+ *   now reproduced SAFELY via the shared `<Emojify>` primitive
+ *   (`app/react/shared/emoji.tsx`): it tokenises `:name:` sequences and replaces
+ *   ONLY names present in the trusted `window.taiga.emojis` table with an
+ *   `<img class="emoji">` React node, leaving every other character as escaped
+ *   plain text — so no `dangerouslySetInnerHTML` and no HTML injection. Icon
+ *   accessible names and any user-facing control labels resolve through the
+ *   shared angular-translate bridge (`app/react/shared/i18n.ts`, `translate()`),
+ *   falling back to English when the shell translation service is unavailable.
  *
  * Compiled under `jsx: "react-jsx"` (automatic runtime), so there is
  * deliberately NO `import React`. All type-only imports use `import type`
@@ -65,53 +70,41 @@ import type { HTMLAttributes, MouseEvent } from 'react';
 
 import type { Attachment, BoardCard, ColorizedTag, Project } from '../../shared/types';
 import { can } from '../../shared/permissions';
+import { TgSvg } from '../../shared/icon';
+import { emojify } from '../../shared/emoji';
+import { translate } from '../../shared/i18n';
 import { CardData } from './CardData';
 import { CardAssignedTo } from './CardAssignedTo';
 import { CardActions } from './CardActions';
 
 /*
- * `<tg-svg>` and `<tg-preload-image>` are custom elements the AngularJS shell
- * relies on so that existing CSS selectors (e.g. `tg-svg svg.icon`,
- * `tg-preload-image img`) keep matching and the lazy-load / sprite hooks stay
- * wired. Declaring them here (module-local) merges with the global `JSX`
- * namespace supplied by `@types/react`, letting the lowercase-hyphen intrinsic
- * tags type-check under `strict` without importing React. Both are typed `any`
- * — identical to the sibling board components' `tg-svg` declarations — so the
- * global interface merge across the compilation is conflict-free. This block is
- * purely type-level, so it is legal under `isolatedModules` (the file is a
- * module via its imports / exports).
+ * `<tg-card>` and `<tg-preload-image>` are the two custom-element hosts the
+ * AngularJS shell relied on so that existing CSS selectors keep matching:
+ *   - `tg-card` is the board card HOST tag. The retained SCSS folds a column by
+ *     hiding its cards with the TAG selector `.vfold tg-card { display: none }`
+ *     and animates fold/unfold via `.vfold-remove-active tg-card` /
+ *     `.vunfold-add-active tg-card` (`app/styles/modules/kanban/kanban-table.scss`
+ *     :64-78). Rendering the root as a plain `<div class="card">` (as the first
+ *     migration cut did) means those TAG selectors never match, so folded cards
+ *     stay visible — exactly the F-UI-01 defect. The root is therefore emitted
+ *     as `<tg-card class="card …">` to restore that scoped styling.
+ *   - `tg-preload-image` keeps the slideshow's lazy-load hook + `img` selector.
+ * Icons no longer need a local `tg-svg` intrinsic: they render through the
+ * shared `<TgSvg>` primitive (`app/react/shared/icon.tsx`, F-UI-02), which owns
+ * its own module-local `tg-svg` alias. Declaring these two hosts here
+ * (module-local) merges with the global `JSX` namespace supplied by
+ * `@types/react`; both are typed `any`, matching the sibling board components,
+ * so the interface merge across the compilation is conflict-free. This block is
+ * purely type-level, so it is legal under `isolatedModules`.
  */
 declare global {
     // eslint-disable-next-line @typescript-eslint/no-namespace
     namespace JSX {
         interface IntrinsicElements {
-            'tg-svg': any;
+            'tg-card': any;
             'tg-preload-image': any;
         }
     }
-}
-
-/**
- * Render an inline sprite icon exactly like the AngularJS `CardSvgTemplate` /
- * `tg-svg[svg-icon]` directive:
- * `<tg-svg><svg class="icon <icon>"><use xlink:href="#<icon>" attr-href="#<icon>"/></svg></tg-svg>`.
- * The SVG sprite (`#icon-arrow-up`, etc.) is already loaded into the document by
- * the AngularJS shell, so the `<use>` reference resolves at runtime.
- *
- * The non-standard `attr-href` attribute (preserved for DOM parity with the
- * original sprite markup, which set both `xlink:href` and `attr-href`) is
- * applied through a `Record<string, string>` cast spread because React's SVG
- * prop types have no string index signature.
- */
-function svgIcon(icon: string): JSX.Element {
-    const extraUseAttrs = { 'attr-href': `#${icon}` } as Record<string, string>;
-    return (
-        <tg-svg>
-            <svg className={`icon ${icon}`}>
-                <use xlinkHref={`#${icon}`} {...extraUseAttrs} />
-            </svg>
-        </tg-svg>
-    );
 }
 
 /**
@@ -180,7 +173,7 @@ export interface CardProps extends HTMLAttributes<HTMLDivElement> {
  * always emits the `.card` host + the `.card-transit-multi` mirror; the
  * `.card-inner` content is emitted only when the card is in the viewport.
  */
-export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
+export const Card = forwardRef<HTMLElement, CardProps>(function Card(
     {
         item,
         project,
@@ -313,8 +306,11 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
     };
 
     // Unfold click: `ng-click="!$event.ctrlKey && !$event.metaKey && vm.toggleFold()"`
-    // -> `vm.toggleFold()` calls `onToggleFold({id: item.get('id')})`.
-    const handleUnfoldClick = (e: MouseEvent<HTMLDivElement>): void => {
+    // -> `vm.toggleFold()` calls `onToggleFold({id: item.get('id')})`. Typed on the
+    // generic `HTMLElement` so the same handler is valid on the native `<button>`
+    // disclosure control (F-UI-04) — a button fires this on both pointer click and
+    // keyboard Enter/Space, so keyboard operability comes for free.
+    const handleUnfoldClick = (e: MouseEvent<HTMLElement>): void => {
         if (!e.ctrlKey && !e.metaKey) {
             onToggleFold?.(item.id);
         }
@@ -340,9 +336,10 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
                             title={epic.subject}
                         />
                         {index === 0 && zoomLevel !== 0 ? (
-                            // emojify -> plain text (see i18n note in the file header).
+                            // `ng-bind-html="::epic.get('subject') | emojify"` — the
+                            // subject is emojified via the shared safe primitive (F-UI-07).
                             <span className="epic-name" title={epic.subject}>
-                                {epic.subject}
+                                {emojify(epic.subject)}
                             </span>
                         ) : null}
                     </a>
@@ -354,40 +351,46 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
     // `card-slideshow.jade` — inline; the left/right sprite arrows show only when
     // there is more than one image, and exactly the current slide is rendered.
     function renderSlideshow(): JSX.Element {
-        // Inlined sprite markup (rather than the shared `svgIcon` helper) so the
-        // slideshow classes live on the `<tg-svg>` wrapper itself, exactly as the
-        // jade `tg-svg.slideshow-icon.slideshow-left[svg-icon="icon-arrow-left"]`
-        // produced: `<tg-svg class="slideshow-icon slideshow-left"><svg
-        // class="icon icon-arrow-left"><use .../></svg></tg-svg>`.
-        //
-        // NOTE: React 18 does NOT translate `className` -> `class` on unknown
-        // (hyphenated) custom elements; it emits a literal lowercased `classname`
-        // attribute instead, so the SCSS `.slideshow-left`/`.slideshow-right`
-        // selectors would never match. We therefore pass the DOM attribute `class`
-        // directly on `<tg-svg>` (typed `any`) to preserve exact class/DOM parity.
-        const leftUseAttrs = { 'attr-href': '#icon-arrow-left' } as Record<string, string>;
-        const rightUseAttrs = { 'attr-href': '#icon-arrow-right' } as Record<string, string>;
+        // The jade `tg-svg.slideshow-icon.slideshow-left[svg-icon=…][ng-click]`
+        // rendered a CLICKABLE custom element with NO accessible name and no
+        // keyboard operability. Per F-UI-04 the two arrows become NATIVE
+        // `<button>`s (the codebase's own established icon-button pattern — see
+        // `CardActions`): a button is focusable and Enter/Space-activatable for
+        // free, and carries a localised `aria-label`. The visual
+        // `slideshow-icon`/`slideshow-left`/`slideshow-right` classes stay ON the
+        // control so the retained SCSS positions the arrows exactly as before,
+        // and the sprite glyph renders through the shared decorative `<TgSvg>`
+        // (F-UI-02, `aria-hidden` inside the labelled button).
         return (
             <div className="card-slideshow">
                 {images.length > 1 ? (
-                    <tg-svg class="slideshow-icon slideshow-left" onClick={previous}>
-                        <svg className="icon icon-arrow-left">
-                            <use xlinkHref="#icon-arrow-left" {...leftUseAttrs} />
-                        </svg>
-                    </tg-svg>
+                    <button
+                        type="button"
+                        className="slideshow-icon slideshow-left"
+                        aria-label={translate('COMMON.PREVIOUS', undefined, 'Previous image')}
+                        onClick={previous}
+                    >
+                        <TgSvg icon="icon-arrow-left" />
+                    </button>
                 ) : null}
                 {images.length > 1 ? (
-                    <tg-svg class="slideshow-icon slideshow-right" onClick={next}>
-                        <svg className="icon icon-arrow-right">
-                            <use xlinkHref="#icon-arrow-right" {...rightUseAttrs} />
-                        </svg>
-                    </tg-svg>
+                    <button
+                        type="button"
+                        className="slideshow-icon slideshow-right"
+                        aria-label={translate('COMMON.NEXT', undefined, 'Next image')}
+                        onClick={next}
+                    >
+                        <TgSvg icon="icon-arrow-right" />
+                    </button>
                 ) : null}
                 {images.map((image, index) =>
                     index === slideIndex ? (
                         <div className="card-slideshow-wrapper" key={image.id}>
                             <tg-preload-image preload-src={image.thumbnail_card_url ?? ''}>
-                                <img src={image.thumbnail_card_url ?? ''} />
+                                <img
+                                    src={image.thumbnail_card_url ?? ''}
+                                    alt={translate('COMMON.ATTACHMENTS.TITLE', undefined, 'Attachment')}
+                                />
                             </tg-preload-image>
                         </div>
                     ) : null,
@@ -429,6 +432,10 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
     } else {
         unfoldIcon = item.foldStatusChanged ? 'icon-arrow-down' : 'icon-arrow-up';
     }
+    // The up-arrow means the extra rows are currently shown (expanded); the
+    // down-arrow means they are collapsed. Used for the disclosure control's
+    // `aria-expanded` + accessible name (F-UI-04).
+    const unfoldExpanded = unfoldIcon === 'icon-arrow-up';
 
     // The `.card` host classes (the consuming `kanban-table.jade` added these to
     // the `<tg-card>` element; the React `Card` IS that host element).
@@ -444,9 +451,18 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
      *   the DnD wrapper.
      * ---------------------------------------------------------------------- */
     return (
-        <div
+        // Root HOST is the `<tg-card>` custom element (NOT a `<div>`): the
+        // retained SCSS folds/animates cards via the TAG selector
+        // `.vfold tg-card` (kanban-table.scss:64-78), so the tag must be present
+        // for folded cards to hide (F-UI-01). React 18 emits `className` as a
+        // literal `classname` attribute on unknown tags, so the DOM attribute
+        // `class` is passed directly to keep `.card`/`.vfold tg-card` matching.
+        // `{...rest}` (DnD listeners/attributes/style/aria/data) is spread before
+        // the explicit `onClick` so the root-click handler is never overridden;
+        // `ref` is forwarded to the host for the DnD wrapper.
+        <tg-card
             ref={ref}
-            className={rootClass}
+            class={rootClass}
             data-id={String(item.id)}
             {...rest}
             onClick={handleRootClick}
@@ -496,8 +512,11 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
                                 <span className="card-ref">{`#${model.ref}`}</span>
                             ) : null}
                             {visible('subject') ? (
-                                // emojify -> plain text (see i18n note in the file header).
-                                <span className="card-subject e2e-title">{model.subject}</span>
+                                // `ng-bind-html="… subject | emojify"` (card-title.jade:16)
+                                // reproduced via the shared safe emoji primitive (F-UI-07).
+                                <span className="card-subject e2e-title">
+                                    {emojify(model.subject)}
+                                </span>
                             ) : null}
                         </a>
                         {zoomLevel === 0 ? (
@@ -541,8 +560,12 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
                                             }`.trim()}
                                         >
                                             <span className="card-task-ref">{`#${task.ref}`}</span>
-                                            {/* emojify -> plain text (see i18n note in the header). */}
-                                            <span className="card-task-subject">{task.subject}</span>
+                                            {/* `ng-bind-html="task.get('subject') | emojify"`
+                                                (card-tasks.jade:20) via the shared safe
+                                                emoji primitive (F-UI-07). */}
+                                            <span className="card-task-subject">
+                                                {emojify(task.subject)}
+                                            </span>
                                         </a>
                                     </li>
                                 ))}
@@ -552,13 +575,26 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
 
                     {/* 8 — card-unfold + sibling loading-extra (card-templates/card-unfold.jade) */}
                     {visible('unfold') && (hasTasks() || hasVisibleAttachments()) ? (
-                        <div
+                        // Was a clickable `<div role="button">` with no keyboard
+                        // handler; now a NATIVE `<button>` disclosure control
+                        // (F-UI-04) — focusable + Enter/Space-activatable for free,
+                        // with `aria-expanded` reflecting the fold state and a
+                        // localised accessible name. Visual `.card-unfold` +
+                        // `.ng-animate-disabled` classes are preserved for the
+                        // retained SCSS.
+                        <button
+                            type="button"
                             className="card-unfold ng-animate-disabled"
-                            role="button"
+                            aria-expanded={unfoldExpanded}
+                            aria-label={
+                                unfoldExpanded
+                                    ? translate('COMMON.FOLD', undefined, 'Show less')
+                                    : translate('COMMON.UNFOLD', undefined, 'Show more')
+                            }
                             onClick={handleUnfoldClick}
                         >
-                            {svgIcon(unfoldIcon)}
-                        </div>
+                            <TgSvg icon={unfoldIcon} />
+                        </button>
                     ) : null}
                     {/* The tg-loading spinner slot: render the container so the
                         `.loading-extra` class exists only while extra data loads. */}
@@ -583,6 +619,6 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
                     </div>
                 </div>
             </div>
-        </div>
+        </tg-card>
     );
 });

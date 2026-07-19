@@ -263,9 +263,11 @@ describe('computeMovePayload — no-op guard', () => {
 
 /* ========================================================================== *
  * computeMovePayload — real move.
- * A cross-status drop produces the full payload; `newSwimlane` is surfaced RAW
- * as a number (-1 is the "Unclassified"/no-swimlane sentinel — the downstream
- * `onMoveUs` handler owns any -1 -> null normalisation, NOT this pure mapper).
+ * A cross-status drop produces the full payload; `newSwimlane` is echoed
+ * unchanged as `number | null`. Per F-AAP-09 the onDragEnd boundary already
+ * normalized a MISSING swimlane to `null` (never NaN) before calling this pure
+ * mapper, and the synthetic `-1` "Unclassified" sentinel is passed through
+ * as-is — the downstream `onMoveUs`/hook owns the `-1 -> null` API mapping.
  * ========================================================================== */
 
 describe('computeMovePayload — real move', () => {

@@ -109,7 +109,7 @@ describe('SquishColumnPlaceholder — archived', () => {
 
         const archived = container.querySelector('.archived');
         expect(archived).toBeInTheDocument();
-        expect(archived).toHaveTextContent('Archived');
+        expect(archived).toHaveTextContent('(Archived)');
 
         // The counter block is suppressed for archived columns.
         expect(container.querySelector('.ammount')).not.toBeInTheDocument();
@@ -130,11 +130,11 @@ describe('SquishColumnToggle — non-archived fold/unfold', () => {
         const status = makeStatus({ is_archived: false });
         render(<SquishColumnToggle status={status} folded={false} onToggleFold={() => undefined} />);
 
-        const foldBtn = screen.getByTitle('Fold');
+        const foldBtn = screen.getByTitle('Fold column');
         expect(foldBtn).toHaveClass('btn-board', 'option');
         expect(foldBtn).not.toHaveClass('hidden');
 
-        const unfoldBtn = screen.getByTitle('Unfold');
+        const unfoldBtn = screen.getByTitle('Unfold column');
         expect(unfoldBtn).toHaveClass('btn-board', 'option', 'hunfold');
         expect(unfoldBtn).toHaveClass('hidden');
     });
@@ -143,11 +143,11 @@ describe('SquishColumnToggle — non-archived fold/unfold', () => {
         const status = makeStatus({ is_archived: false });
         render(<SquishColumnToggle status={status} folded={true} onToggleFold={() => undefined} />);
 
-        const foldBtn = screen.getByTitle('Fold');
+        const foldBtn = screen.getByTitle('Fold column');
         expect(foldBtn).toHaveClass('btn-board', 'option');
         expect(foldBtn).toHaveClass('hidden');
 
-        const unfoldBtn = screen.getByTitle('Unfold');
+        const unfoldBtn = screen.getByTitle('Unfold column');
         expect(unfoldBtn).toHaveClass('btn-board', 'option', 'hunfold');
         expect(unfoldBtn).not.toHaveClass('hidden');
     });
@@ -157,11 +157,11 @@ describe('SquishColumnToggle — non-archived fold/unfold', () => {
         const status = makeStatus({ is_archived: false });
         render(<SquishColumnToggle status={status} folded={false} onToggleFold={onToggleFold} />);
 
-        fireEvent.click(screen.getByTitle('Fold'));
+        fireEvent.click(screen.getByTitle('Fold column'));
         expect(onToggleFold).toHaveBeenCalledTimes(1);
         expect(onToggleFold).toHaveBeenCalledWith(status);
 
-        fireEvent.click(screen.getByTitle('Unfold'));
+        fireEvent.click(screen.getByTitle('Unfold column'));
         expect(onToggleFold).toHaveBeenCalledTimes(2);
         expect(onToggleFold).toHaveBeenLastCalledWith(status);
     });
@@ -184,12 +184,12 @@ describe('SquishColumnToggle — archived (fold button only, no unfold)', () => 
         );
 
         // The fold button is rendered for archived columns too.
-        const foldBtn = screen.getByTitle('Fold');
+        const foldBtn = screen.getByTitle('Fold column');
         expect(foldBtn).toBeInTheDocument();
         expect(foldBtn).toHaveClass('btn-board', 'option');
 
         // The unfold (.hunfold) button is suppressed for archived columns.
-        expect(screen.queryByTitle('Unfold')).not.toBeInTheDocument();
+        expect(screen.queryByTitle('Unfold column')).not.toBeInTheDocument();
         expect(container.querySelector('.hunfold')).not.toBeInTheDocument();
 
         // Clicking the fold button still signals the user's toggle intent.

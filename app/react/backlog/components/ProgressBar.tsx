@@ -30,6 +30,11 @@
  * `import React` statement and no hooks are used.
  */
 
+// F-UI-06: bridge the three bar titles to the AngularJS shell's angular-translate
+// service (English fallback keeps shell-less unit renders correct). Mirrors the
+// legacy `title="{{'BACKLOG.…' | translate}}"` attributes in `progress-bar.jade`.
+import { translate } from '../../shared/i18n';
+
 /**
  * Subset of the backlog `stats` object consumed by this bar. Declared locally and
  * kept self-contained (no `Stats`/domain type is imported from `../../shared/types`);
@@ -131,20 +136,42 @@ function computePercentages(stats: ProgressBarStats | null | undefined): {
 export function ProgressBar(props: ProgressBarProps) {
   const { projectPointsPercentaje, closedPointsPercentaje } = computePercentages(props.stats);
 
+  // F-UI-05: expose the meter to assistive tech as a `progressbar`. The
+  // announced value is the CLEAN closed-points completion (closed / total,
+  // clamped to 0–100) — deliberately WITHOUT the `- 3` visual inset the sub-bar
+  // widths use, so screen-reader users hear the true completion percentage. The
+  // legacy template announced nothing here (visual-only), so this is a pure
+  // a11y addition that leaves the rendered DOM/SCSS untouched.
+  const stats = props.stats;
+  const totalForAria = stats ? stats.total_points || stats.defined_points || 0 : 0;
+  const closedForAria = stats ? stats.closed_points || 0 : 0;
+  const closedCompletion = totalForAria > 0 ? adjustPercentaje((closedForAria * 100) / totalForAria) : 0;
+
   return (
-    <div className="summary-progress-bar">
-      {/* Background/track bar. i18n: BACKLOG.EXCESS_OF_POINTS -> "Excess of points". No inline width. */}
-      <div className="defined-points" title="Excess of points" />
-      {/* Pending points. i18n: BACKLOG.PENDING_POINTS -> "Pending Points". */}
+    <div
+      className="summary-progress-bar"
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={closedCompletion}
+      aria-valuetext={`${closedCompletion}%`}
+      aria-label={translate('BACKLOG.PROGRESS', undefined, 'Backlog points progress')}
+    >
+      {/* Background/track bar. F-UI-06: BACKLOG.EXCESS_OF_POINTS -> "Excess of points". */}
+      <div
+        className="defined-points"
+        title={translate('BACKLOG.EXCESS_OF_POINTS', undefined, 'Excess of points')}
+      />
+      {/* Pending points. F-UI-06: BACKLOG.PENDING_POINTS -> "Pending Points". */}
       <div
         className="project-points-progress"
-        title="Pending Points"
+        title={translate('BACKLOG.PENDING_POINTS', undefined, 'Pending Points')}
         style={{ width: `${projectPointsPercentaje}%` }}
       />
-      {/* Closed points. i18n: BACKLOG.CLOSED_POINTS -> "closed" (lowercase, verbatim). */}
+      {/* Closed points. F-UI-06: BACKLOG.CLOSED_POINTS -> "closed" (lowercase, verbatim). */}
       <div
         className="closed-points-progress"
-        title="closed"
+        title={translate('BACKLOG.CLOSED_POINTS', undefined, 'closed')}
         style={{ width: `${closedPointsPercentaje}%` }}
       />
     </div>

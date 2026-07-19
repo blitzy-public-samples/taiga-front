@@ -65,10 +65,26 @@ import { BacklogApp } from './backlog/BacklogApp';
  * call sites in both the minified (deploy) and non-minified (watch) esbuild
  * outputs.
  */
+/*
+ * The observed attributes carry the authoritative project context. The host
+ * Jade partials interpolate them with AngularJS (`project-id="{{project.id}}"`,
+ * `project-slug="{{project.slug}}"`), and the browser upgrades/connects the
+ * element BEFORE AngularJS's first `$digest` resolves those bindings. Declaring
+ * them as observed lets `mountElement` re-render each screen once AngularJS
+ * writes the resolved values back onto the DOM attributes (F-REG-01).
+ */
+const PROJECT_CONTEXT_ATTRS = ['project-id', 'project-slug'] as const;
+
 if (!customElements.get('tg-react-kanban')) {
-    customElements.define('tg-react-kanban', mountElement(KanbanApp));
+    customElements.define(
+        'tg-react-kanban',
+        mountElement(KanbanApp, PROJECT_CONTEXT_ATTRS),
+    );
 }
 
 if (!customElements.get('tg-react-backlog')) {
-    customElements.define('tg-react-backlog', mountElement(BacklogApp));
+    customElements.define(
+        'tg-react-backlog',
+        mountElement(BacklogApp, PROJECT_CONTEXT_ATTRS),
+    );
 }

@@ -110,6 +110,24 @@ describe('ArchivedStatusHeader — folded class + toggle/show', () => {
         expect(button).toHaveClass('hidden');
     });
 
+    it('F-UI-02/06: renders the shared `<tg-svg>` sprite icon and a localized title', () => {
+        const status = makeStatus({ is_archived: true });
+
+        const { container } = render(
+            <ArchivedStatusHeader status={status} folded={true} />,
+        );
+
+        const button = screen.getByRole('button');
+        // F-UI-06: the title comes through the i18n bridge (English fallback here),
+        // matching the legacy `title="{{'KANBAN.TITLE_ACTION_UNFOLD' | translate}}"`.
+        expect(button).toHaveAttribute('title', 'Unfold column');
+        // F-UI-02: the icon is the shared `<tg-svg>` host wrapping a real sprite
+        // `<svg class="icon icon-unfold-column"><use/></svg>`, not an empty span.
+        const svg = container.querySelector('tg-svg svg.icon.icon-unfold-column');
+        expect(svg).not.toBeNull();
+        expect(svg?.querySelector('use')).not.toBeNull();
+    });
+
     it('fires onToggleFold and onShowArchived once each with the status on click', () => {
         const status = makeStatus({ is_archived: true });
         const onToggleFold = jest.fn();

@@ -31,10 +31,22 @@
  *     therefore pass only endpoint paths beginning with `/userstories/…`.
  *
  * FIDELITY NOTES (see the per-function docs for line references)
- *   - The backend `bulk_stories` field is OVERLOADED: for {@link bulkCreate} it
- *     is a newline-separated STRING of subjects; for {@link bulkUpdateMilestone}
- *     it is an ARRAY of {@link BulkUserStoryOrder}. The two are typed distinctly
- *     below.
+ *   - PAYLOAD TYPES ARE ENDPOINT-SPECIFIC and are declared distinctly below to
+ *     match the Django validators byte-for-byte (taiga-back
+ *     `userstories/validators.py`), with NO type-erasing double-casts at any
+ *     call site:
+ *       • `bulk_userstories` (backlog + kanban order) is a `number[]` — a plain
+ *         array of user-story ids: `ListField(child=IntegerField(min_value=1))`.
+ *       • `bulk_stories` for {@link bulkUpdateMilestone} is a
+ *         `BulkUserStoryOrder[]` (`{ us_id, order }` objects):
+ *         `_UserStoryMilestoneBulkValidator(many=True)`.
+ *       • `bulk_stories` for {@link bulkCreate} is a newline-separated STRING of
+ *         subjects: `serializers.CharField()`.
+ *   - There is deliberately NO `bulkUpdateSprintOrder` wrapper: the backend has
+ *     no `bulk_update_sprint_order` route (only `bulk_create`,
+ *     `bulk_update_milestone`, `bulk_update_backlog_order`,
+ *     `bulk_update_kanban_order` exist in `userstories/api.py`), so any such
+ *     wrapper would have targeted a non-existent endpoint.
  *   - The `after_userstory_id` / `before_userstory_id` pair is mutually
  *     exclusive with `after` winning when both are truthy, mirroring the coffee
  *     `if … else if …` blocks exactly.
@@ -52,14 +64,19 @@ import { api } from './client';
 import type { UserStory, FiltersData } from '../types';
 
 /**
- * A single entry in a bulk-order payload: the user-story id together with its
- * new position within the target list.
+ * A single entry in the `bulk_stories` payload of {@link bulkUpdateMilestone}:
+ * the user-story id together with its new position within the target sprint.
  *
- * This mirrors the object the AngularJS backlog controller built when it mapped
- * a list of stories to `{ us_id: x.id, order: x[field] }`
- * (`app/coffee/modules/backlog/main.coffee:504-505`). `../types` has no
- * equivalent, and this type is intentionally declared HERE so the `api/` layer
- * stays self-contained (the sibling `types.ts` is not edited).
+ * This is used EXCLUSIVELY by the milestone move endpoint, whose backend
+ * validator is `_UserStoryMilestoneBulkValidator(many=True)` — i.e. an array of
+ * `{ us_id, order }` objects. It mirrors the object the AngularJS backlog
+ * controller built when moving selected stories into a sprint,
+ * `{ us_id: us.id, order: us.sprint_order }` (`backlog/main.coffee:793-798`).
+ *
+ * It is intentionally NOT used for the backlog/kanban ORDER endpoints, whose
+ * `bulk_userstories` field is a plain `number[]` of ids (see the FIDELITY NOTES
+ * above). `../types` has no equivalent, and this type is declared HERE so the
+ * `api/` layer stays self-contained (the sibling `types.ts` is not edited).
  */
 export interface BulkUserStoryOrder {
     /** The id of the user story being (re)ordered. */
@@ -121,14 +138,24 @@ export function bulkCreate(
  *                          Takes precedence over `beforeUserstoryId`.
  * @param beforeUserstoryId Anchor: place the moved stories BEFORE this story.
  *                          Used only when `afterUserstoryId` is falsy.
- * @param bulkUserstories   The ordered `{ us_id, order }` entries to persist.
+ * @param bulkUserstories   The ordered user-story ids to persist, as a
+ *                          `number[]`. This matches the backend contract
+ *                          exactly: `UpdateUserStoriesBacklogOrderBulkValidator`
+ *                          declares `bulk_userstories =
+ *                          ListField(child=IntegerField(min_value=1))`
+ *                          (taiga-back `userstories/validators.py`), and the
+ *                          AngularJS caller passed
+ *                          `bulkUserstories = _.map(usList, (it) -> it.id)`
+ *                          — a plain array of ids (`backlog/main.coffee:535-537`).
+ *                          It is NOT the `{ us_id, order }` object array used by
+ *                          {@link bulkUpdateMilestone}'s `bulk_stories`.
  */
 export function bulkUpdateBacklogOrder(
     projectId: number,
     milestoneId: number | null,
     afterUserstoryId: number | null,
     beforeUserstoryId: number | null,
-    bulkUserstories: BulkUserStoryOrder[],
+    bulkUserstories: number[],
 ): Promise<unknown> {
     const params: Record<string, unknown> = {
         project_id: projectId,
@@ -207,7 +234,18 @@ export function bulkUpdateMilestone(
  * @param afterUserstoryId  Anchor: place AFTER this story. Wins over `before`.
  * @param beforeUserstoryId Anchor: place BEFORE this story. Used only when
  *                          `afterUserstoryId` is falsy.
- * @param bulkUserstories   The ordered `{ us_id, order }` entries to persist.
+ * @param bulkUserstories   The ordered user-story ids to persist, as a
+ *                          `number[]`. This matches the backend contract
+ *                          exactly: `UpdateUserStoriesKanbanOrderBulkValidator`
+ *                          declares `bulk_userstories =
+ *                          ListField(child=IntegerField(min_value=1))`
+ *                          (taiga-back `userstories/validators.py`), and the
+ *                          AngularJS board passed a plain array of ids
+ *                          (`kanban-usertories.coffee:184-190` returns
+ *                          `bulkUserstories: usList` where `usList` is
+ *                          `usList.map((it) => it.id)`, `kanban/main.coffee:610`).
+ *                          It is NOT the `{ us_id, order }` object array used by
+ *                          {@link bulkUpdateMilestone}'s `bulk_stories`.
  */
 export function bulkUpdateKanbanOrder(
     projectId: number,
@@ -215,7 +253,7 @@ export function bulkUpdateKanbanOrder(
     swimlaneId: number | null,
     afterUserstoryId: number | null,
     beforeUserstoryId: number | null,
-    bulkUserstories: BulkUserStoryOrder[],
+    bulkUserstories: number[],
 ): Promise<unknown> {
     const params: Record<string, unknown> = {
         project_id: projectId,
@@ -237,40 +275,6 @@ export function bulkUpdateKanbanOrder(
     }
 
     return api.post('/userstories/bulk_update_kanban_order', params);
-}
-
-/**
- * Reorder stories within a sprint/milestone.
- *
- * There is no dedicated method for this in `resources/userstories.coffee`, but
- * the endpoint is present in the AngularJS URL map under the key
- * `bulk-update-us-miles-order` → `/userstories/bulk_update_sprint_order`
- * (`app/coffee/modules/resources.coffee:111`) and is required by the migration
- * (AAP §0.4.1 / §0.6.5). Its payload mirrors the sprint/backlog order contract
- * — `{ project_id, bulk_userstories, [milestone_id] }` — with `milestone_id`
- * included only when truthy, consistent with the backlog-order guard.
- *
- * @param projectId       The target project id (`project_id`).
- * @param milestoneId     The sprint/milestone id, or `null`. Included only when
- *                        truthy.
- * @param bulkUserstories The ordered `{ us_id, order }` entries to persist.
- */
-export function bulkUpdateSprintOrder(
-    projectId: number,
-    milestoneId: number | null,
-    bulkUserstories: BulkUserStoryOrder[],
-): Promise<unknown> {
-    const params: Record<string, unknown> = {
-        project_id: projectId,
-        bulk_userstories: bulkUserstories,
-    };
-
-    // Mirror the backlog-order `if milestoneId` guard.
-    if (milestoneId) {
-        params.milestone_id = milestoneId;
-    }
-
-    return api.post('/userstories/bulk_update_sprint_order', params);
 }
 
 /**

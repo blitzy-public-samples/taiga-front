@@ -591,7 +591,21 @@ export function reducer(state: State, action: Action): State {
                 // is reproduced EXACTLY; only the Immutable.js writes become immer
                 // mutations. The wire payload is produced separately by
                 // `getMovePayload` (a reducer only returns state).
-                const { usIds, statusId, swimlaneId, previousCard } = action;
+                const { usIds, statusId, previousCard } = action;
+
+                // F-AAP-09 (data integrity): defensively coerce a NaN swimlane to
+                // `null` at the state boundary. The primary normalization happens
+                // upstream (the DnD boundary reads a missing `data-swimlane` as
+                // `null`, and the hook maps `-1`/NaN to `null`), but the reducer is
+                // the LAST gate before `usModel.swimlane` is written below — it must
+                // never persist NaN into a card's model, which would corrupt
+                // swimlane grouping (`getUsByStatusInternal`'s `it.swimlane ===
+                // swimlaneId` can never match NaN) and serialize as an invalid
+                // wire value. A real id (including `-1`) or `null` passes through.
+                const swimlaneId =
+                    typeof action.swimlaneId === 'number' && Number.isNaN(action.swimlaneId)
+                        ? null
+                        : action.swimlaneId;
 
                 // SOURCE 151-152: stories in the destination status/lane, sorted
                 // by order (operate on a copy — do not disturb raw here).
@@ -759,9 +773,16 @@ export function getMovePayload(
     previousCard: number | null,
     nextCard: number | null,
 ): MovePayload {
+    // F-AAP-09 (data integrity): the request body must never carry NaN. A NaN
+    // swimlane (missing lane in no-swimlane mode) is coerced to `null` so the
+    // `/userstories/bulk_update_kanban_order` payload sends a clean
+    // `number | null` — mirroring the AngularJS contract where a falsy swimlane
+    // is simply omitted. A real id (including the synthetic `-1`) passes through.
+    const safeSwimlaneId =
+        typeof swimlaneId === 'number' && Number.isNaN(swimlaneId) ? null : swimlaneId;
     return {
         statusId,
-        swimlaneId,
+        swimlaneId: safeSwimlaneId,
         afterUserstoryId: previousCard,
         beforeUserstoryId: nextCard,
         bulkUserstories: usIds,

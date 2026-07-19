@@ -75,11 +75,17 @@
 import { Fragment } from 'react';
 
 import type { Project, Status, UsMap } from '../../shared/types';
-import { can } from '../../shared/permissions';
+import { canMutate } from '../../shared/permissions';
+import { DroppableColumn, DraggableCard } from '../dnd/KanbanDndContext';
 import { Card } from './Card';
 import { WipLimit, computeWipLimit } from './WipLimit';
 import { SquishColumnPlaceholder } from './SquishColumn';
 import { ArchivedStatusIntro } from './ArchivedStatusIntro';
+// F-UI-06: bridge the counter title and empty/not-found placeholder copy to the
+// AngularJS shell's angular-translate service (English fallback keeps unit tests
+// and shell-less renders correct). Mirrors the legacy `| translate` filters and
+// `translate="…"` directives in `kanban-table.jade` / `kanban-placeholder.jade`.
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link TaskboardColumn}.
@@ -185,7 +191,9 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
      * cannot `modify_task` on the project sees the column/cards in the read-only
      * visual state. Reproduced verbatim via the shared `can` gate.
      * ---------------------------------------------------------------------- */
-    const readonly = !can(project, 'modify_task');
+    // F-REG-03: task editing is a mutation, so an archived project forces
+    // read-only even when the user holds `modify_task`.
+    const readonly = !canMutate(project, 'modify_task');
 
     /* ---------------------------------------------------------------------- *
      * Phase 5 (computed once) — where, if anywhere, the WIP-limit marker sits.
@@ -224,9 +232,20 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
     // cross-folder contract.
     const swimlaneAttr = hasSwimlane ? { 'data-swimlane': String(swimlaneId) } : {};
 
+    // F-CQ-01: the column body is a @dnd-kit DROPPABLE (id === its columnKey), so
+    // a card can be dropped onto it — including onto an EMPTY column. `setNodeRef`
+    // attaches the droppable to the real `.kanban-uses-box` node the DnD layer
+    // reads card order from (`readOrderedCardIds`), and `isTarget` reproduces the
+    // legacy over/out highlight (`sortable.coffee:65-73`): the `target-drop` class
+    // appears ONLY on a container different from the drag source. On a read-only /
+    // archived board the wrapper is disabled by the internal context, so this adds
+    // no drag affordance there (F-REG-03 parity is preserved by `isBoardDraggable`).
     return (
+        <DroppableColumn statusId={status.id} swimlaneId={swimlaneId ?? null}>
+            {({ setNodeRef, isTarget }): JSX.Element => (
         <div
-            className={rootClass}
+            ref={setNodeRef}
+            className={rootClass + (isTarget ? ' target-drop' : '')}
             id={`column-${status.id}`}
             data-status={String(status.id)}
             {...swimlaneAttr}
@@ -235,7 +254,10 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
                 The two are mutually exclusive by `folded`, exactly as the legacy
                 `ng-if='!folds[s.id]'` / `ng-if='folds[s.id]'` pair. */}
             {!folded && (
-                <div className="kanban-task-counter" title="Number of US">
+                <div
+                    className="kanban-task-counter"
+                    title={translate('KANBAN.NUMBER_US', undefined, 'Number of US')}
+                >
                     {/* Reproduces the `tgAnimatedCounter` template
                         (`animated-counter.directive.coffee`). The original rendered
                         three `.result` rows (previous/current/next) purely to drive a
@@ -294,17 +316,52 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
                                 <div className="image" />
                                 <div className="text" />
                             </div>
-                            <p className="title">This could be a user story</p>
-                            <p>Create user stories here and change their status to track their progress.</p>
+                            <p className="title">
+                                {translate(
+                                    'KANBAN.PLACEHOLDER_CARD_TITLE',
+                                    undefined,
+                                    'This could be a user story',
+                                )}
+                            </p>
+                            <p>
+                                {translate(
+                                    'KANBAN.PLACEHOLDER_CARD_TEXT',
+                                    undefined,
+                                    'Create user stories here and change their status to track their progress.',
+                                )}
+                            </p>
                         </>
                     ) : (
                         <>
-                            <p className="title">No matching results found</p>
-                            <p>Try again using more general search terms or disabled some filters.</p>
-                            <p>
-                                <strong>Archived stories</strong> are not loaded by default. Unfold
-                                the archived statuses to expand your search.
+                            <p className="title">
+                                {translate(
+                                    'KANBAN.US_NOT_FOUND_TITLE',
+                                    undefined,
+                                    'No matching results found',
+                                )}
                             </p>
+                            <p>
+                                {translate(
+                                    'KANBAN.US_NOT_FOUND_TEXT_P1',
+                                    undefined,
+                                    'Try again using more general search terms or disabled some filters.',
+                                )}
+                            </p>
+                            {/* F-UI-06: `KANBAN.US_NOT_FOUND_TEXT_P2` ships with a
+                                `<strong>` in its value; the legacy `translate="…"`
+                                attribute directive rendered it as HTML. The value comes
+                                from the trusted, developer-controlled locale bundle (no
+                                user input flows in), so reproducing that behaviour via
+                                `dangerouslySetInnerHTML` is safe and faithful. */}
+                            <p
+                                dangerouslySetInnerHTML={{
+                                    __html: translate(
+                                        'KANBAN.US_NOT_FOUND_TEXT_P2',
+                                        undefined,
+                                        '<strong>Archived stories</strong> are not loaded by default. Unfold the archived statuses to expand your search.',
+                                    ),
+                                }}
+                            />
                         </>
                     )}
                 </div>
@@ -325,27 +382,49 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
 
                 return (
                     <Fragment key={usId}>
-                        <Card
-                            data-id={String(usId)}
-                            item={item}
-                            project={project}
-                            zoom={zoom}
-                            zoomLevel={zoomLevel}
-                            type="us"
-                            archived={isUsArchivedHidden(usId)}
-                            inViewPort={inViewPort[usId] ?? false}
-                            isFirst={i === 0}
-                            selected={!!selectedUss[usId]}
-                            // Difference #3: `kanban-moved` only in swimlane mode.
-                            moved={hasSwimlane ? movedUs.indexOf(usId) !== -1 : false}
-                            onToggleFold={onToggleFold}
-                            onClickEdit={onClickEdit}
-                            onClickDelete={onClickDelete}
-                            onClickAssignedTo={onClickAssignedTo}
-                            // Difference #3: move-to-top wired only in swimlane mode.
-                            onClickMoveToTop={hasSwimlane ? onClickMoveToTop : undefined}
-                            onToggleSelected={onToggleSelectedUs}
-                        />
+                        {/* F-CQ-01: every card is a @dnd-kit DRAGGABLE (and card-level
+                            droppable, for precise neighbour/index detection). The render
+                            prop hands the drag `ref` (`setNodeRef`), the pointer/keyboard
+                            `listeners` and the ARIA `attributes` straight onto the
+                            @dnd-kit-free `Card` via its `forwardRef` + `...rest` contract,
+                            so a drag can START (pointer/keyboard) and the board can
+                            resolve which card the pointer is over. `data-id` is preserved
+                            because the DnD layer reads DOM card order from it. On a
+                            read-only/archived board the wrapper is disabled (internal
+                            context), so no listeners are attached — parity with the old
+                            `modify_us`/`archived_code` gate. */}
+                        <DraggableCard
+                            id={usId}
+                            statusId={status.id}
+                            swimlaneId={swimlaneId ?? null}
+                        >
+                            {({ setNodeRef, listeners, attributes }): JSX.Element => (
+                                <Card
+                                    ref={setNodeRef}
+                                    {...attributes}
+                                    {...(listeners ?? {})}
+                                    data-id={String(usId)}
+                                    item={item}
+                                    project={project}
+                                    zoom={zoom}
+                                    zoomLevel={zoomLevel}
+                                    type="us"
+                                    archived={isUsArchivedHidden(usId)}
+                                    inViewPort={inViewPort[usId] ?? false}
+                                    isFirst={i === 0}
+                                    selected={!!selectedUss[usId]}
+                                    // Difference #3: `kanban-moved` only in swimlane mode.
+                                    moved={hasSwimlane ? movedUs.indexOf(usId) !== -1 : false}
+                                    onToggleFold={onToggleFold}
+                                    onClickEdit={onClickEdit}
+                                    onClickDelete={onClickDelete}
+                                    onClickAssignedTo={onClickAssignedTo}
+                                    // Difference #3: move-to-top wired only in swimlane mode.
+                                    onClickMoveToTop={hasSwimlane ? onClickMoveToTop : undefined}
+                                    onToggleSelected={onToggleSelectedUs}
+                                />
+                            )}
+                        </DraggableCard>
                         {wip && wip.afterIndex === i ? <WipLimit className={wip.className} /> : null}
                     </Fragment>
                 );
@@ -355,5 +434,7 @@ export function TaskboardColumn(props: TaskboardColumnProps): JSX.Element {
                 an archived column (legacy `div.kanban-column-intro(ng-if="s.is_archived")`). */}
             {status.is_archived && <ArchivedStatusIntro status={status} />}
         </div>
+            )}
+        </DroppableColumn>
     );
 }

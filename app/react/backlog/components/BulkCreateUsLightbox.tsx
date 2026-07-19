@@ -51,43 +51,21 @@
  * `import React` statement — only the hooks / types actually used are imported.
  */
 
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, useId, type FormEvent } from 'react';
 
 import type { Status, Swimlane, UserStory } from '../../shared/types';
 import { bulkCreate } from '../../shared/api/userstories';
-
-/*
- * Taiga renders inline SVG sprites through its `<tg-svg>` web component (so CSS
- * selectors such as `tg-svg svg.icon` keep matching). It is not a standard HTML
- * element, so we widen the JSX intrinsic-element table locally. Typed `any`
- * because the element is opaque to React/TS and is resolved by the existing
- * sprite runtime at render time. The identical local declaration exists in the
- * sibling components; duplicate ambient merges are harmless.
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup. The inner `<svg>` carries the `icon <name>`
- * classes the SCSS targets, and `<use>` references the sprite by id. `className`
- * is forwarded onto the custom element for parity with the shared convention.
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration — icons used here: `icon-close`,
+// `icon-arrow-down`).
+import { TgSvg } from '../../shared/icon';
+// F-UI-06: the shared translation bridge for the title, section labels, the
+// textarea placeholder and the action copy (`COMMON.*`, `LIGHTBOX.CREATE_EDIT.*`).
+import { translate } from '../../shared/i18n';
+// F-UI-05: shared modal-dialog behaviour (focus trap, Escape-to-close, restore
+// focus) applied to the lightbox so it is announced as a modal dialog and is
+// fully keyboard-operable — see `useModalDialog`.
+import { useModalDialog } from '../../shared/useModalDialog';
 
 /**
  * Props for {@link BulkCreateUsLightbox}. Matches the `BacklogApp` container
@@ -166,6 +144,16 @@ export function BulkCreateUsLightbox({
   // containment check — the React equivalent of the directive inspecting the
   // clicked node's parents for the `bulk-status-selector-wrapper` class.
   const statusWrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // F-UI-05: turn the lightbox into a real accessible modal dialog — focus
+  // trap, Escape-to-close and focus restoration to the opener. The returned ref
+  // is spread onto the `.lightbox` shell (which also carries `role="dialog"` +
+  // `aria-modal="true"`); it is inert while `open` is false. With no dedicated
+  // field-focus effect here, the hook's fallback focuses the first focusable
+  // control (the close affordance) on open.
+  const dialogRef = useModalDialog<HTMLDivElement>(open, onClose);
+  // Stable id linking the dialog to its heading via `aria-labelledby`.
+  const titleId = useId();
 
   // Derived current status — mirrors `getCurrentStatus`
   // (`project.us_statuses.filter(s => s.id === statusId).pop()`).
@@ -312,7 +300,21 @@ export function BulkCreateUsLightbox({
   };
 
   return (
-    <div className={`lightbox lightbox-generic-bulk${open ? ' open' : ''}`}>
+    <div
+      ref={dialogRef}
+      className={`lightbox lightbox-generic-bulk${open ? ' open' : ''}`}
+      /*
+        F-UI-05: dialog semantics. `.lightbox` is `display:none` until the
+        `open` class is applied (see the `lightbox` SCSS mixin), so assistive
+        tech only sees the dialog while it is actually open; `aria-labelledby`
+        names it from the `<h2 .title>` heading and `aria-busy` reflects the
+        in-flight submit.
+      */
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      aria-busy={submitting}
+    >
       {/*
         Close control — replaces the `tg-lightbox-close` directive
         (`<a class="close" ng-click="onClose()" …>`). `href=""` is preserved from
@@ -321,22 +323,31 @@ export function BulkCreateUsLightbox({
       <a
         className="close"
         href=""
-        title="Close" /* i18n: COMMON.CLOSE */
+        title={translate('COMMON.CLOSE', undefined, 'close')}
+        /* F-UI-04: the control is icon-only, so it needs an accessible name. */
+        aria-label={translate('COMMON.CLOSE', undefined, 'close')}
         onClick={(event) => {
           event.preventDefault();
           onClose();
         }}
       >
-        {svgIcon('icon-close')}
+        <TgSvg icon="icon-close" />
       </a>
 
       <form onSubmit={handleSubmit}>
-        {/* i18n: COMMON.NEW_BULK */}
-        <h2 className="title">New bulk insert</h2>
+        <h2 className="title" id={titleId}>
+          {translate('COMMON.NEW_BULK', undefined, 'New bulk insert')}
+        </h2>
 
-        {/* General backend error region (no toast in React). */}
+        {/*
+          General backend error region (no toast in React). F-UI-05:
+          `role="alert"` (implicit `aria-live="assertive"`) announces the
+          failure to screen-reader users the moment it appears.
+        */}
         {generalError && (
-          <div className="checksley-error-list">{generalError}</div>
+          <div className="checksley-error-list" role="alert">
+            {generalError}
+          </div>
         )}
 
         {/*
@@ -346,24 +357,47 @@ export function BulkCreateUsLightbox({
         */}
         {statuses.length > 0 && (
           <fieldset>
-            {/* i18n: LIGHTBOX.CREATE_EDIT.SELECT_STATUS */}
-            <div className="label">Select status</div>
+            <div className="label">
+              {translate('LIGHTBOX.CREATE_EDIT.SELECT_STATUS', undefined, 'Select status')}
+            </div>
             <div className="bulk-status-selector-wrapper" ref={statusWrapperRef}>
               <button
                 type="button"
                 className="bulk-status-selector"
                 style={{ backgroundColor: currentStatus?.color }}
+                /*
+                  F-UI-04: expose the collapsible status menu to assistive tech.
+                  `aria-haspopup="menu"` + `aria-expanded` track the dropdown,
+                  and the trigger is named from the current status.
+                */
+                aria-haspopup="menu"
+                aria-expanded={displayStatusSelector}
+                aria-label={translate(
+                  'LIGHTBOX.CREATE_EDIT.SELECT_STATUS',
+                  undefined,
+                  'Select status',
+                )}
                 onClick={toggleStatus}
               >
                 <span>{currentStatus?.name}</span>
-                {svgIcon('icon-arrow-down')}
+                <TgSvg icon="icon-arrow-down" />
               </button>
               {displayStatusSelector && (
-                <div className="bulk-status-option-wrapper">
+                <div
+                  className="bulk-status-option-wrapper"
+                  role="menu"
+                  aria-label={translate(
+                    'LIGHTBOX.CREATE_EDIT.SELECT_STATUS',
+                    undefined,
+                    'Select status',
+                  )}
+                >
                   {statuses.map((status) => (
                     <button
                       key={status.id}
                       type="button"
+                      role="menuitem"
+                      aria-current={status.id === statusId}
                       className={`bulk-status-option${
                         status.id === statusId ? ' selected' : ''
                       }`}
@@ -386,8 +420,9 @@ export function BulkCreateUsLightbox({
           one group `name`.
         */}
         <fieldset className="creation-position">
-          {/* i18n: LIGHTBOX.CREATE_EDIT.LOCATION */}
-          <div className="label">Location</div>
+          <div className="label">
+            {translate('LIGHTBOX.CREATE_EDIT.LOCATION', undefined, 'Location')}
+          </div>
           <div className="creation-position-fields">
             <label className="custom-radio">
               <input
@@ -399,8 +434,9 @@ export function BulkCreateUsLightbox({
                 onChange={() => setUsPosition('bottom')}
               />
               <span className="radio-control" />
-              {/* i18n: LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM */}
-              <span className="radio-label">at the bottom</span>
+              <span className="radio-label">
+                {translate('LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM', undefined, 'at the bottom')}
+              </span>
             </label>
             <label className="custom-radio">
               <input
@@ -412,8 +448,9 @@ export function BulkCreateUsLightbox({
                 onChange={() => setUsPosition('top')}
               />
               <span className="radio-control" />
-              {/* i18n: LIGHTBOX.CREATE_EDIT.CREATE_TOP */}
-              <span className="radio-label">on top</span>
+              <span className="radio-label">
+                {translate('LIGHTBOX.CREATE_EDIT.CREATE_TOP', undefined, 'on top')}
+              </span>
             </label>
           </div>
         </fieldset>
@@ -428,10 +465,13 @@ export function BulkCreateUsLightbox({
         */}
         {isKanbanActivated && swimlanes && swimlanes.length > 0 && (
           <fieldset className="swimlane-select">
-            {/* i18n: LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE */}
-            <div className="label">Select swimlane</div>
+            <div className="label" id={`${titleId}-swimlane-label`}>
+              {translate('LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE', undefined, 'Select swimlane')}
+            </div>
             <select
               className="swimlane-select-input"
+              /* F-UI-04: the native select is named by its section label. */
+              aria-labelledby={`${titleId}-swimlane-label`}
               value={swimlaneId ?? ''}
               onChange={(event) => {
                 const value = event.target.value;
@@ -453,12 +493,14 @@ export function BulkCreateUsLightbox({
             cols={200}
             wrap="off"
             className={bulkError ? 'checksley-error' : undefined}
-            placeholder="One item per line..." /* i18n: COMMON.ONE_ITEM_LINE */
+            placeholder={translate('COMMON.ONE_ITEM_LINE', undefined, 'One item per line...')}
+            aria-label={translate('COMMON.ONE_ITEM_LINE', undefined, 'One item per line...')}
+            aria-invalid={bulkError ? true : undefined}
             value={bulk}
             onChange={(event) => setBulk(event.target.value)}
           />
           {bulkError && (
-            <ul className="checksley-error-list">
+            <ul className="checksley-error-list" role="alert">
               <li>{bulkError}</li>
             </ul>
           )}
@@ -473,11 +515,10 @@ export function BulkCreateUsLightbox({
           <button
             className="btn-small js-submit-button"
             type="submit"
-            title="Save" /* i18n: COMMON.SAVE */
+            title={translate('COMMON.SAVE', undefined, 'Save')}
             disabled={submitting}
           >
-            {/* i18n: COMMON.SAVE */}
-            Save
+            {translate('COMMON.SAVE', undefined, 'Save')}
           </button>
         </div>
       </form>

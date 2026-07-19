@@ -19,12 +19,23 @@
  *   adapter (`../api/client`'s `api.post` / `api.get`) and asserts the exact
  *   endpoint path and the exact JSON body each function produces, with special
  *   attention to:
- *     - the `bulk_stories` overload (STRING for create, ARRAY for milestone);
+ *     - the ENDPOINT-SPECIFIC payload shapes, asserted against the Django
+ *       validators byte-for-byte (taiga-back `userstories/validators.py`):
+ *         • `bulk_userstories` (backlog + kanban ORDER) is a plain `number[]`
+ *           of ids — `ListField(child=IntegerField(min_value=1))`;
+ *         • `bulk_stories` for the MILESTONE move is a `BulkUserStoryOrder[]`
+ *           (`{ us_id, order }` objects) — `_UserStoryMilestoneBulkValidator`;
+ *         • `bulk_stories` for CREATE is a newline-separated STRING —
+ *           `serializers.CharField()`;
  *     - the `after_userstory_id` / `before_userstory_id` mutual exclusivity
  *       (with `after` winning when both are truthy);
  *     - the truthy `milestone_id` / `swimlane_id` guards; and
  *     - the deliberate unconditional inclusion of `swimlane_id` (create) and
  *       `milestone_id` (bulkUpdateMilestone).
+ *
+ *   There is deliberately NO `bulkUpdateSprintOrder` wrapper (and hence no spec
+ *   for it): the backend exposes no `bulk_update_sprint_order` route, so it was
+ *   removed as dead code (AAP §0.2.1, §0.4.1).
  *
  * TEST-LAYER ISOLATION
  *   No network, no browser, no UI framework. `../api/client` is fully mocked, so
@@ -40,7 +51,6 @@ import {
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
     bulkUpdateKanbanOrder,
-    bulkUpdateSprintOrder,
     filtersData,
 } from '../api/userstories';
 import type { BulkUserStoryOrder } from '../api/userstories';
@@ -59,8 +69,17 @@ jest.mock('../api/client', () => ({
 const postMock = api.post as unknown as jest.Mock;
 const getMock = api.get as unknown as jest.Mock;
 
-// A representative bulk-order list reused across the ordering assertions. Typed
-// with the exported `BulkUserStoryOrder` to prove the type is exported/usable.
+// A representative id list reused across the backlog/kanban ORDER assertions.
+// These endpoints take a plain `number[]` of user-story ids
+// (`bulk_userstories = ListField(child=IntegerField(min_value=1))`), so the
+// fixture is typed `number[]` — the compiler now REJECTS passing
+// `{ us_id, order }` objects here, statically guaranteeing the fix.
+const IDS: number[] = [2, 3];
+
+// A representative `{ us_id, order }` list reused by the MILESTONE-move
+// assertion only. Typed with the exported `BulkUserStoryOrder` to prove the
+// type is exported/usable and to keep the milestone `bulk_stories` shape
+// distinct from the order endpoints' `number[]`.
 const ORDER: BulkUserStoryOrder[] = [
     { us_id: 2, order: 0 },
     { us_id: 3, order: 1 },
@@ -117,14 +136,14 @@ describe('bulkCreate', () => {
 });
 
 describe('bulkUpdateBacklogOrder', () => {
-    it('includes milestone_id + after_userstory_id (after wins) and OMITS before_userstory_id', async () => {
-        await bulkUpdateBacklogOrder(1, 5, 9, null, [{ us_id: 2, order: 0 }]);
+    it('sends bulk_userstories as a plain number[] and includes milestone_id + after_userstory_id (after wins), OMITTING before_userstory_id', async () => {
+        await bulkUpdateBacklogOrder(1, 5, 9, null, [2]);
 
         expect(postMock).toHaveBeenCalledTimes(1);
         const body = lastPostBody();
         expect(body).toEqual({
             project_id: 1,
-            bulk_userstories: [{ us_id: 2, order: 0 }],
+            bulk_userstories: [2],
             milestone_id: 5,
             after_userstory_id: 9,
         });
@@ -132,12 +151,12 @@ describe('bulkUpdateBacklogOrder', () => {
     });
 
     it('uses before_userstory_id and OMITS milestone_id and after_userstory_id when only before is truthy', async () => {
-        await bulkUpdateBacklogOrder(1, null, null, 9, [{ us_id: 2, order: 0 }]);
+        await bulkUpdateBacklogOrder(1, null, null, 9, [2]);
 
         const body = lastPostBody();
         expect(body).toEqual({
             project_id: 1,
-            bulk_userstories: [{ us_id: 2, order: 0 }],
+            bulk_userstories: [2],
             before_userstory_id: 9,
         });
         expect(body).not.toHaveProperty('milestone_id');
@@ -145,16 +164,18 @@ describe('bulkUpdateBacklogOrder', () => {
     });
 
     it('prefers after_userstory_id over before_userstory_id when BOTH are truthy', async () => {
-        await bulkUpdateBacklogOrder(1, null, 7, 9, ORDER);
+        await bulkUpdateBacklogOrder(1, null, 7, 9, IDS);
 
         const body = lastPostBody();
         expect(body).toHaveProperty('after_userstory_id', 7);
         expect(body).not.toHaveProperty('before_userstory_id');
     });
 
-    it('targets the backlog-order endpoint', async () => {
-        await bulkUpdateBacklogOrder(1, null, null, null, ORDER);
+    it('targets the backlog-order endpoint and forwards the id array verbatim', async () => {
+        await bulkUpdateBacklogOrder(1, null, null, null, IDS);
         expect(postMock).toHaveBeenCalledWith('/userstories/bulk_update_backlog_order', expect.any(Object));
+        // The id array is forwarded unchanged (no `{ us_id, order }` wrapping).
+        expect(lastPostBody()).toHaveProperty('bulk_userstories', IDS);
     });
 });
 
@@ -184,36 +205,36 @@ describe('bulkUpdateMilestone', () => {
 });
 
 describe('bulkUpdateKanbanOrder', () => {
-    it('posts the minimal kanban body with NO swimlane_id / after / before when all are falsy', async () => {
-        await bulkUpdateKanbanOrder(1, 4, null, null, null, [{ us_id: 2, order: 0 }]);
+    it('posts the minimal kanban body (bulk_userstories as number[]) with NO swimlane_id / after / before when all are falsy', async () => {
+        await bulkUpdateKanbanOrder(1, 4, null, null, null, [2]);
 
         expect(postMock).toHaveBeenCalledTimes(1);
         const body = lastPostBody();
         expect(body).toEqual({
             project_id: 1,
             status_id: 4,
-            bulk_userstories: [{ us_id: 2, order: 0 }],
+            bulk_userstories: [2],
         });
         expect(body).not.toHaveProperty('swimlane_id');
         expect(body).not.toHaveProperty('after_userstory_id');
         expect(body).not.toHaveProperty('before_userstory_id');
     });
 
-    it('includes swimlane_id and after_userstory_id when provided', async () => {
-        await bulkUpdateKanbanOrder(1, 4, 8, 9, null, [{ us_id: 2, order: 0 }]);
+    it('includes swimlane_id and after_userstory_id when provided (bulk_userstories stays a number[])', async () => {
+        await bulkUpdateKanbanOrder(1, 4, 8, 9, null, [2]);
 
         const body = lastPostBody();
         expect(body).toEqual({
             project_id: 1,
             status_id: 4,
-            bulk_userstories: [{ us_id: 2, order: 0 }],
+            bulk_userstories: [2],
             after_userstory_id: 9,
             swimlane_id: 8,
         });
     });
 
     it('uses before_userstory_id when only before is truthy, and keeps swimlane_id independent', async () => {
-        await bulkUpdateKanbanOrder(1, 4, 8, null, 9, ORDER);
+        await bulkUpdateKanbanOrder(1, 4, 8, null, 9, IDS);
 
         const body = lastPostBody();
         expect(body).toHaveProperty('before_userstory_id', 9);
@@ -222,7 +243,7 @@ describe('bulkUpdateKanbanOrder', () => {
     });
 
     it('prefers after over before when both are truthy', async () => {
-        await bulkUpdateKanbanOrder(1, 4, null, 7, 9, ORDER);
+        await bulkUpdateKanbanOrder(1, 4, null, 7, 9, IDS);
 
         const body = lastPostBody();
         expect(body).toHaveProperty('after_userstory_id', 7);
@@ -230,32 +251,10 @@ describe('bulkUpdateKanbanOrder', () => {
         expect(body).not.toHaveProperty('swimlane_id');
     });
 
-    it('targets the kanban-order endpoint', async () => {
-        await bulkUpdateKanbanOrder(1, 4, null, null, null, ORDER);
+    it('targets the kanban-order endpoint and forwards the id array verbatim', async () => {
+        await bulkUpdateKanbanOrder(1, 4, null, null, null, IDS);
         expect(postMock).toHaveBeenCalledWith('/userstories/bulk_update_kanban_order', expect.any(Object));
-    });
-});
-
-describe('bulkUpdateSprintOrder', () => {
-    it('mirrors the backlog-order contract: {project_id, bulk_userstories, [milestone_id]}', async () => {
-        await bulkUpdateSprintOrder(1, 3, [{ us_id: 2, order: 0 }]);
-
-        expect(postMock).toHaveBeenCalledWith('/userstories/bulk_update_sprint_order', {
-            project_id: 1,
-            bulk_userstories: [{ us_id: 2, order: 0 }],
-            milestone_id: 3,
-        });
-    });
-
-    it('omits milestone_id when it is falsy', async () => {
-        await bulkUpdateSprintOrder(1, null, ORDER);
-
-        const body = lastPostBody();
-        expect(body).toEqual({
-            project_id: 1,
-            bulk_userstories: ORDER,
-        });
-        expect(body).not.toHaveProperty('milestone_id');
+        expect(lastPostBody()).toHaveProperty('bulk_userstories', IDS);
     });
 });
 

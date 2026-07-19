@@ -64,10 +64,9 @@ import { reducer, initialState, getMovePayload } from './boardReducer';
 import type { State, Action } from './boardReducer';
 import { api } from '../../shared/api/client';
 import { bulkUpdateKanbanOrder, filtersData } from '../../shared/api/userstories';
-import type { BulkUserStoryOrder } from '../../shared/api/userstories';
 import { subscribeProjectChanges } from '../../shared/events';
 import type { ProjectChangeHandlers } from '../../shared/events';
-import { isBoardDraggable } from '../../shared/permissions';
+import { isBoardDraggable, canMutate } from '../../shared/permissions';
 import type {
     Project,
     UserStory,
@@ -75,6 +74,7 @@ import type {
     Status,
     AssignedUser,
     FiltersData,
+    UsMap,
 } from '../../shared/types';
 
 /* ========================================================================== *
@@ -133,6 +133,16 @@ export type UseKanbanBoardResult = {
     initialLoad: boolean;
     /** `true` while a page/refresh fetch is in flight. */
     loading: boolean;
+    /**
+     * F-AAP-10: `true` when the LAST initial load (or live/reload refresh)
+     * FAILED. Deliberately DISTINCT from "loaded but empty": the first React cut
+     * swallowed the initial-load error in the effect `catch` and merely set
+     * `initialLoad = true`, so a failed load rendered IDENTICALLY to a
+     * legitimately empty Kanban board. The container can now tell them apart and
+     * offer a retry (`reload`). Cleared at the start of every (re)load; set
+     * `true` when a load/refresh rejects. Init `false`.
+     */
+    loadError: boolean;
     /** `true` when an active filter/search produced zero stories. */
     notFoundUserstories: boolean;
     // Actions.
@@ -157,6 +167,12 @@ export type UseKanbanBoardResult = {
     hideArchivedStatus: (statusId: number) => void;
     /** Re-fetch the board with the current filters/search/zoom. */
     reload: () => void;
+    /**
+     * Delete a single user story (SOURCE `deleteUserStory` 289-304): archive-aware
+     * `delete_us` gate, optimistic `REMOVE`, `DELETE /userstories/{id}`, and
+     * reload-on-error reconciliation. The confirm dialog is owned by the container.
+     */
+    deleteUserStory: (usId: number) => Promise<void>;
 };
 
 /* ========================================================================== *
@@ -198,6 +214,8 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     // Flags / derived config (mirror the AngularJS scope fields).
     const [initialLoad, setInitialLoad] = useState(false);
     const [loading, setLoading] = useState(false);
+    // F-AAP-10: initial/refresh load-failure flag (distinct from empty).
+    const [loadError, setLoadError] = useState(false);
     const [notFoundUserstories, setNotFoundUserstories] = useState(false);
     const [project, setProject] = useState<Project | null>(null);
     const [usStatusList, setUsStatusList] = useState<Status[]>([]);
@@ -384,12 +402,16 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     const loadProjectRef = useRef(loadProject);
     const loadUserstoriesRef = useRef(loadUserstories);
     const buildParamsRef = useRef(buildUserstoriesParams);
+    // F-CQ-02: latest board index so the stable `deleteUserStory` action can
+    // resolve a story's model (id + status) without a stale closure.
+    const usMapRef = useRef<UsMap>({});
 
     useEffect(() => {
         projectRef.current = project;
         loadProjectRef.current = loadProject;
         loadUserstoriesRef.current = loadUserstories;
         buildParamsRef.current = buildUserstoriesParams;
+        usMapRef.current = state.usMap;
     });
 
     /* ---------------------------------------------------------------------- *
@@ -493,7 +515,15 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
             }
 
             // SOURCE 606-608: the synthetic unclassified swimlane (-1) is the API `null`.
-            const apiSwimlaneId = swimlaneId === -1 ? null : swimlaneId;
+            // F-AAP-09 (data integrity): also coerce a NaN swimlane to `null`. The
+            // primary normalization lives at the DnD boundary, but move() may be
+            // invoked programmatically (keyboard DnD / move-to-top) with a raw
+            // value, so this secondary guard ensures neither the optimistic reducer
+            // dispatch nor the API body can ever receive NaN.
+            const apiSwimlaneId =
+                swimlaneId === -1 || (typeof swimlaneId === 'number' && Number.isNaN(swimlaneId))
+                    ? null
+                    : swimlaneId;
 
             // (2) Optimistic local update; the reducer receives the API swimlane.
             dispatch({
@@ -512,17 +542,19 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
             try {
                 // CRITICAL kanban wire contract: `bulkUserstories` is a PLAIN
                 // `number[]` of ids — NOT `{us_id, order}` objects. The kanban
-                // endpoint posts the id array as-is
-                // (resources/userstories.coffee:112-129; main.coffee:609-625). The
-                // sibling types the last param `BulkUserStoryOrder[]`, so we forward
-                // the id array through a documented double-cast (no runtime change).
+                // endpoint posts the id array as-is (kanban/main.coffee:609-625;
+                // backend validator `bulk_userstories =
+                // ListField(child=IntegerField(min_value=1))`). `getMovePayload`
+                // already yields `number[]` and `bulkUpdateKanbanOrder` now types
+                // its last param `number[]`, so the id array is forwarded directly
+                // with NO cast — the request body is byte-for-byte identical.
                 await bulkUpdateKanbanOrder(
                     projectId,
                     statusId,
                     apiSwimlaneId,
                     payload.afterUserstoryId,
                     payload.beforeUserstoryId,
-                    payload.bulkUserstories as unknown as BulkUserStoryOrder[],
+                    payload.bulkUserstories,
                 );
             } catch {
                 // On persistence failure, reconcile the board with the server so
@@ -591,10 +623,82 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
      */
     const reload = useCallback((): void => {
         const proj = projectRef.current;
-        if (proj) {
-            void loadUserstoriesRef.current(proj);
+        if (!proj) {
+            return;
         }
+        // F-AAP-10: centralize the retry — clear the failure flag, re-fetch, and
+        // SURFACE a fresh failure rather than swallowing it. The previous
+        // `void loadUserstories()` discarded the rejection, so a failed refresh
+        // was invisible. `reload` stays fire-and-forget for the container, but
+        // the outcome is now observable through `loadError`.
+        setLoadError(false);
+        void (async () => {
+            try {
+                await loadUserstoriesRef.current(proj);
+            } catch {
+                setLoadError(true);
+            }
+        })();
     }, []);
+
+    /**
+     * Delete a single user story. This is the ONE Kanban CRUD control the legacy
+     * `KanbanController` OWNED directly rather than delegating to the common
+     * module: `deleteUserStory` (SOURCE main.coffee 289-304) called
+     * `@confirm.askOnDelete(...)` and, on confirmation, `@repo.remove(model)`
+     * followed by `$scope.$broadcast("kanban:us:deleted", model)` which the
+     * board's `kanban:us:deleted` handler (SOURCE 216-224) reacted to by pruning
+     * the story from the board state.
+     *
+     * F-CQ-02 faithful port:
+     *   - The confirm dialog (`$confirm.askOnDelete`) has no React equivalent in
+     *     the AAP §0.4.1 manifest, so we reuse the established `window.confirm`
+     *     stand-in already used by `CreateEditSprintLightbox` (documented pattern).
+     *   - The removal is persisted directly via `api.del('/userstories/{id}')`
+     *     (the same `/api/v1/` DELETE the AngularJS `@repo.remove` issued).
+     *   - The optimistic board prune reproduces the `kanban:us:deleted` handler
+     *     through the reducer's `REMOVE` action (mirrors the service `remove`).
+     *   - Defense-in-depth permission gate via `canMutate(project, 'delete_us')`
+     *     (archive-aware, F-REG-03); the container gates the affordance too.
+     *   - On persistence failure the board is reconciled with the server so an
+     *     optimistic prune can never leave the UI out of sync (mirrors move()).
+     *
+     * Stable across renders; reads the freshest project + board index via refs.
+     */
+    const deleteUserStory = useCallback(
+        async (usId: number): Promise<void> => {
+            const proj = projectRef.current;
+            // Defense-in-depth: archive-aware `delete_us` gate. The container
+            // gates the affordance, but this guard preserves the invariant if
+            // deleteUserStory is ever invoked programmatically.
+            if (!canMutate(proj, 'delete_us')) {
+                return;
+            }
+            // Resolve the story's model (id + status) from the freshest board
+            // index so the optimistic `REMOVE` can prune the correct column.
+            const card = usMapRef.current[usId];
+            if (!card) {
+                return;
+            }
+            const usModel = card.model;
+
+            // (1) Optimistic prune — mirrors the `kanban:us:deleted` handler.
+            dispatch({ type: 'REMOVE', usModel });
+
+            try {
+                // (2) Persist the deletion via the same `/api/v1/` DELETE the
+                // AngularJS `@repo.remove(model)` issued.
+                await api.del(`/userstories/${usId}`);
+            } catch {
+                // (3) On failure, reconcile the board with the server so the
+                // optimistic prune cannot leave the UI out of sync.
+                if (proj) {
+                    void loadUserstoriesRef.current(proj);
+                }
+            }
+        },
+        [],
+    );
 
     /* ---------------------------------------------------------------------- *
      * Effects
@@ -607,6 +711,9 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     useEffect(() => {
         let cancelled = false;
         setLoading(true);
+        // F-AAP-10: clear any prior failure at the start of a fresh load so the
+        // error state does not persist across a successful reload.
+        setLoadError(false);
 
         void (async () => {
             try {
@@ -628,7 +735,13 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                     /* filters are non-critical; ignore */
                 }
             } catch {
-                /* never throw from an effect; keep the safe empty board */
+                // F-AAP-10: SURFACE the failure instead of silently leaving a
+                // "successful empty board". Guarded by `cancelled` so a
+                // superseded load (unmount / projectId change) cannot flip the
+                // flag of a newer one. Still never THROWS from the effect.
+                if (!cancelled) {
+                    setLoadError(true);
+                }
             } finally {
                 if (!cancelled) {
                     setInitialLoad(true);
@@ -697,12 +810,14 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
         swimlanesStatuses,
         initialLoad,
         loading,
+        loadError,
         notFoundUserstories,
         move,
         toggleFold,
         showArchivedStatus,
         hideArchivedStatus,
         reload,
+        deleteUserStory,
     };
 }
 

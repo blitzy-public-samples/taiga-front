@@ -79,6 +79,7 @@ jest.mock('../../shared/api/client', () => ({
         post: jest.fn(),
         patch: jest.fn(),
         put: jest.fn(),
+        del: jest.fn(),
     },
 }));
 
@@ -96,6 +97,7 @@ jest.mock('../../shared/events', () => ({
  * ========================================================================== */
 
 const getMock = api.get as unknown as jest.Mock;
+const delMock = api.del as unknown as jest.Mock;
 const bulkUpdateKanbanOrderMock = bulkUpdateKanbanOrder as unknown as jest.Mock;
 const filtersDataMock = filtersData as unknown as jest.Mock;
 const subscribeMock = subscribeProjectChanges as unknown as jest.Mock;
@@ -152,6 +154,7 @@ beforeEach(() => {
 
     armGet();
     bulkUpdateKanbanOrderMock.mockResolvedValue(undefined);
+    delMock.mockResolvedValue(undefined);
     filtersDataMock.mockResolvedValue({});
     subscribeMock.mockReturnValue(unsubscribeSpy);
 });
@@ -615,6 +618,103 @@ describe('showArchivedStatus with an active filter', () => {
                 include_tasks: true,
                 q: 'needle',
             }),
+        );
+    });
+});
+
+/* ========================================================================== *
+ * deleteUserStory — F-CQ-02 (SOURCE `deleteUserStory` 289-304)
+ *
+ * The ONE Kanban CRUD control the legacy `KanbanController` OWNED directly:
+ * `@repo.remove(model)` (a `/api/v1/` DELETE) followed by the `kanban:us:deleted`
+ * board prune. The confirm dialog lives in the CONTAINER; the hook action owns
+ * the archive-aware gate, the `api.del` persistence, the optimistic `REMOVE`,
+ * and the reload-on-error reconciliation.
+ * ========================================================================== */
+
+describe('deleteUserStory', () => {
+    it('persists via DELETE /userstories/{id} and optimistically prunes the board when GRANTED', async () => {
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_ID })],
+            my_permissions: ['view_us', 'delete_us'],
+        });
+
+        const { result } = await renderLoaded();
+        // Precondition: story 1 is on the board.
+        expect(result.current.usMap[1]).toBeDefined();
+
+        await act(async () => {
+            await result.current.deleteUserStory(1);
+        });
+
+        // The same `/api/v1/` DELETE the AngularJS `@repo.remove(model)` issued.
+        expect(delMock).toHaveBeenCalledTimes(1);
+        expect(delMock).toHaveBeenCalledWith('/userstories/1');
+
+        // Optimistic `REMOVE` prunes the story from the board index.
+        expect(result.current.usMap[1]).toBeUndefined();
+    });
+
+    it('does NOT delete when the project lacks the delete_us permission', async () => {
+        // Default factory permissions = ['view_us'] (no delete_us) -> gate closed.
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            await result.current.deleteUserStory(1);
+        });
+
+        expect(delMock).not.toHaveBeenCalled();
+        // The story remains on the board — the gate short-circuited before any
+        // optimistic prune.
+        expect(result.current.usMap[1]).toBeDefined();
+    });
+
+    it('is a no-op for an unknown story id (nothing to remove)', async () => {
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_ID })],
+            my_permissions: ['view_us', 'delete_us'],
+        });
+
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            // id 999 is not on the board -> the missing-card guard returns early.
+            await result.current.deleteUserStory(999);
+        });
+
+        expect(delMock).not.toHaveBeenCalled();
+        // The real story is untouched.
+        expect(result.current.usMap[1]).toBeDefined();
+    });
+
+    it('reconciles with the server (re-fetch) when the DELETE rejects', async () => {
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_ID })],
+            my_permissions: ['view_us', 'delete_us'],
+        });
+        delMock.mockRejectedValueOnce(new Error('server rejected the delete'));
+
+        const { result } = await renderLoaded();
+        getMock.mockClear();
+
+        await act(async () => {
+            await result.current.deleteUserStory(1);
+        });
+
+        // The optimistic prune is reconciled with the server by reloading the
+        // board — proving the failure never throws out of deleteUserStory and
+        // leaves the UI consistent (mirrors the move() failure path).
+        await waitFor(() =>
+            expect(getMock).toHaveBeenCalledWith(
+                '/userstories',
+                expect.objectContaining({ project: PID }),
+            ),
         );
     });
 });

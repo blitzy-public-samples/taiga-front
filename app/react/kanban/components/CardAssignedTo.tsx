@@ -32,6 +32,7 @@
 
 import type { MouseEvent } from 'react';
 import type { BoardCard, Project, AssignedUser } from '../../shared/types';
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link CardAssignedTo}.
@@ -148,9 +149,15 @@ export function CardAssignedTo(props: CardAssignedToProps) {
         // carried only `title` + `src` (no `alt`), reproduced exactly.
         // i18n: title = COMMON.ASSIGNED_TO.NOT_ASSIGNED.
         <div className="card-user-avatar card-not-assigned">
-          <img title="Not assigned" src={`${version}/images/unnamed.png`} />
+          <img
+            title={translate('COMMON.ASSIGNED_TO.NOT_ASSIGNED', undefined, 'Not assigned')}
+            alt={translate('COMMON.ASSIGNED_TO.NOT_ASSIGNED', undefined, 'Not assigned')}
+            src={`${version}/images/unnamed.png`}
+          />
           {visible('assigned_to_extended') && (
-            <span className="card-not-assigned-title">Not assigned</span>
+            <span className="card-not-assigned-title">
+              {translate('COMMON.ASSIGNED_TO.NOT_ASSIGNED', undefined, 'Not assigned')}
+            </span>
           )}
         </div>
       )}
@@ -168,8 +175,27 @@ export function CardAssignedTo(props: CardAssignedToProps) {
             const showExtra = index === 2 && assignedCount > 3;
             const extraCount = assignedCount - 2;
 
+            // F-UI-04: the assignee avatar was a clickable `<div>` with no
+            // keyboard behaviour or accessible name. It is now a NATIVE
+            // `<button>` (focusable + Enter/Space-operable) named after the
+            // assignee (or the assign action when the "+N" chip is shown). The
+            // visual `.card-user-avatar` class is preserved for the SCSS.
+            const previewLabel = showExtra
+              ? translate(
+                  'COMMON.CARD.EXTRA_ASSIGNED_USERS',
+                  { total: extraCount },
+                  `${extraCount} more assigned users`,
+                )
+              : avatar.fullName ||
+                translate('COMMON.ASSIGNED_TO.ASSIGN', undefined, 'Assign');
             return (
-              <div className="card-user-avatar" key={assignedUser.id} onClick={handleAvatarClick}>
+              <button
+                type="button"
+                className="card-user-avatar"
+                key={assignedUser.id}
+                aria-label={previewLabel}
+                onClick={handleAvatarClick}
+              >
                 {showImage && (
                   <img
                     src={avatar.url}
@@ -180,16 +206,33 @@ export function CardAssignedTo(props: CardAssignedToProps) {
                 )}
                 {showExtra && (
                   // i18n: title = COMMON.CARD.EXTRA_ASSIGNED_USERS = "{{total}} more assigned users".
-                  <span className="extra-assigned" title={`${extraCount} more assigned users`}>
+                  <span
+                    className="extra-assigned"
+                    title={translate(
+                      'COMMON.CARD.EXTRA_ASSIGNED_USERS',
+                      { total: extraCount },
+                      `${extraCount} more assigned users`,
+                    )}
+                  >
                     {`${extraCount}+`}
                   </span>
                 )}
-              </div>
+              </button>
             );
           })
         ) : (
           // Fallback branch: a single `assigned_to` with no preview array.
-          <div className="card-user-avatar" onClick={handleAvatarClick}>
+          // F-UI-04: native `<button>` (was a clickable `<div>`), named after the
+          // assignee; `.card-user-avatar` class preserved for the SCSS.
+          <button
+            type="button"
+            className="card-user-avatar"
+            aria-label={
+              singleAvatar?.fullName ||
+              translate('COMMON.ASSIGNED_TO.ASSIGN', undefined, 'Assign')
+            }
+            onClick={handleAvatarClick}
+          >
             {singleAvatar && (
               <img
                 src={singleAvatar.url}
@@ -210,7 +253,7 @@ export function CardAssignedTo(props: CardAssignedToProps) {
                 </svg>
               </div>
             )}
-          </div>
+          </button>
         ))}
     </div>
   );

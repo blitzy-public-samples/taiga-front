@@ -149,8 +149,29 @@ export interface BacklogState {
     firstUsInBacklog?: number;
     /** Overall initial-load flag (init true). */
     loading: boolean;
+    /**
+     * F-AAP-10: whether the LAST full/initial load (or a live refresh) FAILED.
+     * This is deliberately DISTINCT from "loaded but empty": the AngularJS
+     * source never conflated the two, but the first React cut swallowed load
+     * errors in the effect `catch` and merely cleared `loading`, so a failed
+     * initial load rendered IDENTICALLY to a legitimately empty backlog (a
+     * "successful empty screen"). With this flag the container can render a
+     * genuine error state (with a retry affordance) instead of the empty-backlog
+     * CTA. Set `true` when a load/refresh rejects; cleared at the start of every
+     * (re)load attempt and on a successful load. Init `false`.
+     */
+    loadError: boolean;
     /** Pagination in-flight flag (source `loadingUserstories`; init false). */
     loadingUserstories: boolean;
+    /**
+     * The most recent DRAG/REORDER write error, or `null` when the last reorder
+     * succeeded (or none has run). F-AAP-03: a rejected `bulkUpdateBacklogOrder`
+     * must be SURFACED rather than silently swallowed, so the UI can tell the
+     * user the move did not persist and the board is being reconciled. Set by
+     * the hook's queue processor on a failed write; cleared on the next
+     * optimistic move and on a successful server reconcile.
+     */
+    moveError: string | null;
 }
 
 /* ========================================================================== *
@@ -187,7 +208,9 @@ export const initialBacklogState: BacklogState = {
     newUs: [],
     firstUsInBacklog: undefined,
     loading: true,
+    loadError: false,
     loadingUserstories: false,
+    moveError: null,
 };
 
 /* ========================================================================== *
@@ -350,6 +373,17 @@ function calculateForecastingInto(draft: BacklogState): void {
 export type BacklogAction =
     /** Toggle the overall initial-load flag. */
     | { type: 'setLoading'; loading: boolean }
+    /** F-AAP-10: set/clear the initial-or-refresh load-failure flag. */
+    | { type: 'setLoadError'; error: boolean }
+    /**
+     * F-CQ-05: set/clear the pagination in-flight flag. The hook sets this
+     * `true` when a "load more" page fetch starts; the `setUserstories` /
+     * `appendUserstories` cases reset it to `false` when a batch lands, and the
+     * hook's `loadMore` `catch` resets it on failure. Nothing set this flag
+     * `true` before (it was write-only-`false`), so the load-more spinner and
+     * the in-flight guard were dead.
+     */
+    | { type: 'setLoadingUserstories'; loading: boolean }
     /** Store the loaded project + derive `isBacklogActivated` + seed swimlanes. */
     | { type: 'setProject'; project: Project }
     /** REPLACE the backlog list (resetPagination): sort + full derived recompute. */
@@ -390,6 +424,11 @@ export type BacklogAction =
     | { type: 'addUsOptimistic'; userstories: UserStory[]; position: 'top' | 'bottom' }
     /** Optimistically remove a story from the backlog list (deleteUserStory). */
     | { type: 'removeUsOptimistic'; usId: number }
+    /**
+     * Optimistically replace a single story in place by id (F-CQ-03 inline
+     * status / points edit). Preserves list position; recomputes derived state.
+     */
+    | { type: 'replaceUs'; us: UserStory }
     /** OPTIMISTIC drag move (backlog <-> sprint <-> sprint / reorder). */
     | {
           type: 'moveUs';
@@ -403,7 +442,8 @@ export type BacklogAction =
     | {
           type: 'reconcileMoveResult';
           updatedRows: Array<{ id: number; milestone: number | null; backlog_order?: number }>;
-      };
+      }
+    | { type: 'setMoveError'; message: string | null };
 
 /* ========================================================================== *
  * Phase 5-7 — backlogReducer
@@ -418,6 +458,18 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
         switch (action.type) {
             case 'setLoading': {
                 draft.loading = action.loading;
+                break;
+            }
+
+            case 'setLoadError': {
+                // F-AAP-10: surface a failed load instead of swallowing it.
+                draft.loadError = action.error;
+                break;
+            }
+
+            case 'setLoadingUserstories': {
+                // F-CQ-05: the load-more page fetch is in flight.
+                draft.loadingUserstories = action.loading;
                 break;
             }
 
@@ -546,7 +598,16 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
             }
 
             case 'toggleTags': {
-                // Persistence (storeShowTags) is the hook's concern (L236-239, L501-502).
+                // The reducer owns ONLY the in-memory flag flip. F-CQ-09: the
+                // project-scoped PERSISTENCE (`storeShowTags`) and REHYDRATION
+                // (`getShowTags`) genuinely live in the hook (`useBacklog`) — it
+                // writes `localStorage` whenever `toggleTags` is dispatched and
+                // reads it back on mount per `projectId`, reproducing the
+                // AngularJS `rs.userstories.storeShowTags` / `getShowTags`
+                // behaviour (`main.coffee:236-239,501-502`,
+                // `resources/userstories.coffee:169-177`). This comment previously
+                // claimed the hook persisted but the hook did NOT — that
+                // ownership mismatch is now resolved by making the claim TRUE.
                 draft.showTags =
                     action.showTags !== undefined ? action.showTags : !draft.showTags;
                 break;
@@ -615,6 +676,21 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
                 break;
             }
 
+            case 'replaceUs': {
+                // F-CQ-03 inline single-story edit (status / points). Replace the
+                // story in place by id, preserving its list position, then
+                // recompute derived state so the row re-renders with the new
+                // status colour / points value. Mirrors the AngularJS in-scope
+                // model mutation (`us.status = ...` / `us.points = ...`) that
+                // preceded `@repo.save(us)`; the hook owns the persistence.
+                const index = draft.userstories.findIndex((u) => u.id === action.us.id);
+                if (index > -1) {
+                    draft.userstories[index] = action.us;
+                    recomputeBacklogDerived(draft);
+                }
+                break;
+            }
+
             case 'moveUs': {
                 // -----------------------------------------------------------------
                 // Phase 6 — OPTIMISTIC in-memory move ONLY (reproduces the `if ctx`
@@ -626,6 +702,10 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
                 if (usList.length === 0) {
                     break;
                 }
+
+                // F-AAP-03: a fresh drag starts optimistically clean — clear any
+                // stale reorder error so it does not linger over a new move.
+                draft.moveError = null;
 
                 // oldSprintId = usList[0].milestone (L524). A backlog story => null.
                 const oldSprintId: number | null = usList[0].milestone ?? null;
@@ -750,6 +830,17 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
                 applyTo(draft.userstories);
                 draft.sprints.forEach((s) => applyTo(s.user_stories));
                 draft.closedSprints.forEach((s) => applyTo(s.user_stories));
+                // F-AAP-03: a successful server reconcile clears any prior
+                // reorder error — the board now reflects server truth.
+                draft.moveError = null;
+                break;
+            }
+
+            case 'setMoveError': {
+                // F-AAP-03: surface (or clear) the drag/reorder write error so the
+                // UI can report a move that did not persist. The hook sets this on
+                // a rejected `bulkUpdateBacklogOrder` and clears it (via `null`).
+                draft.moveError = action.message;
                 break;
             }
 

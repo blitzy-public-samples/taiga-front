@@ -343,4 +343,96 @@ describe('UsRolePointsSelector', () => {
       expect(queryPopover(container)).toBeNull();
     });
   });
+
+  /* ------------------------------------------------------------------ *
+   * F-UI-02 / F-UI-04 / F-UI-06 — sprite icon, accessibility, i18n
+   * ------------------------------------------------------------------ */
+  describe('F-UI-04 accessible disclosure control', () => {
+    it('renders the interactive header as a native <button> with disclosure semantics', () => {
+      const { container } = renderSelector(makeProject(), null, jest.fn());
+
+      const header = getHeader(container);
+      // Was a clickable <span>; now a real <button> — focusable + Enter/Space-operable.
+      expect(header.tagName).toBe('BUTTON');
+      expect(header).toHaveAttribute('type', 'button');
+      expect(header).toHaveAttribute('aria-haspopup', 'true');
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+      // Accessible name from BACKLOG.TABLE.TITLE_COLUMN_POINTS.
+      expect(header).toHaveAttribute('aria-label', 'Select view per Role');
+    });
+
+    it('reflects the open/closed state through aria-expanded', () => {
+      const { container } = renderSelector(makeProject(), null, jest.fn());
+
+      const header = getHeader(container);
+      expect(header).toHaveAttribute('aria-expanded', 'false');
+
+      fireEvent.click(header);
+      expect(getHeader(container)).toHaveAttribute('aria-expanded', 'true');
+
+      fireEvent.click(getHeader(container));
+      expect(getHeader(container)).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('renders the inert header as a plain non-button <span>', () => {
+      const project = makeProject({
+        roles: [{ id: 1, name: 'Back', slug: 'back', computable: true, order: 1 }],
+      });
+      const { container } = renderSelector(project, null, jest.fn());
+
+      const header = getHeader(container);
+      expect(header.tagName).toBe('SPAN');
+      expect(header).toHaveClass('not-clickable');
+    });
+
+    it('exposes the popover as an ARIA menu with keyboard-operable menuitems', () => {
+      const onSelectRole = jest.fn();
+      const { container } = renderSelector(makeProject(), null, onSelectRole);
+
+      openPopover(container);
+      const popover = getPopover(container);
+      expect(popover).toHaveAttribute('role', 'menu');
+
+      // Every entry is a focusable menuitem (tabIndex 0).
+      const items = popover.querySelectorAll<HTMLElement>('[role="menuitem"]');
+      expect(items.length).toBe(3); // clear-selection + Back + Front
+      items.forEach((item) => expect(item).toHaveAttribute('tabindex', '0'));
+
+      // Pressing Enter on a role entry selects it (keyboard activation).
+      const backRole = within(popover).getByText('Back');
+      fireEvent.keyDown(backRole, { key: 'Enter' });
+      expect(onSelectRole).toHaveBeenCalledWith(1);
+      // …and closes the popover.
+      expect(queryPopover(container)).toBeNull();
+    });
+  });
+
+  describe('F-UI-02 sprite icon (shared TgSvg)', () => {
+    it('renders the filter affordance as a <tg-svg> sprite host', () => {
+      const { container } = renderSelector(makeProject(), null, jest.fn());
+
+      const host = container.querySelector('tg-svg');
+      expect(host).toBeInTheDocument();
+      const use = host?.querySelector('svg.icon.icon-filter use');
+      expect(use).toBeInTheDocument();
+      expect(use).toHaveAttribute('href', '#icon-filter');
+    });
+  });
+
+  describe('F-UI-06 localized copy', () => {
+    it('shows the localized default "Points" header and "All points" clear entry', () => {
+      const { container } = renderSelector(makeProject(), null, jest.fn());
+
+      // Default header label reads COMMON.FIELDS.POINTS.
+      expect(getHeader(container)).toHaveTextContent('Points');
+
+      openPopover(container);
+      const clear = container.querySelector<HTMLElement>(
+        '.popover.pop-role .clear-selection',
+      );
+      // Clear entry reads COMMON.ROLES.ALL for both its text and title.
+      expect(clear).toHaveTextContent('All points');
+      expect(clear).toHaveAttribute('title', 'All points');
+    });
+  });
 });

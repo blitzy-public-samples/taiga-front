@@ -66,46 +66,18 @@ import { useDroppable, useDraggable } from '@dnd-kit/core';
 import { UsEditSelector } from './UsEditSelector';
 import { UsRolePointsSelector } from './UsRolePointsSelector';
 
-import { can } from '../../shared/permissions';
+import { canMutate } from '../../shared/permissions';
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration — icons used here: `icon-draggable`,
+// `icon-clock`, `icon-arrow-down`). F-UI-06: the shared translation bridge for
+// the column headers and status/points tooltips (`BACKLOG.TABLE.*`,
+// `COMMON.FIELDS.*`, `BACKLOG.STATUS_NAME`). F-UI-07: the shared emoji renderer
+// so `us.subject` reproduces the legacy `ng-bind-html="us.subject | emojify"`.
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
+import { emojify } from '../../shared/emoji';
 
 import type { UserStory, Status, Project, Tag } from '../../shared/types';
-
-/*
- * Taiga renders inline SVG sprites through its `<tg-svg>` web component, which
- * is not a standard HTML element, so we widen the JSX intrinsic-element table
- * locally (mirroring the sibling backlog/kanban components). Typed `any` because
- * the element is opaque to React/TS and is resolved by the existing sprite
- * runtime at render time. (Duplicate ambient merges across sibling modules are
- * harmless.)
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup. The inner `<svg>` carries the `icon <name>`
- * classes the retained SCSS targets, and `<use>` references the sprite by id.
- * `className` is forwarded onto the custom element for parity with the shared
- * convention. Icons used by this table: `icon-draggable` (row drag handle),
- * `icon-clock` (due-date), `icon-arrow-down` (status disclosure); the header
- * `icon-filter` and the per-row `icon-more-vertical` are rendered by the nested
- * {@link UsRolePointsSelector} / {@link UsEditSelector}.
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
 
 /**
  * Props for {@link BacklogTable}.
@@ -167,8 +139,12 @@ export interface BacklogTableProps {
    * directive's `$repo.save(us).then -> onUpdate`).
    */
   onUpdateStatus: (us: UserStory, newStatusId: number) => void;
-  /** Optional points-cell click → the container opens the points editor. */
-  onEditPoints?: (us: UserStory, roleId: number | null) => void;
+  /**
+   * F-CQ-03 points-estimate change: the inline popover chose `pointId` for
+   * `roleId`; the container PATCHes `us.points` + reloads stats. Absent → the
+   * points cell renders read-only.
+   */
+  onUpdatePoints?: (us: UserStory, roleId: number, pointId: number) => void;
 }
 
 /**
@@ -191,7 +167,7 @@ interface BacklogRowProps {
   onMoveUsToTop: (us: UserStory) => void;
   onToggleCheck: (us: UserStory, checked: boolean, shiftKey: boolean) => void;
   onUpdateStatus: (us: UserStory, newStatusId: number) => void;
-  onEditPoints?: (us: UserStory, roleId: number | null) => void;
+  onUpdatePoints?: (us: UserStory, roleId: number, pointId: number) => void;
 }
 
 /**
@@ -205,6 +181,18 @@ interface ComputableRole {
   id: number;
   name: string;
   computable?: boolean;
+}
+
+/**
+ * A project estimation point option (`project.points`, `_.sortBy(…, "order")`,
+ * `main.coffee:479`). `name` is the label shown in the estimate popover ("1",
+ * "?", "∞", …); `value` is numeric (or `null` for the unestimated `?`).
+ */
+interface ProjectPoint {
+  id: number;
+  name: string;
+  value?: number | null;
+  order?: number;
 }
 
 /**
@@ -258,7 +246,7 @@ const BacklogRow = ({
   onMoveUsToTop,
   onToggleCheck,
   onUpdateStatus,
-  onEditPoints,
+  onUpdatePoints,
 }: BacklogRowProps): JSX.Element => {
   // Draggable registration. `disabled: !canModify` reproduces the legacy
   // `modify_us` gate on `backlog/sortable.coffee`. The row is the draggable
@@ -308,6 +296,44 @@ const BacklogRow = ({
     };
   }, [statusOpen]);
 
+  // F-CQ-03 points-estimate popover state (reproduces `tgBacklogUsPoints` /
+  // `renderRolesSelector` + `renderPointsSelector`). `pointsOpen` is the
+  // popover flag; `pointsEditRole` is the role currently being estimated —
+  // `null` means the role picker is still showing (multiple computable roles,
+  // none pre-selected), matching the directive's two-step flow.
+  const [pointsOpen, setPointsOpen] = useState(false);
+  const [pointsEditRole, setPointsEditRole] = useState<number | null>(null);
+  const pointsRef = useRef<HTMLDivElement>(null);
+
+  // Outside-click + Escape closing for the points popover (same pattern as the
+  // status popover; listeners exist only while it is open).
+  useEffect(() => {
+    if (!pointsOpen) {
+      return;
+    }
+
+    const onDocumentMouseDown = (event: globalThis.MouseEvent) => {
+      const root = pointsRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setPointsOpen(false);
+      }
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPointsOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', onDocumentMouseDown);
+    document.addEventListener('keydown', onKeyDown);
+
+    return () => {
+      document.removeEventListener('mousedown', onDocumentMouseDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [pointsOpen]);
+
   // Fields that are NOT on the trimmed `UserStory` type (`is_blocked`, `new`,
   // `due_date`, `epics`) are read through the type's `[key: string]: unknown`
   // index signature via a single documented cast.
@@ -330,6 +356,29 @@ const BacklogRow = ({
   ).filter((r) => r.computable);
   const totalPoints = us.total_points ?? 0;
   const editable = canModify && computableRoles.length > 0;
+
+  // F-CQ-03 points-estimate popover data. Point OPTIONS come from
+  // `project.points` (`_.sortBy(…, "order")`, main.coffee:479) — no estimation
+  // service needed. When there is exactly one computable role it is
+  // pre-resolved (the directive's single-role preselect); otherwise the popover
+  // shows a role picker first.
+  const projectPoints = (
+    (project.points as ProjectPoint[] | undefined) ?? []
+  )
+    .slice()
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const singleRoleId = computableRoles.length === 1 ? computableRoles[0].id : null;
+  // Role resolved for editing: the header filter selection, else the sole role.
+  const resolvedEditRole = selectedRoleId ?? singleRoleId;
+
+  const openPointsPopover = (): void => {
+    setPointsEditRole(resolvedEditRole);
+    setPointsOpen(true);
+  };
+  const choosePoint = (roleId: number, pointId: number): void => {
+    setPointsOpen(false);
+    onUpdatePoints?.(us, roleId, pointId);
+  };
 
   // The US detail href (mirrors `tg-nav="project-userstories-detail:…"` with the
   // optional `tg-nav-get-params`). The subject is rendered as PLAIN TEXT: the
@@ -361,7 +410,7 @@ const BacklogRow = ({
             {...attributes}
             {...(listeners ?? {})}
           >
-            {svgIcon('icon-draggable')}
+            <TgSvg icon="icon-draggable" />
           </div>
         )}
         {/* Selection checkbox — only rendered with `modify_us`. */}
@@ -380,6 +429,17 @@ const BacklogRow = ({
                 name="filter-mode"
                 id={`us-check-${us.ref}`}
                 checked={isChecked}
+                /*
+                  F-UI-04: the legacy `<label for>` carried NO text, so the
+                  bulk-select checkbox had no accessible name. Give it one via a
+                  localised `aria-label` (forward-compatible key + descriptive
+                  English fallback) referencing the story it selects.
+                */
+                aria-label={translate(
+                  'BACKLOG.SELECT_US',
+                  { ref: us.ref },
+                  `Select user story #${us.ref}`,
+                )}
                 onClick={(e) =>
                   onToggleCheck(us, e.currentTarget.checked, e.nativeEvent.shiftKey)
                 }
@@ -397,8 +457,15 @@ const BacklogRow = ({
         <a className="user-story-link" href={usHref}>
           {/* Ref number (mirrors `tg-bo-ref="us.ref"`). */}
           <span className="user-story-number">{`#${us.ref}`}</span>
-          {/* Subject as PLAIN TEXT — original `| emojify`; no dangerouslySetInnerHTML. */}
-          <span className="user-story-name">{us.subject}</span>
+          {/*
+            F-UI-07: the original bound `us.subject | emojify` via ng-bind-html
+            (`backlog-row.jade`). `emojify()` reproduces that filter — parsing
+            `:shortcode:` tokens into `<img class="emoji">` React nodes — WITHOUT
+            `dangerouslySetInnerHTML`: it emits safe React elements, so the story
+            subject renders emoji exactly as the AngularJS screen did while
+            remaining XSS-safe.
+          */}
+          <span className="user-story-name">{emojify(us.subject)}</span>
         </a>
         {/*
           Due date — simplified `tgDueDate` reproduction (render-only): preserves
@@ -407,7 +474,7 @@ const BacklogRow = ({
         */}
         {dueDate && (
           <span className="due-date" title={dueDate}>
-            {svgIcon('icon-clock', 'due-date-icon')}
+            <TgSvg icon="icon-clock" className="due-date-icon" />
           </span>
         )}
         {/* Tag pills — only when `showTags`; the final tag also carries `last`. */}
@@ -447,9 +514,16 @@ const BacklogRow = ({
         <a
           className={`us-status${canModify ? '' : ' not-clickable'}`}
           href="#"
-          /* i18n: BACKLOG.STATUS_NAME */
-          title="Status Name"
+          /* F-UI-06: BACKLOG.STATUS_NAME. */
+          title={translate('BACKLOG.STATUS_NAME', undefined, 'Status Name')}
           style={{ color: currentStatus?.color }}
+          /*
+            F-UI-04: when editable this anchor is a disclosure control — expose
+            the popup relationship + open state to assistive tech (invisible; no
+            visual change). The `<a href="#">` is already keyboard-focusable.
+          */
+          aria-haspopup={canModify ? 'menu' : undefined}
+          aria-expanded={canModify ? statusOpen : undefined}
           onClick={
             canModify
               ? (e) => {
@@ -460,12 +534,16 @@ const BacklogRow = ({
           }
         >
           <span className="us-status-bind">{currentStatus?.name}</span>
-          {canModify && svgIcon('icon-arrow-down')}
+          {canModify && <TgSvg icon="icon-arrow-down" />}
         </a>
         {canModify && statusOpen && (
-          <ul className="popover pop-status">
+          <ul
+            className="popover pop-status"
+            role="menu"
+            aria-label={translate('COMMON.FIELDS.STATUS', undefined, 'Status')}
+          >
             {statuses.map((status) => (
-              <li className="popover-status" key={status.id}>
+              <li className="popover-status" key={status.id} role="none">
                 {/*
                   DEVIATION: the original `popover-us-status.jade` put
                   `id="js-status-btn"` on EVERY `a.status`; reproducing that would
@@ -480,6 +558,7 @@ const BacklogRow = ({
                       : ''
                   }`}
                   href="#"
+                  role="menuitem"
                   title={status.name}
                   data-status-id={status.id}
                   onClick={(e) => {
@@ -500,21 +579,22 @@ const BacklogRow = ({
 
       {/*
         Points cell (inline `tgBacklogUsPoints` display). Render-only: NO inline
-        points-edit popover (the full `pop-role`/`pop-points` editing flow is out
-        of scope per the AAP); the optional `onEditPoints` callback lets the
-        container own editing later. `us.points` is `Record<string, number>` in
-        the trimmed type (role id → numeric points), so we render the numeric
-        value — the original resolved a point NAME via `pointsById`.
+        F-CQ-03: the estimate is now EDITABLE. Clicking the cell (with
+        `modify_us` + ≥1 computable role) opens the two-step popover — a role
+        picker (`pop-role`) when >1 role and none pre-selected, then a
+        point-value list (`pop-points`) from `project.points`. Picking a value
+        calls `onUpdatePoints(us, roleId, pointId)`; the container PATCHes
+        `us.points` + reloads stats. When not editable the cell stays
+        `not-clickable` (display only). `us.points` is `Record<string, number>`
+        (role id → point id); the display renders the numeric value.
       */}
-      <div className="points">
+      <div className="points" ref={pointsRef}>
         <button
           type="button"
           className={`us-points${editable ? '' : ' not-clickable'}`}
-          onClick={
-            editable && onEditPoints
-              ? () => onEditPoints(us, selectedRoleId)
-              : undefined
-          }
+          onClick={editable ? openPointsPopover : undefined}
+          aria-haspopup={editable ? 'menu' : undefined}
+          aria-expanded={editable ? pointsOpen : undefined}
         >
           <span className="points-value">
             {selectedRoleId == null || computableRoles.length <= 1 ? (
@@ -527,6 +607,68 @@ const BacklogRow = ({
             )}
           </span>
         </button>
+        {editable && pointsOpen && pointsEditRole == null && (
+          /* Step 1 — role picker (renderRolesSelector): only when >1 computable
+             role and none pre-selected via the header filter. */
+          <ul
+            className="popover pop-role"
+            role="menu"
+            aria-label={translate(
+              'BACKLOG.TABLE.TITLE_COLUMN_POINTS',
+              undefined,
+              'Select view per Role',
+            )}
+          >
+            {computableRoles.map((role) => (
+              <li key={role.id} role="none">
+                <a
+                  className="role"
+                  href="#"
+                  role="menuitem"
+                  title={role.name}
+                  data-role-id={role.id}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setPointsEditRole(role.id);
+                  }}
+                >
+                  <span className="item-text">{role.name}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
+        {editable && pointsOpen && pointsEditRole != null && (
+          /* Step 2 — point-value list (renderPointsSelector) for the resolved
+             role. */
+          <ul
+            className="popover pop-points"
+            role="menu"
+            aria-label={translate('COMMON.FIELDS.POINTS', undefined, 'Points')}
+          >
+            {projectPoints.map((point) => (
+              <li key={point.id} role="none">
+                <a
+                  className={`point${
+                    us.points?.[String(pointsEditRole)] === point.id
+                      ? ' active-popover'
+                      : ''
+                  }`}
+                  href="#"
+                  role="menuitem"
+                  title={point.name}
+                  data-point-id={point.id}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    choosePoint(pointsEditRole, point.id);
+                  }}
+                >
+                  <span className="item-text">{point.name}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {/*
@@ -583,12 +725,13 @@ export const BacklogTable = ({
   onMoveUsToTop,
   onToggleCheck,
   onUpdateStatus,
-  onEditPoints,
+  onUpdatePoints,
 }: BacklogTableProps): JSX.Element => {
   // Whether the current user may modify user stories — computed once and passed
   // down to every row (drives the drag handle, checkbox, options and the
   // clickable status). Mirrors the legacy `tg-check-permission="modify_us"`.
-  const canModify = can(project, 'modify_us');
+  // F-REG-03: story-editing affordance -> archive-aware mutation gate.
+  const canModify = canMutate(project, 'modify_us');
 
   // Header role filter — INTERNAL state (NOT a prop). `null` = "All points".
   const [selectedRoleId, setSelectedRoleId] = useState<number | null>(null);
@@ -646,13 +789,22 @@ export const BacklogTable = ({
           {canModify && <div className="draggable-us-column" />}
           {canModify && <div className="input" />}
           <div className="user-stories">
-            {/* i18n: BACKLOG.TABLE.COLUMN_US */}User Story
+            {/* F-UI-06: BACKLOG.TABLE.COLUMN_US */}
+            {translate('BACKLOG.TABLE.COLUMN_US', undefined, 'User Story')}
           </div>
           <div className="status">
-            {/* i18n: COMMON.FIELDS.STATUS */}Status
+            {/* F-UI-06: COMMON.FIELDS.STATUS */}
+            {translate('COMMON.FIELDS.STATUS', undefined, 'Status')}
           </div>
-          {/* i18n: BACKLOG.TABLE.TITLE_COLUMN_POINTS */}
-          <div className="points" title="Select view per Role">
+          {/* F-UI-06: BACKLOG.TABLE.TITLE_COLUMN_POINTS */}
+          <div
+            className="points"
+            title={translate(
+              'BACKLOG.TABLE.TITLE_COLUMN_POINTS',
+              undefined,
+              'Select view per Role',
+            )}
+          >
             {/*
               `UsRolePointsSelector` renders the `.inner` root itself (inner +
               header-points + icon-filter + popover), so it is mounted directly
@@ -696,7 +848,7 @@ export const BacklogTable = ({
             onMoveUsToTop={onMoveUsToTop}
             onToggleCheck={onToggleCheck}
             onUpdateStatus={onUpdateStatus}
-            onEditPoints={onEditPoints}
+            onUpdatePoints={onUpdatePoints}
           />
         ))}
         {loading && <div className="loading" />}

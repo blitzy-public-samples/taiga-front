@@ -217,3 +217,157 @@ export function getRefreshToken(): string | null {
 export function getSessionId(): string | null {
     return window.taiga?.sessionId ?? null;
 }
+
+/* ========================================================================== *
+ * Phase 4 — Preferred-language accessor (read fresh on every call)
+ * ========================================================================== */
+
+/**
+ * Return the language tag the React screens must send as `Accept-Language`,
+ * reproducing the AngularJS data-layer contract EXACTLY.
+ *
+ * SOURCE OF TRUTH (`app/coffee/modules/base/http.coffee:25-28`)
+ *   `$tgHttp` — the general HTTP service that `resources.coffee` (and therefore
+ *   every user-story / milestone request the React `client.ts` replaces) routes
+ *   through — attaches `Accept-Language: <lang>` on EVERY verb, where
+ *   `<lang> = $translate.preferredLanguage()`. So this header is not optional or
+ *   verb-specific: to be byte-for-byte indistinguishable from AngularJS traffic
+ *   the React client must send it on GET, POST, PATCH, PUT and DELETE alike.
+ *
+ * RESOLUTION ORDER (most-live first, mirroring how the shell derives the value)
+ *   1. `document.documentElement.lang` — `i18nInit` sets `<html lang="…">` on
+ *      every `$translateChangeEnd` (`app.coffee:859`), so this reflects the
+ *      language the user is CURRENTLY viewing, including any runtime switch.
+ *      This is the single most faithful mirror of `preferredLanguage()` in a
+ *      live session, and it automatically tracks language changes with no
+ *      caching.
+ *   2. `userInfo.lang` from `localStorage.userInfo` — the persisted per-user
+ *      preference that SEEDS `preferredLanguage()` at bootstrap
+ *      (`app.coffee:793-796`, `.preferredLanguage(preferedLangCode)` at :805).
+ *      Used when React renders before the first `$translateChangeEnd` has
+ *      stamped `<html lang>`.
+ *   3. `window.taigaConfig.defaultLanguage` — the instance-wide default, the
+ *      next term of the same coffee expression (`app.coffee:796`).
+ *   4. `"en"` — angular-translate's `fallbackLanguage("en")` (`app.coffee:808`),
+ *      the final backstop so the header is always well-formed.
+ *
+ * Returns `null` only in the (practically impossible) case that every source is
+ * absent AND the `"en"` backstop is somehow unreachable; callers then simply
+ * omit the header, matching AngularJS when `preferredLanguage()` is falsy.
+ *
+ * @returns The BCP-47 language tag to send, or `null` when none is resolvable.
+ */
+export function getLanguage(): string | null {
+    // 1. Live current language stamped on <html> by i18nInit.
+    const htmlLang = document.documentElement.getAttribute('lang');
+    if (htmlLang) {
+        return htmlLang;
+    }
+
+    // 2. Persisted per-user preference (localStorage.userInfo is a JSON object,
+    //    not a `$tgStorage` string, so it is parsed directly here).
+    const rawUserInfo = localStorage.getItem('userInfo');
+    if (rawUserInfo) {
+        try {
+            const userInfo = JSON.parse(rawUserInfo) as { lang?: unknown };
+            if (typeof userInfo.lang === 'string' && userInfo.lang) {
+                return userInfo.lang;
+            }
+        } catch {
+            // Corrupt userInfo — fall through to the config/default chain,
+            // exactly as the coffee `userInfo?.lang` would yield undefined.
+        }
+    }
+
+    // 3. Instance default from runtime config.
+    const configured = getConfig().defaultLanguage;
+    if (configured) {
+        return configured;
+    }
+
+    // 4. angular-translate's fallbackLanguage backstop.
+    return 'en';
+}
+
+/* ========================================================================== *
+ * Phase 5 — Token mutators & logout (used by the client's 401 refresh machine)
+ *
+ * These write the SAME `localStorage` keys, JSON-encoded the SAME way, as the
+ * AngularJS auth service (`auth.coffee`) and its 401 interceptor
+ * (`app.coffee:608-707`). They exist so `shared/api/client.ts` can port the
+ * shell's single-flight token-refresh/retry/logout state machine for the React
+ * screens — whose `fetch` calls are NOT intercepted by the AngularJS
+ * `$httpProvider` interceptor and therefore must refresh their own token to stay
+ * behaviourally identical to AngularJS traffic (review finding F-SEC-02).
+ *
+ * A React-initiated refresh and an AngularJS-initiated refresh remain mutually
+ * consistent precisely because both read and write these identical keys.
+ * ========================================================================== */
+
+/**
+ * Persist a freshly-minted JWT access token, JSON-encoded under the literal key
+ * `"token"` — byte-for-byte how `auth.coffee`'s `setToken` →
+ * `$tgStorage.set("token", …)` stores it (`auth.coffee:136-137`,
+ * `base/storage.coffee:27-32`). The very next `getAuthToken()` (and thus the
+ * next `Authorization: Bearer` header) picks it up because nothing is cached.
+ *
+ * @param token The new raw JWT string returned by `/auth/refresh`
+ *              (`responseRefresh.data.auth_token`, `app.coffee:632`).
+ */
+export function setAuthToken(token: string): void {
+    localStorage.setItem('token', JSON.stringify(token));
+}
+
+/**
+ * Persist a freshly-minted refresh token, JSON-encoded under the literal key
+ * `"refresh"`, mirroring `auth.coffee`'s `setRefreshToken` →
+ * `$tgStorage.set("refresh", …)` (`auth.coffee:130-131`).
+ *
+ * @param token The new refresh token returned by `/auth/refresh`
+ *              (`responseRefresh.data.refresh`, `app.coffee:633`).
+ */
+export function setRefreshToken(token: string): void {
+    localStorage.setItem('refresh', JSON.stringify(token));
+}
+
+/**
+ * Clear the stored session on an unrecoverable auth failure, removing exactly
+ * the three keys the AngularJS interceptor's `errorToken` path removes: the
+ * access `token`, the `refresh` token, and the cached `userInfo`
+ * (`app.coffee:627-628,636-641` → `storage.remove("refresh")` +
+ * `removeUser()` which removes `token` and `userInfo`; cf. `auth.coffee`
+ * `removeToken`/`clear`). After this, `getAuthToken()`/`getRefreshToken()`
+ * return `null`, so no stale or compromised credential is ever reused.
+ */
+export function clearSession(): void {
+    localStorage.removeItem('token');
+    localStorage.removeItem('refresh');
+    localStorage.removeItem('userInfo');
+}
+
+/**
+ * Navigate the whole client to the login screen after an unrecoverable auth
+ * failure, reproducing the AngularJS interceptor's default redirect
+ * `window.location.href = $navUrls.resolve("login") +
+ * '?unauthorized=true&next=' + nextUrl` (`app.coffee:643-645`).
+ *
+ * The login path is the same `/login` route the shell resolves
+ * (`base.coffee:42`), prefixed by the configured `baseHref` (default `/`), and
+ * `next` is the current in-app URL so the user returns where they were after
+ * re-authenticating. The assignment is wrapped in a `try/catch` because jsdom
+ * (unit-test environment) does not implement navigation and would otherwise
+ * throw; in a real browser the navigation proceeds normally.
+ */
+export function redirectToLogin(): void {
+    const baseHref = getConfig().baseHref ?? '/';
+    const loginBase = `${baseHref.replace(/\/+$/, '')}/login`;
+    const nextUrl = `${window.location.pathname}${window.location.search}`;
+    const target = `${loginBase}?unauthorized=true&next=${encodeURIComponent(nextUrl)}`;
+
+    try {
+        window.location.href = target;
+    } catch {
+        // jsdom has no navigation; swallowing keeps the transport total in unit
+        // tests. Real browsers navigate before this line can throw.
+    }
+}

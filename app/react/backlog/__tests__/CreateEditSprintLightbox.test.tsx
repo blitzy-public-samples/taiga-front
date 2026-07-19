@@ -68,6 +68,7 @@ import { render, screen, fireEvent, waitFor, within } from '@testing-library/rea
 import { CreateEditSprintLightbox } from '../components/CreateEditSprintLightbox';
 import { makeMilestone } from './factories';
 import { createMilestone, saveMilestone } from '../../shared/api/milestones';
+import { ApiError } from '../../shared/api/client';
 
 import type { Milestone } from '../../shared/types';
 
@@ -372,7 +373,7 @@ describe('CreateEditSprintLightbox', () => {
       expect(get(container, DATE_END)).toHaveValue('15 Feb 2021');
     });
 
-    it('calls saveMilestone with the sprint id + changed name and YYYY-MM-DD dates, then fires onSaved + onClose', async () => {
+    it('calls saveMilestone with ONLY the changed name + version (dates unchanged), then fires onSaved + onClose', async () => {
       const sprint = makeMilestone({
         id: 99,
         name: 'Sprint 9',
@@ -382,27 +383,44 @@ describe('CreateEditSprintLightbox', () => {
 
       const { container, onSaved, onClose } = renderLightbox({ mode: 'edit', sprint, projectId: 7 });
 
+      // Change ONLY the name; leave both dates at their prefilled values.
       typeInto(container, NAME, 'Sprint 9 edited');
       submitForm(container);
 
       await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
 
-      // The edit payload carries the sprint id, the new name, and the dates
-      // (round-tripped through the display format back to the wire format).
-      expect(mockSave).toHaveBeenCalledWith(
-        expect.objectContaining({
-          id: 99,
-          name: 'Sprint 9 edited',
-          estimated_start: '2021-02-01',
-          estimated_finish: '2021-02-15',
-        }),
-      );
+      // F-REG-05: minimal-diff PATCH — the body is EXACTLY the changed `name`
+      // plus the concurrency `version` (from the fixture, 1). The dates
+      // round-trip to their original wire values, so they are NOT in the diff,
+      // and NO whole-model fields (slug/closed/total_points/…) are sent.
+      expect(mockSave).toHaveBeenCalledWith(99, { name: 'Sprint 9 edited' }, 1);
 
       // Edit mode must never invoke the create endpoint.
       expect(mockCreate).not.toHaveBeenCalled();
 
       await waitFor(() => expect(onSaved).toHaveBeenCalledWith(savedMilestone));
       await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    });
+
+    it('includes a changed date in the diff (and omits an unchanged field)', async () => {
+      const sprint = makeMilestone({
+        id: 42,
+        name: 'Keep Name',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+
+      const { container } = renderLightbox({ mode: 'edit', sprint, projectId: 7 });
+
+      // Change ONLY the finish date; leave the name and start date untouched.
+      typeInto(container, DATE_END, '20 Feb 2021');
+      submitForm(container);
+
+      await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+
+      // Only the changed finish date rides in the diff (as YYYY-MM-DD), plus
+      // version; name and estimated_start are omitted because they did not change.
+      expect(mockSave).toHaveBeenCalledWith(42, { estimated_finish: '2021-02-20' }, 1);
     });
   });
 
@@ -504,6 +522,52 @@ describe('CreateEditSprintLightbox', () => {
       expect(onCreated).not.toHaveBeenCalled();
       expect(onClose).not.toHaveBeenCalled();
     });
+
+    it('reads the Django field + general errors from ApiError.body (F-REG-04), and does NOT leak the Error class name as a spurious field error', async () => {
+      // This is the PRIMARY F-REG-04 regression guard. The transport throws a
+      // real `ApiError`, whose parsed Django response body lives on `err.body`.
+      // The OLD (buggy) code read `err` directly, so it picked up the Error's
+      // OWN members — most damagingly `err.name`, which for an ApiError instance
+      // is the class name string `"ApiError"` — and fabricated a bogus `name`
+      // field error on EVERY failure while ignoring the real body payload.
+      //
+      // Here the backend body deliberately carries NO `name` key; it reports a
+      // `estimated_finish` field error plus a general `_error_message`. The fix
+      // must therefore: (a) surface the real body errors, and (b) show NO "name"
+      // field error at all — proving the class name never leaks.
+      const body = {
+        estimated_finish: ['Finish date must be after the start date'],
+        _error_message: 'Sprint could not be saved',
+      };
+      mockSave.mockRejectedValueOnce(new ApiError(400, body, 'Bad Request'));
+
+      const sprint = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+      const { container, onSaved, onClose } = renderLightbox({ mode: 'edit', sprint, projectId: 7 });
+
+      // Make a real change so the submit reaches the API (and rejects).
+      typeInto(container, DATE_END, '20 Feb 2021');
+      submitForm(container);
+
+      await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+
+      // (a) The body's field error and general message are surfaced verbatim.
+      await waitFor(() =>
+        expect(screen.getByText('Finish date must be after the start date')).toBeInTheDocument(),
+      );
+      expect(screen.getByText('Sprint could not be saved')).toBeInTheDocument();
+
+      // (b) The Error's class name ("ApiError") must NOT appear as a field error.
+      expect(screen.queryByText('ApiError')).not.toBeInTheDocument();
+
+      // Failure keeps the lightbox open; no success callback fires.
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    });
   });
 
   describe('closed state', () => {
@@ -580,6 +644,156 @@ describe('CreateEditSprintLightbox', () => {
       expect(label.textContent).toContain('last sprint is');
       const strong = get(container, '.last-sprint-name strong');
       expect(strong.textContent).toContain('Sprint 7');
+    });
+  });
+
+  /* ======================================================================== *
+   * F-UI-05 / F-UI-04 / F-UI-02 / F-UI-06 — accessible modal dialog, sprite
+   * icons and localisation.
+   *
+   * The AngularJS lightbox was opened by the shared lightbox-service, which
+   * supplied dialog semantics, an Escape binding and focus management. The
+   * React port had been a plain `<div>` with NONE of that (F-UI-05), used empty
+   * `<span>` icon placeholders that cannot render the SVG sprite (F-UI-02), had
+   * an unlabelled icon-only close control (F-UI-04) and hard-coded English copy
+   * (F-UI-06). These specs lock in the fixes.
+   * ======================================================================== */
+  describe('F-UI-05 accessible modal dialog + F-UI-02/04/06 icons & i18n', () => {
+    it('marks the shell as a modal dialog labelled by its heading (F-UI-05)', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+      const root = get(container, ROOT);
+
+      expect(root).toHaveAttribute('role', 'dialog');
+      expect(root).toHaveAttribute('aria-modal', 'true');
+
+      // `aria-labelledby` points at the real heading id (non-empty, resolves).
+      const labelledBy = root.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading).toHaveClass('title');
+      expect(heading?.textContent).toBe('New sprint');
+    });
+
+    it('reflects the in-flight submit through aria-busy (F-UI-05)', async () => {
+      // A deferred create keeps the request in flight so aria-busy is observable
+      // (mirrors the re-entrant-submit spec's deferred-promise technique).
+      let resolveCreate!: (milestone: Milestone) => void;
+      mockCreate.mockImplementationOnce(
+        () =>
+          new Promise<Milestone>((resolve) => {
+            resolveCreate = resolve;
+          }),
+      );
+
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+      const root = get(container, ROOT);
+      expect(root).toHaveAttribute('aria-busy', 'false');
+
+      typeInto(container, NAME, 'Busy Sprint');
+      typeInto(container, DATE_START, '01 Jan 2021');
+      typeInto(container, DATE_END, '15 Jan 2021');
+      submitForm(container);
+
+      // While the request is pending the dialog announces itself as busy…
+      await waitFor(() => expect(root).toHaveAttribute('aria-busy', 'true'));
+
+      // …and clears once it settles (also prevents a stray act() warning).
+      resolveCreate(createdMilestone);
+      await waitFor(() => expect(root).toHaveAttribute('aria-busy', 'false'));
+    });
+
+    it('closes on Escape via the modal keydown handler (F-UI-05)', () => {
+      const { container, onClose } = renderLightbox({ mode: 'create', projectId: 7 });
+
+      // Escape from inside the dialog bubbles to the shell handler and closes it.
+      fireEvent.keyDown(get(container, NAME), { key: 'Escape' });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('traps Tab focus inside the dialog, wrapping at both ends (F-UI-05)', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+      const root = get(container, ROOT);
+
+      const focusables = Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled])',
+        ),
+      );
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      // Sanity: the close anchor is first, the Save submit button is last.
+      expect(first).toHaveClass('close');
+      expect(last.getAttribute('type')).toBe('submit');
+
+      // Tab off the last element wraps focus back to the first.
+      last.focus();
+      fireEvent.keyDown(last, { key: 'Tab' });
+      expect(document.activeElement).toBe(first);
+
+      // Shift+Tab off the first element wraps focus to the last.
+      first.focus();
+      fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
+      expect(document.activeElement).toBe(last);
+    });
+
+    it('focuses the name field on open (component focus wins over the trap fallback)', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+      expect(document.activeElement).toBe(get(container, NAME));
+    });
+
+    it('renders the close + delete controls as real sprite icons, not empty spans (F-UI-02)', () => {
+      const { container } = renderLightbox({
+        mode: 'edit',
+        sprint: makeMilestone({ id: 9, name: 'Sprint 9' }),
+        canDeleteMilestone: true,
+        projectId: 7,
+      });
+      // The close control renders `<tg-svg><svg class="icon icon-close">…`.
+      expect(container.querySelector('a.close tg-svg svg.icon-close')).not.toBeNull();
+      // The delete control renders the trash sprite icon.
+      expect(
+        container.querySelector('button.delete-sprint tg-svg svg.icon-trash'),
+      ).not.toBeNull();
+    });
+
+    it('gives the icon-only close control an accessible name (F-UI-04)', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+      const close = get(container, CLOSE);
+      expect(close).toHaveAttribute('aria-label', 'close');
+      expect(close).toHaveAttribute('title', 'close');
+    });
+
+    it('localises placeholders and action labels through the bridge (F-UI-06)', () => {
+      const { container } = renderLightbox({
+        mode: 'edit',
+        sprint: makeMilestone({ id: 9, name: 'Sprint 9' }),
+        canDeleteMilestone: true,
+        projectId: 7,
+      });
+      expect(get(container, NAME)).toHaveAttribute('placeholder', 'sprint name');
+      expect(get(container, DATE_START)).toHaveAttribute('placeholder', 'Estimated Start');
+      expect(get(container, DATE_END)).toHaveAttribute('placeholder', 'Estimated End');
+      // Edit-mode heading + the delete action label are localised.
+      expect(screen.getByText('Edit Sprint')).toBeInTheDocument();
+      expect(get(container, DELETE)).toHaveAttribute('title', 'delete sprint');
+      expect(screen.getByText('Do you want to delete this sprint?')).toBeInTheDocument();
+    });
+
+    it('announces field + general errors via role="alert" (F-UI-05)', async () => {
+      const body = { name: ['Sprint name taken'], _error_message: 'Server exploded' };
+      mockCreate.mockRejectedValueOnce(new ApiError(400, body, 'Bad Request'));
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+
+      typeInto(container, NAME, 'Dup');
+      typeInto(container, DATE_START, '01 Jan 2021');
+      typeInto(container, DATE_END, '15 Jan 2021');
+      submitForm(container);
+
+      await waitFor(() => expect(screen.getByText('Server exploded')).toBeInTheDocument());
+      // Both the general error and the name field error are live-announced.
+      const alerts = container.querySelectorAll('.checksley-error-list[role="alert"]');
+      expect(alerts.length).toBeGreaterThanOrEqual(2);
     });
   });
 });

@@ -152,6 +152,21 @@ class EventsBridge {
     private heartbeatTimer: ReturnType<typeof setInterval> | undefined = undefined;
 
     /**
+     * The pending reconnect timer handle, or `undefined` when no reconnect is
+     * scheduled.
+     *
+     * F-AAP-04: the AngularJS original fires a bare `setTimeout` in
+     * `randomTryInterval` (`events.coffee:280-284`) and never keeps the handle,
+     * so a queued reconnect cannot be cancelled. Here the handle is stored so
+     * {@link stopReconnect} can cancel it the instant the last subscriber
+     * leaves — otherwise a reconnect scheduled just before the final
+     * unsubscribe would resurrect the socket after teardown (the resource leak
+     * flagged in the review). Typed via `ReturnType<typeof setTimeout>` for the
+     * same DOM/Node overload reason as {@link heartbeatTimer}.
+     */
+    private reconnectTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+
+    /**
      * Frames awaiting delivery. Frames are enqueued here whenever the socket is
      * not yet OPEN and flushed (in FIFO order) the moment it opens
      * (`events.coffee:160-176`).
@@ -178,6 +193,11 @@ class EventsBridge {
      */
     connect(): void {
         this.stopExistingConnection();
+
+        // We are (re)connecting right now, so any previously-scheduled reconnect
+        // is redundant — cancel it so it cannot fire a second, overlapping
+        // connect later (F-AAP-04).
+        this.stopReconnect();
 
         const url = this.resolveUrl();
         if (url === null) {
@@ -229,15 +249,45 @@ class EventsBridge {
     }
 
     /**
-     * Fully disconnect and reset the lazy-connect latch. After this call the
-     * next {@link subscribe} will open a fresh socket. Exposed on the manager
-     * for explicit lifecycle teardown; the ordinary unsubscribe path does not
-     * call it (matching AngularJS, which keeps the connection warm).
+     * Fully disconnect and reset for a fresh session. Closes the socket, stops
+     * the heartbeat, cancels any pending reconnect, clears the outbound queue
+     * and resets the lazy-connect latch and error/heartbeat counters. After
+     * this call the next {@link subscribe} opens a fresh socket with a clean
+     * error budget.
+     *
+     * F-AAP-04: unlike AngularJS (which keeps the connection warm forever), the
+     * ordinary unsubscribe path DOES call this once the last listener across all
+     * keys is gone — see {@link removeSubscription}. That closes the socket,
+     * heartbeat interval, reconnect timer and queue that would otherwise survive
+     * with zero subscribers. Because the error/heartbeat counters are reset
+     * here, the next subscription session starts with a full retry budget rather
+     * than inheriting the previous session's (a stale count would otherwise let
+     * a fresh session give up early, since {@link connect} clears `error` but
+     * not `errors`).
      */
     disconnect(): void {
         this.stopExistingConnection();
+        this.stopReconnect();
         this.started = false;
+        this.error = false;
+        this.errors = 0;
+        this.missedHeartbeats = 0;
         this.pendingMessages = [];
+    }
+
+    /**
+     * @returns The REAL connection state — `true` only while the socket is
+     *          actually open (between `open` and `close`/teardown), `false`
+     *          while connecting, in reconnect backoff, errored or torn down.
+     *
+     * F-AAP-03: consumers must distinguish "an events URL is configured" from
+     * "a live socket is currently connected". This exposes the latter (the
+     * private {@link connected} flag) so a post-write reconcile can decide
+     * whether live pushes will actually refresh the board, rather than assuming
+     * a configured URL means a healthy socket.
+     */
+    isConnected(): boolean {
+        return this.connected;
     }
 
     /**
@@ -353,11 +403,61 @@ class EventsBridge {
      * `randomTryInterval` backoff (`events.coffee:280-284`): a uniform value in
      * `[reconnect/2, reconnect]` milliseconds. Randomization spreads reconnect
      * storms across many clients.
+     *
+     * F-AAP-04 hardening over the AngularJS original:
+     *   1. The timer handle is stored in {@link reconnectTimer} so
+     *      {@link stopReconnect} can cancel it — the AngularJS `setTimeout`
+     *      handle was discarded and thus uncancellable.
+     *   2. It is a no-op when there are no subscribers, so a socket error/close
+     *      that races the final unsubscribe cannot resurrect the connection
+     *      after teardown.
+     *   3. Pending reconnects are coalesced: if one is already scheduled a
+     *      second is not stacked on top.
+     * The timer callback re-checks {@link hasSubscriptions} because the last
+     * subscriber may leave while the delay elapses.
      */
     private scheduleReconnect(): void {
-        setTimeout((): void => {
+        if (!this.hasSubscriptions()) {
+            return;
+        }
+
+        if (this.reconnectTimer !== undefined) {
+            return;
+        }
+
+        this.reconnectTimer = setTimeout((): void => {
+            this.reconnectTimer = undefined;
+            if (!this.hasSubscriptions()) {
+                return;
+            }
             this.connect();
         }, this.randomTryInterval());
+    }
+
+    /**
+     * Cancel a pending reconnect timer, if any (F-AAP-04). Idempotent. Called
+     * from {@link connect} (we are connecting now) and {@link disconnect} (the
+     * last subscriber left) so a queued reconnect can never reopen the socket
+     * after teardown.
+     */
+    private stopReconnect(): void {
+        if (this.reconnectTimer === undefined) {
+            return;
+        }
+
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = undefined;
+    }
+
+    /**
+     * @returns `true` while at least one routing key still has a listener. This
+     *          is the single source of truth for whether the socket should stay
+     *          open (F-AAP-04): {@link removeSubscription} deletes a key the
+     *          moment its listener set empties, so a non-zero map size means at
+     *          least one live subscriber remains.
+     */
+    private hasSubscriptions(): boolean {
+        return this.subscriptions.size > 0;
     }
 
     /**
@@ -561,6 +661,18 @@ class EventsBridge {
      * Remove one listener for a key and, when the last listener for that key is
      * gone, emit the `unsubscribe` frame (`events.coffee:225-230`) and drop the
      * key locally.
+     *
+     * F-AAP-04: additionally, once the last listener across ALL keys is gone,
+     * fully tear the connection down via {@link disconnect}. Without this the
+     * socket, the heartbeat interval, any pending reconnect timer and the
+     * outbound message queue would all survive with zero subscribers — the
+     * resource leak flagged in the review. The `unsubscribe` frame is enqueued
+     * (and flushed synchronously if the socket is OPEN) BEFORE the teardown
+     * closes the socket, so it still reaches the wire in the normal case; if the
+     * socket was never open the server has no subscription for us anyway and the
+     * subsequent `close` cleans up server-side. The next {@link subscribe} then
+     * opens a fresh socket because {@link disconnect} resets the `started`
+     * latch.
      */
     private removeSubscription(routingKey: string, callback: EventCallback): void {
         const handlers = this.subscriptions.get(routingKey);
@@ -576,6 +688,10 @@ class EventsBridge {
                 cmd: 'unsubscribe',
                 routing_key: routingKey,
             });
+        }
+
+        if (!this.hasSubscriptions()) {
+            this.disconnect();
         }
     }
 
@@ -630,6 +746,20 @@ function getBridge(): EventsBridge {
 const NO_OP_UNSUBSCRIBE = (): void => {
     /* events disabled — nothing to tear down */
 };
+
+/**
+ * @returns `true` only when a live socket is CURRENTLY open.
+ *
+ * F-AAP-03: this reports the REAL connection state, not merely whether an
+ * events URL is configured. It never creates the bridge — if nothing has
+ * subscribed yet (`bridge === null`) or the socket is connecting / in backoff /
+ * errored / torn down, it returns `false`. Consumers (e.g. `useBacklog`) use it
+ * to decide whether live pushes will refresh the board or a fallback reload is
+ * required after a write settles.
+ */
+export function isEventsConnected(): boolean {
+    return bridge !== null && bridge.isConnected();
+}
 
 /**
  * Subscribe to a raw routing key.

@@ -311,5 +311,16 @@ describe('SprintHeader', () => {
 
       expect(screen.getByTitle('Compact Sprint')).toBeInTheDocument();
     });
+
+    it('F-UI-02: the compact-sprint toggle renders the shared `<tg-svg>` arrow sprite', () => {
+      const { container } = renderHeader();
+
+      // The retained SCSS targets the `tg-svg` host + `svg.icon`, so the icon must
+      // be a real custom element wrapping an `<svg class="icon icon-arrow-right">`
+      // with a sprite `<use>` — not a bare span.
+      const svg = container.querySelector('.compact-sprint tg-svg svg.icon.icon-arrow-right');
+      expect(svg).not.toBeNull();
+      expect(svg?.querySelector('use')).not.toBeNull();
+    });
   });
 });

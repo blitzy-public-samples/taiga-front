@@ -25,21 +25,54 @@
  *     AngularJS service, and it pulls in NONE of the globally-loaded libraries
  *     (Immutable.js, dragula, dom-autoscroller, checksley). Its only dependency
  *     is the shared `../session` bridge.
- *   - It does NOT own authentication. It implements no login, no logout, and no
- *     401/refresh interceptor — the AngularJS shell still owns token refresh.
- *     This adapter merely reads whatever token/session the shell currently holds.
+ *   - It does NOT own login: it never mints the FIRST token — the AngularJS
+ *     login screen still does that. It merely reads whatever token/session the
+ *     shell established, and keeps that token fresh on 401 (see below).
+ *
+ * 401 TOKEN-REFRESH PARITY (review finding F-SEC-02)
+ *   React's `fetch` calls are NOT seen by the AngularJS `$httpProvider`
+ *   interceptor (`app.coffee:608-707`), which is the shell's single-flight
+ *   token-refresh/retry/logout state machine. If this adapter did nothing on a
+ *   `401`, a React screen would hard-fail on an expired token while the
+ *   AngularJS screens silently refreshed — a behavioural divergence AND a
+ *   security regression (a stale/compromised token would linger in storage).
+ *   To stay byte-for-byte equivalent, `request()` therefore PORTS that exact
+ *   state machine (see {@link refreshAuthToken}):
+ *     - on a `401` (except for the `/auth/refresh` call itself — loop
+ *       prevention, mirroring the coffee `if url.includes('/auth/refresh')`
+ *       guard), it performs a SINGLE-FLIGHT `POST /auth/refresh` so concurrent
+ *       401s share ONE refresh round-trip;
+ *     - on success it persists the new `auth_token` + `refresh` and RETRIES the
+ *       original request exactly once with the rotated Bearer token;
+ *     - on failure (or a missing refresh token) it CLEARS the stored session
+ *       (`token`/`refresh`/`userInfo`) and redirects to `/login`, exactly as the
+ *       coffee `errorToken` path does, then rejects with the original error.
+ *   Because both the shell and this adapter read/write the identical
+ *   `localStorage` keys, a refresh performed by either side is honoured by both.
  *
  * FRESH-READ INVARIANT
- *   The base URL, JWT token, and session id are read FRESH on every request (via
- *   `getApiUrl()` / `getAuthToken()` / `getSessionId()` from `../session`), never
- *   cached at module load. Consequently a token rotated by the AngularJS 401
- *   interceptor propagates to React automatically on the very next call.
+ *   The base URL, JWT token, language, and session id are read FRESH on every
+ *   request (via `getApiUrl()` / `getAuthToken()` / `getLanguage()` /
+ *   `getSessionId()` from `../session`), never cached at module load.
+ *   Consequently a token rotated by EITHER the AngularJS 401 interceptor OR this
+ *   adapter's own refresh propagates automatically on the very next call — and
+ *   the one-shot retry after a refresh here picks up the new token the same way.
  *
  * Toolchain: pure TypeScript 5.4.5 under `strict` (no React/JSX here), Node
  * v16.19.1 compatible, bundled by esbuild into `dist/js/react.js`.
  */
 
-import { getApiUrl, getAuthToken, getSessionId } from '../session';
+import {
+    getApiUrl,
+    getAuthToken,
+    getSessionId,
+    getLanguage,
+    getRefreshToken,
+    setAuthToken,
+    setRefreshToken,
+    clearSession,
+    redirectToLogin,
+} from '../session';
 
 /* ========================================================================== *
  * Phase 2 — Public types
@@ -211,13 +244,19 @@ function buildQueryString(params?: QueryParams): string {
  * - `Content-Type: application/json` whenever a body is sent (`app.coffee:591`).
  * - `Authorization: Bearer <jwt>` only when a token is present
  *   (`http.coffee:21-23`).
+ * - `Accept-Language: <lang>` on EVERY verb when a language is resolvable
+ *   (`http.coffee:25-28` — `$tgHttp` attaches it in `request()`, which GET,
+ *   POST, PUT, PATCH and DELETE all funnel through, so it is NOT verb-specific).
+ *   The value comes from `getLanguage()`, which mirrors
+ *   `$translate.preferredLanguage()` and tracks live language switches.
  * - `X-Session-Id: <sessionId>` only when a session id is present
  *   (`app.coffee:593,601` — set on GET and on bodied verbs alike).
  *
- * The token and session id are read FRESH here on every call (never hoisted or
- * cached at module load), so refreshes performed by the AngularJS shell are
- * picked up automatically. Caller-supplied `extra` headers are merged LAST so
- * they can override any default (e.g. `x-disable-pagination`).
+ * The token, language, and session id are read FRESH here on every call (never
+ * hoisted or cached at module load), so refreshes and language switches
+ * performed by the AngularJS shell are picked up automatically. Caller-supplied
+ * `extra` headers are merged LAST so they can override any default (e.g.
+ * `x-disable-pagination`).
  */
 function buildHeaders(hasBody: boolean, extra?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {};
@@ -231,6 +270,14 @@ function buildHeaders(hasBody: boolean, extra?: Record<string, string>): Record<
         headers['Authorization'] = `Bearer ${token}`;
     }
 
+    // Accept-Language on every verb, mirroring `$tgHttp.headers()`
+    // (http.coffee:25-28). Omitted only when no language is resolvable, exactly
+    // as the coffee omits it when `preferredLanguage()` is falsy.
+    const lang = getLanguage();
+    if (lang) {
+        headers['Accept-Language'] = lang;
+    }
+
     const sessionId = getSessionId();
     if (sessionId) {
         headers['X-Session-Id'] = sessionId;
@@ -240,7 +287,124 @@ function buildHeaders(hasBody: boolean, extra?: Record<string, string>): Record<
 }
 
 /* ========================================================================== *
- * Phase 5 — Core request()
+ * Phase 5 — Single-flight 401 token refresh (ports app.coffee:608-707)
+ * ========================================================================== */
+
+/**
+ * The refresh endpoint path, matching the AngularJS URL map entry
+ * `"refresh": "/auth/refresh"` (`resources.coffee:18`). Kept as a module
+ * constant so both the loop-prevention guard in {@link request} and the refresh
+ * POST in {@link refreshAuthToken} reference the SAME literal.
+ */
+const REFRESH_PATH = '/auth/refresh';
+
+/**
+ * The in-flight refresh promise, or `null` when no refresh is running. This is
+ * the React equivalent of the coffee interceptor's shared
+ * `retry = { inProgress, promise }` object (`app.coffee:610-613`): every 401
+ * that arrives while a refresh is underway JOINS this one promise instead of
+ * firing its own `POST /auth/refresh`, so a burst of concurrent 401s triggers
+ * exactly ONE refresh round-trip.
+ */
+let refreshInFlight: Promise<boolean> | null = null;
+
+/**
+ * The shape of the `/auth/refresh` success body — `{ auth_token, refresh }`,
+ * exactly the fields the coffee reads (`responseRefresh.data.auth_token` /
+ * `.refresh`, `app.coffee:632-633`).
+ */
+interface RefreshResponse {
+    auth_token: string;
+    refresh: string;
+}
+
+/**
+ * Execute one `POST /auth/refresh`, persisting the rotated tokens on success.
+ * On ANY failure — a missing refresh token, a non-2xx refresh response, or a
+ * network/parse error — it performs the coffee `errorToken` logout (clears the
+ * stored session and redirects to `/login`) and resolves `false`. It never
+ * throws, so callers can branch on the boolean.
+ *
+ * This is the body of the single-flight; {@link refreshAuthToken} is the
+ * de-duplicating wrapper callers actually invoke.
+ */
+async function performRefresh(): Promise<boolean> {
+    const refreshToken = getRefreshToken();
+
+    // coffee: the `else` branch when `storage.get("refresh")` is falsy — there
+    // is nothing to refresh with, so log out and bail (app.coffee:648-663).
+    if (!refreshToken) {
+        clearSession();
+        redirectToLogin();
+        return false;
+    }
+
+    try {
+        // The refresh POST goes through the same same-origin `resolveUrl` guard
+        // and carries `Content-Type: application/json`; it deliberately does NOT
+        // recurse through `request()` (no 401 handling on the refresh call
+        // itself — loop prevention).
+        const url = resolveUrl(getApiUrl(), REFRESH_PATH);
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh: refreshToken }),
+        });
+
+        if (!response.ok) {
+            // coffee `request.catch` → errorToken (app.coffee:636-641).
+            clearSession();
+            redirectToLogin();
+            return false;
+        }
+
+        const text = await response.text();
+        const data = (text ? JSON.parse(text) : {}) as Partial<RefreshResponse>;
+
+        // A 2xx with a malformed body (no auth_token) is treated as a failure so
+        // we never persist an `undefined` token.
+        if (!data.auth_token) {
+            clearSession();
+            redirectToLogin();
+            return false;
+        }
+
+        // coffee refreshTokenReponse: persist both rotated tokens
+        // (app.coffee:632-633).
+        setAuthToken(data.auth_token);
+        if (data.refresh) {
+            setRefreshToken(data.refresh);
+        }
+        return true;
+    } catch {
+        // Network or JSON error → same logout path as a rejected refresh.
+        clearSession();
+        redirectToLogin();
+        return false;
+    }
+}
+
+/**
+ * Single-flight wrapper over {@link performRefresh}. The FIRST 401 starts the
+ * refresh and stores its promise; concurrent 401s return that SAME promise; and
+ * once it settles the slot is reset so a genuinely later token expiry can
+ * refresh again. Resolves `true` when a new token was stored (caller should
+ * retry), `false` when refresh was impossible/failed (caller should surface the
+ * original error — the session has already been cleared).
+ */
+function refreshAuthToken(): Promise<boolean> {
+    if (!refreshInFlight) {
+        refreshInFlight = performRefresh().finally(() => {
+            // Reset once, after the shared promise settles, so the next 401 can
+            // start a fresh refresh (coffee resets `retry.inProgress = false`).
+            refreshInFlight = null;
+        });
+    }
+    return refreshInFlight;
+}
+
+/* ========================================================================== *
+ * Phase 6 — Core request()
  * ========================================================================== */
 
 /**
@@ -258,8 +422,12 @@ function buildHeaders(hasBody: boolean, extra?: Record<string, string>): Record<
  * - Any non-2xx response throws an {@link ApiError} carrying the status and the
  *   parsed body.
  *
- * No `401`/refresh interceptor is implemented — that remains the responsibility
- * of the AngularJS shell; this adapter only reads the current token per call.
+ * 401 handling ports the AngularJS single-flight refresh/retry/logout state
+ * machine (see {@link refreshAuthToken} and the module header): a `401` on any
+ * call other than `/auth/refresh` itself triggers a shared refresh; on success
+ * the request is retried exactly once with the rotated token; on failure the
+ * session is cleared, the client is redirected to `/login`, and the original
+ * error is thrown.
  *
  * @typeParam T The expected shape of the parsed response body.
  */
@@ -273,18 +441,39 @@ async function request<T = unknown>(
     const url = resolveUrl(getApiUrl(), path) + buildQueryString(config.params);
 
     const hasBody = config.body !== undefined && config.body !== null && method !== 'GET';
-    const headers = buildHeaders(hasBody, config.headers);
 
-    const init: RequestInit = { method, headers };
-    if (hasBody) {
-        init.body = JSON.stringify(config.body);
-    }
-
+    // A closure that issues one attempt. `buildHeaders` is called INSIDE so the
+    // `Authorization` header is rebuilt from storage each time — the post-refresh
+    // retry therefore automatically carries the rotated Bearer token, exactly as
+    // the coffee reset `response.config.headers.Authorization` before retrying.
+    //
     // Intentionally leave `credentials` at the fetch default ('same-origin'):
     // AngularJS `$http` authenticates with the Bearer token, not cookies. Every
     // request reaching this point is guaranteed same-origin with the API base by
     // `resolveUrl`, so no cross-origin credentialed request is ever made.
-    const response = await fetch(url, init);
+    const attempt = (): Promise<Response> => {
+        const headers = buildHeaders(hasBody, config.headers);
+        const init: RequestInit = { method, headers };
+        if (hasBody) {
+            init.body = JSON.stringify(config.body);
+        }
+        return fetch(url, init);
+    };
+
+    let response = await attempt();
+
+    // 401 single-flight refresh + one retry. The `/auth/refresh` call itself is
+    // exempt (loop prevention), mirroring the coffee guard
+    // `if response.config.url.includes('/auth/refresh') return $q.reject(...)`.
+    if (response.status === 401 && !path.includes(REFRESH_PATH)) {
+        const refreshed = await refreshAuthToken();
+        if (refreshed) {
+            // coffee: retry the ORIGINAL request once, now with the new token.
+            response = await attempt();
+        }
+        // If the refresh failed, `refreshAuthToken` has already cleared the
+        // session and redirected; we fall through and throw the original error.
+    }
 
     // Parse the body gracefully so empty (204) and non-JSON responses are safe.
     const text = await response.text();
@@ -305,7 +494,7 @@ async function request<T = unknown>(
 }
 
 /* ========================================================================== *
- * Phase 6 — Public `api` object
+ * Phase 7 — Public `api` object
  *
  * The convenience verb methods resolve directly to the parsed response body for
  * ergonomic callers. The raw `request` is exposed on the object (and as a named

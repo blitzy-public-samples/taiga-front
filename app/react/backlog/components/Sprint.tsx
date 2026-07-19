@@ -66,43 +66,17 @@ import { useState } from 'react';
 import { useDroppable, useDraggable } from '@dnd-kit/core';
 
 import { SprintHeader } from './SprintHeader';
-import { can } from '../../shared/permissions';
+import { can, canMutate } from '../../shared/permissions';
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration — icon used here: `icon-clock`).
+// F-UI-06: the shared translation bridge for the empty-sprint warnings and the
+// taskboard link (`BACKLOG.SPRINTS.*`). F-UI-07: the shared emoji renderer so
+// `us.subject` reproduces the legacy `tg-bind-html="us.subject | emojify"`.
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
+import { emojify } from '../../shared/emoji';
 
 import type { Milestone, Project, UserStory } from '../../shared/types';
-
-/*
- * Taiga renders inline SVG sprites through its `<tg-svg>` web component, which
- * is not a standard HTML element, so we widen the JSX intrinsic-element table
- * locally (mirroring `SprintHeader` and the kanban components). Typed `any`
- * because the element is opaque to React/TS and is resolved by the existing
- * sprite runtime at render time.
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup and the sibling kanban / SprintHeader
- * convention. `className` is forwarded onto the custom element (the sprite
- * runtime reads it); the inner `<svg>` carries the `icon <name>` classes the
- * retained SCSS targets, and `<use>` references the sprite by id. Icon used by
- * this component: `icon-clock` (the due-date badge).
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
 
 /**
  * Props for {@link Sprint}.
@@ -137,7 +111,7 @@ interface SprintRowProps {
   us: UserStory;
   /** The owning project (supplies `slug` for the detail link). */
   project: Project;
-  /** `can(project, 'modify_us')`, precomputed once by the parent for all rows. */
+  /** `canMutate(project, 'modify_us')` (archive-aware, F-REG-03), precomputed once by the parent for all rows. */
   canModify: boolean;
   /** Owning sprint id — becomes the draggable's `fromSprintId`. */
   sprintId: number;
@@ -222,12 +196,14 @@ function SprintRow(props: SprintRowProps) {
             {/* tg-bo-ref="us.ref" rendered as "#<ref>". */}
             <span className="us-ref-text">{`#${us.ref}`}</span>
             {/*
-              The original bound `us.subject | emojify` via tg-bind-html. We
-              render PLAIN TEXT (no dangerouslySetInnerHTML): the emojify filter
-              is a presentation-only enhancement, and plain text is the safe,
-              faithful baseline for the migrated screen.
+              F-UI-07: the original bound `us.subject | emojify` via
+              tg-bind-html (`sprint.jade:35`). `emojify()` reproduces that filter
+              — parsing `:shortcode:` tokens into `<img class="emoji">` React
+              nodes — WITHOUT `dangerouslySetInnerHTML`: it emits safe React
+              elements, so the story subject renders emoji exactly as the
+              AngularJS screen did while remaining XSS-safe.
             */}
-            <span className="us-name-text">{us.subject}</span>
+            <span className="us-name-text">{emojify(us.subject)}</span>
 
             {/*
               Epics pills — reproduces `tg-belong-to-epics format="pill"`
@@ -256,7 +232,7 @@ function SprintRow(props: SprintRowProps) {
             */}
             {dueDate ? (
               <span className="due-date" title={dueDate}>
-                {svgIcon('icon-clock', 'due-date-icon')}
+                <TgSvg icon="icon-clock" className="due-date-icon" />
               </span>
             ) : null}
           </a>
@@ -323,7 +299,7 @@ export const Sprint = (props: SprintProps) => {
 
   // `modify_us` gate — drives row draggability and the empty-message spans
   // (backlog sortable.coffee:30). Computed once and shared by every row.
-  const canModify = can(project, 'modify_us');
+  const canModify = canMutate(project, 'modify_us');
 
   // Defensive guard: `user_stories` is `UserStory[]` on the type, but guard
   // against a not-yet-hydrated milestone.
@@ -378,7 +354,22 @@ export const Sprint = (props: SprintProps) => {
         the clamped percentage. NOT the backlog-summary ProgressBar component.
       */}
       <div className="summary-progress-wrapper">
-        <div className="sprint-progress-bar">
+        {/*
+          F-UI-05: announce the per-sprint completion as a `progressbar`. The
+          width stays the UNROUNDED clamped percentage (exact visual parity with
+          the legacy `tgProgressBar`); `aria-valuenow` is the rounded integer so
+          screen readers announce a clean value. The legacy bar announced
+          nothing, so this is a pure a11y addition.
+        */}
+        <div
+          className="sprint-progress-bar"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progressPct)}
+          aria-valuetext={`${Math.round(progressPct)}%`}
+          aria-label={translate('BACKLOG.SPRINT_PROGRESS', undefined, 'Sprint progress')}
+        >
           <div
             className="current-progress"
             style={{ width: `${progressPct}%` }}
@@ -407,17 +398,25 @@ export const Sprint = (props: SprintProps) => {
               Anonymous span (WARNING_EMPTY_SPRINT_ANONYMOUS): gets `hidden` WHEN
               the user HAS modify_us → visible only WITHOUT modify_us.
             */}
-            {/* i18n: BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS */}
+            {/* F-UI-06: BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS */}
             <span className={canModify ? 'hidden' : undefined}>
-              This sprint has no user stories
+              {translate(
+                'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS',
+                undefined,
+                'This sprint has no user stories',
+              )}
             </span>
             {/*
               Has-permission span (WARNING_EMPTY_SPRINT): gets `hidden` WHEN the
               user LACKS modify_us → visible only WITH modify_us.
             */}
-            {/* i18n: BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT */}
+            {/* F-UI-06: BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT */}
             <span className={!canModify ? 'hidden' : undefined}>
-              Drop here Stories from your backlog to start a new sprint
+              {translate(
+                'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT',
+                undefined,
+                'Drop here Stories from your backlog to start a new sprint',
+              )}
             </span>
           </div>
         ) : (
@@ -443,11 +442,18 @@ export const Sprint = (props: SprintProps) => {
         <a
           className="btn-small"
           href={`/project/${project.slug}/taskboard/${sprint.slug ?? ''}`}
-          title={`Go to Taskboard of "${sprint.name}"`}
+          // F-UI-06: BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD interpolates {name}.
+          title={translate(
+            'BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD',
+            { name: sprint.name },
+            `Go to Taskboard of "${sprint.name}"`,
+          )}
           {...{ variant: 'secondary' }}
         >
-          {/* i18n: BACKLOG.SPRINTS.LINK_TASKBOARD */}
-          <span>Sprint Taskboard</span>
+          {/* F-UI-06: BACKLOG.SPRINTS.LINK_TASKBOARD */}
+          <span>
+            {translate('BACKLOG.SPRINTS.LINK_TASKBOARD', undefined, 'Sprint Taskboard')}
+          </span>
         </a>
       ) : null}
     </div>

@@ -57,10 +57,30 @@ import { BacklogDndContext } from './dnd/BacklogDndContext';
 import type { BacklogMovePayload } from './dnd/BacklogDndContext';
 import { BacklogTable } from './components/BacklogTable';
 import { Sprint } from './components/Sprint';
+import { ProgressBar } from './components/ProgressBar';
 import { CreateEditSprintLightbox } from './components/CreateEditSprintLightbox';
 import { BulkCreateUsLightbox } from './components/BulkCreateUsLightbox';
-import { canModifyUs, canAddUs, canAddMilestone, can } from '../shared/permissions';
-import type { Project, UserStory, Milestone, Status } from '../shared/types';
+// F-CQ-06: the sidebar filter panel. `FiltersSidebar` is the presentational port
+// of the shared AngularJS `<tg-filter>` component that BOTH the Kanban board and
+// the Backlog hosted verbatim (retired `backlog.jade` `.backlog-filter > tg-filter`
+// with the identical `filters`/`custom-filters`/`selected-filters` bindings). It is
+// purely presentational ("props down, events up"), so it is reused here; the
+// data-shaping is done by the shared `UsFiltersMixin` port in `../shared/filters`.
+import { FiltersSidebar } from '../kanban/components/FiltersSidebar';
+import type { CustomFilter } from '../kanban/components/FiltersSidebar';
+import {
+    buildDataCollection,
+    buildCategories,
+    buildSelectedFilters,
+    addFilterSelection,
+    removeFilterSelection,
+} from '../shared/filters';
+import type { FilterCategory, SelectedFilter } from '../shared/filters';
+import { canModifyUs, canAddUs, canAddMilestone, canMutate } from '../shared/permissions';
+// F-UI-02: the ONE shared SVG-sprite icon primitive (replaces the container's
+// broken empty-span placeholder).
+import { TgIcon } from '../shared/icon';
+import type { Project, UserStory, Milestone, Status, FilterOption } from '../shared/types';
 
 /* ========================================================================== *
  * Props
@@ -149,15 +169,13 @@ function formatNumber(value: unknown): string {
     return String(Math.round(n * 100) / 100);
 }
 
-/**
- * A small inline icon placeholder that preserves the AngularJS `tg-svg`
- * `svg-icon="icon-*"` class contract so the retained SCSS (which targets these
- * `icon-*` class names) styles the React DOM identically. It is purely
- * decorative, hence `aria-hidden`.
- */
-const TgIcon: FC<{ name: string }> = ({ name }) => (
-    <span className={`icon ${name}`} aria-hidden="true" />
-);
+// F-UI-02: icons render through the ONE shared `TgSvg` sprite primitive
+// (`../shared/icon`). The container previously emitted an empty
+// `<span class="icon …">`, which CANNOT paint a Taiga SVG-sprite icon (the
+// retained SCSS targets the `tg-svg` host + `svg.icon` `<use href="#…">`
+// reference). The `TgIcon` compat alias forwards a decorative `name` to the
+// shared primitive so every `<TgIcon name="icon-…"/>` call site below renders
+// the real sprite reference, matching the sibling child components.
 
 /* ========================================================================== *
  * The container component
@@ -165,9 +183,14 @@ const TgIcon: FC<{ name: string }> = ({ name }) => (
 
 export const BacklogApp: FC<BacklogAppProps> = (props) => {
     // Coerce the string `project-id` attribute to a number ONCE (mount passes
-    // strings). `Number.isFinite` guards a missing / malformed attribute.
+    // strings). A valid project id must be a POSITIVE INTEGER (F-REG-01):
+    // `Number.isInteger(...) && > 0` rejects the literal `"{{project.id}}"`
+    // snapshot (NaN), a blank/absent attribute (`Number("")` -> 0) and any
+    // non-positive/fractional value. When AngularJS later resolves the
+    // interpolation, `attributeChangedCallback` in shared/mount.tsx re-renders
+    // with the real id and this guard then passes.
     const projectId = Number(props.projectId);
-    const projectIdValid = Number.isFinite(projectId);
+    const projectIdValid = Number.isInteger(projectId) && projectId > 0;
 
     // The effectful Backlog state hook (data load + WebSocket subscription +
     // thunks). Called UNCONDITIONALLY (Rules of Hooks); when `projectId` is not
@@ -182,6 +205,7 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         sprints,
         closedSprints,
         stats,
+        filtersData,
         selectedFilters,
         currentSprint,
         totalMilestones,
@@ -193,6 +217,12 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         showTags,
         swimlanesList,
         firstUsInBacklog,
+        // F-CQ-05: pagination view fields (drive the load-more sentinel + spinner).
+        loadingUserstories,
+        disablePagination,
+        // F-AAP-10: distinguish a genuine load FAILURE from a legitimately empty
+        // backlog so the container can render an error state (with retry).
+        loadError,
     } = state;
 
     /* ---- Local UI state (the ephemeral view state the AngularJS controller
@@ -234,6 +264,16 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         }
     }, [showGraphPlaceholder]);
 
+    // F-CQ-04 summary loading/error signals. `stats` is populated by the initial
+    // load and every `reloadStats`; until it first arrives the summary meter has
+    // no data. `statsLoading` marks that pre-data window so the region renders a
+    // loading treatment (rather than a misleading "0%"); `statsError` is a load
+    // failure while content is present — the summary keeps the last-known values
+    // and flags the staleness instead of blanking (the board-level error state
+    // at the top handles the genuinely empty + failed case).
+    const statsLoading = stats == null && !loadError;
+    const statsError = loadError && stats == null && userstories.length > 0;
+
     /* ---- Derived values ---------------------------------------------------- */
 
     const usStatusList = useMemo(() => readSortedStatuses(project), [project]);
@@ -242,8 +282,28 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     const defaultSwimlane = readDefaultSwimlane(project);
     const iAmAdmin = readIsAdmin(project);
 
-    // Number of applied backend filters (the AngularJS `selectedFilters.length`).
-    const selectedFilterCount = Object.keys(selectedFilters).length;
+    // F-CQ-06 sidebar filters. The hook keeps the raw `filtersData` facets and the
+    // applied `selectedFilters` (a `Record<dataType, csv-of-values>`); the shared
+    // `UsFiltersMixin` port shapes them into the display structures `FiltersSidebar`
+    // renders. The Backlog uses NO facet exclusions (`excludeFilters = []` in the
+    // legacy `BacklogController`, unlike Kanban which hid `status`), so the STATUS
+    // facet is offered here.
+    const filterDataCollection = useMemo(
+        () => buildDataCollection(filtersData),
+        [filtersData],
+    );
+    const filterCategories = useMemo(
+        () => buildCategories(filterDataCollection, []),
+        [filterDataCollection],
+    );
+    const appliedFilters = useMemo(
+        () => buildSelectedFilters(filterDataCollection, selectedFilters),
+        [filterDataCollection, selectedFilters],
+    );
+
+    // Number of applied FACET filters (the AngularJS `ctrl.selectedFilters.length`
+    // — the count of applied options, NOT the number of populated buckets).
+    const selectedFilterCount = appliedFilters.length;
 
     // The checked user stories, in backlog order (getUsToMove, main.coffee:769-777).
     const checkedUserstories = useMemo(
@@ -270,18 +330,27 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     const mayAddUs = canAddUs(project);
     const mayAddMilestone = canAddMilestone(project);
     const mayModifyUs = canModifyUs(project);
-    const mayDeleteMilestone = can(project, 'delete_milestone');
+    // F-REG-03: deleting a sprint is a mutation -> archive-aware gate.
+    const mayDeleteMilestone = canMutate(project, 'delete_milestone');
 
     /* ====================================================================== *
      * Toolbar / action callbacks
      * ====================================================================== */
 
-    // addNewUs (main.coffee:683-691). SCOPE NOTE: the standard single-US create
-    // flow used the shared AngularJS `genericform:new` form, which is OUT OF
-    // SCOPE (not migrated). Both the standard and bulk paths therefore route to
-    // the in-scope `BulkCreateUsLightbox` — the only migrated create surface.
-    const addNewUs = useCallback((_type: 'standard' | 'bulk') => {
-        setLightbox('bulk-us');
+    // addNewUs (main.coffee:683-691). F-CQ-03 — the two create paths are NOT
+    // interchangeable:
+    //   - 'standard' broadcast `genericform:new` -> the COMMON module's generic
+    //     US form (AAP §0.2.2 common OOS; §0.4.1 defines no React standard-create
+    //     component). It is a DEFERRED no-op; the still-AngularJS shell provides
+    //     the standard create dialog. Routing it to the bulk lightbox (the prior
+    //     cut) was WRONG — the two dialogs are distinct.
+    //   - 'bulk' broadcast `usform:bulk` -> the in-scope `BulkCreateUsLightbox`
+    //     (AAP §0.4.1), the ONLY migrated create surface.
+    const addNewUs = useCallback((type: 'standard' | 'bulk') => {
+        if (type === 'bulk') {
+            setLightbox('bulk-us');
+        }
+        // 'standard' is a deferred no-op (genericform:new, common OOS).
     }, []);
 
     // addNewSprint (main.coffee:693-694) -> open the sprint lightbox in create mode.
@@ -311,8 +380,16 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
             return;
         }
         const target = currentSprint ?? sprints[0];
-        void actions.moveToSprint(checkedUserstories, target.id);
-        clearSelection();
+        // F-REG-06: await the move; clear the selection ONLY on success. On
+        // failure the hook has surfaced `moveError` and reconciled the board to
+        // server truth (the optimistically-removed stories return) — keep the
+        // selection so the user can retry rather than losing it silently.
+        void actions
+            .moveToSprint(checkedUserstories, target.id)
+            .then(() => clearSelection())
+            .catch(() => {
+                /* selection intentionally retained on failure */
+            });
     }, [actions, checkedUserstories, currentSprint, sprints, clearSelection]);
 
     // Move-to-latest-sprint (moveToLatestSprint, main.coffee:812-813):
@@ -321,15 +398,23 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         if (checkedUserstories.length === 0 || sprints.length === 0) {
             return;
         }
-        void actions.moveToSprint(checkedUserstories, sprints[0].id);
-        clearSelection();
+        // F-REG-06: await + clear selection only on success (see moveToCurrentSprint).
+        void actions
+            .moveToSprint(checkedUserstories, sprints[0].id)
+            .then(() => clearSelection())
+            .catch(() => {
+                /* selection intentionally retained on failure */
+            });
     }, [actions, checkedUserstories, sprints, clearSelection]);
 
     // toggleTags (main.coffee:501). The AngularJS source persisted the flag via
-    // `rs.userstories.storeShowTags`; the migrated `useBacklog` hook owns
-    // `showTags` in reducer state and does NOT re-read localStorage on mount, so
-    // the container simply dispatches the toggle (documented deviation — the
-    // persisted value is not re-hydrated, matching the state-owned design).
+    // `rs.userstories.storeShowTags(projectId, value)` and rehydrated it via
+    // `getShowTags(projectId)` on load. The migrated `useBacklog` hook owns
+    // `showTags` in reducer state AND reproduces both halves of that contract
+    // (F-CQ-09): `toggleTags` writes the project-scoped preference to
+    // localStorage, and a mount effect re-reads it on projectId change. The
+    // container therefore just dispatches the toggle; persistence + rehydration
+    // are handled by the hook.
     const handleToggleTags = useCallback(() => {
         actions.toggleTags();
     }, [actions]);
@@ -344,6 +429,59 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     // Custom-filters sidebar visibility (`toggleActiveFilters`, main.coffee:241-242).
     const toggleFiltersSidebar = useCallback(() => {
         setFiltersSidebarOpen((open) => !open);
+    }, []);
+
+    // F-CQ-06 addFilterBacklog (main.coffee:706-708): add the chosen option to the
+    // include/exclude bucket, then reload. `setFilters` replaces the whole
+    // selections map and re-runs the backlog fetch + facet regeneration, so a
+    // single call covers `selectFilter` + `filtersReloadContent` + `generateFilters`.
+    const handleAddFilter = useCallback(
+        (payload: {
+            category: FilterCategory;
+            filter: FilterOption;
+            mode: 'include' | 'exclude';
+        }) => {
+            const next = addFilterSelection(
+                selectedFilters,
+                payload.category.dataType,
+                payload.filter,
+                payload.mode,
+            );
+            actions.setFilters(next);
+        },
+        [actions, selectedFilters],
+    );
+
+    // F-CQ-06 removeFilterBacklog (main.coffee:710-713): drop the applied option
+    // from its bucket, then reload.
+    const handleRemoveFilter = useCallback(
+        (filter: SelectedFilter) => {
+            const next = removeFilterSelection(selectedFilters, filter);
+            actions.setFilters(next);
+        },
+        [actions, selectedFilters],
+    );
+
+    // F-CQ-06 SAVED "custom filters" (named, server-persisted filter SETS) — the
+    // same principled deferral the Kanban board makes: the legacy
+    // `saveCustomFilter`/`selectCustomFilter`/`removeCustomFilter`
+    // (main.coffee via `FiltersMixin`, `controllerMixins.coffee:197-247`) persist
+    // through `filterRemoteStorageService` -> the `/user-storage` endpoint
+    // (`resources.coffee:46`). That service is NOT in the AAP §0.4.1 `shared/api/**`
+    // manifest and belongs to the COMMON module the AAP lists OUT OF SCOPE (§0.2.2),
+    // so there is no in-scope adapter to own saved-filter persistence. The AD-HOC
+    // facet filters above ARE fully implemented (they use the in-scope
+    // `filters_data` endpoint); only the named saved-set feature is deferred, so
+    // the sidebar renders an empty saved-filter list and these three handlers are
+    // documented, AAP-scoped no-ops.
+    const handleSelectCustomFilter = useCallback((_customFilter: CustomFilter) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
+    }, []);
+    const handleRemoveCustomFilter = useCallback((_customFilter: CustomFilter) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
+    }, []);
+    const handleSaveCustomFilter = useCallback((_name: string) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
     }, []);
 
     // Search box (`tg-input-search` -> `ctrl.changeQ`). Binds the `q` text
@@ -437,35 +575,69 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         [actions],
     );
 
-    // Delete a story (deleteUserStory, main.coffee:662-681). SCOPE NOTE: the
-    // confirm dialog + backend DELETE belong to the OUT-OF-SCOPE generic US
-    // surface. The migrated in-scope behaviour is the optimistic removal from
-    // the backlog list (the source's `@scope.userstories = _.without(...)`),
-    // dispatched via the hook's `removeUsOptimistic`.
+    // Delete a story (deleteUserStory, main.coffee:662-681). F-CQ-03 — this
+    // control was OWNED by the legacy controller: `@confirm.askOnDelete` then
+    // `@repo.remove(us)` (a real `DELETE /userstories/{id}`). The prior React cut
+    // only removed the story from the LOCAL list (no backend DELETE) — the
+    // "delete is local-only" bug. Now: archive-aware `delete_us` gate +
+    // `window.confirm` (the established stand-in for `$confirm.askOnDelete`) +
+    // the hook's `deleteUs` thunk (optimistic remove + `api.del` + reload/rollback).
     const handleDeleteUs = useCallback(
         (us: UserStory) => {
-            actions.removeUsOptimistic(us.id);
+            if (!canMutate(project, 'delete_us')) {
+                return;
+            }
+            const confirmed = window.confirm(
+                `Are you sure you want to delete the user story "${us.subject}"?`,
+            );
+            if (!confirmed) {
+                return;
+            }
+            void actions.deleteUs(us);
         },
-        [actions],
+        [actions, project],
     );
 
-    // Edit a story. SCOPE NOTE: the generic US edit form (`genericform:edit`) is
-    // OUT OF SCOPE (not migrated). The row's detail link (the still-AngularJS US
-    // detail screen) handles viewing/editing, so this inline affordance is a
-    // documented no-op.
+    // Edit a story. F-CQ-03 DEFERRED: the generic US edit form was the COMMON
+    // module's `genericform:edit` dialog (AAP §0.2.2 common OOS; §0.4.1 defines no
+    // React US-edit component). The row's subject link opens the still-AngularJS
+    // US detail screen, which owns viewing/editing — so this inline affordance is
+    // an AAP-scoped no-op, not a gap.
     const handleEditUs = useCallback((_us: UserStory) => {
-        /* no-op: the generic US edit form is out of migration scope */
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no React edit component):
+         * generic US edit is owned by the still-AngularJS US detail screen. */
     }, []);
 
-    // Inline status change. SCOPE NOTE: the single-US save endpoint is not part
-    // of the whitelisted shared API (generic US save is out of scope), so this
-    // is a documented no-op — the status popover renders for visual fidelity but
-    // does not persist a change here.
+    // Inline status change (tgUsStatus popover). F-CQ-03 — the status popover UI
+    // is reproduced in-scope by `BacklogTable`; the persistence was missing. Now
+    // the container gates `modify_us` (archive-aware) and delegates to the hook's
+    // `updateUsStatus` thunk (optimistic `replaceUs` + `PATCH /userstories/{id}`
+    // { status, version } + reload stats/filters + reload-on-error reconcile).
     const handleUpdateStatus = useCallback(
-        (_us: UserStory, _newStatusId: number) => {
-            /* no-op: single-US status persistence is out of migration scope */
+        (us: UserStory, newStatusId: number) => {
+            if (!canMutate(project, 'modify_us')) {
+                return;
+            }
+            void actions.updateUsStatus(us, newStatusId);
         },
-        [],
+        [actions, project],
+    );
+
+    // Inline points change (tgBacklogUsPoints estimation edit). F-CQ-03 — the
+    // points editor persists via the hook's `updateUsPoints` thunk (optimistic
+    // `replaceUs` + `PATCH /userstories/{id}` { points, version } + reload stats +
+    // reload-on-error reconcile). The point VALUES come from in-scope
+    // `project.points`, so no common-module estimation service is required. The
+    // container gates `modify_us` (archive-aware); `roleId`/`pointId` are chosen
+    // in the inline popover rendered by `BacklogTable`.
+    const handleUpdatePoints = useCallback(
+        (us: UserStory, roleId: number, pointId: number) => {
+            if (!canMutate(project, 'modify_us')) {
+                return;
+            }
+            void actions.updateUsPoints(us, roleId, pointId);
+        },
+        [actions, project],
     );
 
     /* ====================================================================== *
@@ -507,18 +679,20 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     // stories to move into the new sprint) move them to the current sprint
     // (sprintform:create:success:callback -> moveToCurrentSprint, main.coffee:815-817).
     const handleSprintCreated = useCallback(
-        (_milestone: Milestone, ussToMove?: UserStory[]) => {
-            actions.reloadSprints();
-            actions.reloadStats();
-            if (ussToMove && ussToMove.length > 0) {
-                const target = currentSprint ?? sprints[0];
-                if (target) {
-                    void actions.moveToSprint(ussToMove, target.id);
-                }
-            }
+        (_createdMilestone: Milestone, ussToMove?: UserStory[]) => {
+            // F-REG-07: delegate to the hook's `finishSprintCreation`, which
+            // AWAITS the sprint reload and only THEN moves the chosen stories
+            // into `currentSprint || sprints[0]` computed from the REFRESHED
+            // list — faithful to `sprintform:create:success` →
+            // `moveToCurrentSprint` (main.coffee:170-176,807-817). The previous
+            // version fired `reloadSprints()` WITHOUT awaiting it and computed
+            // the target from STALE pre-create `currentSprint`/`sprints`, so the
+            // stories went to the wrong (old) sprint and the just-created
+            // milestone was ignored.
+            void actions.finishSprintCreation(ussToMove);
             setLightbox('none');
         },
-        [actions, currentSprint, sprints],
+        [actions],
     );
 
     // onSaved -> sprintform:edit:success (main.coffee:189-190). The lightbox has
@@ -558,6 +732,35 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         return <div className="wrapper" data-tg-react-backlog="invalid-project" />;
     }
 
+    // F-AAP-10: a genuine load FAILURE (initial or refresh) with no content to
+    // show renders a DISTINCT error state — never the empty-backlog CTA, which
+    // would misrepresent a failure as a successful empty screen. The retry
+    // button re-runs the centralized, awaited load (`actions.reload`). When the
+    // board already has content, a failed live refresh does NOT blank the screen
+    // (the flag is set but this gate only fires on an empty board).
+    if (loadError && userstories.length === 0) {
+        return (
+            <div className="wrapper">
+                <main className="main scrum">
+                    <section className="backlog">
+                        <div className="empty-large js-backlog-load-error" role="alert">
+                            <p className="title">The backlog could not be loaded.</p>
+                            <button
+                                type="button"
+                                className="button button-green js-backlog-retry"
+                                onClick={() => {
+                                    void actions.reload();
+                                }}
+                            >
+                                Try again
+                            </button>
+                        </div>
+                    </section>
+                </main>
+            </div>
+        );
+    }
+
     // `is_backlog_activated` gate (loadProject, main.coffee:472-473): once the
     // project has loaded and the backlog is NOT activated, render an empty
     // state. (Before load, `isBacklogActivated` defaults to true, so there is no
@@ -584,11 +787,32 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         <div className="wrapper">
             <main className="main scrum">
                 <section className="backlog">
-                    {/* Burndown / summary region (tg-toggle-burndown-visibility). */}
-                    <div className="backlog-summary">
+                    {/*
+                      Burndown / summary region (tg-toggle-burndown-visibility).
+                      F-CQ-04: the `loading`/`error` classes let the retained
+                      summary SCSS dim the meter while stats are in flight or a
+                      refresh failed (the last-known numbers are kept, never
+                      blanked). `aria-busy` mirrors the loading state for AT.
+                    */}
+                    <div
+                        className={`backlog-summary${statsLoading ? ' loading' : ''}${
+                            statsError ? ' error' : ''
+                        }`}
+                        aria-busy={statsLoading}
+                    >
                         <div className="summary">
-                            {/* Progress bar container — styled by the retained summary SCSS. */}
-                            <div className="summary-progress-bar" />
+                            {/*
+                              F-CQ-04: the REAL backlog-summary progress meter
+                              (`ProgressBar`, the port of `tgBacklogProgressBar` +
+                              `progress-bar.jade`). It was implemented but never
+                              mounted — the container rendered an empty
+                              `.summary-progress-bar` placeholder, so the meter was
+                              always blank. It now receives the live `stats`
+                              (structurally a `ProgressBarStats`) and computes the
+                              two sub-bar widths itself; a null `stats` renders 0%
+                              bars (its documented pre-load behavior).
+                            */}
+                            <ProgressBar stats={stats} />
 
                             <div className="data">
                                 <span className="number">
@@ -640,8 +864,28 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                         )}
 
                         {/*
-                          Burndown chart intentionally not reproduced per AAP component
-                          scope (§0.3.1); container preserved for layout fidelity.
+                          Burndown CHART (the plotted graph) — DEFERRED per the
+                          frozen AAP, not an omission:
+                            - The AAP React component manifest (§0.3.1) lists the
+                              backlog components explicitly (BacklogTable, Sprint,
+                              SprintHeader, ProgressBar, UsEditSelector,
+                              UsRolePointsSelector, CreateEditSprintLightbox,
+                              BulkCreateUsLightbox) — there is NO burndown-chart
+                              component among them.
+                            - The legacy chart (`tgBurndownBacklogGraph`, retired
+                              backlog/main.coffee:1217-1338) rendered via the
+                              jQuery Flot plugin (`element.plot(data, options)`).
+                              Flot / any charting library is NOT in the AAP React
+                              dependency inventory (§0.5.1), and the Minimal Change
+                              Clause (§0.7.1) forbids adding dependencies beyond
+                              the migration requirements.
+                            - `burndown.scss` is retained as REFERENCE (§0.2.1),
+                              so the collapsible container, the toggle button, the
+                              admin `empty-burndown` hint and the collapse state
+                              (F-CQ-04 collapse) are all reproduced faithfully for
+                              layout parity; only the plotted series are absent.
+                          The collapse classes (`shown open`) and the toggle above
+                          remain fully functional.
                         */}
                         <div
                             className={`graphics-container js-burndown-graph${
@@ -806,10 +1050,28 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             {filtersSidebarOpen && (
                                 <div className="backlog-filter" id="backlog-filter">
                                     {/*
-                                      The custom-filter chip UI (`tg-filter`) is out of
-                                      migration scope; the container is preserved for
-                                      layout fidelity.
+                                      F-CQ-06: the shared `<tg-filter>` panel, reproduced by
+                                      the reused presentational `FiltersSidebar`. The retired
+                                      `backlog.jade` hosted the identical component here
+                                      (`.backlog-filter > tg-filter` with the same
+                                      `filters`/`custom-filters`/`selected-filters` inputs and
+                                      `on-*` outputs); the data is shaped by the shared
+                                      `UsFiltersMixin` port (`../shared/filters`). The Backlog
+                                      applies NO facet exclusions, so ALL facets (incl. status)
+                                      are offered. Saved custom filters are an AAP-scoped
+                                      deferral (see the handler comments above), hence
+                                      `customFilters={[]}`.
                                     */}
+                                    <FiltersSidebar
+                                        filters={filterCategories}
+                                        customFilters={[]}
+                                        selectedFilters={appliedFilters}
+                                        onAddFilter={handleAddFilter}
+                                        onRemoveFilter={handleRemoveFilter}
+                                        onSelectCustomFilter={handleSelectCustomFilter}
+                                        onRemoveCustomFilter={handleRemoveCustomFilter}
+                                        onSaveCustomFilter={handleSaveCustomFilter}
+                                    />
                                 </div>
                             )}
 
@@ -837,11 +1099,22 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                                 displayVelocity ? visibleUserStories : undefined
                                             }
                                             firstUsInBacklog={firstUsInBacklog}
+                                            /* F-CQ-05: spinner while a page fetch is in flight. */
+                                            loading={loadingUserstories}
+                                            /* F-CQ-05: mount the infinite-scroll sentinel ONLY while
+                                               more pages remain; omitting `onLoadMore` when
+                                               `disablePagination` unmounts the sentinel so no further
+                                               fetches are attempted (the last page had no
+                                               `x-pagination-next`). */
+                                            onLoadMore={
+                                                disablePagination ? undefined : actions.loadMore
+                                            }
                                             onEditUs={handleEditUs}
                                             onDeleteUs={handleDeleteUs}
                                             onMoveUsToTop={handleMoveUsToTop}
                                             onToggleCheck={handleToggleCheck}
                                             onUpdateStatus={handleUpdateStatus}
+                                            onUpdatePoints={handleUpdatePoints}
                                         />
                                     </BacklogDndContext>
                                 )}

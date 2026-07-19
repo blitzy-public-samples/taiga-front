@@ -57,61 +57,12 @@
  */
 
 import { useEffect, useRef } from 'react';
-import type { ReactElement, ReactNode } from 'react';
 import type { Status } from '../../shared/types';
-
-/**
- * `<tg-svg>` is the AngularJS icon custom element rendered by the `tgSvg`
- * directive (`app/coffee/modules/common.coffee`, `restrict: 'E'`). We render it
- * as a raw custom-element tag rather than a `<span>` deliberately: the board
- * SCSS targets it directly.
- *
- *   - `.btn-board tg-svg { fill: currentColor; }`
- *     (`app/styles/components/buttons-next.scss`) colours the icon via the
- *     `tg-svg` selector; a `<span>` would never receive the fill.
- *   - `.vfold.task-colum-name span { display: none; }`
- *     (`app/styles/modules/kanban/kanban-table.scss`) hides `<span>`s in a
- *     FOLDED column header — and this unfold button is shown exactly when the
- *     column IS folded, so a `<span>`-wrapped icon would vanish precisely when
- *     it must be visible.
- *
- * It is typed locally (a cast to a minimal function-component signature) rather
- * than via a global `JSX.IntrinsicElements` augmentation so this file stays
- * self-contained and cannot collide (TS2717) with the other migrated components
- * that also render `<tg-svg>`. At runtime the value is simply the string
- * `'tg-svg'`, which the React JSX runtime renders as a `<tg-svg>` host element;
- * React maps `className` to the `class` attribute for custom elements and omits
- * it entirely when the value is `undefined`.
- */
-const TgSvg = 'tg-svg' as unknown as (props: {
-    className?: string;
-    children?: ReactNode;
-}) => ReactElement;
-
-/**
- * Render the inline SVG icon used across the migrated Kanban components,
- * reproducing the DOM the `tgSvg` directive produced:
- *
- *   <tg-svg[ class="…"]><svg class="icon <icon>"><use xlink:href="#<icon>"/></svg></tg-svg>
- *
- * @param icon      The sprite icon id (also used as the second SVG class),
- *                  e.g. `"icon-unfold-column"`.
- * @param className Optional extra class applied to the `<tg-svg>` host (mirrors
- *                  e.g. `tg-svg.add-action` in the templates). Omitted here — the
- *                  archived unfold `tg-svg` carried no extra class.
- * @returns The icon element.
- */
-function svgIcon(icon: string, className?: string): ReactElement {
-    return (
-        <TgSvg className={className}>
-            <svg className={`icon ${icon}`}>
-                {/* `xlinkHref` mirrors the directive's `xlink:href="#<icon>"`
-                    sprite reference for broad SVG-`<use>` support. */}
-                <use xlinkHref={`#${icon}`} />
-            </svg>
-        </TgSvg>
-    );
-}
+// F-UI-02: the ONE shared SVG-sprite primitive replaces this file's local
+// `tg-svg` host + `svgIcon` helper. F-UI-06: `translate` bridges the button title
+// to the shell's angular-translate service (English fallback for shell-less renders).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link ArchivedStatusHeader}. All handlers are optional so the
@@ -184,8 +135,10 @@ export function ArchivedStatusHeader(props: ArchivedStatusHeaderProps) {
             type="button"
             // `hidden` when NOT folded, mirroring `ng-class='{hidden:!folds[s.id]}'`.
             className={`btn-board option hunfold${!folded ? ' hidden' : ''}`}
-            // i18n: KANBAN.TITLE_ACTION_UNFOLD -> "Unfold".
-            title="Unfold"
+            // F-UI-06: KANBAN.TITLE_ACTION_UNFOLD -> "Unfold column" (localised via
+            // the shell, English fallback here). Matches the legacy
+            // `title="{{'KANBAN.TITLE_ACTION_UNFOLD' | translate}}"` on this button.
+            title={translate('KANBAN.TITLE_ACTION_UNFOLD', undefined, 'Unfold column')}
             // The source element carried BOTH `ng-click='foldStatus(s)'` AND the
             // directive's own `$el.on('click', …)` show-archived handler, so a
             // single click did both. Order preserved: toggle fold, then show.
@@ -194,7 +147,7 @@ export function ArchivedStatusHeader(props: ArchivedStatusHeaderProps) {
                 onShowArchived?.(status);
             }}
         >
-            {svgIcon('icon-unfold-column')}
+            <TgSvg icon="icon-unfold-column" />
         </button>
     );
 }

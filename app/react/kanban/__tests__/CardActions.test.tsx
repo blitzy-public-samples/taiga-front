@@ -166,6 +166,26 @@ describe('gate', () => {
 
         expect(getTrigger(container)).toBeInTheDocument();
     });
+
+    it('renders NOTHING on an archived project even with full modify_us + delete_us (F-REG-03)', () => {
+        // F-REG-03: the edit/delete affordances are MUTATIONS, so an archived
+        // project (`archived_code` truthy) must hide the whole control even when
+        // the user holds both permissions — the archive-aware `canMutate` gate
+        // makes canModify AND canDelete both false, so the OR gate is closed.
+        const item = makeBoardCard();
+        const project = makeProject({
+            my_permissions: ['modify_us', 'delete_us'],
+            archived_code: 'blocked',
+        });
+
+        const { container } = render(
+            <CardActions item={item} project={project} zoomLevel={1} />,
+        );
+
+        expect(container.firstChild).toBeNull();
+        expect(screen.queryByRole('button')).toBeNull();
+        expect(queryPopover()).toBeNull();
+    });
 });
 
 /* ========================================================================== *
@@ -199,6 +219,27 @@ describe('popover open/close', () => {
         expect(popover).toBeInTheDocument();
         expect(container.querySelector('.popover.global-popover')).toBeNull();
         expect(trigger).toHaveClass('popover-open');
+    });
+
+    it('exposes accessible menu-button semantics on the trigger and menu (F-UI-04)', () => {
+        const item = makeBoardCard();
+        const project = makeProject({ my_permissions: ['modify_us'] });
+
+        const { container } = render(
+            <CardActions item={item} project={project} zoomLevel={1} />,
+        );
+        const trigger = getTrigger(container);
+        // The icon-only trigger now has an accessible name + disclosure state.
+        expect(trigger.getAttribute('aria-label')).toBeTruthy();
+        expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
+        expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+        fireEvent.click(trigger);
+        expect(trigger.getAttribute('aria-expanded')).toBe('true');
+        // The popover exposes proper menu semantics.
+        const popover = queryPopover() as HTMLElement;
+        expect(popover.querySelector('ul[role="menu"]')).toBeInTheDocument();
+        expect(popover.querySelectorAll('[role="menuitem"]').length).toBeGreaterThan(0);
     });
 
     it('closes the popover when the trigger is clicked again', () => {
@@ -283,11 +324,11 @@ describe('menu items by permission', () => {
         );
 
         const menu = within(openPopover(container));
-        expect(menu.getByRole('button', { name: /edit card/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /assign to/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /move to top/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /edit card/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /assign to/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /move to top/i })).toBeInTheDocument();
         // `delete_us` is absent, so no delete entry.
-        expect(menu.queryByRole('button', { name: /delete card/i })).toBeNull();
+        expect(menu.queryByRole('menuitem', { name: /delete card/i })).toBeNull();
     });
 
     it('modify_us, first card: suppresses Move to top but keeps Edit and Assign To', () => {
@@ -299,10 +340,10 @@ describe('menu items by permission', () => {
         );
 
         const menu = within(openPopover(container));
-        expect(menu.getByRole('button', { name: /edit card/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /assign to/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /edit card/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /assign to/i })).toBeInTheDocument();
         // `$first` disables "Move to top" for the first card.
-        expect(menu.queryByRole('button', { name: /move to top/i })).toBeNull();
+        expect(menu.queryByRole('menuitem', { name: /move to top/i })).toBeNull();
     });
 
     it('delete_us only: shows Delete; hides Edit, Assign To and Move to top', () => {
@@ -314,11 +355,11 @@ describe('menu items by permission', () => {
         );
 
         const menu = within(openPopover(container));
-        expect(menu.getByRole('button', { name: /delete card/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /delete card/i })).toBeInTheDocument();
         // The modify-gated entries stay hidden without `modify_us`.
-        expect(menu.queryByRole('button', { name: /edit card/i })).toBeNull();
-        expect(menu.queryByRole('button', { name: /assign to/i })).toBeNull();
-        expect(menu.queryByRole('button', { name: /move to top/i })).toBeNull();
+        expect(menu.queryByRole('menuitem', { name: /edit card/i })).toBeNull();
+        expect(menu.queryByRole('menuitem', { name: /assign to/i })).toBeNull();
+        expect(menu.queryByRole('menuitem', { name: /move to top/i })).toBeNull();
     });
 
     it('modify_us + delete_us, not first: shows all four items', () => {
@@ -330,10 +371,10 @@ describe('menu items by permission', () => {
         );
 
         const menu = within(openPopover(container));
-        expect(menu.getByRole('button', { name: /edit card/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /assign to/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /delete card/i })).toBeInTheDocument();
-        expect(menu.getByRole('button', { name: /move to top/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /edit card/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /assign to/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /delete card/i })).toBeInTheDocument();
+        expect(menu.getByRole('menuitem', { name: /move to top/i })).toBeInTheDocument();
     });
 });
 
@@ -362,7 +403,7 @@ describe('action callbacks', () => {
         );
 
         const menu = within(openPopover(container));
-        fireEvent.click(menu.getByRole('button', { name: /edit card/i }));
+        fireEvent.click(menu.getByRole('menuitem', { name: /edit card/i }));
 
         expect(onClickEdit).toHaveBeenCalledTimes(1);
         expect(onClickEdit).toHaveBeenCalledWith(42);
@@ -386,7 +427,7 @@ describe('action callbacks', () => {
         );
 
         const menu = within(openPopover(container));
-        fireEvent.click(menu.getByRole('button', { name: /assign to/i }));
+        fireEvent.click(menu.getByRole('menuitem', { name: /assign to/i }));
 
         expect(onClickAssignedTo).toHaveBeenCalledTimes(1);
         expect(onClickAssignedTo).toHaveBeenCalledWith(42);
@@ -408,7 +449,7 @@ describe('action callbacks', () => {
         );
 
         const menu = within(openPopover(container));
-        fireEvent.click(menu.getByRole('button', { name: /delete card/i }));
+        fireEvent.click(menu.getByRole('menuitem', { name: /delete card/i }));
 
         expect(onClickDelete).toHaveBeenCalledTimes(1);
         expect(onClickDelete).toHaveBeenCalledWith(42);
@@ -430,7 +471,7 @@ describe('action callbacks', () => {
         );
 
         const menu = within(openPopover(container));
-        fireEvent.click(menu.getByRole('button', { name: /move to top/i }));
+        fireEvent.click(menu.getByRole('menuitem', { name: /move to top/i }));
 
         expect(onClickMoveToTop).toHaveBeenCalledTimes(1);
         // The React port passes item.id (a number), not the whole item, to

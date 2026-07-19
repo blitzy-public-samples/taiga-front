@@ -344,3 +344,92 @@ describe('e2e hook classes present', () => {
     expect(container.querySelector('.e2e-open-custom-filter-form')).toBeInTheDocument();
   });
 });
+
+/* ========================================================================== *
+ * F-UI-02 / F-UI-06 / F-UI-07 — icons, localization, emoji
+ * ========================================================================== */
+
+describe('F-UI icons, localization and emoji', () => {
+  it('F-UI-06: the panel title and Add action render through the i18n bridge', () => {
+    const { container } = setup();
+
+    // English fallback in the shell-less unit env — NOT hardcoded literals.
+    expect(container.querySelector('.custom-filters-title .name')).toHaveTextContent(
+      'Custom filters',
+    );
+    expect(container.querySelector('.add-custom-filter')).toHaveTextContent('Add');
+  });
+
+  it('F-UI-02: the saved-filter remove control renders the shared `<tg-svg>` trash sprite', () => {
+    const { container } = setup();
+
+    // The retained `filter.scss` targets the `tg-svg` host (the legacy jade used
+    // `tg-svg(svg-icon="icon-trash")`), so the wrapper must be a real custom element
+    // — NOT a bare `<svg>` or empty span.
+    const svg = container.querySelector(
+      '.e2e-remove-custom-filter tg-svg svg.icon.icon-trash',
+    );
+    expect(svg).not.toBeNull();
+    expect(svg?.querySelector('use')).not.toBeNull();
+  });
+
+  it('F-UI-02: category disclosure arrows render as shared `<tg-svg>` sprites', () => {
+    const { container } = setup({
+      selectedFilters: [makeSelectedFilter({ id: 99, key: 'status:99', name: 'Done' })],
+    });
+
+    // Closed category -> right arrow.
+    expect(
+      container.querySelector('.e2e-category tg-svg svg.icon.icon-arrow-right'),
+    ).not.toBeNull();
+
+    // Open the category -> the arrow swaps to the down variant, still a `<tg-svg>`.
+    fireEvent.click(container.querySelector('.e2e-category') as HTMLButtonElement);
+    expect(
+      container.querySelector('.e2e-category tg-svg svg.icon.icon-arrow-down'),
+    ).not.toBeNull();
+  });
+
+  it('F-UI-07: an applied TAG filter name emojifies while a non-tag name stays plain', () => {
+    // Seed one known emoji token so `emojify` produces an <img class="emoji">.
+    (window as unknown as { taiga?: unknown }).taiga = {
+      emojis: [{ id: 'smile', name: 'smile', image: 'smile.png' }],
+    };
+    (window as unknown as { _version?: string })._version = 'v1';
+
+    const { container } = setup({
+      selectedFilters: [
+        // A TAG filter whose name carries an emoji token.
+        makeSelectedFilter({
+          id: 3,
+          key: 'tags:3',
+          name: 'done :smile:',
+          dataType: 'tags',
+        }),
+      ],
+    });
+
+    // The tag name is emojified -> a real <img class="emoji"> node appears.
+    const tagName = container.querySelector('.filters-included .name');
+    expect(tagName).not.toBeNull();
+    expect(tagName?.querySelector('img.emoji')).not.toBeNull();
+  });
+
+  it('F-UI-07: a non-tag applied filter name renders verbatim (no emoji parsing)', () => {
+    (window as unknown as { taiga?: unknown }).taiga = {
+      emojis: [{ id: 'smile', name: 'smile', image: 'smile.png' }],
+    };
+
+    const { container } = setup({
+      selectedFilters: [
+        makeSelectedFilter({ id: 4, key: 'status:4', name: 'plain :smile:', dataType: 'status' }),
+      ],
+    });
+
+    const name = container.querySelector('.filters-included .name');
+    expect(name).not.toBeNull();
+    // Non-tag facets are NOT emojified — the literal token stays as text.
+    expect(name?.querySelector('img.emoji')).toBeNull();
+    expect(name).toHaveTextContent('plain :smile:');
+  });
+});

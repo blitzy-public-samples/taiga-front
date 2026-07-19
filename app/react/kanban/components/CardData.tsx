@@ -34,30 +34,11 @@
  */
 
 import type { BoardCard, Project } from '../../shared/types';
-import moment from 'moment';
-
-/*
- * `<tg-svg>` is a custom element the AngularJS shell relies on so that CSS
- * selectors such as `tg-svg svg.icon` keep matching. Declaring it here
- * (module-local) merges with the global `JSX` namespace supplied by
- * `@types/react`, allowing the lowercase-hyphen intrinsic tag to type-check
- * under `strict` without importing React. This block is purely type-level, so
- * it is legal under `isolatedModules` (the file is a module via its imports /
- * exports).
- */
-declare global {
-    // eslint-disable-next-line @typescript-eslint/no-namespace
-    namespace JSX {
-        interface IntrinsicElements {
-            // Typed as `any` to stay identical to the sibling board components'
-            // `tg-svg` intrinsic-element declarations (e.g. UsRolePointsSelector,
-            // which also passes a `class` attribute). TypeScript merges these
-            // global JSX augmentations across the compilation and requires every
-            // declaration of the same tag to have a matching type.
-            'tg-svg': any;
-        }
-    }
-}
+// F-PERF-01: use the shell's already-loaded global Moment (see shared/moment.ts) so
+// esbuild does not bundle a second ~60 KB copy of Moment into react.js.
+import moment from '../../shared/moment';
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link CardData}.
@@ -162,31 +143,18 @@ function getDueDateStatus(
  * (`app/coffee/modules/kanban/main.coffee:855-865`).
  * -------------------------------------------------------------------------- */
 
-/**
- * Render an inline sprite icon exactly like the AngularJS `CardSvgTemplate`:
- * `<tg-svg><svg class="icon <icon>" style="fill:<fill>"><use xlink:href="#<icon>"
- * attr-href="#<icon>"><title/></use></svg></tg-svg>`. The SVG sprite
- * (`#icon-clock`, etc.) is already loaded into the document by the AngularJS
- * shell, so the `<use>` reference resolves at runtime.
+/*
+ * Icons render through the ONE shared `<TgSvg>` sprite primitive
+ * (`app/react/shared/icon.tsx`, F-UI-02), replacing this component's former
+ * module-local `svgIcon` helper + `declare global { 'tg-svg' }` block. When a
+ * `title` is passed the primitive renders it as an accessible SVG `<title>` and
+ * marks the `<svg>` `role="img"` (WCAG-correct accessible name for a standalone
+ * meaningful glyph, F-UI-04); decorative icons inside a `title`-bearing wrapper
+ * are `aria-hidden`. All user-facing strings resolve through the shared
+ * angular-translate bridge (`translate()`, F-UI-06) with the English locale
+ * value as the fallback so the labels stay correct when the shell service is
+ * unavailable (unit tests).
  */
-function svgIcon(icon: string, opts?: { title?: string; fill?: string | null }) {
-    // React's SVG prop types have no string index signature, so the non-standard
-    // `attr-href` attribute (preserved for DOM parity with the original) is
-    // applied through a cast spread rather than as a direct typed attribute.
-    const extraUseAttrs = { 'attr-href': `#${icon}` } as Record<string, string>;
-    return (
-        <tg-svg>
-            <svg
-                className={`icon ${icon}`}
-                style={opts?.fill ? { fill: opts.fill } : undefined}
-            >
-                <use xlinkHref={`#${icon}`} {...extraUseAttrs}>
-                    {opts?.title ? <title>{opts.title}</title> : null}
-                </use>
-            </svg>
-        </tg-svg>
-    );
-}
 
 /* -------------------------------------------------------------------------- *
  * Component
@@ -253,17 +221,17 @@ export function CardData(props: CardDataProps) {
                 {type === 'us' ? (
                     <span>
                         {totalPoints ? (
-                            // COMMON.CARD.ESTIMATION (title) + COMMON.CARD.PTS (text).
                             <span
                                 className="card-estimation"
-                                title="Estimation"
+                                title={translate('COMMON.CARD.ESTIMATION', undefined, 'Estimation')}
                                 data-id={model.id}
                             >
-                                {`${totalPoints} pts`}
+                                {translate('COMMON.CARD.PTS', { pts: totalPoints }, `${totalPoints} pts`)}
                             </span>
                         ) : (
-                            // COMMON.CARD.NO_PTS
-                            <span className="card-estimation">N/E</span>
+                            <span className="card-estimation">
+                                {translate('COMMON.CARD.NO_PTS', undefined, 'N/E')}
+                            </span>
                         )}
                     </span>
                 ) : null}
@@ -271,47 +239,69 @@ export function CardData(props: CardDataProps) {
                 {/* due date — icon title is COMMON.CARD.DUE_DATE ("Due date: {{date}}") */}
                 {dueDate ? (
                     <div className="card-due-date" title={dueDateTitle}>
-                        {svgIcon('icon-clock', {
-                            title: `Due date: ${dueDateTitle}`,
-                            fill: dueDateColor,
-                        })}
+                        <TgSvg
+                            icon="icon-clock"
+                            title={translate(
+                                'COMMON.CARD.DUE_DATE',
+                                { date: dueDateTitle },
+                                `Due date: ${dueDateTitle}`,
+                            )}
+                            fill={dueDateColor ?? undefined}
+                        />
                     </div>
                 ) : null}
 
                 {/* iocaine — TASK.FIELDS.IS_IOCAINE */}
                 {isIocaine ? (
-                    <div className="card-iocaine" title="Is iocaine">
-                        {svgIcon('icon-iocaine', { title: 'Is iocaine' })}
+                    <div
+                        className="card-iocaine"
+                        title={translate('TASK.FIELDS.IS_IOCAINE', undefined, 'Is iocaine')}
+                    >
+                        <TgSvg
+                            icon="icon-iocaine"
+                            title={translate('TASK.FIELDS.IS_IOCAINE', undefined, 'Is iocaine')}
+                        />
                     </div>
                 ) : null}
 
                 {/* blocked lock */}
                 {isBlocked ? (
-                    <span className="card-lock">{svgIcon('icon-lock')}</span>
+                    <span className="card-lock">
+                        <TgSvg icon="icon-lock" />
+                    </span>
                 ) : null}
             </div>
 
             <div className="card-statistics">
                 {/* attachments — ATTACHMENT.SECTION_NAME */}
                 {totalAttachments ? (
-                    <div className="statistic card-attachments" title="Attachments">
-                        {svgIcon('icon-paperclip')}
+                    <div
+                        className="statistic card-attachments"
+                        title={translate('ATTACHMENT.SECTION_NAME', undefined, 'Attachments')}
+                    >
+                        <TgSvg icon="icon-paperclip" />
                         <span>{totalAttachments}</span>
                     </div>
                 ) : null}
 
                 {/* watchers — COMMON.WATCHERS.WATCHERS */}
                 {watchersCount ? (
-                    <div className="statistic card-watchers" title="Watchers">
-                        {svgIcon('icon-eye')}
+                    <div
+                        className="statistic card-watchers"
+                        title={translate('COMMON.WATCHERS.WATCHERS', undefined, 'Watchers')}
+                    >
+                        <TgSvg icon="icon-eye" />
                         <span>{watchersCount}</span>
                     </div>
                 ) : null}
 
                 {/* comments — COMMENTS.TITLE */}
                 {totalComments ? (
-                    <div className="statistic card-comments" title="Comments">
-                        {svgIcon('icon-message-square')}
+                    <div
+                        className="statistic card-comments"
+                        title={translate('COMMENTS.TITLE', undefined, 'Comments')}
+                    >
+                        <TgSvg icon="icon-message-square" />
                         <span>{totalComments}</span>
                     </div>
                 ) : null}
@@ -322,7 +312,11 @@ export function CardData(props: CardDataProps) {
                         className={`statistic card-completed-tasks${
                             allClosed ? ' completed' : ''
                         }`}
-                        title={`${closedTasks} tasks of ${totalTasks} completed`}
+                        title={translate(
+                            'COMMON.CARD.TASKS',
+                            { completed: closedTasks, total: totalTasks },
+                            `${closedTasks} tasks of ${totalTasks} completed`,
+                        )}
                     >
                         {`${closedTasks} / ${totalTasks}`}
                     </div>

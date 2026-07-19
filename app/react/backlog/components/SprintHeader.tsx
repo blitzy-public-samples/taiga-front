@@ -48,46 +48,19 @@ import type { FC, MouseEvent } from 'react';
 // format the sprint's estimated start/finish dates, mirroring the directive's
 // `moment(...).format(prettyDate)` calls. `esModuleInterop` (root tsconfig)
 // makes the default import valid.
-import moment from 'moment';
+// F-PERF-01: use the shell's already-loaded global Moment (see shared/moment.ts) so
+// esbuild does not bundle a second ~60 KB copy of Moment into react.js.
+import moment from '../../shared/moment';
 
-import { can } from '../../shared/permissions';
+import { can, canMutate } from '../../shared/permissions';
 
 import type { Milestone, Project } from '../../shared/types';
-
-/*
- * Taiga renders inline SVG sprites through its `<tg-svg>` web component, which
- * is not a standard HTML element, so we widen the JSX intrinsic-element table
- * locally (mirroring the sibling backlog/kanban components). Typed `any` because
- * the element is opaque to React/TS and is resolved by the existing sprite
- * runtime at render time.
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup used in `sprint-header.jade`. `className` is
- * forwarded onto the custom element (the sprite runtime reads it); the inner
- * `<svg>` carries the `icon <name>` classes the retained SCSS targets, and
- * `<use>` references the sprite by id. Icons used by this header:
- * `icon-arrow-right` (the compact-sprint toggle) and `icon-edit` (the
- * edit-sprint pencil).
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
+// F-UI-02: the ONE shared SVG-sprite primitive replaces this file's local
+// `tg-svg` host + `svgIcon` helper. F-UI-06: `translate` bridges the button/link
+// titles and the closed/total labels to the shell's angular-translate service
+// (English fallback for shell-less renders).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Reproduce the AngularJS `| number` filter used by the two points cells
@@ -161,7 +134,9 @@ export const SprintHeader: FC<SprintHeaderProps> = (props) => {
   const prettyDate = 'DD MMM YYYY';
 
   // `!archived_code && modify_milestone` — edit affordance gate.
-  const isEditable = !project.archived_code && can(project, 'modify_milestone');
+  // F-REG-03: archive-aware mutation gate (equivalent to the legacy
+  // `!archived_code && modify_milestone`), centralized in `canMutate`.
+  const isEditable = canMutate(project, 'modify_milestone');
   // `view_milestones` — taskboard link visibility gate.
   const isVisible = can(project, 'view_milestones');
 
@@ -202,18 +177,24 @@ export const SprintHeader: FC<SprintHeaderProps> = (props) => {
           <button
             type="button"
             className="compact-sprint"
-            title="Compact Sprint"
+            title={translate('BACKLOG.COMPACT_SPRINT', undefined, 'Compact Sprint')}
             onClick={onToggleCollapse}
           >
-            {svgIcon('icon-arrow-right')}
+            <TgSvg icon="icon-arrow-right" />
           </button>
 
           {/*
             Taskboard link — shown only when the user can view milestones.
-            i18n: BACKLOG.GO_TO_TASKBOARD -> "Go to the taskboard of {{::name}}".
+            F-UI-06: BACKLOG.GO_TO_TASKBOARD -> "Go to the taskboard of {{::name}}".
+            The shell interpolates `{name}`; the English fallback is pre-interpolated
+            since the fallback interpolator does not parse the `::` one-time-binding
+            token in the shipped value.
           */}
           {isVisible && (
-            <a href={taskboardUrl} title={`Go to the taskboard of ${name}`}>
+            <a
+              href={taskboardUrl}
+              title={translate('BACKLOG.GO_TO_TASKBOARD', { name }, `Go to the taskboard of ${name}`)}
+            >
               <span>{name}</span>
             </a>
           )}
@@ -234,10 +215,10 @@ export const SprintHeader: FC<SprintHeaderProps> = (props) => {
           <a
             className="edit-sprint"
             href="#"
-            title="Edit Sprint"
+            title={translate('BACKLOG.EDIT_SPRINT', undefined, 'Edit Sprint')}
             onClick={handleEditClick}
           >
-            {svgIcon('icon-edit')}
+            <TgSvg icon="icon-edit" />
           </a>
         )}
 
@@ -245,13 +226,17 @@ export const SprintHeader: FC<SprintHeaderProps> = (props) => {
           <ul>
             <li>
               <span className="number">{formatNumber(closedPoints)}</span>
-              {/* i18n: BACKLOG.CLOSED_POINTS -> "closed" (lowercase, verbatim). */}
-              <span className="description">closed</span>
+              {/* F-UI-06: BACKLOG.CLOSED_POINTS -> "closed" (lowercase, verbatim). */}
+              <span className="description">
+                {translate('BACKLOG.CLOSED_POINTS', undefined, 'closed')}
+              </span>
             </li>
             <li>
               <span className="number">{formatNumber(totalPoints)}</span>
-              {/* i18n: BACKLOG.TOTAL_POINTS -> "total" (lowercase, verbatim). */}
-              <span className="description">total</span>
+              {/* F-UI-06: BACKLOG.TOTAL_POINTS -> "total" (lowercase, verbatim). */}
+              <span className="description">
+                {translate('BACKLOG.TOTAL_POINTS', undefined, 'total')}
+              </span>
             </li>
           </ul>
         </div>

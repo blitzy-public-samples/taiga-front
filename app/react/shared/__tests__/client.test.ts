@@ -108,6 +108,9 @@ afterEach(() => {
     delete (window as any).taiga;
     delete (window as any).taigaConfig;
     delete (global as any).fetch;
+    // getLanguage() reads <html lang>; jsdom persists it across tests, so clear
+    // it to keep the Accept-Language specs deterministic and prevent leakage.
+    document.documentElement.removeAttribute('lang');
 });
 
 /**
@@ -430,3 +433,310 @@ describe('network isolation — fetch is always a jest mock', () => {
         expect(jest.isMockFunction(global.fetch)).toBe(true);
     });
 });
+
+/* ========================================================================== *
+ * Accept-Language parity — `$tgHttp.headers()` attaches it on EVERY verb
+ * (http.coffee:25-28). The React client must be byte-for-byte identical.
+ * ========================================================================== */
+
+describe('api — Accept-Language header parity (all verbs)', () => {
+    it('sends Accept-Language on POST, reading the live <html lang> first', async () => {
+        // i18nInit stamps <html lang> on every language change (app.coffee:859);
+        // getLanguage() prefers it, so the client mirrors what the user views.
+        document.documentElement.setAttribute('lang', 'fr');
+
+        await api.post('/userstories/bulk_create', { project_id: 1 });
+
+        const { init } = readFetchCall();
+        expect(init.headers['Accept-Language']).toBe('fr');
+
+        document.documentElement.removeAttribute('lang');
+    });
+
+    it('sends Accept-Language on GET too (the header is NOT verb-specific)', async () => {
+        // Unlike app.coffee:592 defaultHeaders (bodied verbs only), $tgHttp
+        // attaches Accept-Language in request(), which GET also funnels through.
+        document.documentElement.setAttribute('lang', 'de');
+
+        await api.get('/userstories/filters_data', { project: 1 });
+
+        const { init } = readFetchCall();
+        expect(init.headers['Accept-Language']).toBe('de');
+
+        document.documentElement.removeAttribute('lang');
+    });
+
+    it('falls back to taigaConfig.defaultLanguage when <html lang> and userInfo are absent', async () => {
+        // beforeEach sets no <html lang> / userInfo; supply a config default and
+        // confirm the client sends it, matching preferredLanguage()'s seed chain.
+        document.documentElement.removeAttribute('lang');
+        (window as any).taigaConfig = {
+            api: 'http://localhost:8000/api/v1/',
+            eventsUrl: null,
+            defaultLanguage: 'es',
+        };
+
+        await api.patch('/userstories/1', { subject: 'x' });
+
+        const { init } = readFetchCall();
+        expect(init.headers['Accept-Language']).toBe('es');
+    });
+
+    it('defaults to "en" when no language source is resolvable', async () => {
+        // beforeEach's config has no defaultLanguage and there is no <html lang>
+        // or userInfo, so getLanguage() returns the "en" backstop
+        // (angular-translate fallbackLanguage, app.coffee:808).
+        document.documentElement.removeAttribute('lang');
+
+        await api.del('/userstories/1');
+
+        const { init } = readFetchCall();
+        expect(init.headers['Accept-Language']).toBe('en');
+    });
+
+    it('reads the language fresh per request (tracks a runtime language switch)', async () => {
+        // Two calls with a language change in between must send DIFFERENT
+        // Accept-Language values — proving nothing is cached at module load.
+        document.documentElement.setAttribute('lang', 'en');
+        await api.get('/a');
+        expect(readFetchCall(0).init.headers['Accept-Language']).toBe('en');
+
+        document.documentElement.setAttribute('lang', 'ja');
+        await api.get('/b');
+        expect(readFetchCall(1).init.headers['Accept-Language']).toBe('ja');
+
+        document.documentElement.removeAttribute('lang');
+    });
+});
+
+
+/* ========================================================================== *
+ * 401 single-flight token refresh / retry / logout parity (F-SEC-02)
+ *
+ * Ports and verifies the AngularJS `$httpProvider` interceptor state machine
+ * (`app.coffee:608-707`) that React `fetch` calls would otherwise bypass:
+ *   - a 401 triggers ONE `POST /auth/refresh`;
+ *   - on success the rotated token is persisted and the original request is
+ *     retried exactly once with the new Bearer;
+ *   - concurrent 401s share a SINGLE refresh (single-flight);
+ *   - on refresh failure / missing refresh token the session is cleared
+ *     (logout) and the original error is thrown;
+ *   - the `/auth/refresh` call itself is never refreshed (loop prevention);
+ *   - the retry happens at most once (no infinite loop).
+ * The logout side-effect is asserted via `localStorage` (the real
+ * `clearSession` runs), honouring this spec's "only import ../api/client"
+ * isolation rule — no session module is imported or mocked.
+ * ========================================================================== */
+
+/** Build a minimal fetch-Response stub with the fields `client.ts` reads. */
+function makeResponse(status: number, body = ''): any {
+    return {
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => (body ? JSON.parse(body) : {}),
+        text: async () => body,
+        headers: new Headers(),
+    };
+}
+
+/** The JSON body a successful `/auth/refresh` returns (auth_token + refresh). */
+function refreshOk(): string {
+    return JSON.stringify({ auth_token: 'new-jwt', refresh: 'new-refresh' });
+}
+
+describe('api — 401 refresh/retry/logout parity (F-SEC-02)', () => {
+    // `redirectToLogin` sets `window.location.href`; jsdom does not implement
+    // navigation and logs a noisy "Not implemented" error. Replace `location`
+    // with a plain writable stub for these tests so the href assignment is a
+    // no-op we can also ASSERT against. The stub keeps a same-origin absolute
+    // `href`, so `resolveUrl`'s origin resolution is unaffected. Restored after
+    // each test to avoid leaking into later specs in this file.
+    let savedLocationDescriptor: PropertyDescriptor | undefined;
+
+    beforeEach(() => {
+        savedLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+        Object.defineProperty(window, 'location', {
+            configurable: true,
+            writable: true,
+            value: {
+                href: 'http://localhost:8000/kanban',
+                origin: 'http://localhost:8000',
+                pathname: '/kanban',
+                search: '',
+                assign() {},
+                replace() {},
+            },
+        });
+    });
+
+    afterEach(() => {
+        if (savedLocationDescriptor) {
+            Object.defineProperty(window, 'location', savedLocationDescriptor);
+        }
+    });
+
+    it('on 401 refreshes once, persists the rotated token, and retries with the new Bearer', async () => {
+        // A refresh token must be present for the refresh path to run.
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValueOnce(makeResponse(401)) // original request → 401
+            .mockResolvedValueOnce(makeResponse(200, refreshOk())) // POST /auth/refresh
+            .mockResolvedValueOnce(makeResponse(200, JSON.stringify({ ok: true }))); // retry
+        global.fetch = fetchMock as any;
+
+        const result = await api.get('/userstories/filters_data', { project: 1 });
+
+        // Exactly three calls: original, refresh, retry.
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+
+        // The refresh POST hit /auth/refresh with the {refresh} body.
+        const [refreshUrl, refreshInit] = fetchMock.mock.calls[1];
+        expect(refreshUrl).toBe('http://localhost:8000/api/v1/auth/refresh');
+        expect(refreshInit.method).toBe('POST');
+        expect(refreshInit.body).toBe(JSON.stringify({ refresh: 'refresh-tok' }));
+
+        // Rotated tokens were persisted (JSON-encoded, as $tgStorage does).
+        expect(JSON.parse(localStorage.getItem('token') as string)).toBe('new-jwt');
+        expect(JSON.parse(localStorage.getItem('refresh') as string)).toBe('new-refresh');
+
+        // The retry carried the NEW Bearer token (headers rebuilt fresh).
+        const [, retryInit] = fetchMock.mock.calls[2];
+        expect(retryInit.headers['Authorization']).toBe('Bearer new-jwt');
+
+        // The caller sees the retried success body.
+        expect(result).toEqual({ ok: true });
+    });
+
+    it('clears the session (logout) and throws the original error when the refresh itself fails', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+        localStorage.setItem('userInfo', JSON.stringify({ id: 7 }));
+
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValueOnce(makeResponse(401)) // original → 401
+            .mockResolvedValueOnce(makeResponse(401)); // refresh → 401 (fails)
+        global.fetch = fetchMock as any;
+
+        await expect(api.get('/x')).rejects.toBeInstanceOf(ApiError);
+
+        // Original + refresh only — NO retry after a failed refresh.
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+
+        // errorToken logout removed token, refresh AND userInfo.
+        expect(localStorage.getItem('token')).toBeNull();
+        expect(localStorage.getItem('refresh')).toBeNull();
+        expect(localStorage.getItem('userInfo')).toBeNull();
+    });
+
+    it('does not attempt a refresh (and logs out) when no refresh token is stored', async () => {
+        // No 'refresh' key in storage → the refresh is impossible.
+        localStorage.removeItem('refresh');
+
+        const fetchMock = jest.fn().mockResolvedValueOnce(makeResponse(401));
+        global.fetch = fetchMock as any;
+
+        await expect(api.get('/x')).rejects.toBeInstanceOf(ApiError);
+
+        // Only the original request — NO /auth/refresh POST at all.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        // The session was cleared even though no refresh was attempted.
+        expect(localStorage.getItem('token')).toBeNull();
+        // And the client was redirected to /login with the unauthorized+next
+        // query, reproducing the coffee errorToken redirect (app.coffee:643-645).
+        expect(window.location.href).toBe('/login?unauthorized=true&next=%2Fkanban');
+    });
+
+    it('shares a SINGLE refresh across concurrent 401s (single-flight)', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        let refreshCalls = 0;
+        const fetchMock = jest.fn(async (url: string, init: any) => {
+            if (url.includes('/auth/refresh')) {
+                refreshCalls += 1;
+                // Widen the single-flight window so both 401 handlers enter
+                // before the shared refresh settles.
+                await new Promise((r) => setTimeout(r, 5));
+                return makeResponse(200, refreshOk());
+            }
+            // Non-refresh: still-old token → 401; rotated token → 200.
+            if (init.headers['Authorization'] === 'Bearer new-jwt') {
+                return makeResponse(200, JSON.stringify({ ok: true }));
+            }
+            return makeResponse(401);
+        });
+        global.fetch = fetchMock as any;
+
+        const [r1, r2] = await Promise.all([api.get('/a'), api.get('/b')]);
+
+        // Both concurrent requests succeeded after ONE shared refresh.
+        expect(r1).toEqual({ ok: true });
+        expect(r2).toEqual({ ok: true });
+        expect(refreshCalls).toBe(1);
+    });
+
+    it('never refreshes the /auth/refresh call itself (loop prevention)', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        const fetchMock = jest.fn().mockResolvedValue(makeResponse(401));
+        global.fetch = fetchMock as any;
+
+        await expect(api.post('/auth/refresh', { refresh: 'x' })).rejects.toBeInstanceOf(ApiError);
+
+        // A single call: the 401 on /auth/refresh does NOT spawn a nested refresh.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a 2xx refresh with a malformed body (no auth_token) as a logout', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValueOnce(makeResponse(401)) // original → 401
+            .mockResolvedValueOnce(makeResponse(200, JSON.stringify({ unexpected: true }))); // no auth_token
+        global.fetch = fetchMock as any;
+
+        await expect(api.get('/x')).rejects.toBeInstanceOf(ApiError);
+
+        // No retry (the refresh yielded no usable token); session cleared.
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(localStorage.getItem('token')).toBeNull();
+        expect(localStorage.getItem('refresh')).toBeNull();
+    });
+
+    it('logs out when the refresh request rejects at the network layer', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        const fetchMock = jest.fn(async (url: string) => {
+            if (url.includes('/auth/refresh')) {
+                throw new TypeError('network down');
+            }
+            return makeResponse(401);
+        });
+        global.fetch = fetchMock as any;
+
+        await expect(api.get('/x')).rejects.toBeInstanceOf(ApiError);
+
+        // Session cleared on the network-error refresh path (no unhandled throw).
+        expect(localStorage.getItem('token')).toBeNull();
+        expect(localStorage.getItem('refresh')).toBeNull();
+    });
+
+    it('retries at most once — a second 401 after a successful refresh is surfaced', async () => {
+        localStorage.setItem('refresh', JSON.stringify('refresh-tok'));
+
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValueOnce(makeResponse(401)) // original → 401
+            .mockResolvedValueOnce(makeResponse(200, refreshOk())) // refresh OK
+            .mockResolvedValueOnce(makeResponse(401)); // retry STILL 401
+        global.fetch = fetchMock as any;
+
+        await expect(api.get('/x')).rejects.toBeInstanceOf(ApiError);
+
+        // original + refresh + exactly one retry, then give up (no loop).
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+});
+

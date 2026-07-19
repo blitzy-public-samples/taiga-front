@@ -50,40 +50,13 @@
 import { useState, useRef, useEffect } from 'react';
 
 import type { UserStory, Project } from '../../shared/types';
-import { can } from '../../shared/permissions';
-
-/*
- * The backlog markup uses Taiga's `<tg-svg>` web component to render inline SVG
- * sprites (so CSS selectors such as `tg-svg svg.icon` keep matching). It is not
- * a standard HTML element, so we widen the JSX intrinsic-element table locally.
- * Typed `any` because the element is opaque to React/TS and is resolved by the
- * existing sprite runtime at render time. (The same local declaration exists in
- * the sibling `UsRolePointsSelector`; duplicate ambient merges are harmless.)
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` markup. The inner `<svg>` carries the `icon <name>`
- * classes the SCSS targets, and `<use>` references the sprite by id. `className`
- * is forwarded onto the custom element for parity with the shared convention.
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
-}
+import { canMutate } from '../../shared/permissions';
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration). F-UI-06: the shared translation bridge
+// so the option-popover copy reads the same `COMMON.EDIT` / `COMMON.DELETE` /
+// `COMMON.MOVE_TO_TOP` keys the AngularJS `us-edit-popover.jade` used.
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link UsEditSelector}.
@@ -137,8 +110,10 @@ export interface UsEditSelectorProps {
  * `tg-check-permission`. `BacklogTable` already renders this component only when
  * the user holds `modify_us` on the project (the `.us-option` cell's own
  * `tg-check-permission="modify_us"`), so delete is reachable only for users who
- * ALSO hold `delete_us` — exactly the AngularJS gating. The per-item `can()`
- * checks are kept regardless so the component is self-correct if reused.
+ * ALSO hold `delete_us` — exactly the AngularJS gating. The per-item
+ * archive-aware `canMutate()` checks (F-REG-03) are kept regardless so the
+ * component is self-correct if reused, and every action is hidden on an
+ * archived project even when the permission is held.
  */
 export const UsEditSelector = ({
   us,
@@ -203,9 +178,10 @@ export const UsEditSelector = ({
         }${open ? ' popover-open' : ''}`}
         aria-haspopup="true"
         aria-expanded={open}
+        aria-label={translate('BACKLOG.US_OPTIONS', undefined, 'User story options')}
         onClick={() => setOpen((o) => !o)}
       >
-        {svgIcon('icon-more-vertical')}
+        <TgSvg icon="icon-more-vertical" />
       </button>
 
       {/*
@@ -216,52 +192,62 @@ export const UsEditSelector = ({
         then closes the popover.
       */}
       {open && (
-        <ul className={`popover us-option-popup${isFirst ? ' first' : ''}`}>
-          {can(project, 'modify_us') && (
-            <li>
-              {/* Edit → ctrl.editUserStory. i18n: COMMON.EDIT. */}
+        // F-UI-04: expose the option popover as an ARIA menu (matching the
+        // kanban `CardActions` popover pattern); the visible
+        // `.popover.us-option-popup` classes are unchanged.
+        <ul
+          className={`popover us-option-popup${isFirst ? ' first' : ''}`}
+          role="menu"
+          aria-label={translate('BACKLOG.US_OPTIONS', undefined, 'User story options')}
+        >
+          {canMutate(project, 'modify_us') && (
+            <li role="none">
+              {/* Edit → ctrl.editUserStory. F-UI-06: COMMON.EDIT. */}
               <button
                 type="button"
                 className="e2e-edit edit-story"
+                role="menuitem"
                 onClick={() => {
                   onEdit(us);
                   setOpen(false);
                 }}
               >
-                {svgIcon('icon-edit')}
-                <span>Edit</span>
+                <TgSvg icon="icon-edit" />
+                <span>{translate('COMMON.EDIT', undefined, 'Edit')}</span>
               </button>
             </li>
           )}
-          {can(project, 'delete_us') && (
-            <li>
-              {/* Delete → ctrl.deleteUserStory. i18n: COMMON.DELETE. */}
+          {canMutate(project, 'delete_us') && (
+            <li role="none">
+              {/* Delete → ctrl.deleteUserStory. F-UI-06: COMMON.DELETE. */}
               <button
                 type="button"
                 className="e2e-delete"
+                role="menuitem"
                 onClick={() => {
                   onDelete(us);
                   setOpen(false);
                 }}
               >
-                {svgIcon('icon-trash')}
-                <span>Delete</span>
+                <TgSvg icon="icon-trash" />
+                <span>{translate('COMMON.DELETE', undefined, 'Delete')}</span>
               </button>
             </li>
           )}
-          {can(project, 'modify_us') && (
-            <li>
-              {/* Move to top → ctrl.moveUsToTopOfBacklog. i18n: COMMON.MOVE_TO_TOP. */}
+          {canMutate(project, 'modify_us') && (
+            <li role="none">
+              {/* Move to top → ctrl.moveUsToTopOfBacklog. F-UI-06: COMMON.MOVE_TO_TOP. */}
               <button
                 type="button"
                 className="e2e-edit move-to-top"
+                role="menuitem"
                 onClick={() => {
                   onMoveToTop(us);
                   setOpen(false);
                 }}
               >
-                {svgIcon('icon-move-to-top')}
-                <span>Move to top</span>
+                <TgSvg icon="icon-move-to-top" />
+                <span>{translate('COMMON.MOVE_TO_TOP', undefined, 'Move to top')}</span>
               </button>
             </li>
           )}

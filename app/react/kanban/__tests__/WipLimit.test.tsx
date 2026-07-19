@@ -139,4 +139,28 @@ describe('WipLimit render', () => {
         expect(marker).toBeInTheDocument();
         expect(marker).toHaveClass('one-left');
     });
+
+    /*
+     * F-UI-05 — the marker's state was conveyed by colour ALONE (a "visual
+     * label only"). It is now an announced `role="status"` live region whose
+     * `aria-label` folds the state into the accessible name, so a screen-reader
+     * user perceives WHICH WIP state was hit. The visible text is unchanged.
+     */
+    it('F-UI-05: announces each WIP state via role="status" + a state-aware aria-label', () => {
+        const reached = render(<WipLimit className="reached" />).container.querySelector(
+            '.kanban-wip-limit',
+        );
+        expect(reached).toHaveAttribute('role', 'status');
+        expect(reached).toHaveAttribute('aria-label', 'WIP Limit reached');
+
+        const exceeded = render(<WipLimit className="exceeded" />).container.querySelector(
+            '.kanban-wip-limit',
+        );
+        expect(exceeded).toHaveAttribute('aria-label', 'WIP Limit exceeded');
+
+        const oneLeft = render(<WipLimit className="one-left" />).container.querySelector(
+            '.kanban-wip-limit',
+        );
+        expect(oneLeft).toHaveAttribute('aria-label', 'WIP Limit one card left');
+    });
 });

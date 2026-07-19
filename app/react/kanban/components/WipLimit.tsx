@@ -130,8 +130,26 @@ interface WipLimitProps {
  * original template exactly.
  */
 export function WipLimit({ className }: WipLimitProps): JSX.Element {
+    // F-UI-05: the legacy marker conveyed its state (one-left / reached /
+    // exceeded) through colour ALONE — a "visual label only" that assistive
+    // tech could not perceive. `role="status"` makes the marker an announced
+    // live region and `aria-label` folds the state into the accessible name so
+    // a screen-reader hears e.g. "WIP Limit exceeded" when it appears. The
+    // visible text and SCSS class are unchanged (zero visual change).
+    const stateLabel =
+        className === 'one-left'
+            ? 'one card left'
+            : className === 'reached'
+              ? 'reached'
+              : className === 'exceeded'
+                ? 'exceeded'
+                : '';
     return (
-        <div className={`kanban-wip-limit ${className}`}>
+        <div
+            className={`kanban-wip-limit ${className}`}
+            role="status"
+            aria-label={stateLabel ? `WIP Limit ${stateLabel}` : 'WIP Limit'}
+        >
             <span>WIP Limit</span>
         </div>
     );

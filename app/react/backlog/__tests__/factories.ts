@@ -196,6 +196,13 @@ export function makeUserStory(overrides: Partial<UserStory> = {}): UserStory {
  * Build a {@link Milestone} (sprint). Dates are `YYYY-MM-DD` strings, as the
  * backend contract requires. `user_stories` starts as a fresh empty array so
  * specs can push in stories (e.g. from {@link makeUserStories}) without aliasing.
+ *
+ * `version` defaults to `1` because every milestone returned by the Django REST
+ * API carries an optimistic-concurrency `version` (mirroring the AngularJS model
+ * contract in `model.coffee`, whose `getAttrs(patch=true)` always appends
+ * `version` to a PATCH body). The React sprint lightbox forwards this `version`
+ * as the third argument of {@link saveMilestone} so the backend can reject
+ * stale writes, so a faithful fixture must always supply it.
  */
 export function makeMilestone(overrides: Partial<Milestone> = {}): Milestone {
     return {
@@ -210,6 +217,7 @@ export function makeMilestone(overrides: Partial<Milestone> = {}): Milestone {
         total_points: 0,
         closed_points: 0,
         order: 1,
+        version: 1,
         ...overrides,
     };
 }

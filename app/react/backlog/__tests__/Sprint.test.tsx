@@ -358,4 +358,114 @@ describe('Sprint', () => {
       expect(sprintTable).toHaveClass('open');
     });
   });
+
+  /* ------------------------------------------------------------------ *
+   * F-UI-02 / F-UI-06 / F-UI-07 — sprite icon, i18n, emoji
+   * ------------------------------------------------------------------ */
+  describe('F-UI-07 emojified story subject', () => {
+    /** Publish a stub shell emoji table + version (as `app.coffee` does). */
+    function installEmojiTable(): void {
+      (window as unknown as { taiga?: unknown }).taiga = {
+        emojis: [{ id: 'smile', name: 'smile', image: 'smile.png' }],
+      };
+      (window as unknown as { _version?: string })._version = 'v9';
+    }
+
+    afterEach(() => {
+      delete (window as unknown as { taiga?: unknown }).taiga;
+      delete (window as unknown as { _version?: string })._version;
+    });
+
+    it('renders `:shortcode:` tokens in the story subject as <img class="emoji">', () => {
+      installEmojiTable();
+      const stories: UserStory[] = [
+        makeUserStory({ id: 301, ref: 31, subject: 'Fix :smile: bug', milestone: 1 }),
+      ];
+      const sprint: Milestone = makeMilestone({ closed: false, user_stories: stories });
+
+      const { container } = renderInDnd(
+        <Sprint sprint={sprint} project={makeProject()} onEditSprint={jest.fn()} />,
+      );
+
+      const nameText = requireEl(container, '.us-name-text');
+      const img = nameText.querySelector('img.emoji');
+      expect(img).not.toBeNull();
+      expect(img?.getAttribute('src')).toBe('/v9/emojis/smile.png');
+      // Surrounding text is preserved around the emoji.
+      expect(nameText).toHaveTextContent('Fix');
+      expect(nameText).toHaveTextContent('bug');
+    });
+
+    it('renders a plain subject unchanged (no emoji tokens)', () => {
+      const stories: UserStory[] = [
+        makeUserStory({ id: 302, ref: 32, subject: 'Plain subject', milestone: 1 }),
+      ];
+      const sprint: Milestone = makeMilestone({ closed: false, user_stories: stories });
+
+      const { container } = renderInDnd(
+        <Sprint sprint={sprint} project={makeProject()} onEditSprint={jest.fn()} />,
+      );
+
+      const nameText = requireEl(container, '.us-name-text');
+      expect(nameText).toHaveTextContent('Plain subject');
+      expect(nameText.querySelector('img.emoji')).toBeNull();
+    });
+  });
+
+  describe('F-UI-02 sprite icon (shared TgSvg)', () => {
+    it('renders the due-date badge as a <tg-svg> icon-clock sprite host', () => {
+      const stories: UserStory[] = [
+        makeUserStory({
+          id: 303,
+          ref: 33,
+          subject: 'With due date',
+          milestone: 1,
+          due_date: '2025-01-15',
+        }),
+      ];
+      const sprint: Milestone = makeMilestone({ closed: false, user_stories: stories });
+
+      const { container } = renderInDnd(
+        <Sprint sprint={sprint} project={makeProject()} onEditSprint={jest.fn()} />,
+      );
+
+      const use = container.querySelector('.due-date tg-svg svg.icon.icon-clock use');
+      expect(use).not.toBeNull();
+      expect(use).toHaveAttribute('href', '#icon-clock');
+    });
+  });
+
+  describe('F-UI-06 localized copy', () => {
+    it('renders the localized empty-sprint warnings', () => {
+      const sprint: Milestone = makeMilestone({ closed: false, user_stories: [] });
+
+      const { container } = renderInDnd(
+        <Sprint sprint={sprint} project={makeProject()} onEditSprint={jest.fn()} />,
+      );
+
+      const empty = requireEl(container, '.sprint-empty');
+      // Both permission spans render; their localized text is present.
+      expect(empty).toHaveTextContent('This sprint has no user stories');
+      expect(empty).toHaveTextContent(
+        'Drop here Stories from your backlog to start a new sprint',
+      );
+    });
+
+    it('renders the localized taskboard link label and interpolated title', () => {
+      const sprint: Milestone = makeMilestone({
+        closed: false,
+        user_stories: [],
+        name: 'Sprint 7',
+      });
+
+      const { container } = renderInDnd(
+        <Sprint sprint={sprint} project={makeProject()} onEditSprint={jest.fn()} />,
+      );
+
+      const link = requireEl(container, 'a.btn-small');
+      expect(link).toHaveTextContent('Sprint Taskboard');
+      // BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD interpolates {name}.
+      expect(link).toHaveAttribute('title', 'Go to Taskboard of "Sprint 7"');
+    });
+  });
 });

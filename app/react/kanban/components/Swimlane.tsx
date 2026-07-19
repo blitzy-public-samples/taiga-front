@@ -55,13 +55,21 @@
  *   CONTAINER concerns (`../KanbanApp.tsx` / `../state/useKanbanBoard.ts`); WIP
  *   recomputes automatically on re-render in React, so `redraw:wip` is NOT ported.
  *   The drag-hover "auto-unfold a folded swimlane after ~1s of hovering while
- *   dragging" (`KanbanSwimlaneDirective`'s `mouseoverSwimlane`/`mouseleaveSwimlane`,
- *   and its sticky-title-on-scroll transform) is a DRAG-AND-DROP concern owned by
- *   `../dnd/KanbanDndContext.tsx` / the container. This component is therefore
- *   PURE: it receives `folded` via props and merely EMITS intent through
- *   `onToggleSwimlane(id)` (title click) and the optional
- *   `onMouseOverSwimlane`/`onMouseLeaveSwimlane` callbacks (the auto-unfold timer
- *   and drag-detection live in the container/DnD layer).
+ *   dragging" (`KanbanSwimlaneDirective`'s `mouseoverSwimlane`/`mouseleaveSwimlane`)
+ *   is a DRAG-AND-DROP concern owned by `../dnd/KanbanDndContext.tsx`. F-CQ-07: it
+ *   is now INTEGRATED here by consuming the DnD-layer `useSwimlaneAutoUnfold` hook
+ *   (exactly as `TaskboardColumn` consumes `DraggableCard`/`DroppableColumn`): the
+ *   timer, the `pending-to-open` class toggle, the `isDragging` gate and the
+ *   `onRequestUnfoldSwimlane` dispatch all live INSIDE that hook, so this component
+ *   holds no timer/state of its own — it only forwards the title-bar element to the
+ *   hook on hover. The `foldedSwimlane` STATE, its persistence and the actual
+ *   unfold on request stay CONTAINER concerns (`../KanbanApp.tsx`), which wires the
+ *   hook end-to-end via the provider's `onRequestUnfoldSwimlane` prop. The
+ *   sticky-title-on-scroll behaviour is handled natively by the unchanged SCSS
+ *   (`.kanban-swimlane-title { position: sticky; top: 36px }`), so no imperative
+ *   scroll transform is reintroduced. The optional `onMouseOverSwimlane` /
+ *   `onMouseLeaveSwimlane` prop callbacks (id-based) are still emitted for any
+ *   external listener, unchanged.
  *
  * PRESENTATIONAL ONLY ("props down, events up")
  *   No data fetching, no API/WebSocket access, no immer/reducer work, no direct
@@ -77,10 +85,16 @@
  * Node v16.19.1 / TypeScript 5.4.5 / React 18.2.0 compatible.
  */
 
-import type { ReactElement, ReactNode } from 'react';
-
 import type { Project, Status, Swimlane as SwimlaneModel, UsMap } from '../../shared/types';
 import { TaskboardColumn } from './TaskboardColumn';
+import { useSwimlaneAutoUnfold } from '../dnd/KanbanDndContext';
+// F-UI-02: the ONE shared SVG-sprite primitive replaces this component's local
+// `tg-svg` host + `svgIcon` helper, so every migrated screen paints icons through
+// a single implementation (`<tg-svg><svg class="icon …"><use/></svg></tg-svg>`).
+// F-UI-06: `translate` bridges to the AngularJS shell's angular-translate service
+// so the hardcoded English literals below localise at render time.
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Id of the synthetic "unclassified" swimlane — the bucket that holds the user
@@ -90,56 +104,6 @@ import { TaskboardColumn } from './TaskboardColumn';
  * exactly mirroring the legacy template's literal `swimlane.id == -1` guards.
  */
 const UNCLASSIFIED_SWIMLANE_ID = -1;
-
-/**
- * Typed handle for the `<tg-svg>` custom-element host. The repo's `tgSvg`
- * directive rendered `<tg-svg[ class="…"]><svg class="icon <icon>"><use
- * xlink:href="#<icon>"/></svg></tg-svg>`; `tg-svg` is not a known intrinsic JSX
- * element, so it is cast to a function-component signature to satisfy the strict
- * compiler while emitting the identical host tag (the same technique sibling
- * components such as `SquishColumn.tsx` / `ArchivedStatusHeader.tsx` use).
- *
- * IMPORTANT — the modifier prop is `class`, NOT `className`. React only reflects
- * `className` -> the `class` ATTRIBUTE for KNOWN elements; on an UNKNOWN custom
- * element (`tg-svg`) a `className` prop is passed through verbatim and renders as
- * a stray lowercase `classname="…"` attribute, which the existing SCSS selectors
- * (`tg-svg.unfold-action`, `.default-swimlane-icon .icon`, `.add-action`) would
- * NOT match. Passing `class` makes React emit the real `class="…"` attribute the
- * stylesheet targets, reproducing the AngularJS DOM byte-for-byte. (Sibling
- * components never pass a modifier to their `tg-svg` host, so they never hit this
- * pitfall; this component genuinely needs the host modifiers, so it must.)
- */
-const TgSvg = 'tg-svg' as unknown as (props: {
-    class?: string;
-    children?: ReactNode;
-}) => ReactElement;
-
-/**
- * Render the repo's `tg-svg(svg-icon="…")` output: a `<tg-svg>` host wrapping an
- * `<svg class="icon <icon>">` that references the globally-injected sprite symbol
- * via `<use xlinkHref="#<icon>">`. The optional `className` is applied to the
- * `<tg-svg>` HOST as its real `class` attribute (see the `TgSvg` note above),
- * mirroring the template's `tg-svg.<modifier>` form (e.g. `tg-svg.unfold-action`,
- * `tg-svg.default-swimlane-icon`, `tg-svg.add-action`). Sizing/fill come from the
- * unchanged SCSS, so no width/height/inline style is emitted — the source markup
- * carried none. The icons are decorative, so no new ARIA is added (this migration
- * adds ARIA only inside the @dnd-kit board layer).
- *
- * @param icon      Sprite symbol id, e.g. `"icon-unfolded-swimlane"`.
- * @param className Optional modifier class applied to the `<tg-svg>` host element
- *                  (emitted as the DOM `class` attribute). Omitted for the plain
- *                  `tg-svg(svg-icon="icon-help-circle")` help icon.
- * @returns The `<tg-svg>` icon element.
- */
-function svgIcon(icon: string, className?: string): ReactElement {
-    return (
-        <TgSvg class={className}>
-            <svg className={`icon ${icon}`}>
-                <use xlinkHref={`#${icon}`} />
-            </svg>
-        </TgSvg>
-    );
-}
 
 /**
  * Props for {@link Swimlane}.
@@ -247,6 +211,14 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
         onToggleSelectedUs,
     } = props;
 
+    // F-CQ-07: consume the DnD-layer auto-unfold hook. It reads `isDragging` +
+    // `onRequestUnfoldSwimlane` off `KanbanDndContext`'s internal context, so it is
+    // a safe NO-OP when this component is rendered without a provider (e.g. isolated
+    // jsdom specs): `onMouseOverSwimlane` returns early with no timer and no class.
+    // Inside the board it adds `pending-to-open` to the hovered title bar and, after
+    // ~1s of hovering a FOLDED swimlane during a drag, requests the unfold.
+    const autoUnfold = useSwimlaneAutoUnfold(swimlane.id, folded);
+
     // The synthetic "unclassified" row (id === -1) gets the `unclassified-*`
     // treatment: the `unclassified-swimlane` button modifier, the
     // `unclassified-us-title` heading modifier, and the help tooltip. Mirrors the
@@ -273,16 +245,30 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                     (folded ? ' folded' : '')
                 }
                 onClick={() => onToggleSwimlane(swimlane.id)}
-                onMouseOver={() => onMouseOverSwimlane?.(swimlane.id)}
-                onMouseLeave={() => onMouseLeaveSwimlane?.(swimlane.id)}
+                // F-CQ-07: drive the auto-unfold hook with the REAL title-bar element
+                // (`e.currentTarget`) so `pending-to-open` lands on the exact
+                // `.kanban-swimlane-title` node the SCSS targets, then still emit the
+                // optional id-based prop callbacks for any external listener.
+                onMouseOver={(e) => {
+                    autoUnfold.onMouseOverSwimlane(e.currentTarget);
+                    onMouseOverSwimlane?.(swimlane.id);
+                }}
+                onMouseLeave={() => {
+                    autoUnfold.onMouseLeaveSwimlane();
+                    onMouseLeaveSwimlane?.(swimlane.id);
+                }}
             >
                 {/* Fold/unfold sprite icon — mutually exclusive by `folded`, the
                     React equivalent of the legacy `ng-if="!folded"` /
                     `ng-if="folded"` pair. The modifier class rides on the
                     `<tg-svg>` host to match `tg-svg.unfold-action` /
                     `tg-svg.fold-action`. */}
-                {!folded && svgIcon('icon-unfolded-swimlane', 'unfold-action')}
-                {folded && svgIcon('icon-folded-swimlane', 'fold-action')}
+                {!folded && (
+                    <TgSvg icon="icon-unfolded-swimlane" className="unfold-action" />
+                )}
+                {folded && (
+                    <TgSvg icon="icon-folded-swimlane" className="fold-action" />
+                )}
 
                 <h2
                     className={
@@ -292,24 +278,35 @@ export function Swimlane(props: SwimlaneProps): JSX.Element {
                     {swimlane.name}
                 </h2>
 
-                {/* Help tooltip, shown ONLY for the synthetic unclassified row. The
-                    literal is the shipped English of
-                    `KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP`. */}
+                {/* Help tooltip, shown ONLY for the synthetic unclassified row.
+                    F-UI-06: `KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP` localises
+                    through the shell, falling back to the shipped English. */}
                 {isUnclassified && (
                     <div className="unclassified-us-info">
-                        {svgIcon('icon-help-circle')}
+                        <TgSvg icon="icon-help-circle" />
                         <div className="tooltip pop-help">
-                            The user stories that are not part of any swimlane are here.
+                            {translate(
+                                'KANBAN.UNCLASSIFIED_USER_STORIES_TOOLTIP',
+                                undefined,
+                                'The user stories that are not part of any swimlane are here.',
+                            )}
                         </div>
                     </div>
                 )}
 
-                {/* Default-swimlane star badge. The literal is the shipped English
-                    of `ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT`. */}
+                {/* Default-swimlane star badge. F-UI-06:
+                    `ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT` localises through the
+                    shell, falling back to the shipped English. */}
                 {isDefaultSwimlane && (
                     <div className="default-swimlane">
-                        {svgIcon('icon-star', 'default-swimlane-icon')}
-                        <span className="default-text">Default</span>
+                        <TgSvg icon="icon-star" className="default-swimlane-icon" />
+                        <span className="default-text">
+                            {translate(
+                                'ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT',
+                                undefined,
+                                'Default',
+                            )}
+                        </span>
                     </div>
                 )}
             </button>
@@ -403,8 +400,12 @@ export function SwimlaneAddLink({
 
     return (
         <a className="kanban-swimlane-add" href={href}>
-            {svgIcon('icon-add', 'add-action')}
-            <span>Create more swimlanes</span>
+            <TgSvg icon="icon-add" className="add-action" />
+            {/* F-UI-06: `KANBAN.CREATE_SWIMLANE` localises through the shell,
+                falling back to the shipped English. */}
+            <span>
+                {translate('KANBAN.CREATE_SWIMLANE', undefined, 'Create more swimlanes')}
+            </span>
         </a>
     );
 }

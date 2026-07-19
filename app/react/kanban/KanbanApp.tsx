@@ -44,36 +44,73 @@ import type {
     CustomFilter,
 } from './components/FiltersSidebar';
 import { UNCLASSIFIED_SWIMLANE_ID } from './state/boardReducer';
-import { canModifyUs, canAddUs, can } from '../shared/permissions';
+import { canModifyUs, canAddUs, canMutate } from '../shared/permissions';
 import { filtersData } from '../shared/api/userstories';
+import { translate } from '../shared/i18n';
 import type { Project, Status, FiltersData, FilterOption } from '../shared/types';
 
+/*
+ * The board toolbar hosts two AngularJS custom elements the retained SCSS
+ * targets by TAG: `<tg-input-search>` (`app/styles/layout/kanban.scss:84`,
+ * `.kanban-table-options-start tg-input-search`) and `<tg-filter>`
+ * (`app/styles/layout/kanban.scss:50`, `.kanban-filter tg-filter`). Rendering
+ * these as plain `<div class="tg-input-search">` / omitting `<tg-filter>` means
+ * those TAG selectors never match (F-UI-01), so the search box and filter panel
+ * lose their scoped styling. They are declared here as intrinsic elements
+ * (typed `any`, matching the sibling components' custom-element declarations)
+ * and emitted as real custom-element tags below.
+ */
+declare global {
+    // eslint-disable-next-line @typescript-eslint/no-namespace
+    namespace JSX {
+        interface IntrinsicElements {
+            'tg-input-search': any;
+            'tg-filter': any;
+        }
+    }
+}
+
 /* ========================================================================== *
- * Visible copy (literal English matching the app's shipped default strings;
- * there is no i18n bridge in `../shared`, so the translate keys the AngularJS
- * templates used are inlined as their `locale-en.json` values).
+ * Visible copy (F-UI-06).
+ *
+ * These labels are resolved at RENDER TIME through the shared angular-translate
+ * bridge (`useLabels()` below → `translate()`), NOT as module-level constants:
+ * the React bundle loads BEFORE `angular.bootstrap`, so a module-level
+ * `translate()` would run before the shell's `$translate` injector exists and
+ * would freeze at the English fallback forever. Resolving inside the component
+ * (which mounts AFTER bootstrap, when the route renders the custom element)
+ * lets the shell locale apply, while the `locale-en.json` value passed as the
+ * fallback keeps every label correct when the service is unavailable (unit
+ * tests). Each entry is annotated with its original translation key.
  * ========================================================================== */
 
-/** `KANBAN.SECTION_NAME` — the screen title rendered in the header. */
-const SECTION_NAME = 'Kanban';
-/** `BACKLOG.FILTERS.TITLE` — filter toggle label when the panel is closed. */
-const FILTERS_TITLE = 'Filters';
-/** `BACKLOG.FILTERS.HIDE_TITLE` — filter toggle label when the panel is open. */
-const HIDE_FILTERS_TITLE = 'Hide filters';
-/** `COMMON.FILTERS.APPLIED_FILTERS_NUM` — suffix for the applied-filter count title. */
-const APPLIED_FILTERS_NUM = 'filters applied';
-/** `COMMON.FILTERS.INPUT_PLACEHOLDER` — the board search input placeholder. */
-const SEARCH_PLACEHOLDER = 'subject or reference';
-/** `KANBAN.TITLE_ACTION_ADD_US` — status-column "add user story" button title. */
-const ADD_US_TITLE = 'Add new user story';
-/** `KANBAN.TITLE_ACTION_ADD_BULK` — status-column "bulk add" button title. */
-const ADD_BULK_TITLE = 'Add new bulk';
-/** `KANBAN.TITLE_ACTION_FOLD` — status-column fold button title. */
-const FOLD_TITLE = 'Fold column';
-/** `KANBAN.TITLE_ACTION_UNFOLD` — status-column unfold button title. */
-const UNFOLD_TITLE = 'Unfold column';
-/** `ZOOM.TITLE` — zoom-control label. */
-const ZOOM_TITLE = 'Zoom:';
+/**
+ * Resolve the Kanban screen's visible copy through the shell locale. Called once
+ * per render from inside {@link KanbanApp}; returns the same shape the former
+ * module-level string constants exposed so every render site is unchanged.
+ */
+function useLabels() {
+    return {
+        SECTION_NAME: translate('KANBAN.SECTION_NAME', undefined, 'Kanban'),
+        FILTERS_TITLE: translate('BACKLOG.FILTERS.TITLE', undefined, 'Filters'),
+        HIDE_FILTERS_TITLE: translate('BACKLOG.FILTERS.HIDE_TITLE', undefined, 'Hide filters'),
+        APPLIED_FILTERS_NUM: translate(
+            'COMMON.FILTERS.APPLIED_FILTERS_NUM',
+            undefined,
+            'filters applied',
+        ),
+        SEARCH_PLACEHOLDER: translate(
+            'COMMON.FILTERS.INPUT_PLACEHOLDER',
+            undefined,
+            'subject or reference',
+        ),
+        ADD_US_TITLE: translate('KANBAN.TITLE_ACTION_ADD_US', undefined, 'Add new user story'),
+        ADD_BULK_TITLE: translate('KANBAN.TITLE_ACTION_ADD_BULK', undefined, 'Add new bulk'),
+        FOLD_TITLE: translate('KANBAN.TITLE_ACTION_FOLD', undefined, 'Fold column'),
+        UNFOLD_TITLE: translate('KANBAN.TITLE_ACTION_UNFOLD', undefined, 'Unfold column'),
+        ZOOM_TITLE: translate('ZOOM.TITLE', undefined, 'Zoom:'),
+    };
+}
 
 /* ========================================================================== *
  * Zoom model (SOURCE `kanban-board-zoom.directive.coffee` + `main.coffee`
@@ -428,6 +465,9 @@ function StatusColumnHeader({
     onAdd,
     onAddBulk,
 }: StatusColumnHeaderProps): ReactElement {
+    // F-UI-06: column-action button titles resolved through the shell locale at
+    // render time (same rationale as the container's `useLabels`).
+    const { ADD_US_TITLE, ADD_BULK_TITLE, FOLD_TITLE, UNFOLD_TITLE } = useLabels();
     // `add`/`bulk` require `add_us` and are hidden on archived columns
     // (`kanban-table.jade` `tg-check-permission="add_us"` + `ng-hide="s.is_archived"`).
     const canAdd = canAddUs(project) && !status.is_archived;
@@ -524,9 +564,27 @@ export interface KanbanAppProps {
  */
 export function KanbanApp(props: KanbanAppProps): JSX.Element {
     // `project-id` arrives as a string; coerce and guard so a mis-mounted element
-    // (missing/NaN id) renders a minimal empty state instead of throwing.
+    // (missing/NaN id) renders a minimal empty state instead of throwing. A valid
+    // project id must be a POSITIVE INTEGER (F-REG-01): `Number.isInteger(...) &&
+    // > 0` rejects the literal `"{{project.id}}"` snapshot (NaN), a blank/absent
+    // attribute (`Number("")` -> 0) and any non-positive/fractional value. When
+    // AngularJS later resolves the interpolation, `attributeChangedCallback` in
+    // shared/mount.tsx re-renders with the real id and this guard then passes.
     const projectId = Number(props.projectId);
-    const projectIdValid = Number.isFinite(projectId);
+    const projectIdValid = Number.isInteger(projectId) && projectId > 0;
+
+    // F-UI-06: resolve the toolbar/column visible copy through the shell locale
+    // at render time (see `useLabels` for the load-order rationale). The same
+    // names the former module-level constants exposed are destructured here so
+    // every render site is unchanged.
+    const {
+        SECTION_NAME,
+        FILTERS_TITLE,
+        HIDE_FILTERS_TITLE,
+        APPLIED_FILTERS_NUM,
+        SEARCH_PLACEHOLDER,
+        ZOOM_TITLE,
+    } = useLabels();
 
     /* ---- Zoom state (SOURCE `setZoom` 127-147) --------------------------- */
 
@@ -719,6 +777,28 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         [foldedSwimlane, projectId],
     );
 
+    // F-CQ-07: force-unfold a folded swimlane. Wired into `KanbanDndContext` as
+    // `onRequestUnfoldSwimlane`, this is what `useSwimlaneAutoUnfold` invokes after
+    // ~1s of hovering a FOLDED swimlane while a drag is in flight (parity with the
+    // legacy `KanbanSwimlaneDirective` auto-unfold, `main.coffee:1153-1180`). It is
+    // idempotent (a no-op when the swimlane is already open, avoiding needless
+    // state churn / re-render mid-drag) and persists the new fold map exactly like
+    // `toggleSwimlane` so the reopened state survives a reload. The functional
+    // updater reads the latest map, so this callback is stable across renders.
+    const unfoldSwimlane = useCallback(
+        (id: number) => {
+            setFoldedSwimlane((prev) => {
+                if (!prev[id]) {
+                    return prev; // already unfolded — no state change, no persist
+                }
+                const next = { ...prev, [id]: false };
+                writeBoolMap(swimlaneModesStorageKey(projectId), next);
+                return next;
+            });
+        },
+        [projectId],
+    );
+
     /* ---- Zoom control (SOURCE `setZoom` 127-147) ------------------------- */
 
     const setZoom = useCallback(
@@ -766,7 +846,10 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         (
             finalUsList: FinalUsListItem[],
             newStatus: number,
-            newSwimlane: number,
+            // F-AAP-09: `number | null` — the DnD boundary already normalizes a
+            // missing swimlane to `null` (never NaN); a real id or `-1` may also
+            // arrive. `board.move` maps `-1`/NaN to the API `null`.
+            newSwimlane: number | null,
             index: number,
             previousCard: number | null,
             nextCard: number | null,
@@ -775,10 +858,11 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             setSelectedUss({});
             const usIds = finalUsList.map((item) => item.id);
             // `board.move` performs the canonical `newSwimlane === -1 -> null` mapping
-            // (SOURCE 604-607), the optimistic reducer update AND the
-            // `/userstories/bulk_update_kanban_order` call. Forward `newSwimlane` RAW
-            // so the mapping lives in exactly one place (the hook) — do NOT pre-map
-            // here. The argument order is FROZEN to match the source `moveUs`.
+            // (SOURCE 604-607) plus the NaN guard (F-AAP-09), the optimistic reducer
+            // update AND the `/userstories/bulk_update_kanban_order` call. Forward
+            // `newSwimlane` unchanged so the mapping lives in exactly one place (the
+            // hook) — do NOT pre-map here. The argument order is FROZEN to match the
+            // source `moveUs`.
             void board
                 .move(usIds, newStatus, newSwimlane, index, previousCard, nextCard)
                 .then(() => {
@@ -820,9 +904,9 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                     oldSwimlaneId: card.swimlane,
                 };
                 // SOURCE 183: moveUs(null, uss, us.status, us.swimlane, 0, null, nextUsId).
-                // `handleMoveUs` expects `newSwimlane: number`; map the model's `null`
-                // swimlane to the synthetic unclassified id (-1) so the hook round-trips
-                // it back to `null` on the wire.
+                // Map the model's `null` swimlane to the synthetic unclassified id
+                // (-1) so the hook round-trips it back to `null` on the wire — this
+                // deliberately mirrors the source's `-1` routing for "move to top".
                 const swimlaneArg = swimlaneId == null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneId;
                 handleMoveUs([item], statusId, swimlaneArg, 0, null, nextUsId);
             }
@@ -831,12 +915,34 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     );
 
     /* ---- Card action handlers -------------------------------------------- *
-     * SCOPE NOTE: in AngularJS these opened lightboxes (`genericform:edit`,
-     * `askOnDelete`, `tg-lb-select-user`, new-US / bulk-create) owned by the
-     * still-AngularJS shell. Those lightboxes are OUT OF SCOPE for this migration
-     * (only the Backlog sprint/bulk lightboxes are in scope, under
-     * `app/react/backlog/**`). These handlers are therefore permission-gated
-     * no-ops so the board never throws; the shell provides the actual UI.
+     * F-CQ-02 SCOPE NOTE — the five card/board controls split into TWO groups
+     * based on what the legacy `KanbanController` actually OWNED:
+     *
+     *   OWNED (in scope, implemented below): DELETE. `deleteUserStory`
+     *   (SOURCE main.coffee 289-304) asked `@confirm.askOnDelete(...)` and, on
+     *   confirmation, called `@repo.remove(model)` DIRECTLY, then broadcast
+     *   `kanban:us:deleted` to prune the board. The controller owned the
+     *   mutation end-to-end, so the React port owns it too (confirm ->
+     *   `api.del` -> optimistic `REMOVE` -> reload-on-error) via
+     *   `board.deleteUserStory`.
+     *
+     *   DELEGATED (deferred with citations): EDIT, ASSIGN, NEW, BULK. In
+     *   AngularJS these controls did NOT own their mutation — they merely
+     *   `$rootscope.$broadcast(...)` to open a COMMON-module lightbox
+     *   (`genericform:edit` / `genericform:new` / `usform:bulk` /
+     *   `tg-lb-select-user`) which owned the save; the controller only REACTED
+     *   to the `usform:*:success` outcome (SOURCE 187-224) by refreshing the
+     *   board. The AAP places the common module OUT OF SCOPE (§0.2.2) and the
+     *   React file manifest (§0.4.1) defines NO Kanban lightbox component, so
+     *   there is no in-scope surface that owns these saves. Reaching the
+     *   AngularJS lightboxes from React would require a cross-framework
+     *   `$rootscope` bridge that is itself scope creep. When those out-of-scope
+     *   lightboxes DO persist a change, the board still reflects it: the events
+     *   bridge (`useKanbanBoard` subscription to
+     *   `changes.project.{id}.userstories`) re-lists and re-renders — exactly
+     *   the reflection path the legacy success handlers provided. These four
+     *   handlers therefore stay permission-gated no-ops (the affordance is only
+     *   ever presented while the still-AngularJS shell is mounted).
      * ---------------------------------------------------------------------- */
 
     const handleClickEdit = useCallback(
@@ -844,8 +950,11 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canModifyUs(board.project)) {
                 return;
             }
-            // TODO(migration): edit-user-story lightbox is provided by the
-            // out-of-scope AngularJS shell.
+            // DELEGATED (deferred): the edit lightbox is the common module's
+            // `genericform:edit` directive (AAP §0.2.2 OOS; §0.4.1 defines no
+            // Kanban edit component). The controller only reacted to
+            // `usform:edit:success`; the events bridge reflects the persisted
+            // change back onto the board.
             void usId;
         },
         [board.project],
@@ -853,14 +962,25 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
     const handleClickDelete = useCallback(
         (usId: number) => {
-            if (!can(board.project, 'delete_us')) {
+            // F-REG-03: archive-aware mutation gate — an archived project blocks
+            // deletion even when the user holds `delete_us`.
+            if (!canMutate(board.project, 'delete_us')) {
                 return;
             }
-            // TODO(migration): delete-confirmation lightbox is provided by the
-            // out-of-scope AngularJS shell.
-            void usId;
+            // OWNED (in scope) — SOURCE `deleteUserStory` 289-304. The legacy
+            // controller asked `@confirm.askOnDelete(...)` then removed the story
+            // directly. `window.confirm` is the established React stand-in for
+            // `$confirm.askOnDelete` (documented pattern, CreateEditSprintLightbox).
+            const confirmed = window.confirm(
+                'Are you sure you want to delete this user story?',
+            );
+            if (!confirmed) {
+                return;
+            }
+            // Persist + optimistically prune the board; reload-on-error reconciles.
+            void board.deleteUserStory(usId);
         },
-        [board.project],
+        [board],
     );
 
     const handleClickAssignedTo = useCallback(
@@ -868,8 +988,10 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canModifyUs(board.project)) {
                 return;
             }
-            // TODO(migration): assigned-users lightbox (tg-lb-select-user) is
-            // provided by the out-of-scope AngularJS shell.
+            // DELEGATED (deferred): the assignee picker is the common module's
+            // `tg-lb-select-user` lightbox (AAP §0.2.2 OOS; §0.4.1 defines no
+            // Kanban assignee component). The events bridge reflects the
+            // persisted assignment back onto the board.
             void usId;
         },
         [board.project],
@@ -880,8 +1002,10 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canAddUs(board.project)) {
                 return;
             }
-            // TODO(migration): new-user-story lightbox (genericform) is provided by
-            // the out-of-scope AngularJS shell.
+            // DELEGATED (deferred): the new-story dialog is the common module's
+            // `genericform:new` lightbox (AAP §0.2.2 OOS; §0.4.1 defines no
+            // Kanban create component). The controller only reacted to
+            // `usform:new:success`; the events bridge reflects the new story.
             void statusId;
         },
         [board.project],
@@ -892,8 +1016,10 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canAddUs(board.project)) {
                 return;
             }
-            // TODO(migration): bulk-create lightbox is provided by the out-of-scope
-            // AngularJS shell.
+            // DELEGATED (deferred): bulk-create is the common module's
+            // `usform:bulk` lightbox (`lightbox-us-bulk`) (AAP §0.2.2 OOS; the
+            // Backlog bulk lightbox in §0.4.1 is a distinct component). The
+            // events bridge reflects the created stories onto the board.
             void statusId;
         },
         [board.project],
@@ -954,18 +1080,32 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         });
     }, []);
 
-    // SCOPE NOTE: saved "custom filters" used a remote filter-storage service with
-    // no in-scope shared adapter, so the sidebar renders with an empty custom-filter
-    // list and these are documented no-ops (the container "only owns the toggle,
-    // the query, and wiring").
+    // F-CQ-02 SCOPE NOTE — TWO kinds of "filters" must be distinguished:
+    //   - AD-HOC FACET filters (add/remove a tag / status / assignee inline):
+    //     IN SCOPE and fully implemented above (`handleAddFilter` /
+    //     `handleRemoveFilter`), driven by the `filters_data` facet endpoint that
+    //     the AAP §0.4.1 manifest DOES list (`shared/api/userstories.filtersData`).
+    //   - SAVED "custom filters" (named, server-persisted filter sets): the legacy
+    //     `FiltersMixin` (`common/controllerMixins.coffee:197-247`) persists these
+    //     through `filterRemoteStorageService`, which hits the `/user-storage`
+    //     endpoint (`resources.coffee:46`). That service is NOT in the AAP §0.4.1
+    //     `shared/api/**` manifest (only client / userstories / milestones), and it
+    //     belongs to the COMMON module the AAP lists OUT OF SCOPE (§0.2.2). There is
+    //     therefore no in-scope adapter that owns saved-filter persistence, so the
+    //     sidebar renders an empty saved-filter list and these three handlers are
+    //     documented, AAP-scoped no-ops (the container "only owns the toggle, the
+    //     query, and wiring").
     const handleSelectCustomFilter = useCallback((_customFilter: CustomFilter) => {
-        /* no-op: remote custom-filter storage is out of scope for this migration */
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter): saved
+         * custom-filter selection is owned by the out-of-scope FiltersMixin. */
     }, []);
     const handleRemoveCustomFilter = useCallback((_customFilter: CustomFilter) => {
-        /* no-op: remote custom-filter storage is out of scope for this migration */
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter): saved
+         * custom-filter removal is owned by the out-of-scope FiltersMixin. */
     }, []);
     const handleSaveCustomFilter = useCallback((_name: string) => {
-        /* no-op: remote custom-filter storage is out of scope for this migration */
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter): saved
+         * custom-filter persistence is owned by the out-of-scope FiltersMixin. */
     }, []);
 
     /* ---- Derived render helpers ------------------------------------------ */
@@ -1007,6 +1147,29 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         return <div className="wrapper" data-tg-react-kanban="invalid-project" />;
     }
 
+    // F-AAP-10: a genuine load FAILURE with an empty board renders a DISTINCT
+    // error state (with retry) — never the empty-board placeholder, which would
+    // misrepresent a failure as a successful empty board. A populated board with
+    // a failed live refresh is NOT blanked (this gate requires `boardEmpty`).
+    if (board.loadError && boardEmpty) {
+        return (
+            <div className="wrapper">
+                <section className="main kanban">
+                    <div className="empty-large js-kanban-load-error" role="alert">
+                        <p className="title">The board could not be loaded.</p>
+                        <button
+                            type="button"
+                            className="button button-green js-kanban-retry"
+                            onClick={() => board.reload()}
+                        >
+                            Try again
+                        </button>
+                    </div>
+                </section>
+            </div>
+        );
+    }
+
     const project = board.project;
     const swimlanesList = board.swimlanesList;
     const hasSwimlanes = swimlanesList.length > 0;
@@ -1038,15 +1201,21 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                                     <span className="selected-filters">{selectedFilterCount}</span>
                                 ) : null}
                             </button>
-                            <div className="tg-input-search">
+                            {/* F-UI-01: the host is the `<tg-input-search>` custom
+                                element (was `<div class="tg-input-search">`) so the
+                                retained `.kanban-table-options-start tg-input-search`
+                                TAG selector matches. F-UI-04: the search field is
+                                given an accessible name (was placeholder-only). */}
+                            <tg-input-search>
                                 <input
                                     type="search"
+                                    aria-label={SEARCH_PLACEHOLDER}
                                     placeholder={SEARCH_PLACEHOLDER}
                                     value={searchInput}
                                     onChange={handleSearchChange}
                                 />
                                 {svgIcon('icon-search')}
-                            </div>
+                            </tg-input-search>
                         </div>
                         <div className="kanban-table-options-end">
                             <div className="board-zoom">
@@ -1073,17 +1242,22 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
                 <div className={managerClass}>
                     {openFilter ? (
+                        // F-UI-01: FiltersSidebar renders the `<tg-filter>` BODY, so
+                        // it is wrapped in the `<tg-filter>` host element to satisfy
+                        // the retained `.kanban-filter tg-filter` TAG selector.
                         <div className="kanban-filter">
-                            <FiltersSidebar
-                                filters={filterCategories}
-                                customFilters={[]}
-                                selectedFilters={selectedFilters}
-                                onAddFilter={handleAddFilter}
-                                onRemoveFilter={handleRemoveFilter}
-                                onSelectCustomFilter={handleSelectCustomFilter}
-                                onRemoveCustomFilter={handleRemoveCustomFilter}
-                                onSaveCustomFilter={handleSaveCustomFilter}
-                            />
+                            <tg-filter>
+                                <FiltersSidebar
+                                    filters={filterCategories}
+                                    customFilters={[]}
+                                    selectedFilters={selectedFilters}
+                                    onAddFilter={handleAddFilter}
+                                    onRemoveFilter={handleRemoveFilter}
+                                    onSelectCustomFilter={handleSelectCustomFilter}
+                                    onRemoveCustomFilter={handleRemoveCustomFilter}
+                                    onSaveCustomFilter={handleSaveCustomFilter}
+                                />
+                            </tg-filter>
                         </div>
                     ) : null}
 
@@ -1095,6 +1269,11 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                             zoom={zoom}
                             zoomLevel={zoomLevel}
                             onMoveUs={handleMoveUs}
+                            // F-CQ-07: enable the drag-hover auto-unfold. `Swimlane`
+                            // calls `useSwimlaneAutoUnfold`, which reads this callback
+                            // off the DnD internal context and fires it after ~1s of
+                            // hovering a folded swimlane mid-drag.
+                            onRequestUnfoldSwimlane={unfoldSwimlane}
                         >
                             <div className={tableClass}>
                                 <div className="kanban-table-header">

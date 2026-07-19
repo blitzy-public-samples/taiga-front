@@ -19,16 +19,17 @@
     "scss-lint": "gulp scss-lint --fail",
     "test": "jest --config jest.config.js",
     "e2e": "playwright test --config e2e-react/playwright.config.ts",
+    "e2e:chromium": "TAIGA_E2E_CHROMIUM=1 playwright test --config e2e-react/playwright.config.ts --project=chromium-fallback",
     "start": "npx gulp",
     "ci:test": "npx gulp deploy && ./node_modules/karma/bin/karma start --single-run --browsers=ChromeHeadlessCI"
   },
   "devDependencies": {
     "@playwright/test": "1.44.1",
-    "@testing-library/jest-dom": "^6.0.0",
-    "@testing-library/react": "^14.0.0",
-    "@types/jest": "^29.5.0",
-    "@types/react": "^18.2.0",
-    "@types/react-dom": "^18.2.0",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "14.3.1",
+    "@types/jest": "29.5.14",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
     "angular-mocks": "1.5.5",
     "babel-cli": "^6.23.0",
     "babel-polyfill": "^6.7.4",
@@ -111,6 +112,9 @@
   "pre-commit": [
     "scss-lint"
   ],
+  "overrides": {
+    "node-releases": "2.0.10"
+  },
   "dependencies": {
     "@dnd-kit/core": "6.3.1",
     "@highlightjs/cdn-assets": "^10.5.0",

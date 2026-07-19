@@ -105,6 +105,24 @@ describe('ProgressBar', () => {
       expect(host?.querySelector('.project-points-progress')).toBeInTheDocument();
       expect(host?.querySelector('.closed-points-progress')).toBeInTheDocument();
     });
+
+    it('F-UI-06: the three sub-bar titles come through the i18n bridge', () => {
+      const { container } = renderBar({ total_points: 100, defined_points: 100, closed_points: 50 });
+
+      // English fallback in the shell-less unit env — NOT hardcoded literals.
+      expect(container.querySelector('.defined-points')).toHaveAttribute(
+        'title',
+        'Excess of points',
+      );
+      expect(container.querySelector('.project-points-progress')).toHaveAttribute(
+        'title',
+        'Pending Points',
+      );
+      expect(container.querySelector('.closed-points-progress')).toHaveAttribute(
+        'title',
+        'closed',
+      );
+    });
   });
 
   describe('width math', () => {
@@ -184,6 +202,42 @@ describe('ProgressBar', () => {
       // Exact anchors so the math (and its direction) stays locked.
       expect(lowWidth).toBe(17);
       expect(highWidth).toBe(57);
+    });
+  });
+
+  /* ======================================================================== *
+   * F-UI-05 — the meter is an announced `progressbar`.
+   *
+   * The legacy template announced nothing (the three sub-bars were visual-only
+   * with tooltip titles). F-UI-05 requires progress to be announced, so the
+   * host now carries `role="progressbar"` with a CLEAN closed-points completion
+   * as `aria-valuenow` (no `- 3` visual inset).
+   * ======================================================================== */
+  describe('F-UI-05 progressbar semantics', () => {
+    it('exposes role="progressbar" with the 0–100 bounds and a labelled value', () => {
+      const { getByRole } = renderBar({ total_points: 100, defined_points: 100, closed_points: 50 });
+      const bar = getByRole('progressbar');
+
+      expect(bar).toHaveClass('summary-progress-bar');
+      expect(bar).toHaveAttribute('aria-valuemin', '0');
+      expect(bar).toHaveAttribute('aria-valuemax', '100');
+      // 50 closed of 100 total = 50% (clean, WITHOUT the -3 sub-bar inset).
+      expect(bar).toHaveAttribute('aria-valuenow', '50');
+      expect(bar).toHaveAttribute('aria-valuetext', '50%');
+      expect(bar).toHaveAttribute('aria-label', 'Backlog points progress');
+    });
+
+    it('reports 0% when there is no data (null stats)', () => {
+      const { getByRole } = renderBar(null);
+      const bar = getByRole('progressbar');
+      expect(bar).toHaveAttribute('aria-valuenow', '0');
+    });
+
+    it('never emits a non-finite value when totals are zero (divide-by-zero guard)', () => {
+      const { getByRole } = renderBar({ total_points: 0, defined_points: 0, closed_points: 0 });
+      const bar = getByRole('progressbar');
+      expect(bar).toHaveAttribute('aria-valuenow', '0');
+      expect(bar).toHaveAttribute('aria-valuetext', '0%');
     });
   });
 });

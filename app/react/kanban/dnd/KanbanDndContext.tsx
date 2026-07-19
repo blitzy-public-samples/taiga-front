@@ -255,7 +255,11 @@ export function buildFinalUsList(
 export interface MoveUsPayload {
   finalUsList: FinalUsListItem[];
   newStatus: number;
-  newSwimlane: number;
+  // F-AAP-09: `number | null`. A real swimlane id (INCLUDING the synthetic `-1`
+  // "Unclassified" lane) or `null` when the board has no swimlanes. The onDragEnd
+  // boundary normalizes a missing `data-swimlane` (which `Number()` would make
+  // NaN) to `null`, so NaN can never reach the reducer state or the API body.
+  newSwimlane: number | null;
   index: number;
   previousCard: number | null;
   nextCard: number | null;
@@ -268,15 +272,18 @@ export interface MoveUsPayload {
  * dropped back into the SAME container at the SAME position
  * (`sameContainer && index === oldIndex`), so no callback fires.
  *
- * `newSwimlane` is surfaced RAW (may be `NaN` in no-swimlane mode, or `-1` for
- * the synthetic "Unclassified" swimlane); this mapper never normalises it.
+ * `newSwimlane` is `number | null` (F-AAP-09): the onDragEnd boundary normalizes
+ * a missing `data-swimlane` to `null` BEFORE calling this mapper, so a real
+ * swimlane id (INCLUDING `-1` for the synthetic "Unclassified" swimlane) or
+ * `null` reaches here — never NaN. This mapper echoes the value unchanged.
  *
  * @param input.draggedIds   Dragged user-story ids, in drag order.
  * @param input.destExcl     Destination ordered ids, dragged ids removed.
  * @param input.overCardId   Non-dragged over-card id, or `null` to append.
  * @param input.insertAfter  Drop lands after the over-card.
  * @param input.newStatus    Destination status id (raw `data-status`).
- * @param input.newSwimlane  Destination swimlane id (raw `data-swimlane`).
+ * @param input.newSwimlane  Destination swimlane id: a real id, `-1`, or `null`
+ *                           (already normalized at the boundary; never NaN).
  * @param input.oldIndex     Source index of the first dragged card (with the
  *                           card still in place).
  * @param input.sameContainer Whether source and destination columns match.
@@ -288,7 +295,7 @@ export function computeMovePayload(input: {
   overCardId: number | null;
   insertAfter: boolean;
   newStatus: number;
-  newSwimlane: number;
+  newSwimlane: number | null;
   oldIndex: number;
   sameContainer: boolean;
   usMap: UsMap;
@@ -557,11 +564,15 @@ export interface KanbanDndContextProps {
   zoom: string[];
   /** Numeric board zoom level (forwarded to the overlay `Card`). */
   zoomLevel: number;
-  /** Drop callback — FROZEN argument order (see interface docs). */
+  /**
+   * Drop callback — FROZEN argument order (see interface docs). `newSwimlane` is
+   * `number | null` (F-AAP-09): a real swimlane id, the synthetic `-1`
+   * "Unclassified" lane, or `null` on a swimlane-less board — never NaN.
+   */
   onMoveUs: (
     finalUsList: FinalUsListItem[],
     newStatus: number,
-    newSwimlane: number,
+    newSwimlane: number | null,
     index: number,
     previousCard: number | null,
     nextCard: number | null,
@@ -707,15 +718,21 @@ export function KanbanDndContext(props: KanbanDndContextProps): ReactElement {
         return;
       }
 
-      // RAW status / swimlane (sortable.coffee:121-122). NO -1/NaN mapping here:
-      // in no-swimlane mode data-swimlane is undefined => Number(undefined) ===
-      // NaN (faithful; the downstream `if (swimlaneId)` truthy check omits it),
-      // and in swimlane mode it is the swimlane id INCLUDING -1 for the synthetic
-      // "Unclassified" swimlane. KanbanApp.onMoveUs / useKanbanBoard.move performs
-      // apiSwimlaneId = swimlaneId === -1 ? null : swimlaneId and the API omits a
-      // falsy swimlane, so this file surfaces the raw value unchanged.
+      // Status / swimlane from the destination column (sortable.coffee:121-122).
+      //
+      // F-AAP-09 (data integrity): normalize a MISSING swimlane to `null` at THIS
+      // boundary. In no-swimlane mode `data-swimlane` is absent, so
+      // `Number(undefined)` is NaN. Previously the raw NaN was surfaced and only
+      // survived by coincidence (NaN is falsy, so the downstream `swimlaneId ===
+      // -1 ? null : swimlaneId` fell through and `if (swimlaneId)` omitted it) —
+      // but a NaN could still reach the optimistic reducer state and the
+      // `/userstories/bulk_update_kanban_order` body. We coerce NaN -> `null` here
+      // so the value is a clean `number | null`: a real swimlane id (INCLUDING -1
+      // for the synthetic "Unclassified" lane) or `null` when there are none.
+      // `useKanbanBoard.move` still maps the synthetic `-1` to the API `null`.
       const newStatus = Number(destColumnNode.dataset.status);
-      const newSwimlane = Number(destColumnNode.dataset.swimlane);
+      const rawSwimlane = Number(destColumnNode.dataset.swimlane);
+      const newSwimlane: number | null = Number.isNaN(rawSwimlane) ? null : rawSwimlane;
 
       // Destination card order, dragged ids removed.
       const destExcl = readOrderedCardIds(destColumnNode).filter(
@@ -742,10 +759,10 @@ export function KanbanDndContext(props: KanbanDndContextProps): ReactElement {
         }
       }
 
-      const destColumnKey = columnKey(
-        newStatus,
-        Number.isNaN(newSwimlane) ? null : newSwimlane,
-      );
+      // `newSwimlane` is already normalized to `number | null` (F-AAP-09), so it
+      // is passed straight through — `columnKey` renders `null` as the `ns`
+      // (no-swimlane) sentinel.
+      const destColumnKey = columnKey(newStatus, newSwimlane);
       const sameContainer = sourceKeySnap === destColumnKey;
 
       const payload = computeMovePayload({

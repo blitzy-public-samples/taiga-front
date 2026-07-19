@@ -580,6 +580,57 @@ describe('addUsOptimistic / removeUsOptimistic', () => {
     });
 });
 
+/* ========================================================================== *
+ * replaceUs (F-CQ-03 — in-place single-story status / points edit)
+ * ========================================================================== */
+
+describe('replaceUs', () => {
+    it('replaces a story in place by id, preserving its list position', () => {
+        let state = seedBacklog([
+            [10, 1],
+            [20, 2],
+            [30, 3],
+        ]);
+        const updated = makeUserStory({
+            id: 20,
+            ref: 20,
+            milestone: null,
+            backlog_order: 2,
+            status: 99,
+        });
+        state = dispatch(state, { type: 'replaceUs', us: updated });
+
+        // Same order, same length — only the id-20 entry changed.
+        expect(ids(state.userstories)).toEqual([10, 20, 30]);
+        expect(mustFind(state.userstories, 20).status).toBe(99);
+    });
+
+    it('carries a new points map onto the replaced story', () => {
+        let state = seedBacklog([[10, 1]]);
+        const updated = makeUserStory({
+            id: 10,
+            ref: 10,
+            milestone: null,
+            backlog_order: 1,
+            points: { '1': 11 },
+        });
+        state = dispatch(state, { type: 'replaceUs', us: updated });
+        expect(mustFind(state.userstories, 10).points).toEqual({ '1': 11 });
+    });
+
+    it('is a no-op when the id is not present in the backlog', () => {
+        const before = seedBacklog([
+            [10, 1],
+            [20, 2],
+        ]);
+        const after = dispatch(before, {
+            type: 'replaceUs',
+            us: makeUserStory({ id: 999, ref: 999, milestone: null }),
+        });
+        expect(ids(after.userstories)).toEqual([10, 20]);
+    });
+});
+
 
 /* ========================================================================== *
  * moveUs — optimistic transitions (THE critical coverage)
@@ -956,6 +1007,58 @@ describe('reconcileMoveResult', () => {
         expect(byId(state.userstories, 20)?.milestone).toBe(5);
         // backlog_order untouched because the row omitted it.
         expect(byId(state.userstories, 20)?.backlog_order).toBe(2);
+    });
+
+    it('clears moveError on a successful reconcile (F-AAP-03)', () => {
+        let state = dispatch(seedBacklog([[10, 1]]), {
+            type: 'setMoveError',
+            message: 'earlier reorder failed',
+        });
+        expect(state.moveError).toBe('earlier reorder failed');
+
+        state = dispatch(state, { type: 'reconcileMoveResult', updatedRows: [{ id: 10, milestone: null }] });
+        expect(state.moveError).toBeNull();
+    });
+});
+
+/* ========================================================================== *
+ * moveError surfacing / clearing (F-AAP-03)
+ * ========================================================================== */
+
+describe('moveError (F-AAP-03)', () => {
+    it('has a null moveError in the initial state', () => {
+        expect(initialBacklogState.moveError).toBeNull();
+    });
+
+    it('setMoveError surfaces a message and clears it with null', () => {
+        let state = dispatch(initialBacklogState, {
+            type: 'setMoveError',
+            message: 'Server rejected the reorder',
+        });
+        expect(state.moveError).toBe('Server rejected the reorder');
+
+        state = dispatch(state, { type: 'setMoveError', message: null });
+        expect(state.moveError).toBeNull();
+    });
+
+    it('a fresh optimistic moveUs clears a stale moveError', () => {
+        let state = seedBacklog([
+            [10, 1],
+            [20, 2],
+        ]);
+        state = dispatch(state, { type: 'setMoveError', message: 'stale error' });
+        expect(state.moveError).toBe('stale error');
+
+        const moving = mustFind(state.userstories, 20);
+        state = dispatch(state, {
+            type: 'moveUs',
+            usList: [moving],
+            newUsIndex: 0,
+            newSprintId: null,
+            previousUs: 10,
+            nextUs: null,
+        });
+        expect(state.moveError).toBeNull();
     });
 });
 

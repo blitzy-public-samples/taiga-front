@@ -124,9 +124,26 @@ describe('root .card host', () => {
         expect(root.style.opacity).toBe('0.5');
     });
 
+    it('renders the root as the `<tg-card>` custom-element host so `.vfold tg-card` folds it (F-UI-01)', () => {
+        const card = makeBoardCard({ model: makeUserStory({ id: 7 }) });
+        const { container } = render(
+            <Card item={card} project={makeProject()} zoom={[]} zoomLevel={1} />,
+        );
+        const root = container.firstChild as HTMLElement;
+        // The retained SCSS hides folded cards with the TAG selector
+        // `.vfold tg-card { display:none }`; a `<div>` root never matched it.
+        expect(root.tagName).toBe('TG-CARD');
+        // Class must appear on the DOM `class` attribute (React would otherwise
+        // emit a literal `classname` on the custom element) so `.card` still hits.
+        expect(root.getAttribute('class')).toContain('card');
+        expect(root.getAttribute('data-id')).toBe('7');
+    });
+
     it('forwards the ref to the `.card` host element', () => {
         const card = makeBoardCard();
-        let node: HTMLDivElement | null = null;
+        // The `.card` root is now the `<tg-card>` custom-element HOST (F-UI-01),
+        // so the forwarded ref is a generic `HTMLElement`, not an `HTMLDivElement`.
+        let node: HTMLElement | null = null;
 
         const { container } = render(
             <Card
@@ -545,6 +562,28 @@ describe('slideshow', () => {
         expect(container.querySelector('.slideshow-left')).toBeNull();
         expect(container.querySelector('.slideshow-right')).toBeNull();
     });
+
+    it('renders the arrows as NATIVE buttons with accessible names (F-UI-04)', () => {
+        const { container } = render(
+            <Card
+                item={twoImageCard()}
+                project={project()}
+                zoom={['attachments']}
+                zoomLevel={1}
+                inViewPort
+            />,
+        );
+        const left = container.querySelector('.slideshow-left') as HTMLElement;
+        const right = container.querySelector('.slideshow-right') as HTMLElement;
+        // Was an inert clickable `<tg-svg>`; now a keyboard-operable <button>.
+        expect(left.tagName).toBe('BUTTON');
+        expect(right.tagName).toBe('BUTTON');
+        expect(left.getAttribute('type')).toBe('button');
+        expect(left.getAttribute('aria-label')).toBeTruthy();
+        expect(right.getAttribute('aria-label')).toBeTruthy();
+        // The sprite glyph inside is decorative (hidden from assistive tech).
+        expect(left.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    });
 });
 
 /* ========================================================================== *
@@ -630,7 +669,13 @@ describe('unfold + loading-extra', () => {
         const unfold = shown.querySelector('.card-unfold') as HTMLElement;
         expect(unfold).toBeInTheDocument();
         expect(unfold).toHaveClass('ng-animate-disabled');
-        expect(unfold.getAttribute('role')).toBe('button');
+        // F-UI-04: the unfold is now a NATIVE `<button>` disclosure control
+        // (focusable + Enter/Space-operable for free) with an `aria-expanded`
+        // state and a non-empty accessible name, replacing the old inert
+        // `<div role="button">` that had no keyboard behaviour.
+        expect(unfold.tagName).toBe('BUTTON');
+        expect(unfold.getAttribute('aria-label')).toBeTruthy();
+        expect(['true', 'false']).toContain(unfold.getAttribute('aria-expanded'));
     });
 
     it('fires onToggleFold on a plain click but not on ctrl/meta click', () => {
@@ -788,5 +833,70 @@ describe('transit mirror + robustness', () => {
                 />,
             ),
         ).not.toThrow();
+    });
+});
+
+/* ========================================================================== *
+ * Emojify content fidelity (F-UI-07)
+ *
+ * The legacy card templates piped subject / task subject / epic name through the
+ * `| emojify` filter (`ng-bind-html`). The React port reproduces that via the
+ * shared safe `emojify()` primitive: `:name:` tokens whose name is present in
+ * the trusted `window.taiga.emojis` table become `<img class="emoji">` React
+ * nodes; everything else — including any typed markup — stays escaped plain text.
+ * ========================================================================== */
+describe('emojify content fidelity (F-UI-07)', () => {
+    const project = () => makeProject({ my_permissions: ['view_us', 'view_tasks'] });
+
+    beforeEach(() => {
+        (window as any).taiga = {
+            emojis: [{ id: 'smile', name: 'smile', image: 'smile.png' }],
+        };
+        (window as any)._version = 'v1';
+    });
+    afterEach(() => {
+        delete (window as any).taiga;
+        delete (window as any)._version;
+    });
+
+    it('renders a known `:token:` in the subject as an <img class="emoji">', () => {
+        const card = makeBoardCard({ model: makeUserStory({ subject: 'Hello :smile: world' }) });
+        const { container } = render(
+            <Card item={card} project={project()} zoom={['subject']} zoomLevel={1} inViewPort />,
+        );
+        const subject = container.querySelector('.card-subject.e2e-title') as HTMLElement;
+        const img = subject.querySelector('img.emoji') as HTMLImageElement;
+        expect(img).toBeInTheDocument();
+        expect(img.getAttribute('src')).toBe('/v1/emojis/smile.png');
+        // Surrounding text is preserved verbatim around the glyph.
+        expect(subject.textContent).toContain('Hello');
+        expect(subject.textContent).toContain('world');
+    });
+
+    it('never injects HTML from a hostile subject (no <script>/<img> element created)', () => {
+        const hostile = 'safe <script>alert(1)</script> :smile: <img src=x onerror=alert(1)>';
+        const card = makeBoardCard({ model: makeUserStory({ subject: hostile }) });
+        const { container } = render(
+            <Card item={card} project={project()} zoom={['subject']} zoomLevel={1} inViewPort />,
+        );
+        const subject = container.querySelector('.card-subject.e2e-title') as HTMLElement;
+        // The only element inside the subject is the trusted emoji <img>.
+        expect(subject.querySelector('script')).toBeNull();
+        const imgs = subject.querySelectorAll('img');
+        expect(imgs).toHaveLength(1);
+        expect(imgs[0]).toHaveClass('emoji');
+        // The hostile markup survives ONLY as inert, escaped text.
+        expect(subject.textContent).toContain('<script>');
+        expect(subject.textContent).toContain('onerror');
+    });
+
+    it('renders a plain subject (no tokens) as literal text with no <img>', () => {
+        const card = makeBoardCard({ model: makeUserStory({ subject: 'Plain subject' }) });
+        const { container } = render(
+            <Card item={card} project={project()} zoom={['subject']} zoomLevel={1} inViewPort />,
+        );
+        const subject = container.querySelector('.card-subject.e2e-title') as HTMLElement;
+        expect(subject.textContent).toBe('Plain subject');
+        expect(subject.querySelector('img')).toBeNull();
     });
 });

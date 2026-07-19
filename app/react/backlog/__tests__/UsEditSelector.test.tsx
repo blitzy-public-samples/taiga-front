@@ -411,4 +411,59 @@ describe('UsEditSelector', () => {
       expect(queryPopover(container)).not.toHaveClass('first');
     });
   });
+
+  /* ------------------------------------------------------------------ *
+   * F-UI-02 / F-UI-04 / F-UI-06 — sprite icons, a11y, i18n
+   * ------------------------------------------------------------------ */
+  describe('F-UI-02 sprite icons (shared TgSvg)', () => {
+    it('renders every action icon as a <tg-svg> sprite host', () => {
+      const { container } = renderSelector(makeFullPermsProject());
+      openPopover(container);
+
+      // Trigger + three action icons all resolve to real sprite hosts.
+      for (const icon of [
+        'icon-more-vertical',
+        'icon-edit',
+        'icon-trash',
+        'icon-move-to-top',
+      ]) {
+        const use = container.querySelector(`tg-svg svg.icon.${icon} use`);
+        expect(use).toBeInTheDocument();
+        expect(use).toHaveAttribute('href', `#${icon}`);
+      }
+    });
+  });
+
+  describe('F-UI-04 accessible menu semantics', () => {
+    it('names the icon-only trigger and exposes disclosure semantics', () => {
+      const { container } = renderSelector(makeFullPermsProject());
+
+      const trigger = getTrigger(container);
+      expect(trigger.tagName).toBe('BUTTON');
+      expect(trigger).toHaveAttribute('aria-haspopup', 'true');
+      expect(trigger).toHaveAttribute('aria-label', 'User story options');
+    });
+
+    it('exposes the popover as an ARIA menu whose items are menuitems', () => {
+      const { container } = renderSelector(makeFullPermsProject());
+      openPopover(container);
+
+      const popover = queryPopover(container);
+      expect(popover).toHaveAttribute('role', 'menu');
+
+      const items = popover?.querySelectorAll('[role="menuitem"]');
+      expect(items).toHaveLength(3);
+    });
+  });
+
+  describe('F-UI-06 localized action labels', () => {
+    it('renders the localized Edit / Delete / Move-to-top labels', () => {
+      const { container } = renderSelector(makeFullPermsProject());
+      openPopover(container);
+
+      expect(container.querySelector(EDIT)).toHaveTextContent('Edit');
+      expect(container.querySelector(DELETE)).toHaveTextContent('Delete');
+      expect(container.querySelector(MOVE_TO_TOP)).toHaveTextContent('Move to top');
+    });
+  });
 });

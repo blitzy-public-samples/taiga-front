@@ -75,9 +75,13 @@ module.exports = {
   // the plain JS/JSON fallbacks.
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
 
-  // Register the extended DOM assertion matchers (e.g. `toBeInTheDocument`)
-  // relied on by the @testing-library/react component tests.
-  setupFilesAfterEnv: ['@testing-library/jest-dom'],
+  // Setup executed after the test framework is installed, before each spec file:
+  //   1. `./jest.setup.js` assigns `globalThis.moment` from the real `moment` package
+  //      so the browserless React sources that read the shell's global Moment via
+  //      `app/react/shared/moment.ts` work under jsdom (see F-PERF-01); and
+  //   2. `@testing-library/jest-dom` registers the extended DOM assertion matchers
+  //      (e.g. `toBeInTheDocument`) relied on by the component tests.
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js', '@testing-library/jest-dom'],
 
   // Always collect coverage so the threshold below is enforced on every run.
   collectCoverage: true,

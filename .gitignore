@@ -1,7 +1,6 @@
 .sass-cache/
 dist/
 node_modules/
-coverage/
 app/vendor
 vendor/
 config/main.coffee

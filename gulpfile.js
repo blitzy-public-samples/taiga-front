@@ -572,6 +572,18 @@ gulp.task("elements", function() {
 // at the top of the file) so the require stays grouped with the task that uses
 // it. esbuild 0.21.5 exposes a Node API that is compatible with the project's
 // pinned Node 16.19.1 toolchain.
+//
+// F-SEC-03 — dependency-advisory risk acceptance (esbuild 0.21.5, GHSA-67mh-4wv8-2f99):
+//   The advisory affects ONLY esbuild's optional development SERVER (`esbuild.serve()` /
+//   `context().serve()` / `--serve`), whose responses carry a permissive
+//   `Access-Control-Allow-Origin` header. Its fixed line (>= 0.25.x) requires Node >= 18,
+//   which would violate this project's HARD Node 16.19.1 pin — AAP sub-sections 0.5.1 and
+//   0.7.1 fix esbuild at 0.21.5 as an explicit user directive. Per the frozen AAP the
+//   version is NOT upgraded; the risk is instead eliminated by MITIGATION + BUILD ISOLATION:
+//   this project uses ONLY the build API (`esbuild.build()`, in the `react` task below) and
+//   NEVER the dev server, so the vulnerable code path is unreachable. The compiled react.js
+//   is served exclusively by the unchanged nginx gateway, never by esbuild. Do NOT introduce
+//   `esbuild.serve()` / `context().serve()` anywhere in the build.
 var esbuild = require("esbuild");
 
 // Bundle the React entry (app/react/index.tsx) and everything it imports

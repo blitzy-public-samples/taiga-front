@@ -539,4 +539,150 @@ describe('BulkCreateUsLightbox', () => {
       expect(mockBulk).not.toHaveBeenCalled();
     });
   });
+
+  /* ======================================================================== *
+   * F-UI-05 / F-UI-04 / F-UI-02 / F-UI-06 — accessible modal dialog, sprite
+   * icons and localisation.
+   *
+   * The AngularJS lightbox was opened by the shared lightbox-service (dialog
+   * semantics, Escape, focus management). The React port had been a plain
+   * `<div>` with none of that (F-UI-05), used empty `<span>` icon placeholders
+   * that cannot render the SVG sprite (F-UI-02), left the icon-only close
+   * control unnamed (F-UI-04) and hard-coded English copy (F-UI-06). These
+   * specs lock the fixes in.
+   * ======================================================================== */
+  describe('F-UI-05 accessible modal dialog + F-UI-02/04/06 icons & i18n', () => {
+    it('marks the shell as a modal dialog labelled by its heading (F-UI-05)', () => {
+      const { container } = renderLightbox();
+      const root = getRoot(container);
+
+      expect(root).toHaveAttribute('role', 'dialog');
+      expect(root).toHaveAttribute('aria-modal', 'true');
+
+      const labelledBy = root.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading).toHaveClass('title');
+      expect(heading?.textContent).toBe('New bulk insert');
+    });
+
+    it('reflects the in-flight submit through aria-busy (F-UI-05)', async () => {
+      // Deferred bulkCreate keeps the request in flight so aria-busy is
+      // observable (mirrors the re-entrant-submit spec's technique).
+      let resolveBulk!: (value: UserStory[]) => void;
+      mockBulk.mockReturnValueOnce(
+        new Promise<UserStory[]>((resolve) => {
+          resolveBulk = resolve;
+        }),
+      );
+
+      const { container } = renderLightbox();
+      const root = getRoot(container);
+      expect(root).toHaveAttribute('aria-busy', 'false');
+
+      typeBulk(container, 'Story A');
+      submitForm(container);
+
+      await waitFor(() => expect(root).toHaveAttribute('aria-busy', 'true'));
+
+      resolveBulk(created);
+      await waitFor(() => expect(root).toHaveAttribute('aria-busy', 'false'));
+    });
+
+    it('closes on Escape via the modal keydown handler (F-UI-05)', () => {
+      const { container, onClose } = renderLightbox();
+
+      fireEvent.keyDown(getTextarea(container), { key: 'Escape' });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('traps Tab focus inside the dialog, wrapping at both ends (F-UI-05)', () => {
+      const { container } = renderLightbox();
+      const root = getRoot(container);
+
+      const focusables = Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled])',
+        ),
+      );
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      // Sanity: the close anchor is first, the Save submit button is last.
+      expect(first).toHaveClass('close');
+      expect(last.getAttribute('type')).toBe('submit');
+
+      last.focus();
+      fireEvent.keyDown(last, { key: 'Tab' });
+      expect(document.activeElement).toBe(first);
+
+      first.focus();
+      fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
+      expect(document.activeElement).toBe(last);
+    });
+
+    it('focuses the first focusable control (the close affordance) on open (F-UI-05)', () => {
+      const { container } = renderLightbox();
+      expect(document.activeElement).toBe(
+        container.querySelector<HTMLElement>('a.close'),
+      );
+    });
+
+    it('renders the close + status-selector icons as real sprite icons, not empty spans (F-UI-02)', () => {
+      const { container } = renderLightbox();
+      // Close control renders `<tg-svg><svg class="icon icon-close">…`.
+      expect(container.querySelector('a.close tg-svg svg.icon-close')).not.toBeNull();
+      // Status selector trigger renders the arrow-down sprite icon.
+      expect(
+        container.querySelector('.bulk-status-selector tg-svg svg.icon-arrow-down'),
+      ).not.toBeNull();
+    });
+
+    it('gives the icon-only close control an accessible name (F-UI-04)', () => {
+      const { container } = renderLightbox();
+      const close = container.querySelector<HTMLElement>('a.close');
+      expect(close).toHaveAttribute('aria-label', 'close');
+      expect(close).toHaveAttribute('title', 'close');
+    });
+
+    it('exposes the status selector as a collapsible menu (F-UI-04)', () => {
+      const { container } = renderLightbox();
+      const trigger = container.querySelector<HTMLElement>('.bulk-status-selector');
+      expect(trigger).toHaveAttribute('aria-haspopup', 'menu');
+      expect(trigger).toHaveAttribute('aria-expanded', 'false');
+
+      fireEvent.click(trigger as HTMLElement);
+      expect(trigger).toHaveAttribute('aria-expanded', 'true');
+
+      // The open dropdown is a menu whose options are menuitems.
+      const menu = container.querySelector('.bulk-status-option-wrapper');
+      expect(menu).toHaveAttribute('role', 'menu');
+      const items = container.querySelectorAll('.bulk-status-option[role="menuitem"]');
+      expect(items.length).toBe(3);
+    });
+
+    it('localises the title, labels, placeholder and action copy through the bridge (F-UI-06)', () => {
+      const { container } = renderLightbox({ isKanbanActivated: true, swimlanes: [makeSwimlane({ id: 1 })] });
+
+      expect(screen.getByText('New bulk insert')).toBeInTheDocument();
+      expect(screen.getByText('Select status')).toBeInTheDocument();
+      expect(screen.getByText('Location')).toBeInTheDocument();
+      expect(screen.getByText('at the bottom')).toBeInTheDocument();
+      expect(screen.getByText('on top')).toBeInTheDocument();
+      expect(screen.getByText('Select swimlane')).toBeInTheDocument();
+      expect(getTextarea(container)).toHaveAttribute('placeholder', 'One item per line...');
+      // The submit button is titled + labelled 'Save'.
+      const save = within(getRoot(container)).getByRole('button', { name: 'Save' });
+      expect(save).toHaveAttribute('title', 'Save');
+    });
+
+    it('announces the required-field + backend errors via role="alert" (F-UI-05)', async () => {
+      // Empty submit surfaces the required-field error as a live region.
+      const { container } = renderLightbox();
+      submitForm(container);
+      const fieldAlert = container.querySelector('.checksley-error-list[role="alert"]');
+      expect(fieldAlert).not.toBeNull();
+      expect(fieldAlert?.textContent).toContain('This value is required.');
+    });
+  });
 });

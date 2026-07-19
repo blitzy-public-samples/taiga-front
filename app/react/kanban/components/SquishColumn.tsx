@@ -56,54 +56,15 @@
  * compatible.
  */
 
-import type { ReactElement, ReactNode } from 'react';
+import type { ReactElement } from 'react';
 
 import type { Status } from '../../shared/types';
-
-/**
- * Typed alias for the `<tg-svg>` custom element — the host of the AngularJS
- * shell's `tgSvg` directive. The SVG sprite `#icon-*` symbols are injected into
- * the document by that shell, so `<use xlinkHref="#icon-…">` resolves at runtime.
- *
- * We render the REAL `<tg-svg>` tag rather than a `<span>` wrapper for fidelity:
- * the folded-header rule `.vfold.task-colum-name span { display: none; }`
- * (`kanban-table.scss`) hides ANY descendant `<span>`, which would blank the icon
- * inside the still-visible `.hunfold` unfold button. A `<tg-svg>` element is not
- * matched by that `span` selector, exactly like the original markup, and the
- * existing element-selector styles (e.g. `tg-svg { fill: … }`) keep applying.
- *
- * Declaring the element through a module-local typed alias lets it render under
- * `strict` + `jsx: "react-jsx"` WITHOUT a global `JSX.IntrinsicElements`
- * augmentation (which could collide with sibling Kanban components at the merged
- * type-check). At runtime the alias is simply the string `'tg-svg'`, so the JSX
- * factory emits a native custom element.
- */
-const TgSvg = 'tg-svg' as unknown as (props: {
-    className?: string;
-    children?: ReactNode;
-}) => ReactElement;
-
-/**
- * Reproduce the repo's `tg-svg(svg-icon="…")` output: a `<tg-svg>` host wrapping
- * an `<svg class="icon <icon>">` that references the injected sprite symbol via
- * `<use xlinkHref="#<icon>">`. When supplied, `className` is applied to the host
- * element (mirroring how the AngularJS template placed extra classes on `tg-svg`);
- * the two call sites in this file pass none. Sizing and fill come from SCSS, so no
- * width, height, or inline style is emitted — the fold/unfold buttons had none.
- *
- * @param icon Sprite symbol id, e.g. `"icon-fold-column"` / `"icon-unfold-column"`.
- * @param className Optional extra class applied to the `<tg-svg>` host element.
- * @returns The `<tg-svg>` icon element.
- */
-function svgIcon(icon: string, className?: string): ReactElement {
-    return (
-        <TgSvg className={className}>
-            <svg className={`icon ${icon}`}>
-                <use xlinkHref={`#${icon}`} />
-            </svg>
-        </TgSvg>
-    );
-}
+// F-UI-02: the ONE shared SVG-sprite primitive replaces this file's local
+// `tg-svg` host + `svgIcon` helper, so every migrated screen paints icons through
+// a single implementation. F-UI-06: `translate` bridges the fold/unfold titles and
+// the `(Archived)` label to the shell's angular-translate service (English fallback).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * Props for {@link SquishColumnPlaceholder}.
@@ -147,7 +108,14 @@ export function SquishColumnPlaceholder(props: SquishColumnPlaceholderProps): Re
                     </div>
                 )}
                 <div className="text-holder">
-                    {status.is_archived && <div className="archived">Archived</div>}
+                    {/* F-UI-06: `KANBAN.ARCHIVED` -> "(Archived)" localises through
+                        the shell (English fallback). Matches the legacy
+                        `div.archived {{'KANBAN.ARCHIVED' | translate}}`. */}
+                    {status.is_archived && (
+                        <div className="archived">
+                            {translate('KANBAN.ARCHIVED', undefined, '(Archived)')}
+                        </div>
+                    )}
                     <div className="name">{status.name}</div>
                 </div>
                 <div className="square-color" style={{ backgroundColor: status.color }} />
@@ -200,19 +168,21 @@ export function SquishColumnToggle(props: SquishColumnToggleProps): ReactElement
             <button
                 type="button"
                 className={`btn-board option${folded ? ' hidden' : ''}`}
-                title="Fold"
+                // F-UI-06: KANBAN.TITLE_ACTION_FOLD -> "Fold column".
+                title={translate('KANBAN.TITLE_ACTION_FOLD', undefined, 'Fold column')}
                 onClick={() => onToggleFold(status)}
             >
-                {svgIcon('icon-fold-column')}
+                <TgSvg icon="icon-fold-column" />
             </button>
             {!status.is_archived && (
                 <button
                     type="button"
                     className={`btn-board option hunfold${!folded ? ' hidden' : ''}`}
-                    title="Unfold"
+                    // F-UI-06: KANBAN.TITLE_ACTION_UNFOLD -> "Unfold column".
+                    title={translate('KANBAN.TITLE_ACTION_UNFOLD', undefined, 'Unfold column')}
                     onClick={() => onToggleFold(status)}
                 >
-                    {svgIcon('icon-unfold-column')}
+                    <TgSvg icon="icon-unfold-column" />
                 </button>
             )}
         </>

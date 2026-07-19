@@ -17,7 +17,15 @@ div.wrapper(ng-init="section='backlog'")
     //- app/react/shared/mount.tsx; the react.js bundle loads before angular.bootstrap).
     //- Lower-kebab attributes are bridged to camelCase React props ("props down");
     //- React self-resolves the project from URL/session, so empty values are safe.
+    //- F-UI-03 host layout contract: a custom element defaults to `display:
+    //- inline`, so an unstyled <tg-react-backlog> would size to its content and
+    //- leave the rest of the `.wrapper` flex row unused. This inline style makes
+    //- the host take the place `section.main` held in the original DOM — a flex
+    //- child that grows to fill the remaining width (flex: 1; min-width: 0) and
+    //- a flex COLUMN container so its single React child stretches to the host's
+    //- full width (align-items: stretch on the cross axis).
     tg-react-backlog(
+        style="display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0;"
         project-id="{{ project.id }}"
         project-slug="{{ project.slug }}"
     )

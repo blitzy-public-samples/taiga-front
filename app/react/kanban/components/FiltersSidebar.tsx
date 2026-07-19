@@ -58,6 +58,16 @@
 import { useMemo, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { FilterOption } from '../../shared/types';
+// F-UI-02: the ONE shared SVG-sprite primitive replaces this file's local bare
+// `<svg>` `svgIcon` helper — the legacy `filter.jade` wrapped every icon in a
+// `tg-svg` host (`tg-svg(svg-icon="icon-…")`), and the retained `filter.scss`
+// targets that host, so the wrapper must be present. F-UI-06: `translate` bridges
+// the hardcoded English labels to the shell's angular-translate service. F-UI-07:
+// `emojify` renders emoji tokens in tag-filter names (the legacy
+// `ng-bind-html="it.name | emojify"` for `dataType === 'tags'`).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
+import { emojify } from '../../shared/emoji';
 
 /**
  * A processed filter category as emitted by `generateFilters`
@@ -127,31 +137,16 @@ export interface FiltersSidebarProps {
 const filterModeOptions = ['include', 'exclude'] as const;
 
 /**
- * Human-readable labels for each mode
- * (COMMON.FILTERS.ADVANCED_FILTERS.INCLUDE / .EXCLUDE), resolved to their
- * shipped English strings.
+ * F-UI-06: resolve the human-readable label for an advanced-filter mode at RENDER
+ * time (`COMMON.FILTERS.ADVANCED_FILTERS.INCLUDE` / `.EXCLUDE`), falling back to
+ * the shipped English. Render-time resolution (rather than a module-level const)
+ * is required because the React bundle loads BEFORE `angular.bootstrap`, so a
+ * module-level `translate` would freeze at the English fallback.
  */
-const filterModeLabels: Record<'include' | 'exclude', string> = {
-  include: 'Include',
-  exclude: 'Exclude',
-};
-
-/**
- * Render an inline SVG sprite icon, reproducing the legacy `tg-svg(svg-icon=…)`
- * output. The `icon <name>` class pair is what the existing SCSS targets, and
- * `<use xlinkHref="#<name>">` references the globally-loaded sprite sheet. The
- * optional extra class reproduces the template's `tg-svg.ng-animate-disabled`
- * modifier on the category arrows. The icon is decorative; ARIA is deliberately
- * kept identical to the source (this migration adds no new ARIA outside the
- * @dnd-kit board, per the AAP).
- */
-function svgIcon(icon: string, className?: string): ReactElement {
-  const cls = className ? `icon ${icon} ${className}` : `icon ${icon}`;
-  return (
-    <svg className={cls}>
-      <use xlinkHref={`#${icon}`} />
-    </svg>
-  );
+function filterModeLabel(mode: 'include' | 'exclude'): string {
+  return mode === 'include'
+    ? translate('COMMON.FILTERS.ADVANCED_FILTERS.INCLUDE', undefined, 'Include')
+    : translate('COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDE', undefined, 'Exclude');
 }
 
 /**
@@ -289,8 +284,10 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
       <div className="custom-filters">
         <div className="custom-filters-header">
           <div className="custom-filters-title">
-            {/* i18n: COMMON.FILTERS.TITLE */}
-            <span className="name">Custom filters</span>
+            {/* F-UI-06: COMMON.FILTERS.TITLE */}
+            <span className="name">
+              {translate('COMMON.FILTERS.TITLE', undefined, 'Custom filters')}
+            </span>
             {/* Parentheses are part of the label, matching `({{vm.customFilters.length}})`. */}
             <span className="number">({customFilters.length})</span>
           </div>
@@ -301,8 +298,8 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
               disabled={selectedFilters.length === 0}
               onClick={() => openCustomFilter()}
             >
-              {/* i18n: COMMON.FILTERS.ACTION_ADD */}
-              Add
+              {/* F-UI-06: COMMON.FILTERS.ACTION_ADD */}
+              {translate('COMMON.FILTERS.ACTION_ADD', undefined, 'Add')}
             </button>
           ) : null}
         </div>
@@ -320,24 +317,42 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
                 lengthZeroError || repeatedFilterError ? ' checksley-error' : ''
               }`}
               type="text"
-              aria-label="Write the filter name and press enter"
-              placeholder="Write the filter name and press enter"
+              // F-UI-06: COMMON.FILTERS.PLACEHOLDER_FILTER_NAME (both the a11y name
+              // and the visible placeholder, matching the legacy jade).
+              aria-label={translate(
+                'COMMON.FILTERS.PLACEHOLDER_FILTER_NAME',
+                undefined,
+                'Write the filter name and press enter',
+              )}
+              placeholder={translate(
+                'COMMON.FILTERS.PLACEHOLDER_FILTER_NAME',
+                undefined,
+                'Write the filter name and press enter',
+              )}
               value={customFilterName}
               onChange={(e) => setCustomFilterName(e.target.value)}
             />
 
             {lengthZeroError ? (
-              // i18n: COMMON.FILTERS.LENGTH_ZERO_ERROR
-              <span className="error-text">Please add a filter name</span>
+              // F-UI-06: COMMON.FILTERS.LENGTH_ZERO_ERROR
+              <span className="error-text">
+                {translate('COMMON.FILTERS.LENGTH_ZERO_ERROR', undefined, 'Please add a filter name')}
+              </span>
             ) : null}
             {repeatedFilterError && !lengthZeroError ? (
-              // i18n: COMMON.FILTERS.REPEATED_FILTER_ERROR
-              <span className="error-text">This filter name is already in use</span>
+              // F-UI-06: COMMON.FILTERS.REPEATED_FILTER_ERROR
+              <span className="error-text">
+                {translate(
+                  'COMMON.FILTERS.REPEATED_FILTER_ERROR',
+                  undefined,
+                  'This filter name is already in use',
+                )}
+              </span>
             ) : null}
 
-            {/* i18n: COMMON.FILTERS.ACTION_SAVE_CUSTOM_FILTER */}
+            {/* F-UI-06: COMMON.FILTERS.ACTION_SAVE_CUSTOM_FILTER */}
             <button type="submit" className="btn-small e2e-open-custom-filter-form">
-              save filter
+              {translate('COMMON.FILTERS.ACTION_SAVE_CUSTOM_FILTER', undefined, 'save filter')}
             </button>
           </form>
         ) : null}
@@ -359,7 +374,7 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
                   className="remove-filter e2e-remove-custom-filter"
                   onClick={() => removeCustomFilter(it)}
                 >
-                  {svgIcon('icon-trash')}
+                  <TgSvg icon="icon-trash" />
                 </button>
               </div>
             ))}
@@ -372,24 +387,28 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
           <div className="filters-applied">
             {includedFilters.length > 0 ? (
               <div className="filters-included">
-                {/* i18n: COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED */}
-                <div className="filters-title">Filtered by:</div>
+                {/* F-UI-06: COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED */}
+                <div className="filters-title">
+                  {translate('COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED', undefined, 'Filtered by:')}
+                </div>
                 <div className="filters-wrapper">
                   {sortByModeDesc(includedFilters).map((it) => (
                     <div
                       key={it.key ?? `${it.dataType}:${String(it.id)}`}
                       className={`single-applied-filter ng-animate-disabled ${it.mode}`}
                     >
-                      {/* Tags used `emojify` in the source; the card components
-                          downgraded that to plain text, so `{it.name}` is rendered
-                          verbatim for every data type. */}
-                      <div className="name">{it.name}</div>
+                      {/* F-UI-07: tag filter names emojify (the legacy
+                          `ng-bind-html="it.name | emojify"` for `dataType === 'tags'`);
+                          all other data types render the name verbatim. */}
+                      <div className="name">
+                        {it.dataType === 'tags' ? emojify(it.name) : it.name}
+                      </div>
                       <button
                         type="button"
                         className="remove-filter e2e-remove-filter"
                         onClick={() => unselectFilter(it)}
                       >
-                        {svgIcon('icon-close')}
+                        <TgSvg icon="icon-close" />
                       </button>
                     </div>
                   ))}
@@ -399,21 +418,26 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
 
             {excludedFilters.length > 0 ? (
               <div className="filters-excluded">
-                {/* i18n: COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED */}
-                <div className="filters-title">Excluded:</div>
+                {/* F-UI-06: COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED */}
+                <div className="filters-title">
+                  {translate('COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED', undefined, 'Excluded:')}
+                </div>
                 <div className="filters-wrapper">
                   {sortByModeDesc(excludedFilters).map((it) => (
                     <div
                       key={it.key ?? `${it.dataType}:${String(it.id)}`}
                       className={`single-applied-filter ng-animate-disabled ${it.mode}`}
                     >
-                      <div className="name">{it.name}</div>
+                      {/* F-UI-07: tag filter names emojify (see the INCLUDED block). */}
+                      <div className="name">
+                        {it.dataType === 'tags' ? emojify(it.name) : it.name}
+                      </div>
                       <button
                         type="button"
                         className="remove-filter e2e-remove-filter"
                         onClick={() => unselectFilter(it)}
                       >
-                        {svgIcon('icon-close')}
+                        <TgSvg icon="icon-close" />
                       </button>
                     </div>
                   ))}
@@ -443,7 +467,7 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
                   <div className="radio-mark">
                     <div className={`radio-mark-inner ${option}`} />
                   </div>
-                  <span>{filterModeLabels[option]}</span>
+                  <span>{filterModeLabel(option)}</span>
                 </label>
               </div>
             ))}
@@ -468,9 +492,11 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
                     onClick={() => toggleFilterCategory(filter.dataType)}
                   >
                     <span className="title">{filter.title}</span>
-                    {open
-                      ? svgIcon('icon-arrow-down', 'ng-animate-disabled')
-                      : svgIcon('icon-arrow-right', 'ng-animate-disabled')}
+                    {open ? (
+                      <TgSvg icon="icon-arrow-down" className="ng-animate-disabled" />
+                    ) : (
+                      <TgSvg icon="icon-arrow-right" className="ng-animate-disabled" />
+                    )}
                   </button>
 
                   {open ? (

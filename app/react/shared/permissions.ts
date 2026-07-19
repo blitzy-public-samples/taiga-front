@@ -80,36 +80,80 @@ export function can(
 }
 
 /**
+ * Common ARCHIVE-AWARE mutation gate (regression fix F-REG-03).
+ *
+ * The raw {@link can} above answers ONLY "does the user hold this permission?"
+ * — it deliberately ignores the project's archived state, because read gates
+ * (`view_milestones`, `view_tasks`, …) must stay enabled on an archived project.
+ * MUTATIONS, however, must additionally be disabled while the project is
+ * archived. The legacy AngularJS shell enforced exactly this pairing for every
+ * editing affordance, not just drag-and-drop:
+ *   - `common/components.coffee:207`
+ *       `return !$scope.project.archived_code && project.my_permissions.indexOf("modify_us") != -1`
+ *   - `common/estimation.coffee:144`
+ *       `@isEditable = !@project.archived_code and @project.my_permissions.indexOf("modify_us") != -1`
+ *
+ * Before this fix only the DnD path ({@link isBoardDraggable}) honoured
+ * `archived_code`; the non-DnD mutation gates (`canModifyUs`, `canAddUs`,
+ * `canAddMilestone`, `canModifyMilestone`) and the raw `can(project, "delete_us")`
+ * / `can(project, "modify_task")` sites left create/edit/delete affordances
+ * ENABLED on an archived project. Centralizing the archived check here — and
+ * routing every mutation consumer through it — restores byte-for-byte legacy
+ * behaviour: an archived project can be viewed but never mutated.
+ *
+ * @param project    The project, or `null` / `undefined` before load.
+ * @param permission The mutation permission code, e.g. `"modify_us"`,
+ *                   `"delete_us"`, `"add_milestone"`, `"modify_task"`.
+ * @returns `true` only when the project is NOT archived AND the user holds
+ *          `permission`. A missing / archived project always denies.
+ */
+export function canMutate(
+    project: Project | null | undefined,
+    permission: string,
+): boolean {
+    return !project?.archived_code && can(project, permission);
+}
+
+/**
  * Convenience gate: may the current user modify user stories on `project`?
  * Drives Kanban / Backlog drag-and-drop enablement and story-editing affordances
- * (legacy code: `my_permissions` contains `"modify_us"`).
+ * (legacy permission code `"modify_us"`).
+ *
+ * ARCHIVE-AWARE (F-REG-03): routes through {@link canMutate}, so an archived
+ * project denies modification even when the user holds `modify_us`.
  */
 export const canModifyUs = (project: Project | null | undefined): boolean =>
-    can(project, 'modify_us');
+    canMutate(project, 'modify_us');
 
 /**
  * Convenience gate: may the current user create user stories on `project`?
  * (legacy permission code `"add_us"`).
+ *
+ * ARCHIVE-AWARE (F-REG-03): an archived project denies creation.
  */
 export const canAddUs = (project: Project | null | undefined): boolean =>
-    can(project, 'add_us');
+    canMutate(project, 'add_us');
 
 /**
  * Convenience gate: may the current user create sprints / milestones on
  * `project`? Drives the "create sprint" affordance in the Backlog view
  * (legacy permission code `"add_milestone"`).
+ *
+ * ARCHIVE-AWARE (F-REG-03): an archived project denies creation.
  */
 export const canAddMilestone = (project: Project | null | undefined): boolean =>
-    can(project, 'add_milestone');
+    canMutate(project, 'add_milestone');
 
 /**
  * Convenience gate: may the current user edit existing sprints / milestones on
  * `project`? Drives the "edit sprint" affordance in the Backlog view
  * (legacy permission code `"modify_milestone"`).
+ *
+ * ARCHIVE-AWARE (F-REG-03): an archived project denies editing.
  */
 export const canModifyMilestone = (
     project: Project | null | undefined,
-): boolean => can(project, 'modify_milestone');
+): boolean => canMutate(project, 'modify_milestone');
 
 /**
  * Combined drag-and-drop gate for both the Kanban board and the Backlog:

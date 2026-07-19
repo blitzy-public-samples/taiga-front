@@ -17,7 +17,15 @@ tg-project-archived-warning
 div.wrapper(ng-init="section='kanban'")
     tg-project-menu
 
+    //- F-UI-03 host layout contract: a custom element defaults to `display:
+    //- inline`, so an unstyled <tg-react-kanban> would size to its content and
+    //- leave the rest of the `.wrapper` flex row unused. This inline style makes
+    //- the host take the place `section.main.kanban` held in the original DOM —
+    //- a flex child that grows to fill the remaining width (flex: 1; min-width:
+    //- 0) and a flex COLUMN container so its single React child stretches to the
+    //- host's full width (align-items: stretch on the cross axis).
     tg-react-kanban(
+        style="display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0;"
         project-id="{{project.id}}"
         project-slug="{{project.slug}}"
     )

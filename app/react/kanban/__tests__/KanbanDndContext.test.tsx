@@ -25,9 +25,12 @@
  *      `sortable.coffee:37,40`).
  *   3. The drag lifecycle dispatches `onMoveUs` with the FROZEN argument order
  *      `(finalUsList, newStatus, newSwimlane, index, previousCard, nextCard)`
- *      (`main.coffee:596`), surfaces the RAW swimlane (`NaN` in no-swimlane
- *      mode; no `-1`/`NaN` mapping here), skips the callback on the no-op drop,
- *      and never fires on a read-only board or a cancelled / out-of-bounds drop.
+ *      (`main.coffee:596`). F-AAP-09: a MISSING swimlane (no `data-swimlane` in
+ *      no-swimlane mode) is normalized to `null` at the boundary — never NaN — so
+ *      `newSwimlane` is a clean `number | null` (a real id, `-1`, or `null`). The
+ *      `-1 -> null` API mapping still lives downstream in the hook. The callback
+ *      is skipped on the no-op drop, and never fires on a read-only board or a
+ *      cancelled / out-of-bounds drop.
  *   4. `isTarget` (`target-drop`) appears ONLY on a container different from the
  *      drag source (`sortable.coffee:65-73`).
  *   5. The `DragOverlay` renders the single-card mirror and the
@@ -165,8 +168,16 @@ import {
     DroppableColumn,
     useSwimlaneAutoUnfold,
 } from '../dnd/KanbanDndContext';
-import { makeProject, makeUserStory, makeBoardCard, makeUsMap } from './factories';
-import type { Project, UsMap, BoardCard } from '../../shared/types';
+import {
+    makeProject,
+    makeUserStory,
+    makeBoardCard,
+    makeUsMap,
+    makeStatus,
+    makeSwimlane,
+} from './factories';
+import type { Project, UsMap, BoardCard, Status, Swimlane as SwimlaneModel } from '../../shared/types';
+import { Swimlane } from '../components/Swimlane';
 
 /* ========================================================================== *
  * Shared fixtures + typed access to the @dnd-kit mock store
@@ -648,7 +659,7 @@ describe('KanbanDndContext — mount & gate', () => {
  * ========================================================================== */
 
 describe('KanbanDndContext — drag lifecycle dispatch', () => {
-    it('same-container move-to-end fires onMoveUs with the FROZEN arg order + RAW NaN swimlane', () => {
+    it('same-container move-to-end fires onMoveUs with the FROZEN arg order + null swimlane (F-AAP-09)', () => {
         const { container, onMoveUs } = renderBoard();
         const col = getCol(container, 100);
 
@@ -672,10 +683,46 @@ describe('KanbanDndContext — drag lifecycle dispatch', () => {
         const args = onMoveUs.mock.calls[0];
         expect(args[0]).toEqual([{ id: 3, oldStatusId: 100, oldSwimlaneId: null }]); // finalUsList
         expect(args[1]).toBe(100); // newStatus
-        expect(Number.isNaN(args[2])).toBe(true); // newSwimlane RAW NaN (no-swimlane mode)
+        // F-AAP-09: the destination column has NO `data-swimlane` (no-swimlane
+        // mode), so `Number(undefined)` -> NaN is normalized to `null` at the
+        // onDragEnd boundary. It must be a real null, never NaN, so the value
+        // cannot corrupt the reducer state or the API body downstream.
+        expect(args[2]).toBeNull(); // newSwimlane normalized to null
+        expect(Number.isNaN(args[2])).toBe(false);
         expect(args[3]).toBe(4); // index
         expect(args[4]).toBe(5); // previousCard
         expect(args[5]).toBeNull(); // nextCard
+    });
+
+    it('drop into a swimlane column surfaces the REAL swimlane id, not null (F-AAP-09)', () => {
+        // Swimlane mode: the destination column carries `data-swimlane="7"`. The
+        // F-AAP-09 boundary normalization only touches a MISSING/NaN swimlane, so
+        // a real id (here 7) must pass straight through to `onMoveUs`.
+        const usMap: UsMap = {
+            ...usMapOf([1, 2, 3], 100, 7),
+            ...usMapOf([10, 20], 200, 7),
+        };
+        const { container, onMoveUs } = renderBoard({
+            usMap,
+            cols: [
+                { statusId: 100, swimlaneId: 7, cardIds: [1, 2, 3] },
+                { statusId: 200, swimlaneId: 7, cardIds: [10, 20] },
+            ],
+        });
+        const src = getCol(container, 100, 7);
+        const dest = getCol(container, 200, 7);
+
+        act(() => {
+            dndMock().onDragStart?.(startEvent(1, '7:100', getCard(src, 1)));
+        });
+        act(() => {
+            dndMock().onDragEnd?.(endOverColumn(1, dest));
+        });
+
+        expect(onMoveUs).toHaveBeenCalledTimes(1);
+        const args = onMoveUs.mock.calls[0];
+        expect(args[1]).toBe(200); // newStatus
+        expect(args[2]).toBe(7); // newSwimlane — the REAL id, unchanged
     });
 
     it('same-container same-position drop is a no-op (onMoveUs NOT called)', () => {
@@ -1093,5 +1140,145 @@ describe('useSwimlaneAutoUnfold', () => {
         });
         expect(onReq).toHaveBeenCalledTimes(1);
         expect(onReq).toHaveBeenCalledWith(7);
+    });
+});
+
+/* ========================================================================== *
+ * Phase E (F-CQ-07) — the PRODUCTION `Swimlane` wires `useSwimlaneAutoUnfold`.
+ *
+ * The block above proves the hook via a synthetic `UnfoldProbe`. This block
+ * closes the F-CQ-07 gap: it renders the REAL production `Swimlane` (folded, so
+ * only its `.kanban-swimlane-title` bar renders — no columns/cards) inside the
+ * REAL `KanbanDndContext` given an `onRequestUnfoldSwimlane`, and proves that
+ * hovering the PRODUCTION title bar during a drag drives the hook end-to-end:
+ * `pending-to-open` toggles on the real title node and the unfold is requested
+ * after 1000ms — with the wiring living entirely in shipping code.
+ * ========================================================================== */
+
+/** Build a COMPLETE, neutral `SwimlaneProps` for a FOLDED swimlane (title only). */
+function foldedSwimlaneProps(
+    swimlaneId: number,
+    project: Project,
+): Parameters<typeof Swimlane>[0] {
+    const swimlane: SwimlaneModel = makeSwimlane({ id: swimlaneId, name: `S${swimlaneId}` });
+    const statuses: Status[] = [makeStatus({ id: 100 })];
+    return {
+        swimlane,
+        statuses,
+        project,
+        folded: true, // folded -> Swimlane renders ONLY the title bar
+        usMap: {},
+        zoom: [],
+        zoomLevel: 0,
+        getColumnCardIds: () => [],
+        statusFolds: {},
+        unfoldStatusId: null,
+        showPlaceholderFor: () => false,
+        notFoundUserstories: false,
+        selectedUss: {},
+        movedUs: [],
+        inViewPort: {},
+        isUsArchivedHidden: () => false,
+        onToggleSwimlane: jest.fn(),
+        onToggleFold: jest.fn(),
+        onClickEdit: jest.fn(),
+        onClickDelete: jest.fn(),
+        onClickAssignedTo: jest.fn(),
+        onClickMoveToTop: jest.fn(),
+        onToggleSelectedUs: jest.fn(),
+    };
+}
+
+describe('F-CQ-07 — production Swimlane wires useSwimlaneAutoUnfold', () => {
+    beforeEach(() => {
+        jest.useFakeTimers();
+    });
+    afterEach(() => {
+        jest.runOnlyPendingTimers();
+        jest.useRealTimers();
+    });
+
+    function renderProductionSwimlane(opts: {
+        onReq: jest.Mock;
+        swimlaneId?: number;
+        startDrag?: boolean;
+    }): { title: HTMLElement } {
+        const swimlaneId = opts.swimlaneId ?? 42;
+        const { container } = render(
+            <KanbanDndContext
+                project={draggableProject()}
+                usMap={usMapOf([1])}
+                selectedUss={{}}
+                zoom={[]}
+                zoomLevel={0}
+                onMoveUs={jest.fn()}
+                onRequestUnfoldSwimlane={opts.onReq}
+            >
+                {/* A drag SOURCE column so a real onDragStart flips `isDragging`. */}
+                <Board cols={[{ statusId: 100, cardIds: [1] }]} />
+                {/* The REAL production Swimlane under test (folded -> title only). */}
+                <Swimlane {...foldedSwimlaneProps(swimlaneId, draggableProject())} />
+            </KanbanDndContext>,
+        );
+        if (opts.startDrag !== false) {
+            const col = getCol(container, 100);
+            act(() => {
+                dndMock().onDragStart?.(startEvent(1, 'ns:100', getCard(col, 1)));
+            });
+        }
+        const title = container.querySelector('.kanban-swimlane-title') as HTMLElement;
+        if (!title) {
+            throw new Error('production .kanban-swimlane-title not found');
+        }
+        return { title };
+    }
+
+    it('hovering the PRODUCTION title bar mid-drag adds pending-to-open then unfolds after 1000ms', () => {
+        const onReq = jest.fn();
+        const { title } = renderProductionSwimlane({ onReq, swimlaneId: 42 });
+
+        act(() => {
+            fireEvent.mouseOver(title);
+        });
+        // The class lands on the REAL production title node (the SCSS target).
+        expect(title.classList.contains('pending-to-open')).toBe(true);
+        expect(onReq).not.toHaveBeenCalled();
+
+        act(() => {
+            jest.advanceTimersByTime(1000);
+        });
+        expect(onReq).toHaveBeenCalledTimes(1);
+        expect(onReq).toHaveBeenCalledWith(42);
+        expect(title.classList.contains('pending-to-open')).toBe(false);
+    });
+
+    it('mouseleave on the PRODUCTION title cancels the pending unfold', () => {
+        const onReq = jest.fn();
+        const { title } = renderProductionSwimlane({ onReq });
+        act(() => {
+            fireEvent.mouseOver(title);
+        });
+        expect(title.classList.contains('pending-to-open')).toBe(true);
+        act(() => {
+            fireEvent.mouseLeave(title);
+        });
+        expect(title.classList.contains('pending-to-open')).toBe(false);
+        act(() => {
+            jest.advanceTimersByTime(1000);
+        });
+        expect(onReq).not.toHaveBeenCalled();
+    });
+
+    it('does NOT unfold when no drag is in flight (production title hover)', () => {
+        const onReq = jest.fn();
+        const { title } = renderProductionSwimlane({ onReq, startDrag: false });
+        act(() => {
+            fireEvent.mouseOver(title);
+        });
+        expect(title.classList.contains('pending-to-open')).toBe(false);
+        act(() => {
+            jest.advanceTimersByTime(1000);
+        });
+        expect(onReq).not.toHaveBeenCalled();
     });
 });

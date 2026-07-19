@@ -44,24 +44,15 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { Project } from '../../shared/types';
-
-/*
- * The board header uses Taiga's `<tg-svg>` web component to render inline SVG
- * sprites. It is not a standard HTML element, so we widen the JSX intrinsic
- * element table locally (no such declaration exists elsewhere under
- * `app/react/**`). Typed `any` because the element is opaque to React/TS and is
- * resolved by the existing sprite runtime at render time.
- */
-declare global {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      'tg-svg': any;
-    }
-  }
-}
+// F-UI-02: the ONE shared SVG-sprite primitive (replaces this file's former
+// local `svgIcon`/`tg-svg` declaration). F-UI-06: the shared translation bridge
+// so the header/popover copy reads the same i18n keys the AngularJS directive
+// used (`COMMON.FIELDS.POINTS`, `COMMON.ROLES.ALL`, `BACKLOG.TABLE.TITLE_COLUMN_POINTS`).
+import { TgSvg } from '../../shared/icon';
+import { translate } from '../../shared/i18n';
 
 /**
  * A project role as consumed by this selector. There is no `Role` shape in
@@ -75,22 +66,6 @@ interface ComputableRole {
   id: number;
   name: string;
   computable?: boolean;
-}
-
-/**
- * Render Taiga's `<tg-svg>` sprite wrapper, mirroring the AngularJS
- * `tg-svg(svg-icon="…")` header markup. `className` is forwarded onto the custom
- * element (the sprite runtime reads it); the inner `<svg>` carries the
- * `icon <name>` classes the SCSS targets, and `<use>` references the sprite by id.
- */
-function svgIcon(icon: string, className?: string) {
-  return (
-    <tg-svg class={className}>
-      <svg className={`icon ${icon}`}>
-        <use xlinkHref={`#${icon}`} />
-      </svg>
-    </tg-svg>
-  );
 }
 
 /**
@@ -162,10 +137,39 @@ export const UsRolePointsSelector = ({
   const hasSelector = roles.length > 1;
 
   // Header label: the selected role's name when a real role is filtered,
-  // otherwise the default "Points" (i18n: COMMON.FIELDS.POINTS).
+  // otherwise the default "Points". F-UI-06: the default reads the same
+  // `COMMON.FIELDS.POINTS` key the AngularJS header used
+  // (`span.header-points(translate="COMMON.FIELDS.POINTS")`); role names are
+  // dynamic API data and are shown verbatim.
   const selectedRole = roles.find((r) => r.id === selectedRoleId);
   const headerText =
-    selectedRoleId != null && selectedRole ? selectedRole.name : 'Points';
+    selectedRoleId != null && selectedRole
+      ? selectedRole.name
+      : translate('COMMON.FIELDS.POINTS', undefined, 'Points');
+
+  // F-UI-06: the "clear selection" (all-points) entry and the accessible name
+  // for the disclosure control, translated once. `COMMON.ROLES.ALL` and
+  // `BACKLOG.TABLE.TITLE_COLUMN_POINTS` are the exact keys the AngularJS
+  // popover template and header cell used.
+  const allPointsLabel = translate('COMMON.ROLES.ALL', undefined, 'All points');
+  const selectViewPerRoleLabel = translate(
+    'BACKLOG.TABLE.TITLE_COLUMN_POINTS',
+    undefined,
+    'Select view per Role',
+  );
+
+  // F-UI-04: keyboard activation for the popover's role/clear entries. They stay
+  // `<a>` elements (the `popover()` SCSS mixin styles items by the `a` tag, so
+  // preserving the tag keeps pixel fidelity), but the React port had dropped the
+  // legacy `href=""` that made them focusable. Restoring `tabIndex`, `role`, and
+  // an Enter/Space handler makes each entry operable by keyboard again.
+  const activateOnKey =
+    (activate: () => void) => (event: ReactKeyboardEvent<HTMLElement>) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        activate();
+      }
+    };
 
   // Outside-click + Escape closing, gated on `open` so listeners exist only while
   // the popover is shown. The popover is rendered inline inside `.inner` (no
@@ -201,20 +205,39 @@ export const UsRolePointsSelector = ({
   return (
     <div className={`inner${open ? ' popover-open' : ''}`} ref={rootRef}>
       {/*
-        Header label. When interactive, clicking it toggles the popover (the
-        directive's whole-`$el` click that added `popover-open` and opened the
-        popover). When inert (`<= 1` computable role) it carries `not-clickable`
-        and has no click handler.
+        Header label. When interactive it toggles the popover (the directive's
+        whole-`$el` click that added `popover-open` and opened the popover).
+
+        F-UI-04: the interactive header is now a NATIVE <button> (was a clickable
+        <span>), so it is focusable and Enter/Space-operable for free and carries
+        proper disclosure semantics (`aria-haspopup` + `aria-expanded`) plus an
+        accessible name. It keeps the `.header-points` class for the SCSS text
+        styling; because that class does not neutralise UA button chrome (unlike
+        e.g. `.card-user-avatar`), a minimal inline normalization
+        (transparent background, zero padding, inherited font) makes the button
+        render pixel-identically to the legacy span — this introduces NO design
+        values, it only removes UA button defaults (visual fidelity per the AAP).
+        When inert (`<= 1` computable role) the label is a plain, non-interactive
+        <span> carrying `not-clickable`, exactly as before.
       */}
-      <span
-        className={`header-points${hasSelector ? '' : ' not-clickable'}`}
-        onClick={hasSelector ? () => setOpen((o) => !o) : undefined}
-      >
-        {headerText}
-      </span>
+      {hasSelector ? (
+        <button
+          type="button"
+          className="header-points"
+          aria-haspopup="true"
+          aria-expanded={open}
+          aria-label={selectViewPerRoleLabel}
+          style={{ background: 'none', padding: 0, font: 'inherit' }}
+          onClick={() => setOpen((o) => !o)}
+        >
+          {headerText}
+        </button>
+      ) : (
+        <span className="header-points not-clickable">{headerText}</span>
+      )}
 
       {/* Filter affordance — shown only when the selector is interactive. */}
-      {hasSelector && svgIcon('icon-filter')}
+      {hasSelector && <TgSvg icon="icon-filter" />}
 
       {/*
         Role popover (`us-role-points-popover.jade`): a "clear selection" entry
@@ -222,29 +245,45 @@ export const UsRolePointsSelector = ({
         current selection (the clear anchor when `selectedRoleId` is null).
       */}
       {hasSelector && open && (
-        <ul className="popover pop-role">
-          <li>
-            {/* i18n: COMMON.ROLES.ALL -> "All points". Clears the filter. */}
+        // F-UI-04: expose the popover as an ARIA menu so assistive tech
+        // announces it as a role chooser (matching the CardActions popover
+        // pattern); the visible `.popover.pop-role` classes are unchanged.
+        <ul className="popover pop-role" role="menu" aria-label={selectViewPerRoleLabel}>
+          <li role="none">
+            {/*
+              F-UI-06: "clear selection" entry reads `COMMON.ROLES.ALL`
+              ("All points"). F-UI-04: kept an `<a>` for exact SCSS fidelity (the
+              `popover()` mixin styles `a`), made keyboard-operable with
+              `role="menuitem"`, `tabIndex`, and an Enter/Space handler.
+            */}
             <a
               className={`clear-selection${
                 selectedRoleId == null ? ' active-popover' : ''
               }`}
-              title="All points"
+              role="menuitem"
+              tabIndex={0}
+              title={allPointsLabel}
               onClick={(e) => {
                 e.preventDefault();
                 onSelectRole(null);
                 setOpen(false);
               }}
+              onKeyDown={activateOnKey(() => {
+                onSelectRole(null);
+                setOpen(false);
+              })}
             >
-              All points
+              {allPointsLabel}
             </a>
           </li>
           {roles.map((role) => (
-            <li key={role.id}>
+            <li key={role.id} role="none">
               <a
                 className={`role${
                   selectedRoleId === role.id ? ' active-popover' : ''
                 }`}
+                role="menuitem"
+                tabIndex={0}
                 title={role.name}
                 data-role-id={role.id}
                 onClick={(e) => {
@@ -252,6 +291,10 @@ export const UsRolePointsSelector = ({
                   onSelectRole(role.id);
                   setOpen(false);
                 }}
+                onKeyDown={activateOnKey(() => {
+                  onSelectRole(role.id);
+                  setOpen(false);
+                })}
               >
                 <span className="item-text">{role.name}</span>
               </a>
