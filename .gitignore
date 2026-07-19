@@ -22,3 +22,11 @@ coverage/
 # Playwright baseline & post-migration parity artifacts are a COMMITTED deliverable
 # (see e2e-react/). Never ignore them; do NOT use Playwright's default test-results/ dir.
 !e2e-react/artifacts/
+# ...but the committed deliverable is the screenshots (*.png) + recordings (*.webm)
+# ONLY (mirroring artifacts/baseline/, which contains zero traces). Playwright's
+# per-test trace archives are large (~2.5 MB each; ~140 MB across the full suite)
+# debug artifacts, and its `.last-run.json` is an ephemeral run pointer — neither
+# is parity evidence, so keep both out of git. These file-level rules come AFTER
+# the `!e2e-react/artifacts/` un-ignore so they take precedence for these names.
+e2e-react/artifacts/**/trace.zip
+e2e-react/artifacts/**/.last-run.json
