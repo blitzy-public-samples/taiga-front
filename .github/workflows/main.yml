@@ -100,3 +100,123 @@ jobs:
     # coverage-gated run.
     - name: pass unit test (karma + jest coverage gate)
       run: npm run ci:test
+
+  # [W7 F-09] Dedicated end-to-end parity GATE.
+  #
+  # The Playwright react-phase suite (e2e-react/) is the headline migration
+  # deliverable — it proves the React Kanban/Backlog screens reproduce the
+  # AngularJS behavior — yet it was previously wired into NO CI pipeline. That
+  # gap is exactly why the CRITICAL + MAJOR E2E defects (F-03..F-08) shipped
+  # undetected. Provisioning a full live stack is non-trivial, so per the
+  # finding's guidance this is a SEPARATE job (not folded into unit-test): it
+  # brings up the complete stack via the taiga-docker compose (the FROZEN
+  # taiga-back API + Postgres + RabbitMQ + events + gateway — AAP §0.2.2),
+  # deterministically seeds sample_data, and runs `npm run test:e2e`, FAILING
+  # THE BUILD on any test failure. The suite is zero-skip (F-02) and
+  # `forbidOnly` is enabled under CI (playwright.config.ts), so a stray `.only`
+  # or a reintroduced skip also fails the build.
+  e2e:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Set node version (AAP §0.7.2 frozen Node-16 toolchain)
+    strategy:
+      matrix:
+        node-version: [16.19.1]
+
+    steps:
+    # This repo (taiga-front, the PR under test) — checked out into a sibling
+    # subdirectory so the taiga-docker compose's `context: ../taiga-front` and
+    # `context: ../taiga-back` build the PR's code from source.
+    - name: Checkout taiga-front (this repo)
+      uses: actions/checkout@v2
+      with:
+        path: taiga-front
+        persist-credentials: false
+
+    # The FROZEN backend that forms the E2E contract stack (out of scope for this
+    # migration, but required to run the parity suite against a real API).
+    - name: Checkout taiga-back (frozen backend)
+      uses: actions/checkout@v2
+      with:
+        repository: blitzy-public-samples/taiga-back
+        path: taiga-back
+        persist-credentials: false
+
+    # The compose topology that wires the whole stack together.
+    - name: Checkout taiga-docker (compose topology)
+      uses: actions/checkout@v2
+      with:
+        repository: blitzy-public-samples/taiga-docker
+        path: taiga-docker
+        persist-credentials: false
+
+    # https://github.com/actions/setup-node/issues/214 workaround npm i by url
+    - name: Reconfigure git to use HTTP authentication
+      run: >
+        git config --global url."https://github.com/".insteadOf
+        ssh://git@github.com/
+
+    - name: Cache node modules
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('taiga-front/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+
+    - name: Node ${{ matrix.node-version }}
+      uses: actions/setup-node@v1
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: npm install
+      working-directory: taiga-front
+      run: npm ci
+
+    # Playwright's Chromium + its Linux system libraries (the suite runs headless
+    # Chromium with --no-sandbox --disable-dev-shm-usage, see playwright.config.ts).
+    - name: Install Playwright Chromium
+      working-directory: taiga-front
+      run: npx playwright install --with-deps chromium
+
+    # Build back + front FROM SOURCE and start Postgres/RabbitMQ/events/gateway.
+    # This exercises the Step-0 build-from-source Dockerfile with the PR's code
+    # and serves the freshly-built React bundle at the gateway (localhost:9000).
+    - name: Bring up the full Taiga stack
+      working-directory: taiga-docker
+      run: docker compose up -d --build
+
+    # Wait for Postgres before the suite's globalSetup reseed touches the DB.
+    - name: Wait for the database to be ready
+      working-directory: taiga-docker
+      run: |
+        for i in $(seq 1 60); do
+          if docker compose exec -T taiga-db pg_isready -U taiga >/dev/null 2>&1; then
+            echo "postgres ready"; exit 0
+          fi
+          sleep 2
+        done
+        echo "postgres did not become ready"; docker compose ps; exit 1
+
+    # Run the React parity suite. globalSetup performs the deterministic
+    # drop-schema + migrate + sample_data reseed via E2E_RESEED_CMD (the same
+    # proven reset that produced the committed artifacts/react/ evidence), then
+    # Playwright drives the live gateway. Any failure fails the build.
+    - name: Run React E2E parity suite (gate)
+      working-directory: taiga-front
+      env:
+        CI: "true"
+        E2E_BASE_URL: http://localhost:9000/
+        E2E_RESEED_CMD: bash e2e-react/ci/reseed-sample-data.sh
+      run: npm run test:e2e
+
+    # Publish the generated parity media (screenshots + recordings) so a failing
+    # gate leaves inspectable evidence. `always()` uploads on pass and fail alike.
+    - name: Upload E2E parity artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-react-artifacts
+        path: taiga-front/e2e-react/artifacts/react/
+        if-no-files-found: warn
