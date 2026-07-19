@@ -144,6 +144,15 @@ export interface SprintListProps {
   closedSprints: SprintModel[];
   /** Total number of milestones — drives the h1 `.number` badge and gates the header "Add sprint" button. */
   totalMilestones: number;
+  /**
+   * Whether the sprints list has finished its first server load (reducer
+   * `sprintsLoaded`). Gates the `.empty-small` illustration together with
+   * `totalMilestones === 0` so the empty state is NEVER shown during the async
+   * load window — only for a genuinely empty project after it has loaded. This
+   * reproduces the AngularJS `undefined === 0 -> false` behavior and fixes the
+   * F-CLS-01 empty-sprint flash / layout-shift regression.
+   */
+  sprintsLoaded: boolean;
   /** Total closed milestones — gates the `.filter-closed-sprints` toggle link. */
   totalClosedMilestones: number;
   /** Whether closed sprints are currently shown — drives the toggle `.text` label. */
@@ -183,6 +192,7 @@ export function SprintList(props: SprintListProps) {
     openSprints,
     closedSprints,
     totalMilestones,
+    sprintsLoaded,
     totalClosedMilestones,
     showClosedSprints,
     sprintOpen,
@@ -233,8 +243,14 @@ export function SprintList(props: SprintListProps) {
       </header>
 
       {/* Empty state — `div.empty-small(ng-if="totalMilestones === 0")`
-          (sprints.jade:26-39). */}
-      {totalMilestones === 0 ? (
+          (sprints.jade:26-39). Gated ALSO on `sprintsLoaded` so the illustration
+          is suppressed during the async load window and only appears once the
+          sprints have loaded AND the project is genuinely empty. In AngularJS
+          `totalMilestones` was `undefined` until load (`undefined === 0` -> false),
+          so it never flashed; our reducer inits it to `0`, so without this guard
+          `0 === 0` would flash `empty_sprint.png` before the real cards arrive
+          (QA finding F-CLS-01 — Cumulative Layout Shift regression). */}
+      {sprintsLoaded && totalMilestones === 0 ? (
         <div className="empty-small">
           <img
             src={emptySprintImageUrl ?? 'images/empty/empty_sprint.png'}

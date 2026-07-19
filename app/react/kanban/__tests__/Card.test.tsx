@@ -393,7 +393,9 @@ describe('card-actions popover', () => {
     expect(menu).toBeInTheDocument();
     const items = within(menu).getAllByRole('menuitem');
     expect(items.map((i) => i.textContent)).toEqual(
-      expect.arrayContaining(['Edit', 'Assign to', 'Delete', 'Move to top']),
+      // Verbatim from the AngularJS `tgCardActions` menu (`COMMON.CARD.*`):
+      // "Edit card" / "Assign To" / "Delete card" / "Move to top".
+      expect.arrayContaining(['Edit card', 'Assign To', 'Delete card', 'Move to top']),
     );
     expect(items).toHaveLength(4);
   });
@@ -402,32 +404,32 @@ describe('card-actions popover', () => {
     const { container } = renderCard({ isFirst: true });
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
     expect(screen.queryByText('Move to top')).toBeNull();
-    expect(screen.getByText('Edit')).toBeInTheDocument();
+    expect(screen.getByText('Edit card')).toBeInTheDocument();
   });
 
-  it('shows only Delete when the user can delete but not modify', () => {
+  it('shows only Delete card when the user can delete but not modify', () => {
     const { container } = renderCard({ canModify: false, canDelete: true });
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
-    expect(screen.getByText('Delete')).toBeInTheDocument();
-    expect(screen.queryByText('Edit')).toBeNull();
-    expect(screen.queryByText('Assign to')).toBeNull();
+    expect(screen.getByText('Delete card')).toBeInTheDocument();
+    expect(screen.queryByText('Edit card')).toBeNull();
+    expect(screen.queryByText('Assign To')).toBeNull();
     expect(screen.queryByText('Move to top')).toBeNull();
   });
 
-  it('shows Edit/Assign to/Move to top but not Delete when modify-only', () => {
+  it('shows Edit card/Assign To/Move to top but not Delete card when modify-only', () => {
     const { container } = renderCard({ canModify: true, canDelete: false });
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
-    expect(screen.getByText('Edit')).toBeInTheDocument();
-    expect(screen.getByText('Assign to')).toBeInTheDocument();
+    expect(screen.getByText('Edit card')).toBeInTheDocument();
+    expect(screen.getByText('Assign To')).toBeInTheDocument();
     expect(screen.getByText('Move to top')).toBeInTheDocument();
-    expect(screen.queryByText('Delete')).toBeNull();
+    expect(screen.queryByText('Delete card')).toBeNull();
   });
 
   it('invokes the mapped callback and closes on action click', () => {
     const onEdit = jest.fn();
     const { container } = renderCard({ onEdit, usId: 101 });
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
-    fireEvent.click(screen.getByText('Edit'));
+    fireEvent.click(screen.getByText('Edit card'));
     expect(onEdit).toHaveBeenCalledWith(101);
     expect(document.querySelector('.popover.global-popover')).toBeNull();
   });
@@ -441,9 +443,9 @@ describe('card-actions popover', () => {
     const { container, rerender } = render(
       <Card {...makeProps({ item, onDelete, onMoveToTop, onAssignedTo })} />,
     );
-    // Delete
+    // Delete card
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
-    fireEvent.click(screen.getByText('Delete'));
+    fireEvent.click(screen.getByText('Delete card'));
     expect(onDelete).toHaveBeenCalledWith(101);
 
     // Move to top passes the whole item
@@ -451,9 +453,9 @@ describe('card-actions popover', () => {
     fireEvent.click(screen.getByText('Move to top'));
     expect(onMoveToTop).toHaveBeenCalledWith(item);
 
-    // Assign to (from the popover) passes the id
+    // Assign To (from the popover) passes the id
     fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
-    fireEvent.click(screen.getByText('Assign to'));
+    fireEvent.click(screen.getByText('Assign To'));
     expect(onAssignedTo).toHaveBeenCalledWith(101);
 
     rerender(<Card {...makeProps({ item, onDelete, onMoveToTop, onAssignedTo })} />);

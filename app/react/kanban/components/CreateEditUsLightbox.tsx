@@ -219,8 +219,15 @@ export interface CreateEditUsLightboxProps {
   currentUserId: number | null;
   /** Status id the "+" was clicked in (CREATE default); falls back to first status. */
   initialStatusId?: number | null;
-  /** i18n passthrough from KanbanApp (English source strings). */
-  t: (key: string) => string;
+  /**
+   * i18n passthrough from KanbanApp. KanbanApp forwards the SHARED angular-translate
+   * re-implementation (`shared/i18n.ts` `t`), which supports `{{token}}` interpolation
+   * via an optional params map — needed so `ATTACHMENT.ADD` ("Add new attachment.
+   * {{maxFileSizeMsg}}") can have its unset `maxFileSizeMsg` token stripped to empty,
+   * matching the AngularJS `attachments-simple` widget. The signature mirrors the
+   * shared `t(key, params?)` so callers may pass interpolation values.
+   */
+  t: (key: string, params?: Record<string, string | number | boolean | null | undefined>) => string;
   /** Close without saving (✕ / Cancel / backdrop). */
   onClose: () => void;
   /** Persist the form; resolves after the board reflects the change. */
@@ -410,7 +417,7 @@ function CreateEditUsLightbox(props: CreateEditUsLightboxProps): JSX.Element {
     [pointsMap, pointsById],
   );
   const isAssigned = assignedUsers.length > 0;
-  const title = isCreate ? t('LIGHTBOX.CREATE_EDIT_US.NEW') : t('LIGHTBOX.CREATE_EDIT_US.EDIT');
+  const title = isCreate ? t('LIGHTBOX.CREATE_EDIT.NEW_US') : t('LIGHTBOX.CREATE_EDIT.EDIT_US');
   const submitLabel = isCreate ? t('COMMON.CREATE') : t('COMMON.SAVE');
 
   /* --- Handlers --- */
@@ -658,18 +665,31 @@ function CreateEditUsLightbox(props: CreateEditUsLightboxProps): JSX.Element {
                       <span className="attachments-num">{attachments.length}</span>{' '}
                       <span className="attachments-text">{t('ATTACHMENT.SECTION_NAME')}</span>
                     </h3>
-                    <div className="add-attach" id="a11y-add-attach" title={t('ATTACHMENT.ADD')}>
+                    {/* `ATTACHMENT.ADD` = "Add new attachment. {{maxFileSizeMsg}}".
+                        In the `attachments-simple` widget the `maxFileSizeMsg`
+                        interpolation variable is never set (it lives only in the
+                        avatar/user-settings scope, `user-settings/main.coffee:53`),
+                        so angular-translate's `| translate` filter resolves the token
+                        to an empty string → "Add new attachment. ". Pass an explicit
+                        empty `maxFileSizeMsg` so the shared `t()` interpolator strips
+                        the `{{…}}` token identically, instead of leaking the literal
+                        placeholder into the title/aria-label. */}
+                    <div
+                      className="add-attach"
+                      id="a11y-add-attach"
+                      title={t('ATTACHMENT.ADD', { maxFileSizeMsg: '' })}
+                    >
                       <button
                         className="btn-icon add-attachment-button"
                         type="button"
-                        aria-label={t('ATTACHMENT.ADD')}
+                        aria-label={t('ATTACHMENT.ADD', { maxFileSizeMsg: '' })}
                         onClick={openAttachmentPicker}
                       >
                         <Svg icon="icon-add" />
                       </button>
                       <input
                         ref={attachInputRef}
-                        aria-label={t('ATTACHMENT.ADD')}
+                        aria-label={t('ATTACHMENT.ADD', { maxFileSizeMsg: '' })}
                         id="add-attach"
                         type="file"
                         multiple

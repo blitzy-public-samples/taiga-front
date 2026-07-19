@@ -146,6 +146,134 @@ describe('resetI18n() / getDateFormat() defaults', () => {
   });
 });
 
+describe('D#4 — static card/backlog labels resolve to verbatim English and localize', () => {
+  // Each key below is one the migrated screens now route through `t()` instead of
+  // hardcoding (finding D#4). The English value MUST equal the corresponding
+  // `locale-en.json` string so the English POC renders byte-identically to the
+  // AngularJS screens (zero visual change), and each key MUST be a real
+  // angular-translate key so a non-English catalog localizes it.
+  it('resolves the Kanban card ⋮ menu labels to the tgCardActions COMMON.CARD.* strings', () => {
+    expect(t('COMMON.CARD.EDIT')).toBe('Edit card');
+    expect(t('COMMON.CARD.ASSIGN_TO')).toBe('Assign To');
+    expect(t('COMMON.CARD.DELETE')).toBe('Delete card');
+    expect(t('COMMON.CARD.MOVE_TO_TOP')).toBe('Move to top');
+    expect(t('COMMON.CARD.ESTIMATION')).toBe('Estimation');
+  });
+
+  it('resolves the Kanban card statistic tooltips to their legacy keys', () => {
+    expect(t('TASK.FIELDS.IS_IOCAINE')).toBe('Is iocaine');
+    expect(t('ATTACHMENT.SECTION_NAME')).toBe('Attachments');
+    expect(t('COMMON.WATCHERS.WATCHERS')).toBe('Watchers');
+    expect(t('COMMENTS.TITLE')).toBe('Comments');
+    expect(t('COMMON.ASSIGNED_TO.NOT_ASSIGNED')).toBe('Not assigned');
+  });
+
+  it('resolves the Backlog row menu + status labels to the us-edit-popover keys', () => {
+    expect(t('COMMON.EDIT')).toBe('Edit');
+    expect(t('COMMON.DELETE')).toBe('Delete');
+    expect(t('COMMON.MOVE_TO_TOP')).toBe('Move to top');
+    expect(t('BACKLOG.STATUS_NAME')).toBe('Status Name');
+  });
+
+  it('resolves the shared write-error, loading, and empty-burndown keys', () => {
+    expect(t('NOTIFICATION.WARNING_TEXT')).toBe('Your changes were not saved!');
+    expect(t('COMMON.LOADING')).toBe('Loading...');
+    expect(t('BACKLOG.CUSTOMIZE_GRAPH')).toBe('Customize your backlog graph');
+    expect(t('BACKLOG.CUSTOMIZE_GRAPH_TEXT')).toBe(
+      'To have a nice graph that helps you follow the evolution of the project you have to set up the points and sprints through the',
+    );
+    expect(t('BACKLOG.CUSTOMIZE_GRAPH_ADMIN')).toBe('Admin');
+    expect(t('BACKLOG.CUSTOMIZE_GRAPH_TITLE')).toBe(
+      'Set up the points and sprints through the Admin',
+    );
+  });
+
+  it('localizes the routed label keys when a non-English catalog is active', () => {
+    // A representative slice of a Spanish catalog. Because these are REAL
+    // angular-translate keys, injecting a localized catalog resolves them to the
+    // localized text (proving the D#4 fix restored localizability), while keys
+    // absent from the slice still fall back to English.
+    configureI18n(
+      {
+        COMMON: {
+          CARD: { EDIT: 'Editar tarjeta', DELETE: 'Eliminar tarjeta' },
+          EDIT: 'Editar',
+        },
+        NOTIFICATION: { WARNING_TEXT: '¡No se guardaron los cambios!' },
+      },
+      'es',
+    );
+
+    expect(t('COMMON.CARD.EDIT')).toBe('Editar tarjeta');
+    expect(t('COMMON.CARD.DELETE')).toBe('Eliminar tarjeta');
+    expect(t('COMMON.EDIT')).toBe('Editar');
+    expect(t('NOTIFICATION.WARNING_TEXT')).toBe('¡No se guardaron los cambios!');
+    // Absent from the Spanish slice -> English fallback still applies.
+    expect(t('COMMON.CARD.MOVE_TO_TOP')).toBe('Move to top');
+    expect(getLocale()).toBe('es');
+  });
+});
+
+describe('w001 L1-L4 — backlog/kanban toolbar labels resolve to verbatim English and localize', () => {
+  // The four MINOR label drifts flagged by w001 (search placeholder, add button,
+  // tags toggle, summary metrics). Each value MUST equal the corresponding
+  // `locale-en.json` string so the English POC matches the AngularJS baseline
+  // exactly, and each MUST be a real angular-translate key so it localizes.
+
+  it('L1: resolves the filter search placeholder to COMMON.FILTERS.INPUT_PLACEHOLDER', () => {
+    // Shared `tg-input-search` placeholder (input-search.component.coffee:17).
+    expect(t('COMMON.FILTERS.INPUT_PLACEHOLDER')).toBe('subject or reference');
+  });
+
+  it('L2: resolves the backlog add-user-story buttons to US.ADD / US.ADD_BULK', () => {
+    // addnewus.jade: primary button visible text + bulk button aria-label.
+    expect(t('US.ADD')).toBe('user story');
+    expect(t('US.ADD_BULK')).toBe('Add some new user stories in bulk');
+  });
+
+  it('L3: resolves the tags-visibility toggle to BACKLOG.TAGS.*', () => {
+    // backlog.jade #show-tags label + wrapper title.
+    expect(t('BACKLOG.TAGS.SHOW')).toBe('tags');
+    expect(t('BACKLOG.TAGS.TOGGLE')).toBe('Toggle tags visibility');
+    expect(t('BACKLOG.TAGS.HIDE')).toBe('Hide tags');
+  });
+
+  it('L4: resolves the summary metric labels to BACKLOG.SUMMARY.* (with <br /> line breaks)', () => {
+    // summary.jade .summary-stats .description translate keys. The literal
+    // `<br />` is preserved verbatim (rendered via dangerouslySetInnerHTML).
+    expect(t('BACKLOG.SUMMARY.PROJECT_POINTS')).toBe('project<br />points');
+    expect(t('BACKLOG.SUMMARY.DEFINED_POINTS')).toBe('defined<br />points');
+    expect(t('BACKLOG.SUMMARY.CLOSED_POINTS')).toBe('closed<br />points');
+    expect(t('BACKLOG.SUMMARY.POINTS_PER_SPRINT')).toBe('points /<br />sprint');
+  });
+
+  it('strips the unset {{maxFileSizeMsg}} token from ATTACHMENT.ADD via interpolation', () => {
+    // The create/edit lightbox passes an explicit empty maxFileSizeMsg so the
+    // token resolves to empty, matching angular-translate in the attachments-simple
+    // widget (the variable is never set there). Without params the literal token
+    // would leak; with params it is stripped.
+    expect(t('ATTACHMENT.ADD')).toBe('Add new attachment. {{maxFileSizeMsg}}');
+    expect(t('ATTACHMENT.ADD', { maxFileSizeMsg: '' })).toBe('Add new attachment. ');
+  });
+
+  it('localizes the w001 toolbar keys when a non-English catalog is active', () => {
+    configureI18n(
+      {
+        US: { ADD: 'historia de usuario' },
+        BACKLOG: { TAGS: { SHOW: 'etiquetas' } },
+        COMMON: { FILTERS: { INPUT_PLACEHOLDER: 'asunto o referencia' } },
+      },
+      'es',
+    );
+    expect(t('US.ADD')).toBe('historia de usuario');
+    expect(t('BACKLOG.TAGS.SHOW')).toBe('etiquetas');
+    expect(t('COMMON.FILTERS.INPUT_PLACEHOLDER')).toBe('asunto o referencia');
+    // Absent from the Spanish slice -> English fallback still applies.
+    expect(t('US.ADD_BULK')).toBe('Add some new user stories in bulk');
+    expect(getLocale()).toBe('es');
+  });
+});
+
 describe('loadCatalog() — async fetch path', () => {
   const originalFetch = global.fetch;
 

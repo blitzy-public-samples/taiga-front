@@ -67,6 +67,7 @@ import moment from 'moment';
 
 import { useSortableCard } from '../../shared/dnd/sortable';
 import { DND_CLASS } from '../../shared/dnd/types';
+import { t } from '../../shared/i18n';
 import type { UserStoryData, Project, User } from '../state/kanbanReducer';
 
 /* ------------------------------------------------------------------------- *
@@ -172,24 +173,35 @@ const DEFAULT_DUE_DATE_CONFIG: DueDateAppearance[] = [
  */
 const DUE_DATE_FORMAT = 'DD MMM YYYY';
 
-// NOTE: The AngularJS card ran its user-facing strings through
-// `$translate.instant(...)`. There is no React i18n layer in scope for this
-// coexistence migration, so the handful of labels the card needs are rendered
-// as plain English fallbacks mirroring the default `en` locale. This is purely
-// textual — it introduces no new i18n system and has no structural or layout
-// effect.
-const LABELS = {
-  notAssigned: 'Not assigned',
-  edit: 'Edit',
-  assignTo: 'Assign to',
-  delete: 'Delete',
-  moveToTop: 'Move to top',
-  estimation: 'Estimation',
-  attachments: 'Attachments',
-  watchers: 'Watchers',
-  comments: 'Comments',
-  iocaine: 'Iocaine',
-};
+// The AngularJS card ran every user-facing string through
+// `$translate.instant(...)`. The React coexistence layer has an equivalent
+// `t()` runtime (`shared/i18n.ts`, a faithful angular-translate re-implementation
+// used across both migrated screens), so the card's labels are routed through it
+// with the SAME translation keys the legacy card used, preserving exact English
+// parity while restoring localization (finding D#4). The keys map to the two
+// legacy card sources:
+//   - the ⋮ action menu -> `tgCardActions` (`main.coffee:1068-1094`) via
+//     `COMMON.CARD.EDIT` / `COMMON.CARD.ASSIGN_TO` / `COMMON.CARD.DELETE` /
+//     `COMMON.CARD.MOVE_TO_TOP`;
+//   - the card-data / card-assigned-to tooltips (`card-templates/*.jade`) via
+//     `COMMON.CARD.ESTIMATION`, `TASK.FIELDS.IS_IOCAINE`,
+//     `ATTACHMENT.SECTION_NAME`, `COMMON.WATCHERS.WATCHERS`, `COMMENTS.TITLE`,
+//     and `COMMON.ASSIGNED_TO.NOT_ASSIGNED`.
+// `buildLabels()` is called per-render (inside the component) so a locale change
+// takes effect without a module reload. This is purely textual — it introduces
+// no new i18n system and has no structural or layout effect.
+const buildLabels = () => ({
+  notAssigned: t('COMMON.ASSIGNED_TO.NOT_ASSIGNED'),
+  edit: t('COMMON.CARD.EDIT'),
+  assignTo: t('COMMON.CARD.ASSIGN_TO'),
+  delete: t('COMMON.CARD.DELETE'),
+  moveToTop: t('COMMON.CARD.MOVE_TO_TOP'),
+  estimation: t('COMMON.CARD.ESTIMATION'),
+  attachments: t('ATTACHMENT.SECTION_NAME'),
+  watchers: t('COMMON.WATCHERS.WATCHERS'),
+  comments: t('COMMENTS.TITLE'),
+  iocaine: t('TASK.FIELDS.IS_IOCAINE'),
+});
 
 /* ------------------------------------------------------------------------- *
  * Svg helper — reproduces `CardSvgTemplate` (main.coffee:855)
@@ -655,6 +667,11 @@ const Card = ({
   onMoveToTop,
   onSelect,
 }: CardProps) => {
+  // Per-render translated card labels (finding D#4): resolves the ⋮ menu items
+  // and statistic tooltips through the shared `t()` runtime with the legacy
+  // translation keys (see `buildLabels` above).
+  const LABELS = buildLabels();
+
   // ----- drag-and-drop wiring -----------------------------------------------
   // The card carries `{ usId, statusId, swimlaneId, oldIndex }` as its drag data
   // so the Kanban drag-end handler can read the source column/swimlane AND the

@@ -234,23 +234,127 @@ jest.mock('../../shared/dnd/sortable', () => ({
   ),
 }));
 
-// Defensive: KanbanApp does NOT import this adapter directly (the hook owns every
-// `/api/v1/` call, and the drag handler receives a local no-op `api`), but it is
-// mocked so nothing reachable through the module graph can ever hit the real HTTP
-// layer, and so Phase G can assert the raw endpoint is NEVER called.
+// The `/api/v1/` adapter module. The bulk endpoints stay defensively mocked (the
+// hook owns every bulk call, and the drag handler receives a local no-op `api`),
+// and Phase G asserts the raw bulk endpoint is NEVER called. `getUserStory` IS
+// imported directly by KanbanApp (finding D#1): `handleEditUs` awaits it to fetch
+// the FULL story DETAIL — including the `description` and per-role `points` the
+// Kanban board LIST model omits — plus the authoritative `version`, BEFORE the
+// edit lightbox opens. It resolves to a canonical full detail whose `description`
+// differs from anything the LIST model could carry, so the edit-open spec can
+// prove the prefill comes from the DETAIL fetch (not the hollow list row).
 jest.mock('../../shared/api/userstories', () => {
   const bulkCreate = jest.fn(() => Promise.resolve({}));
   const bulkUpdateKanbanOrder = jest.fn(() => Promise.resolve({}));
   const bulkUpdateBacklogOrder = jest.fn(() => Promise.resolve({}));
   const bulkUpdateMilestone = jest.fn(() => Promise.resolve({}));
+  const getUserStory = jest.fn((id: number) =>
+    Promise.resolve({
+      id,
+      ref: 42,
+      subject: 'Existing subject',
+      // A description that ONLY the full-story DETAIL fetch can supply -- the
+      // Kanban board LIST model never carries it (finding D#1).
+      description: 'Full server description',
+      status: 1,
+      points: { '1': 5 },
+      tags: [
+        ['red', '#ff0000'],
+        ['blue', null],
+      ],
+      assigned_users: [101, 102],
+      assigned_to: 101,
+      total_points: 5,
+      is_blocked: false,
+      blocked_note: '',
+      team_requirement: false,
+      client_requirement: false,
+      version: 7,
+    }),
+  );
   return {
     __esModule: true,
     bulkCreate,
     bulkUpdateKanbanOrder,
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
-    default: { bulkCreate, bulkUpdateKanbanOrder, bulkUpdateBacklogOrder, bulkUpdateMilestone },
+    getUserStory,
+    default: {
+      bulkCreate,
+      bulkUpdateKanbanOrder,
+      bulkUpdateBacklogOrder,
+      bulkUpdateMilestone,
+      getUserStory,
+    },
   };
+});
+
+// CreateEditUsLightbox stub (DEFAULT export of `./components/CreateEditUsLightbox`)
+// -- the full create/edit user-story form KanbanApp now wires in place of the
+// removed reduced inline form (findings D#1 + D#2). The container is a THIN
+// ORCHESTRATOR of this child: the child's OWN field behaviour (subject guard,
+// tag parsing, points grid, requirement toggles, LOCATION radios) is covered by
+// `CreateEditUsLightbox.test.tsx`; here we only assert KanbanApp's WIRING. The
+// stub therefore: (a) renders the real `.lightbox-create-edit` shell class so the
+// pre-existing presence/absence assertions (Phase F, Group A) hold; (b) echoes
+// the derived props KanbanApp computes (`mode`, `initialStatusId`, the `us`
+// model's id/subject/description, and the statuses/roles/points/current-user
+// counts) onto data-attributes; and (c) exposes a submit button that invokes
+// `onSubmit` with the `UsFormValues` a test stages on `__ceSubmitValues`, and a
+// close button that invokes `onClose` (the empty-subject / cancel path the real
+// form routes through `onClose`). Props are captured to `__ceProps` for direct
+// inspection.
+jest.mock('../components/CreateEditUsLightbox', () => {
+  const react = require('react');
+  const Mock = (props: any) => {
+    (globalThis as any).__ceProps = props;
+    const us = props.us || null;
+    return react.createElement(
+      'div',
+      {
+        className: 'lightbox lightbox-generic-form lightbox-create-edit open',
+        role: 'dialog',
+        'data-mode': props.mode,
+        'data-initial-status': props.initialStatusId == null ? '' : String(props.initialStatusId),
+        'data-us-id': us ? String(us.id) : '',
+        'data-us-subject': us ? String(us.subject ?? '') : '',
+        // The prefilled description -- for an EDIT this is the REAL description
+        // the container fetched via `getUserStory` (finding D#1).
+        'data-us-description': us ? String(us.description ?? '') : '',
+        'data-statuses-count': String((props.statuses || []).length),
+        'data-roles-count': String((props.roles || []).length),
+        'data-points-count': String((props.points || []).length),
+        'data-current-user': props.currentUserId == null ? '' : String(props.currentUserId),
+      },
+      react.createElement('button', {
+        type: 'button',
+        className: 'mock-ce-submit',
+        onClick: () =>
+          props.onSubmit &&
+          props.onSubmit(
+            (globalThis as any).__ceSubmitValues || {
+              subject: 'New story',
+              description: '',
+              statusId: 1,
+              position: 'bottom',
+              points: {},
+              tags: [],
+              assignedUsers: [],
+              isBlocked: false,
+              blockedNote: '',
+              teamRequirement: false,
+              clientRequirement: false,
+            },
+          ),
+      }),
+      react.createElement('button', {
+        type: 'button',
+        className: 'mock-ce-close',
+        onClick: () => props.onClose && props.onClose(),
+      }),
+    );
+  };
+  return { __esModule: true, default: Mock };
 });
 
 /* ------------------------------------------------------------------ *
@@ -342,6 +446,33 @@ function renderApp(
 }
 
 /* ------------------------------------------------------------------ *
+ * Lightbox-submit staging helper
+ * ------------------------------------------------------------------ *
+ * The mocked `CreateEditUsLightbox` calls `onSubmit` with whatever is staged on
+ * `__ceSubmitValues`. `stageSubmit(overrides)` builds a FULL `UsFormValues` (the
+ * shape the real form emits) from a minimal, valid subject-only baseline so a
+ * test only states the fields it cares about. Mirrors the disk `UsFormValues`
+ * type: `tags` are `[name, colour]` tuples, `points` is a `{ roleId: pointId }`
+ * map, and `position` is the CREATE-only LOCATION ('top' | 'bottom').
+ */
+function stageSubmit(overrides: Record<string, unknown> = {}) {
+  (globalThis as any).__ceSubmitValues = {
+    subject: 'New story',
+    description: '',
+    statusId: 1,
+    position: 'bottom',
+    points: {},
+    tags: [],
+    assignedUsers: [],
+    isBlocked: false,
+    blockedNote: '',
+    teamRequirement: false,
+    clientRequirement: false,
+    ...overrides,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Per-test hygiene
  * ------------------------------------------------------------------ */
 
@@ -353,6 +484,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUseKanbanBoard.mockReturnValue(makeHookResult());
   delete (globalThis as any).__kanbanDndProps;
+  delete (globalThis as any).__ceProps;
+  delete (globalThis as any).__ceSubmitValues;
   try {
     localStorage.clear();
   } catch {
@@ -374,6 +507,8 @@ afterEach(() => {
     /* ignore */
   }
   delete (globalThis as any).__kanbanDndProps;
+  delete (globalThis as any).__ceProps;
+  delete (globalThis as any).__ceSubmitValues;
   delete (window as any).taiga;
   delete (window as any).taigaConfig;
 });
@@ -763,7 +898,6 @@ describe('KanbanApp - Group A: single-story card operations', () => {
       },
     ],
   } as unknown as UseKanbanBoardResult['state'];
-  const emptyState = { userstoriesRaw: [] } as unknown as UseKanbanBoardResult['state'];
 
   // A project carrying members so the inline assign popover has rows to render.
   const projectWithMembers = {
@@ -778,120 +912,173 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     ],
   } as unknown as UseKanbanBoardResult['project'];
 
-  // ---- KB-5: functional single-story create ----
-  it('KB-5: submitting the create subject calls addUsStandard(statusId, subject, extra) once and closes', async () => {
+  // ---- KB-5: functional single-story create (finding D#2) ----
+  // KanbanApp is a THIN ORCHESTRATOR of the wired `CreateEditUsLightbox` (mocked
+  // above): it OWNS `onAddNewUs('standard') -> open create lightbox` and
+  // `onSubmit(UsFormValues) -> addUsStandard(...)`. The form's own field UI is
+  // covered by `CreateEditUsLightbox.test.tsx`; here we drive the mock's staged
+  // `onSubmit` and assert the container's create wiring + close-on-resolve.
+  it('KB-5: submitting the create lightbox calls addUsStandard(statusId, subject, extra, position) once and closes', async () => {
     const { container, hookResult } = renderApp();
 
+    // Open a PRISTINE create lightbox for the clicked column (status 1).
     fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
-    // A real subject input is rendered (not an inert shell).
-    const input = container.querySelector('.create-us-subject') as HTMLInputElement;
-    expect(input).toBeInTheDocument();
-    fireEvent.change(input, { target: { value: '  New story  ' } });
+    const lb = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    expect(lb).toBeInTheDocument();
+    expect(lb.getAttribute('data-mode')).toBe('create');
+    // The clicked column status is handed to the lightbox as `initialStatusId`.
+    expect(lb.getAttribute('data-initial-status')).toBe('1');
 
+    // The form emits a subject-only `UsFormValues` (the LOCATION defaults to the
+    // bottom). KanbanApp maps it to a subject-only create.
+    stageSubmit({ subject: 'New story', statusId: 1, position: 'bottom' });
     await act(async () => {
-      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+      fireEvent.click(container.querySelector('.mock-ce-submit') as HTMLElement);
     });
 
     expect(hookResult.addUsStandard).toHaveBeenCalledTimes(1);
-    // statusId 1 from the Board stub's onAddNewUs('standard', 1); subject trimmed.
-    // The container delegates to the hook (which owns the frozen POST); it never
-    // builds the request itself. With only the subject filled, the `extra`
-    // payload is an empty object (the adapter then posts a subject-only body,
-    // byte-identical to the legacy quick add).
-    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'New story', {});
-    // The lightbox closes after a successful create.
+    // statusId 1 from the Board stub's onAddNewUs('standard', 1). The container
+    // delegates to the hook (which owns the frozen POST); with only the subject
+    // filled, the `extra` payload is an empty object (byte-identical to the
+    // legacy quick add) and the position is the LOCATION radio value.
+    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'New story', {}, 'bottom');
+    // The lightbox does NOT self-close after onSubmit resolves -- the container
+    // owns the close, and does so once the create promise settles.
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
-  // ---- #7: the create form carries the core card fields; a fully-filled create
-  //          passes the `extra` payload through to addUsStandard ----
-  it('#7: a create with description/tags/blocked/due passes the extra payload to addUsStandard', async () => {
+  // ---- #7 + finding D#2: a fully-filled create maps the FULL UsFormValues
+  //      (description, tags, per-role POINTS, requirement flags, assignees,
+  //      blocked) through to addUsStandard's `extra`, and forwards the LOCATION.
+  it('#7: a create with description/tags/points/requirements/assignees/blocked passes the full extra payload + position', async () => {
     const { container, hookResult } = renderApp();
 
     fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
-    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
-      target: { value: 'Rich story' },
-    });
-    fireEvent.change(container.querySelector('.create-us-description') as HTMLTextAreaElement, {
-      target: { value: 'A description' },
-    });
-    fireEvent.change(container.querySelector('.create-us-tags') as HTMLInputElement, {
-      target: { value: 'alpha, beta ,, alpha' },
-    });
-    fireEvent.change(container.querySelector('.create-us-due-date') as HTMLInputElement, {
-      target: { value: '2026-08-15' },
-    });
-    fireEvent.click(container.querySelector('.create-us-blocked') as HTMLInputElement);
-    fireEvent.change(container.querySelector('.create-us-blocked-note') as HTMLTextAreaElement, {
-      target: { value: 'waiting' },
-    });
 
+    // The wired form emits a rich `UsFormValues`; tags are [name, colour] tuples
+    // and points a { roleId: pointId } map (finding D#2 parity with the AngularJS
+    // generic create form).
+    stageSubmit({
+      subject: 'Rich story',
+      statusId: 1,
+      position: 'top',
+      description: 'A description',
+      tags: [
+        ['alpha', '#111111'],
+        ['beta', null],
+      ],
+      points: { '1': 5, '2': 8 },
+      assignedUsers: [101, 102],
+      teamRequirement: true,
+      clientRequirement: true,
+      isBlocked: true,
+      blockedNote: 'waiting',
+    });
     await act(async () => {
-      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+      fireEvent.click(container.querySelector('.mock-ce-submit') as HTMLElement);
     });
 
     expect(hookResult.addUsStandard).toHaveBeenCalledTimes(1);
-    // Tags are trimmed + de-duplicated to names; the blocked note only rides
-    // along because the story is blocked; due_date is the ISO string.
-    expect(hookResult.addUsStandard).toHaveBeenCalledWith(1, 'Rich story', {
-      description: 'A description',
-      tags: ['alpha', 'beta'],
-      is_blocked: true,
-      blocked_note: 'waiting',
-      due_date: '2026-08-15',
-    });
+    // Every set field rides along in `extra`; the blocked note only rides along
+    // because the story is blocked; the LOCATION 'top' is forwarded as the 4th arg.
+    expect(hookResult.addUsStandard).toHaveBeenCalledWith(
+      1,
+      'Rich story',
+      {
+        description: 'A description',
+        tags: [
+          ['alpha', '#111111'],
+          ['beta', null],
+        ],
+        points: { '1': 5, '2': 8 },
+        assigned_users: [101, 102],
+        team_requirement: true,
+        client_requirement: true,
+        is_blocked: true,
+        blocked_note: 'waiting',
+      },
+      'top',
+    );
   });
 
-  it('KB-5: an empty create subject does NOT call addUsStandard and closes the shell', () => {
+  // The wired form routes an empty subject (and an explicit cancel) through
+  // `onClose`, NOT `onSubmit` (the subject guard lives inside the lightbox, see
+  // CreateEditUsLightbox.test.tsx). At the container boundary that means Close
+  // must dismiss the lightbox WITHOUT any create call.
+  it('KB-5: closing the create lightbox (empty subject / cancel) does NOT call addUsStandard and unmounts it', () => {
     const { container, hookResult } = renderApp();
 
     fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
-    const input = container.querySelector('.create-us-subject') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: '   ' } });
-    fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+    expect(container.querySelector('.lightbox-create-edit')).toBeInTheDocument();
+
+    fireEvent.click(container.querySelector('.mock-ce-close') as HTMLElement);
 
     expect(hookResult.addUsStandard).not.toHaveBeenCalled();
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
-  // ---- KB-2 (#8): edit opens the INLINE edit lightbox (no navigation) ----
-  it('KB-2 (#8): card Edit opens the inline edit lightbox seeded from the model - the user stays on the board', () => {
+  // ---- KB-2 (#8) + finding D#1: edit opens the lightbox IN PLACE, prefilled
+  //      from the FULL-STORY fetch (no navigation) ----
+  it('KB-2 (#8) + D#1: card Edit fetches the FULL story then opens the edit lightbox prefilled with the REAL description', async () => {
     const { container } = renderApp({}, { state: stateWithUs11 });
 
-    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
-
-    // The inline edit lightbox opens with the edit title, seeded from us 11.
-    const lb = container.querySelector('.lightbox-create-edit');
-    expect(lb).toBeInTheDocument();
-    expect(lb?.querySelector('.title')?.textContent).toBe('Edit user story');
-    const subject = container.querySelector('.create-us-subject') as HTMLInputElement;
-    expect(subject.value).toBe('Existing subject');
-    expect((container.querySelector('.create-us-description') as HTMLTextAreaElement).value).toBe(
-      'Existing description',
-    );
-    // Tag NAMES are joined into the comma-separated field (colours dropped).
-    expect((container.querySelector('.create-us-tags') as HTMLInputElement).value).toBe('red, blue');
-  });
-
-  it('KB-2 (#8): editing and saving calls saveUs with the changed fields + version (no navigation)', async () => {
-    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
-
-    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
-    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
-      target: { value: 'Renamed' },
+    await act(async () => {
+      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
     });
 
+    // CRITICAL (finding D#1): the container fetches the FULL story DETAIL via
+    // `getUserStory(id)` BEFORE opening -- the board LIST row omits `description`.
+    expect(userstoriesApi.getUserStory).toHaveBeenCalledTimes(1);
+    expect(userstoriesApi.getUserStory).toHaveBeenCalledWith(11);
+
+    const lb = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    expect(lb).toBeInTheDocument();
+    expect(lb.getAttribute('data-mode')).toBe('edit');
+    expect(lb.getAttribute('data-us-id')).toBe('11');
+    expect(lb.getAttribute('data-us-subject')).toBe('Existing subject');
+    // The prefilled description is the one ONLY the DETAIL fetch supplies
+    // ('Full server description'), NOT the hollow list row -- proving the D#1
+    // data-loss fix (the PATCH will now carry the real description, not '').
+    expect(lb.getAttribute('data-us-description')).toBe('Full server description');
+  });
+
+  it('KB-2 (#8) + D#1: editing and saving calls saveUs with the changed fields + version, PRESERVING the description', async () => {
+    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
+
     await act(async () => {
-      fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    });
+
+    // The form emits the edited values -- crucially it carries the REAL
+    // description it was prefilled with from `getUserStory` (finding D#1).
+    stageSubmit({
+      subject: 'Renamed',
+      statusId: 1,
+      description: 'Full server description',
+      points: { '1': 5 },
+      tags: [
+        ['red', '#ff0000'],
+        ['blue', null],
+      ],
+      assignedUsers: [101, 102],
+    });
+    await act(async () => {
+      fireEvent.click(container.querySelector('.mock-ce-submit') as HTMLElement);
     });
 
     expect(hookResult.saveUs).toHaveBeenCalledTimes(1);
     const [usId, changed] = (hookResult.saveUs as jest.Mock).mock.calls[0];
     expect(usId).toBe(11);
-    // The PATCH body carries the changed subject + the current status + the
-    // concurrency version read off the model.
+    // The PATCH body carries the changed subject + status + the authoritative
+    // `version` captured from the pre-edit DETAIL fetch, and PRESERVES the real
+    // description (finding D#1 -- previously this was wiped to '').
     expect(changed).toEqual(
-      expect.objectContaining({ subject: 'Renamed', status: 1, version: 7 }),
+      expect.objectContaining({
+        subject: 'Renamed',
+        status: 1,
+        description: 'Full server description',
+        version: 7,
+      }),
     );
     // addUsStandard (create path) is NOT used for an edit.
     expect(hookResult.addUsStandard).not.toHaveBeenCalled();
@@ -899,19 +1086,47 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
-  it('KB-2 (#8): an empty subject on edit keeps the form open and does NOT call saveUs', () => {
-    const { container, hookResult } = renderApp({}, { state: stateWithUs11 });
+  // Replaces the former "empty subject on edit" micro-behaviour (now owned by the
+  // lightbox): asserts KanbanApp computes and passes the DERIVED lightbox props
+  // -- statuses, computable-only roles, points, and the current-user id (finding
+  // D#2: the form needs the project's estimation roles/points to render).
+  it('D#2: passes the derived statuses / computable-roles / points / current-user props to the lightbox', () => {
+    const projectWithMeta = {
+      id: 7,
+      slug: 'proj',
+      name: 'Proj',
+      my_permissions: ['modify_us', 'delete_us', 'add_us'],
+      members: [
+        { id: 101, full_name_display: 'Alice' },
+        { id: 102, full_name_display: 'Bob' },
+      ],
+      roles: [
+        { id: 1, name: 'Back', computable: true, order: 1 },
+        { id: 2, name: 'Front', computable: true, order: 2 },
+        { id: 5, name: 'Stakeholder', computable: false, order: 3 },
+      ],
+      points: [
+        { id: 1, name: '?', value: null, order: 1 },
+        { id: 2, name: '1', value: 1, order: 2 },
+        { id: 3, name: '2', value: 2, order: 3 },
+      ],
+    } as unknown as UseKanbanBoardResult['project'];
+    // Seed the logged-in user so the "Assign to me" id flows through.
+    localStorage.setItem('userInfo', JSON.stringify({ id: 999 }));
 
-    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
-    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
-      target: { value: '   ' },
-    });
-    fireEvent.click(container.querySelector('.lightbox-create-edit .btn-save') as HTMLElement);
+    const { container } = renderApp({}, { project: projectWithMeta });
+    fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
 
-    expect(hookResult.saveUs).not.toHaveBeenCalled();
-    // Subject is required on edit, so the form stays open (unlike create, which
-    // closes on an empty subject).
-    expect(container.querySelector('.lightbox-create-edit')).toBeInTheDocument();
+    const lb = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    // Two board statuses -> two lightbox status options.
+    expect(lb.getAttribute('data-statuses-count')).toBe('2');
+    // Only the two `computable` roles are offered for estimation (the
+    // Stakeholder role is filtered out).
+    expect(lb.getAttribute('data-roles-count')).toBe('2');
+    // All three point values are offered.
+    expect(lb.getAttribute('data-points-count')).toBe('3');
+    // The current-user id is read from the session for "Assign to me".
+    expect(lb.getAttribute('data-current-user')).toBe('999');
   });
 
   // ---- KB-3 (#8): assign opens the INLINE assign popover (no navigation) ----
@@ -985,21 +1200,38 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     expect(changed).toEqual({ assigned_users: [], assigned_to: null, version: 7 });
   });
 
-  it('#8: card Edit is a no-op (no lightbox) when the story id cannot be resolved', () => {
-    // Empty userstoriesRaw -> getUsModel returns undefined -> nothing opens.
-    const { container } = renderApp({}, { state: emptyState });
+  // ---- #8 + finding D#1: edit ABORTS (no lightbox, save-failure banner) when
+  //      the pre-edit full-story fetch fails; assign is a no-op when unresolved ----
+  it('#8 + D#1: card Edit aborts (no lightbox + save-failure banner) when the pre-edit fetch fails; Assign is a no-op when unresolved', async () => {
+    // The FULL-story fetch rejects -> parity with a failed `getByRef`: the edit
+    // is aborted, NO lightbox opens (so no PATCH can wipe the description), and
+    // the standard save-failure banner is surfaced.
+    (userstoriesApi.getUserStory as jest.Mock).mockImplementationOnce(() =>
+      Promise.reject(new Error('nope')),
+    );
+    const { container } = renderApp();
 
-    fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
-    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
+    await act(async () => {
+      fireEvent.click(container.querySelector('.mock-card-edit') as HTMLElement);
+    });
 
+    expect(userstoriesApi.getUserStory).toHaveBeenCalledWith(11);
+    // No edit lightbox opened despite the Edit click.
     expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
+    // The save-failure banner (reusing the .write-error treatment) tells the user
+    // the Edit action did not open.
+    expect(container.querySelector('.write-error[role="alert"]')).toBeInTheDocument();
+
+    // Assign with an unresolvable in-memory model (default state has no stories)
+    // opens nothing either.
+    fireEvent.click(container.querySelector('.mock-card-assign') as HTMLElement);
     expect(container.querySelector('.lightbox-select-user')).not.toBeInTheDocument();
   });
 
-  // ---- #9: double-submit guard on the create form ----
-  it('#9: two rapid Save clicks on the create form call addUsStandard exactly once', async () => {
+  // ---- #9: double-submit guard across the wired lightbox's onSubmit ----
+  it('#9: two rapid submits from the create lightbox call addUsStandard exactly once', async () => {
     // A deferred addUsStandard keeps the first write in flight so the second
-    // click hits the in-flight guard.
+    // onSubmit hits the in-flight guard (submittingRef).
     let resolveCreate: () => void = () => undefined;
     const pending = new Promise<void>((res) => {
       resolveCreate = res;
@@ -1009,24 +1241,23 @@ describe('KanbanApp - Group A: single-story card operations', () => {
     const { container } = renderApp({}, { addUsStandard });
 
     fireEvent.click(container.querySelector('.mock-add-standard') as HTMLElement);
-    fireEvent.change(container.querySelector('.create-us-subject') as HTMLInputElement, {
-      target: { value: 'Once only' },
-    });
+    stageSubmit({ subject: 'Once only', statusId: 1, position: 'bottom' });
 
-    const saveBtn = container.querySelector('.lightbox-create-edit .btn-save') as HTMLButtonElement;
-    // Two rapid clicks BEFORE the first create resolves.
-    fireEvent.click(saveBtn);
-    fireEvent.click(saveBtn);
+    const submitBtn = container.querySelector('.mock-ce-submit') as HTMLElement;
+    // Two rapid submits BEFORE the first create resolves; the container's
+    // submittingRef guard swallows the second.
+    fireEvent.click(submitBtn);
+    fireEvent.click(submitBtn);
 
     expect(addUsStandard).toHaveBeenCalledTimes(1);
-    // The Save button is disabled while the write is in flight.
-    expect(saveBtn.disabled).toBe(true);
 
     // Let the write settle so the pending promise does not leak between tests.
     await act(async () => {
       resolveCreate();
       await pending;
     });
+    // After the single write resolves the container closes the lightbox.
+    expect(container.querySelector('.lightbox-create-edit')).not.toBeInTheDocument();
   });
 
   // ---- KB-4: delete confirm fires the pessimistic hook deleteUs ----

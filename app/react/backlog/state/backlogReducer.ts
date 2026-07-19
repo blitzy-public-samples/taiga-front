@@ -211,6 +211,23 @@ export interface BacklogState {
   totalMilestones: number;
   totalOpenMilestones: number;
   totalClosedMilestones: number;
+  /**
+   * Whether the sprints/milestones list has completed its first server load
+   * (set once by `setSprints`, which always fires on load regardless of whether
+   * the project has zero or many sprints).
+   *
+   * PARITY / CLS GUARD (QA finding F-CLS-01): the AngularJS backlog left
+   * `totalMilestones` `undefined` until milestones loaded, so its empty-state
+   * gate `totalMilestones === 0` (`undefined === 0` -> false) never rendered the
+   * `.empty-small` illustration during the async load window. Our reducer
+   * initialises `totalMilestones` to the number `0`, so a naive `=== 0` gate is
+   * TRUE during that window and briefly flashes `empty_sprint.png` before the
+   * real sprint cards arrive — a Cumulative Layout Shift regression. This flag
+   * reproduces the AngularJS "not yet known" state: the empty illustration is
+   * gated on `sprintsLoaded && totalMilestones === 0`, so it is suppressed until
+   * the first `setSprints` and only shown for a genuinely empty project.
+   */
+  sprintsLoaded: boolean;
   currentSprint: Sprint | null;
   closedSprintsVisible: boolean; // inverse of excludeClosedSprints
   sprintOpen: Record<number, boolean>; // per-sprint fold state (sprints.coffee)
@@ -365,6 +382,10 @@ export function createInitialState(): BacklogState {
     totalMilestones: 0,
     totalOpenMilestones: 0,
     totalClosedMilestones: 0,
+    // Starts false so the empty-sprint illustration is suppressed until the
+    // first `setSprints` (see the `sprintsLoaded` doc on BacklogState) — prevents
+    // the F-CLS-01 empty-state flash / layout shift during the async load window.
+    sprintsLoaded: false,
     currentSprint: null,
     closedSprintsVisible: false,
     sprintOpen: {},
@@ -741,6 +762,10 @@ export function setSprints(
     draft.totalClosedMilestones = closed;
     draft.totalOpenMilestones = open;
     draft.totalMilestones = open + closed;
+    // Mark the sprints list as loaded so the empty-state illustration is now
+    // allowed to render for a genuinely empty project (open + closed === 0)
+    // WITHOUT flashing during the preceding async load window (F-CLS-01).
+    draft.sprintsLoaded = true;
     draft.sprints = prepared;
     // Guard kept for parity with the source (main.coffee:322); our init is `[]`.
     if (!draft.closedSprints) {

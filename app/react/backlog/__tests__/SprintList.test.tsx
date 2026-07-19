@@ -156,6 +156,11 @@ const renderList = (over: Partial<SprintListTestProps> = {}) => {
     openSprints: [],
     closedSprints: [],
     totalMilestones: 0,
+    // Default to the "loaded" state so the existing empty-state specs (which pass
+    // totalMilestones: 0) assert the genuinely-empty-after-load case. The F-CLS-01
+    // load-guard behavior (sprintsLoaded: false suppresses the empty illustration)
+    // is covered by its own dedicated describe block below.
+    sprintsLoaded: true,
     totalClosedMilestones: 0,
     showClosedSprints: false,
     sprintOpen: {},
@@ -294,6 +299,43 @@ describe('SprintList — empty state', () => {
     const { container } = renderList({ totalMilestones: 1, openSprints: [makeSprint()] });
 
     expect(container.querySelector('.empty-small')).toBeNull();
+  });
+});
+
+describe('SprintList — empty-state load guard (F-CLS-01)', () => {
+  // Reproduces the AngularJS `totalMilestones === undefined` behavior via the
+  // `sprintsLoaded` flag: the empty illustration must be suppressed during the
+  // async load window (before the first setSprints) so it never flashes and
+  // shifts layout when the real sprint cards arrive.
+  it('does NOT render .empty-small during load (sprintsLoaded=false, totalMilestones=0)', () => {
+    const { container } = renderList({ sprintsLoaded: false, totalMilestones: 0 });
+
+    // No empty-state flash while the sprints are still loading.
+    expect(container.querySelector('.empty-small')).toBeNull();
+  });
+
+  it('renders .empty-small only after load for a genuinely empty project (sprintsLoaded=true, totalMilestones=0)', () => {
+    const { container } = renderList({ sprintsLoaded: true, totalMilestones: 0 });
+
+    const empty = emptySmall(container);
+    expect(empty).toBeInTheDocument();
+    expect(empty.querySelector('p.title')).toHaveTextContent('There are no sprints yet');
+  });
+
+  it('never renders .empty-small once sprints exist, regardless of sprintsLoaded', () => {
+    const withLoad = renderList({
+      sprintsLoaded: true,
+      totalMilestones: 2,
+      openSprints: [makeSprint({ id: 1 }), makeSprint({ id: 2 })],
+    });
+    expect(withLoad.container.querySelector('.empty-small')).toBeNull();
+
+    const preLoad = renderList({
+      sprintsLoaded: false,
+      totalMilestones: 2,
+      openSprints: [makeSprint({ id: 1 }), makeSprint({ id: 2 })],
+    });
+    expect(preLoad.container.querySelector('.empty-small')).toBeNull();
   });
 });
 

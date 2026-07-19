@@ -827,9 +827,10 @@ describe('BacklogTable — loading spinner', () => {
     expect(region).toHaveAttribute('aria-busy', 'true');
 
     // The status region is announced by name — a visually-hidden label carries the
-    // color-independent loading text.
+    // color-independent loading text, routed through the shared `t('COMMON.LOADING')`
+    // key (finding D#4) so it is localizable like the rest of the app.
     const status = screen.getByRole('status');
-    expect(status).toHaveTextContent('Loading more user stories');
+    expect(status).toHaveTextContent('Loading...');
 
     // The label is visually hidden (clip-rect technique) — it must NOT occupy a
     // visible box, so the zero-visual-change contract holds.

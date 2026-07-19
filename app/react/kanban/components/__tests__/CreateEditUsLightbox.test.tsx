@@ -79,8 +79,8 @@ const USERS_BY_ID: Record<number, LightboxUser> = {
 /* A minimal English translator: the handful of keys the specs assert on, with a
  * key-passthrough fallback (mirrors the real KanbanApp I18N subset). */
 const STRINGS: Record<string, string> = {
-  'LIGHTBOX.CREATE_EDIT_US.NEW': 'New user story',
-  'LIGHTBOX.CREATE_EDIT_US.EDIT': 'Edit user story',
+  'LIGHTBOX.CREATE_EDIT.NEW_US': 'New user story',
+  'LIGHTBOX.CREATE_EDIT.EDIT_US': 'Edit user story',
   'LIGHTBOX.CREATE_EDIT.LOCATION': 'Location',
   'LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM': 'at the bottom',
   'LIGHTBOX.CREATE_EDIT.CREATE_TOP': 'on top',

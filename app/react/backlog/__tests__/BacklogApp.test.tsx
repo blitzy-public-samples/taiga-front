@@ -349,6 +349,7 @@ function makeBacklog(over: any = {}): { state: any; actions: any } {
     totalMilestones: 1,
     totalOpenMilestones: 1,
     totalClosedMilestones: 0,
+    sprintsLoaded: true,
     currentSprint: { id: 55, name: 'Sprint 1', closed: false, total_points: 0, user_stories: [] },
     closedSprintsVisible: false,
     sprintOpen: {},
@@ -487,7 +488,7 @@ afterAll(() => {
  * ================================================================== */
 
 describe('BacklogApp - static skeleton & class flags', () => {
-  it('renders div.wrapper > main.main.scrum and a section.backlog with the summary, table and sidebar', () => {
+  it('renders div.wrapper > main.main.scrum, a section.backlog (summary + table), and the sidebar as a SIBLING (finding S1)', () => {
     const { container } = renderApp();
 
     expect(container.querySelector('div.wrapper')).toBeInTheDocument();
@@ -496,11 +497,19 @@ describe('BacklogApp - static skeleton & class flags', () => {
 
     const backlogSection = container.querySelector('section.backlog');
     expect(backlogSection).toBeInTheDocument();
-    // The three structural regions of the scrum screen live inside section.backlog.
+    // The summary + table regions live inside section.backlog (the .scrum grid's first column).
     expect(backlogSection!.querySelector('.backlog-summary')).toBeInTheDocument();
     expect(backlogSection!.querySelector('.backlog-table')).toBeInTheDocument();
-    // The non-standard <sidebar> tag is preserved verbatim for the .scrum grid.
-    expect(backlogSection!.querySelector('sidebar.sidebar')).toBeInTheDocument();
+    // Finding S1: the non-standard <sidebar> sprint panel is the .scrum grid's SECOND column,
+    // so it must be a SIBLING of section.backlog (a direct child of the grid), NOT nested inside
+    // it -- nesting it inside collapsed the panel below the table and left the grid's right
+    // column empty. In production both are direct children of main.scrum (the real DndProvider
+    // adds no DOM wrapper); here the mocked DndProvider wraps them in a single div, so assert the
+    // sidebar is OUTSIDE section.backlog and shares section.backlog's parent (they are siblings).
+    const sidebar = container.querySelector('sidebar.sidebar');
+    expect(sidebar).toBeInTheDocument();
+    expect(backlogSection!.querySelector('sidebar.sidebar')).not.toBeInTheDocument();
+    expect(sidebar!.parentElement).toBe(backlogSection!.parentElement);
   });
 
   it('renders the burndown placeholders inside .backlog-summary (graphics-container + empty-burndown)', () => {

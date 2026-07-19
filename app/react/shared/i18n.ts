@@ -110,6 +110,69 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
     CREATE: 'Create',
     DELETE: 'Delete',
     CANCEL: 'Cancel',
+    // Backlog user-story row ⋮ menu labels (finding D#4). The AngularJS backlog
+    // row popover (`app/partials/backlog/us-edit-popover.jade:15/22/29`) rendered
+    // `COMMON.EDIT` / `COMMON.DELETE` (above) / `COMMON.MOVE_TO_TOP` via the
+    // `translate` filter. Verbatim from `locale-en.json` so the React row renders
+    // identical English while remaining localizable.
+    EDIT: 'Edit',
+    MOVE_TO_TOP: 'Move to top',
+    // Generic loading announcement (finding D#4). Routes the backlog table's
+    // screen-reader "loading more" status text through the same key the rest of
+    // the app uses. Verbatim from `locale-en.json` COMMON.LOADING.
+    LOADING: 'Loading...',
+    // Kanban card ⋮ action-menu labels (finding D#4). The AngularJS Kanban card
+    // menu is built by the `tgCardActions` directive
+    // (`app/coffee/modules/kanban/main.coffee:1068-1094`, template
+    // `app/modules/components/card/card-templates/card-actions.jade` hosted by
+    // `card.jade:16`), which injects each label via
+    // `$translate.instant('COMMON.CARD.*')`. Verbatim from `locale-en.json`
+    // COMMON.CARD so the React card menu reproduces the exact AngularJS text
+    // ("Edit card" / "Assign To" / "Delete card" / "Move to top") and localizes.
+    CARD: {
+      EDIT: 'Edit card',
+      ASSIGN_TO: 'Assign To',
+      DELETE: 'Delete card',
+      MOVE_TO_TOP: 'Move to top',
+      ESTIMATION: 'Estimation',
+    },
+    // Card watchers-statistic tooltip (finding D#4). Verbatim from `locale-en.json`
+    // COMMON.WATCHERS, rendered as the `.card-watchers` title by
+    // `card-templates/card-data.jade:56`.
+    WATCHERS: {
+      WATCHERS: 'Watchers',
+    },
+    // Create/edit user-story lightbox strings (finding D#2 -- the full-featured
+    // Kanban create/edit lightbox is now wired in, replacing the reduced inline
+    // form). Verbatim from `app/locales/taiga/locale-en.json` so the React
+    // lightbox renders identical English text even before/without a localized
+    // catalog fetch, while remaining localizable (finding D#4).
+    OR: 'or',
+    BLOCKED_NOTE: 'Why is this blocked?',
+    BLOCK_TITLE:
+      'Block this item, for example if it has a dependency that can not be satisfied',
+    CLIENT_REQUIREMENT:
+      'A client requirement is a new requirement that was not previously expected and is required to be part of the project',
+    TEAM_REQUIREMENT:
+      'A team requirement is a requirement that must exist in the project but should have no cost for the client',
+    ASSIGNED_TO: {
+      ASSIGN: 'Assign',
+      DELETE_ASSIGNMENT: 'Delete assignment',
+      SELF: 'Assign to me',
+      // Card "not assigned" avatar tooltip + extended label (finding D#4).
+      // Verbatim from `locale-en.json`; rendered by
+      // `card-templates/card-assigned-to.jade:15/19`.
+      NOT_ASSIGNED: 'Not assigned',
+    },
+    FIELDS: {
+      SUBJECT: 'Subject',
+      DUE_DATE: 'Due date',
+      POINTS: 'Points',
+    },
+    TAGS: {
+      ADD: 'Add tag',
+      PLACEHOLDER: 'Enter tag',
+    },
     PICKERDATE: {
       FORMAT: 'DD MMM YYYY',
       FIRST_DAY_OF_WEEK: '1',
@@ -187,6 +250,21 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
     },
   },
   BACKLOG: {
+    // Backlog user-story row status widget tooltip (finding D#4). The AngularJS
+    // row rendered `title="{{'BACKLOG.STATUS_NAME' | translate}}"`
+    // (`app/partials/includes/components/backlog-row.jade:61`). Verbatim from
+    // `locale-en.json`.
+    STATUS_NAME: 'Status Name',
+    // Empty-burndown placeholder (finding D#4). Shown only when the project has
+    // no configured points/sprints AND the current user is an admin
+    // (`showGraphPlaceholder && project.i_am_admin`). Verbatim from `locale-en.json`
+    // BACKLOG.CUSTOMIZE_GRAPH*, so the React placeholder reproduces the exact
+    // AngularJS wording (title + body + trailing "Admin" link) and localizes.
+    CUSTOMIZE_GRAPH: 'Customize your backlog graph',
+    CUSTOMIZE_GRAPH_TEXT:
+      'To have a nice graph that helps you follow the evolution of the project you have to set up the points and sprints through the',
+    CUSTOMIZE_GRAPH_ADMIN: 'Admin',
+    CUSTOMIZE_GRAPH_TITLE: 'Set up the points and sprints through the Admin',
     COMPACT_SPRINT: 'Compact Sprint',
     EDIT_SPRINT: 'Edit Sprint',
     GO_TO_TASKBOARD: 'Go to the taskboard of {{::name}}',
@@ -209,6 +287,29 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
       INCREMENT_CLIENT:
         'Incremented points by client requirements for sprint "{{sprintName}}" is {{value}}',
     },
+    // Tags-visibility toggle in the backlog toolbar (finding w001 L3). The
+    // AngularJS `#show-tags` label rendered `translate="BACKLOG.TAGS.SHOW"`
+    // and its wrapper carried `title="{{'BACKLOG.TAGS.TOGGLE' | translate}}"`
+    // (`app/partials/backlog/backlog.jade:74-89`). Verbatim from
+    // `locale-en.json` so the toggle reads "tags" (not the drifted "Show tags").
+    TAGS: {
+      TOGGLE: 'Toggle tags visibility',
+      SHOW: 'tags',
+      HIDE: 'Hide tags',
+    },
+    // Backlog summary metric labels (finding w001 L4). The AngularJS
+    // `includes/components/summary.jade` rendered each `.summary-stats
+    // .description` via `translate="BACKLOG.SUMMARY.*"`; the values embed a
+    // literal `<br />` so every label wraps onto two lowercase lines. Verbatim
+    // from `locale-en.json` — the React summary renders these through
+    // `dangerouslySetInnerHTML` to reproduce the `<br />` line break exactly
+    // (matching the AngularJS `translate` directive's HTML rendering).
+    SUMMARY: {
+      PROJECT_POINTS: 'project<br />points',
+      DEFINED_POINTS: 'defined<br />points',
+      CLOSED_POINTS: 'closed<br />points',
+      POINTS_PER_SPRINT: 'points /<br />sprint',
+    },
   },
   LIGHTBOX: {
     ADD_EDIT_SPRINT: {
@@ -220,6 +321,59 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
       TITLE_ACTION_DELETE_SPRINT: 'delete sprint',
       LAST_SPRINT_NAME: 'last sprint is <strong> {{lastSprint}} ;-) </strong>',
     },
+    // Create/edit user-story lightbox labels (finding D#2). Verbatim from
+    // `app/locales/taiga/locale-en.json` LIGHTBOX.CREATE_EDIT. These are the
+    // REAL angular-translate keys (`NEW_US` / `EDIT_US`), so the React lightbox
+    // localizes correctly once a non-English catalog is fetched.
+    CREATE_EDIT: {
+      NEW_US: 'New user story',
+      EDIT_US: 'Edit user story',
+      LOCATION: 'Location',
+      CREATE_TOP: 'on top',
+      CREATE_BOTTOM: 'at the bottom',
+      US_PLACEHOLDER_DESCRIPTION:
+        'Please add descriptive text to help others better understand this user story',
+    },
+  },
+  // Attachment section strings referenced by the create/edit US lightbox
+  // (finding D#2). Verbatim from `locale-en.json` ATTACHMENT.
+  ATTACHMENT: {
+    ADD: 'Add new attachment. {{maxFileSizeMsg}}',
+    DROP: 'Drop attachments here!',
+    SECTION_NAME: 'Attachments',
+  },
+  // User-story strings referenced by the create/edit US lightbox estimation
+  // footer (finding D#2). Verbatim from `locale-en.json` US.
+  US: {
+    TOTAL_POINTS: 'total points',
+    // Backlog "new user story" toolbar buttons (finding w001 L2). The AngularJS
+    // `includes/components/addnewus.jade` rendered the standard button's visible
+    // text via `{{'US.ADD' | translate}}` and the bulk button's aria-label via
+    // `{{'US.ADD_BULK' | translate}}`. Verbatim from `locale-en.json` so the
+    // primary button reads "user story" (not the drifted "Add").
+    ADD: 'user story',
+    ADD_BULK: 'Add some new user stories in bulk',
+  },
+  // Card comments-statistic tooltip (finding D#4). Verbatim from `locale-en.json`
+  // COMMENTS, rendered as the `.card-comments` title by
+  // `card-templates/card-data.jade:63`.
+  COMMENTS: {
+    TITLE: 'Comments',
+  },
+  // Iocaine card indicator tooltip (finding D#4). The AngularJS card rendered the
+  // `.card-iocaine` title via `translate('TASK.FIELDS.IS_IOCAINE')`
+  // (`card-templates/card-data.jade:36/38`). Verbatim from `locale-en.json`.
+  TASK: {
+    FIELDS: {
+      IS_IOCAINE: 'Is iocaine',
+    },
+  },
+  // Write-error banner copy (finding D#4). The Kanban board already routed this
+  // through `t('NOTIFICATION.WARNING_TEXT')`; the Backlog board hardcoded the
+  // same English literal. Verbatim from `locale-en.json` so both screens share
+  // one localizable key.
+  NOTIFICATION: {
+    WARNING_TEXT: 'Your changes were not saved!',
   },
 };
 

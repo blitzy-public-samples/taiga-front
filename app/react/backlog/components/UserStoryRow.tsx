@@ -84,6 +84,7 @@ import type { UserStory } from '../state/backlogReducer';
 // Runtime values (a hook and a constant object) -> normal imports.
 import { useSortableRow } from '../../shared/dnd/sortable';
 import { DND_CLASS } from '../../shared/dnd/types';
+import { t } from '../../shared/i18n';
 // Pure estimation helpers reproducing `$tgEstimationsService`
 // (`estimation.coffee`): the per-role points math the points widget displays.
 import {
@@ -496,7 +497,7 @@ export function UserStoryRow(props: UserStoryRowProps) {
         <a
           className="us-status"
           href=""
-          title="Status"
+          title={t('BACKLOG.STATUS_NAME')}
           style={statusColor ? { color: statusColor } : undefined}
           onClick={handleStatusClick}
         >
@@ -649,7 +650,7 @@ export function UserStoryRow(props: UserStoryRowProps) {
                   }}
                 >
                   <Svg icon="icon-edit" />
-                  <span>Edit</span>
+                  <span>{t('COMMON.EDIT')}</span>
                 </button>
               </li>
               {canDelete && (
@@ -663,7 +664,7 @@ export function UserStoryRow(props: UserStoryRowProps) {
                     }}
                   >
                     <Svg icon="icon-trash" />
-                    <span>Delete</span>
+                    <span>{t('COMMON.DELETE')}</span>
                   </button>
                 </li>
               )}
@@ -677,7 +678,7 @@ export function UserStoryRow(props: UserStoryRowProps) {
                   }}
                 >
                   <Svg icon="icon-move-to-top" />
-                  <span>Move to top</span>
+                  <span>{t('COMMON.MOVE_TO_TOP')}</span>
                 </button>
               </li>
             </ul>

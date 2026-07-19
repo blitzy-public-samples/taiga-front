@@ -257,6 +257,9 @@ describe('createInitialState / initialBacklogState — documented defaults', () 
     expect(s.page).toBe(1);
     expect(s.disablePagination).toBe(false);
     expect(s.firstLoadComplete).toBe(false);
+    // F-CLS-01: starts false so the empty-sprint illustration is suppressed until
+    // the first setSprints (prevents the empty-state flash / layout shift).
+    expect(s.sprintsLoaded).toBe(false);
     expect(s.loadingUserstories).toBe(false);
     expect(s.noSwimlaneUserStories).toBe(false);
     expect(s.currentSprint).toBeNull();
@@ -621,6 +624,8 @@ describe('setSprints', () => {
     expect(next.currentSprint!.id).toBe(100);
     // milestonesOrder populated.
     expect(next.milestonesOrder[100]).toEqual({ 1: 1, 2: 2 });
+    // F-CLS-01: setSprints marks the list as loaded so the empty-state gate can act.
+    expect(next.sprintsLoaded).toBe(true);
     // Input untouched.
     expect(state.sprints).toEqual([]);
   });
@@ -630,6 +635,17 @@ describe('setSprints', () => {
     const snapshot = deepClone(original);
     setSprints(createInitialState(), { milestones: [original], closed: 0, open: 1, nowMs: 0 });
     expect(original).toEqual(snapshot);
+  });
+
+  it('sets sprintsLoaded=true even for an empty project (F-CLS-01 load guard)', () => {
+    const state = createInitialState();
+    // Before the first load the guard is false -> empty illustration suppressed.
+    expect(state.sprintsLoaded).toBe(false);
+    // An empty project still fires setSprints (open + closed === 0); the flag must
+    // flip so the empty-state can now render WITHOUT having flashed during load.
+    const next = setSprints(state, { milestones: [], closed: 0, open: 0, nowMs: 0 });
+    expect(next.sprintsLoaded).toBe(true);
+    expect(next.totalMilestones).toBe(0);
   });
 });
 

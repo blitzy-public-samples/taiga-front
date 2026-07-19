@@ -96,6 +96,10 @@ import {
   writeFiltersToLocation,
   type RestoredAppliedFilter,
 } from '../shared/filterUrl';
+// Shared translation runtime (finding D#4): routes the backlog's static labels
+// through the same `t()` layer the Kanban board already uses, with the legacy
+// angular-translate keys, so both screens are consistently localizable.
+import { t } from '../shared/i18n';
 // Drag context (supplies ONLY the `DndContext`; NOT a `SortableContext`).
 import { DndProvider } from '../shared/dnd/DndProvider';
 // Factory for the backlog drag-end handler; owns `bulkUpdateBacklogOrder` + the
@@ -921,7 +925,7 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                 existing SCSS applies and the two screens behave identically. */}
             {writeError ? (
               <div className="write-error" role="alert">
-                Your changes were not saved!
+                {t('NOTIFICATION.WARNING_TEXT')}
               </div>
             ) : null}
             {/* mainTitle include (backlog.jade:18 -> mainTitle.jade). H1 fix: the
@@ -943,23 +947,44 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                   <span className="number">{`${state.stats?.completedPercentage ?? 0}%`}</span>
                 </div>
 
+                {/* Finding w001 L4: reproduce the AngularJS `summary.jade`
+                    `.summary-stats .description` labels exactly. Each renders
+                    `translate="BACKLOG.SUMMARY.*"`, whose catalog value embeds a
+                    literal `<br />` so the label wraps onto two lowercase lines
+                    ("project<br />points", …, "points /<br />sprint"). React was
+                    drifted to single-line capitalized text ("Project points", …,
+                    "Points per sprint"); route through the shared catalog and render
+                    the `<br />` via `dangerouslySetInnerHTML` (safe: static, in-repo
+                    constant) to match the `translate` directive's HTML output. */}
                 {state.stats?.total_points ? (
                   <div className="summary-stats">
                     <span className="number">{state.stats.total_points}</span>
-                    <span className="description">Project points</span>
+                    <span
+                      className="description"
+                      dangerouslySetInnerHTML={{ __html: t('BACKLOG.SUMMARY.PROJECT_POINTS') }}
+                    />
                   </div>
                 ) : null}
                 <div className="summary-stats">
                   <span className="number">{state.stats?.defined_points ?? 0}</span>
-                  <span className="description">Defined points</span>
+                  <span
+                    className="description"
+                    dangerouslySetInnerHTML={{ __html: t('BACKLOG.SUMMARY.DEFINED_POINTS') }}
+                  />
                 </div>
                 <div className="summary-stats">
                   <span className="number">{state.stats?.closed_points ?? 0}</span>
-                  <span className="description">Closed points</span>
+                  <span
+                    className="description"
+                    dangerouslySetInnerHTML={{ __html: t('BACKLOG.SUMMARY.CLOSED_POINTS') }}
+                  />
                 </div>
                 <div className="summary-stats">
                   <span className="number">{state.stats?.speed ?? 0}</span>
-                  <span className="description">Points per sprint</span>
+                  <span
+                    className="description"
+                    dangerouslySetInnerHTML={{ __html: t('BACKLOG.SUMMARY.POINTS_PER_SPRINT') }}
+                  />
                 </div>
 
                 {/* div.stats.js-toggle-burndown-visibility-button(ng-if="!showGraphPlaceholder").
@@ -985,13 +1010,27 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                 ) : null}
               </div>
 
-              {/* div.empty-burndown(ng-if="showGraphPlaceholder && project.i_am_admin"). */}
+              {/* div.empty-burndown(ng-if="showGraphPlaceholder && project.i_am_admin").
+                  Finding D#4: the title/body/link are routed through the shared `t()`
+                  layer with the legacy `BACKLOG.CUSTOMIZE_GRAPH*` keys, so the
+                  placeholder reproduces the exact AngularJS wording ("Customize your
+                  backlog graph" + explanatory sentence + trailing "Admin" link) and
+                  localizes. The link targets the project points/sprints admin
+                  (`/project/{slug}/admin/project-values/points`, app.coffee:352). */}
               {state.showGraphPlaceholder && isAdmin ? (
                 <div className="empty-burndown">
                   <Svg icon="icon-graph" />
                   <div className="empty-text">
-                    <p className="title">Customize your graph</p>
-                    <p>Configure the project modules to display the burndown graph.</p>
+                    <p className="title">{t('BACKLOG.CUSTOMIZE_GRAPH')}</p>
+                    <p>
+                      {t('BACKLOG.CUSTOMIZE_GRAPH_TEXT')}{' '}
+                      <a
+                        href={`/project/${resolvedSlug}/admin/project-values/points`}
+                        title={t('BACKLOG.CUSTOMIZE_GRAPH_TITLE')}
+                      >
+                        {t('BACKLOG.CUSTOMIZE_GRAPH_ADMIN')}
+                      </a>
+                    </p>
                   </div>
                 </div>
               ) : null}
@@ -1042,7 +1081,12 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                             onClick={handleOpenAddStandard}
                           >
                             <Svg icon="icon-add" />
-                            <span className="text">Add</span>
+                            {/* Finding w001 L2: the AngularJS `addnewus.jade` primary
+                                button renders `{{'US.ADD' | translate}}` = "user story"
+                                (uppercased by SCSS), NOT "Add". Route the visible text
+                                through the shared catalog to restore exact parity. The
+                                aria-label is left as an explicit action phrase for a11y. */}
+                            <span className="text">{t('US.ADD')}</span>
                           </button>
                           <button
                             className="btn-icon"
@@ -1084,8 +1128,8 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                       <input
                         type="text"
                         className="tg-input-search"
-                        aria-label="Search"
-                        placeholder="Search"
+                        aria-label={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
+                        placeholder={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
                         value={queryInput}
                         onChange={handleQueryChange}
                       />
@@ -1107,7 +1151,11 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                             />
                             <div />
                           </div>
-                          <label htmlFor="show-tags-input">Show tags</label>
+                          {/* Finding w001 L3: the AngularJS `#show-tags` label reads
+                              `translate="BACKLOG.TAGS.SHOW"` = "tags" (SCSS-capitalized),
+                              NOT "Show tags" (which also wrapped to two lines at some
+                              breakpoints). Route through the shared catalog for parity. */}
+                          <label htmlFor="show-tags-input">{t('BACKLOG.TAGS.SHOW')}</label>
                         </div>
                       ) : null}
                     </div>
@@ -1288,31 +1336,38 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                 <img src="images/empty/empty_mex.png" alt="Your backlog is empty" />
               </div>
             </div>
-
-            {/* sidebar.sidebar (backlog.jade:193-194 -> sprints.jade): the Sprints section.
-                SprintList renders `section.sprints`; the `<sidebar>` wrapper is the
-                `.scrum` grid's second column. */}
-            <sidebar className="sidebar">
-              <SprintList
-                openSprints={state.sprints}
-                closedSprints={state.closedSprints}
-                totalMilestones={state.totalMilestones}
-                totalClosedMilestones={state.totalClosedMilestones}
-                showClosedSprints={state.closedSprintsVisible}
-                sprintOpen={state.sprintOpen}
-                canAddMilestone={can('add_milestone')}
-                canViewMilestones={can('view_milestones')}
-                canEditSprint={can('modify_milestone')}
-                canModifyUs={permsCanModifyUs}
-                buildTaskboardUrl={buildTaskboardUrl}
-                buildUserStoryUrl={buildUserStoryUrl}
-                onAddSprint={handleAddSprint}
-                onToggleClosedSprints={handleToggleClosedSprints}
-                onToggleSprintFold={handleToggleSprintFold}
-                onEditSprint={handleEditSprint}
-              />
-            </sidebar>
           </section>
+
+          {/* sidebar.sidebar (backlog.jade:193-194 -> sprints.jade): the Sprints section.
+              SprintList renders `section.sprints`. The `<sidebar>` wrapper is the
+              `.scrum` grid's SECOND COLUMN, so it must be a SIBLING of `section.backlog`
+              (a direct child of the `.scrum` grid), NOT nested inside it. Finding S1:
+              nesting it inside `section.backlog` collapsed the sprint panel BELOW the
+              backlog table at full width and left the grid's right column
+              (minmax(250px, 3fr), app/styles/layout/backlog.scss:4) empty. Kept inside
+              <DndProvider> so a backlog story dragged onto a sprint (bulk_update_milestone,
+              QA BL-1) still shares the single backlog DnD context. */}
+          <sidebar className="sidebar">
+            <SprintList
+              openSprints={state.sprints}
+              closedSprints={state.closedSprints}
+              totalMilestones={state.totalMilestones}
+              sprintsLoaded={state.sprintsLoaded}
+              totalClosedMilestones={state.totalClosedMilestones}
+              showClosedSprints={state.closedSprintsVisible}
+              sprintOpen={state.sprintOpen}
+              canAddMilestone={can('add_milestone')}
+              canViewMilestones={can('view_milestones')}
+              canEditSprint={can('modify_milestone')}
+              canModifyUs={permsCanModifyUs}
+              buildTaskboardUrl={buildTaskboardUrl}
+              buildUserStoryUrl={buildUserStoryUrl}
+              onAddSprint={handleAddSprint}
+              onToggleClosedSprints={handleToggleClosedSprints}
+              onToggleSprintFold={handleToggleSprintFold}
+              onEditSprint={handleEditSprint}
+            />
+          </sidebar>
         </DndProvider>
       </main>
 

@@ -63,6 +63,7 @@ import type { CSSProperties, KeyboardEvent, MouseEvent, UIEvent } from 'react';
 import type { UserStory } from '../state/backlogReducer';
 import { UserStoryRow, type RowStatusOption } from './UserStoryRow';
 import type { EstimationPoint, EstimationRole } from '../../shared/estimation';
+import { t } from '../../shared/i18n';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useDroppable } from '@dnd-kit/core';
 
@@ -518,7 +519,7 @@ export function BacklogTable(props: BacklogTableProps) {
           className={loadingUserstories ? 'loading-spinner is-loading' : undefined}
         >
           {loadingUserstories ? (
-            <span style={VISUALLY_HIDDEN}>Loading more user stories…</span>
+            <span style={VISUALLY_HIDDEN}>{t('COMMON.LOADING')}</span>
           ) : null}
         </div>
       </div>

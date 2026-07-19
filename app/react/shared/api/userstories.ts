@@ -465,16 +465,49 @@ export interface CreatePayload {
   is_blocked?: boolean;
   blocked_note?: string;
   due_date?: string | null;
+  /**
+   * Points-per-role estimation map (`{ "<roleId>": <pointId> }`). This is the
+   * same `points` model attribute the AngularJS generic new-US form posted
+   * (`common/lightboxes.coffee` -> `repo.create("userstories", data)`), so the
+   * React Kanban create/edit lightbox can set an estimation on creation instead
+   * of leaving every role at "?" (finding D#2 -- missing points estimation).
+   * Contract-preserving: `points` is an existing writable `UserStory` field on
+   * the frozen `POST /userstories` endpoint; only sent when supplied.
+   */
+  points?: Record<string, number>;
+  /**
+   * Team/client-requirement flags -- the same writable `team_requirement` /
+   * `client_requirement` boolean model attributes the legacy generic form's
+   * requirement toggles posted (finding D#2 -- missing requirement toggles).
+   * Only sent when supplied.
+   */
+  team_requirement?: boolean;
+  client_requirement?: boolean;
+  /**
+   * Assigned member ids (`assigned_users` model attribute), so the create
+   * lightbox's assignee control persists on creation exactly as the legacy
+   * generic form did. Only sent when supplied.
+   */
+  assigned_users?: number[];
 }
 
 /**
  * OPTIONAL extra fields a caller may pass to {@link createUserStory} beyond the
  * mandatory subject/status. Mirrors the writable core fields of the legacy
- * new-US generic form (finding #7). All are optional; omitted keys are not sent.
+ * new-US generic form (finding #7 + finding D#2). All are optional; omitted keys
+ * are not sent, so a subject-only create still posts a byte-identical body.
  */
 export type CreateExtra = Pick<
   CreatePayload,
-  'description' | 'tags' | 'is_blocked' | 'blocked_note' | 'due_date'
+  | 'description'
+  | 'tags'
+  | 'is_blocked'
+  | 'blocked_note'
+  | 'due_date'
+  | 'points'
+  | 'team_requirement'
+  | 'client_requirement'
+  | 'assigned_users'
 >;
 
 /**
@@ -573,6 +606,61 @@ export function save(
   return httpClient.patch(`userstories/${usId}`, data);
 }
 
+/**
+ * The full single-user-story DETAIL payload returned by `GET /userstories/{id}`.
+ *
+ * Only the fields the React create/edit lightbox prefills from are typed; the
+ * index signature preserves every other attribute the server returns. CRITICAL
+ * (finding D#1): the Kanban LIST endpoint (`GET /userstories?project=...`)
+ * OMITS the heavy `description` / `description_html` fields for payload size,
+ * whereas the DETAIL endpoint INCLUDES them. Seeding the edit form from the
+ * in-memory LIST model therefore left `description` empty and a subsequent PATCH
+ * WIPED the persisted description. This detail read is what lets the edit form
+ * prefill the REAL description (and the authoritative `version`) before saving.
+ */
+export interface UserStoryDetail {
+  id: number;
+  ref?: number;
+  subject?: string;
+  description?: string | null;
+  status?: number;
+  points?: Record<string, number>;
+  tags?: Array<[string, string | null]>;
+  assigned_users?: number[];
+  assigned_to?: number | null;
+  total_points?: number | null;
+  is_blocked?: boolean;
+  blocked_note?: string | null;
+  team_requirement?: boolean;
+  client_requirement?: boolean;
+  /** Optimistic-concurrency token; MUST be echoed back on the edit PATCH. */
+  version?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Fetch a SINGLE user story by id (the full DETAIL payload).
+ *
+ * Reproduces the AngularJS edit precondition: `KanbanController.editUs`
+ * (`kanban/main.coffee:278-291`) fetches the FULL story via
+ * `rs.userstories.getByRef(project, ref)` BEFORE opening the generic edit form,
+ * so the form is seeded with the complete model (including `description` and the
+ * per-role `points`, which the Kanban board LIST omits). React mirrors that: the
+ * card Edit action awaits `getUserStory(id)` and prefills the lightbox from the
+ * returned detail, so editing NO LONGER wipes the description (finding D#1).
+ *
+ * This is a plain READ of the existing frozen `GET /userstories/{id}` REST
+ * detail endpoint (the same collection registered at `resources.coffee:107`), so
+ * adding a typed adapter is contract-preserving -- no new or changed backend
+ * contract.
+ *
+ * @param usId - Id of the user story to fetch (path segment).
+ * @returns The full user-story detail JSON.
+ */
+export function getUserStory(usId: number): Promise<UserStoryDetail> {
+  return httpClient.get<UserStoryDetail>(`userstories/${usId}`);
+}
+
 // ---------------------------------------------------------------------------
 // Export surface
 //
@@ -592,6 +680,7 @@ export const userstories = {
   createUserStory,
   deleteUserStory,
   save,
+  getUserStory,
   filtersData,
 };
 
