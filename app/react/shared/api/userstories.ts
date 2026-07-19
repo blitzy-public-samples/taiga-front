@@ -117,6 +117,59 @@ export function bulkCreate(
 }
 
 /**
+ * The attributes accepted when creating a single user story.
+ *
+ * Mirrors the `initialData` model the AngularJS COMMON-module create form built
+ * for a user story (`app/coffee/modules/common/lightboxes.coffee:552-560`):
+ * `{ project, subject, description, tags, points, swimlane, status,
+ * is_archived }`. Only `project` and `subject` are required by the backend
+ * (`UserStorySerializer`); every other field is optional and, when omitted, the
+ * backend applies the project defaults (e.g. `default_us_status`), exactly as it
+ * did for the AngularJS create. The optional `status`/`swimlane` are included by
+ * the Kanban "+" action so the new story lands in the clicked column (and, when
+ * kanban is activated, the project's default swimlane).
+ */
+export interface CreateUserStoryPayload {
+    /** Owning project id (`project`). REQUIRED. */
+    project: number;
+    /** The new story's title (`subject`). REQUIRED. */
+    subject: string;
+    /** Target status id (`status`). Omitted → backend default_us_status. */
+    status?: number | null;
+    /** Target swimlane id (`swimlane`). Omitted → backend default. */
+    swimlane?: number | null;
+    /** Optional free-text description (`description`). */
+    description?: string;
+    /** Optional tag list (`tags`). */
+    tags?: string[];
+    /** Optional archived flag (`is_archived`). */
+    is_archived?: boolean;
+}
+
+/**
+ * Create a single user story.
+ *
+ * Reproduces the AngularJS COMMON-module generic-create save
+ * (`genericform:new` → `model.save()` → `POST /userstories`,
+ * `app/coffee/modules/common/lightboxes.coffee:552-560`). The deleted Kanban and
+ * Backlog controllers delegated single-story creation to that common lightbox;
+ * because the common module is out of scope (AAP §0.2.2) and defines no React
+ * component, the two migrated screens call this adapter directly against the
+ * SAME `/api/v1/userstories` endpoint, so the backend cannot distinguish the
+ * React create from the AngularJS create (the REST contract is unchanged).
+ *
+ * @param payload The {@link CreateUserStoryPayload} — `project` + `subject`
+ *                required; `status`/`swimlane`/etc. optional.
+ * @returns The created {@link UserStory} (with server-assigned `id`, `ref`,
+ *          `status`, ordering, etc.).
+ */
+export function createUserStory(
+    payload: CreateUserStoryPayload,
+): Promise<UserStory> {
+    return api.post<UserStory>('/userstories', payload);
+}
+
+/**
  * Reorder stories within the backlog, optionally moving them into a milestone
  * and anchoring the move after/before a sibling story.
  *

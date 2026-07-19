@@ -33,10 +33,13 @@ import type { Page } from '@playwright/test';
 
 /**
  * Project slug for the Kanban screen, seeded by `taiga-manage.sh sample_data`.
- * Confirmed from the legacy kanban suite, which navigated to
- * `project/project-0/kanban`.
+ * `sample_data` creates 1-indexed project slugs (`project-1` .. `project-7`),
+ * so the legacy Protractor comment's `project-0` never exists in the seeded DB
+ * (navigating there yields a blank board). `project-3` is a fully-populated
+ * board (5 swimlanes, 30 stories) and matches the committed baseline capture
+ * `kanban_p3_swimlanes`, maximizing before/after comparability.
  */
-export const KANBAN_PROJECT_SLUG = 'project-0';
+export const KANBAN_PROJECT_SLUG = 'project-3';
 
 /**
  * Project slug for the Backlog / sprint-planning screen, seeded by
@@ -53,6 +56,17 @@ export const BACKLOG_PROJECT_SLUG = 'project-3';
  * not fail the caller.
  */
 const LOADER_TIMEOUT = 15000;
+
+/**
+ * Maximum time (in milliseconds) to wait for the primary board content of a
+ * migrated React screen to render after navigation. The React root mounts,
+ * resolves the project by slug, fetches board data, THEN renders — a sequence
+ * the AngularJS `.loader` overlay does not gate (a screen with no active
+ * `.loader` element clears `waitLoader` instantly, long before React paints).
+ * Best-effort: exceeding it does not fail the caller (the spec's strict count
+ * assertions remain the real gate).
+ */
+const BOARD_READY_TIMEOUT = 30000;
 
 /* ------------------------------------------------------------------ *
  * Stabilizer helpers (behavioral port of the legacy `common` utilities)
@@ -171,6 +185,24 @@ async function openProjectScreen(
 ): Promise<void> {
   await page.goto(`project/${slug}/${screen}`);
   await stabilize(page);
+  // Gate on the primary board content before returning. `waitLoader` (inside
+  // `stabilize`) only clears the AngularJS `.loader` overlay; it does NOT wait
+  // for the React screen's async mount -> slug-resolve -> fetch -> render, so a
+  // spec would otherwise assert card/column/row counts on a still-blank React
+  // root. Wait (best-effort) for the phase-appropriate primary content selector
+  // to become visible. This is a NON-destructive readiness gate — the spec's own
+  // strict count assertions remain the real correctness check.
+  const ready =
+    screen === 'kanban'
+      ? phaseSelector('.task-column', '.taskboard-column')
+      : '.backlog-table-body > div';
+  await page
+    .locator(ready)
+    .first()
+    .waitFor({ state: 'visible', timeout: BOARD_READY_TIMEOUT })
+    .catch(() => {
+      /* proceed best-effort — the spec's strict counts report a genuine miss */
+    });
 }
 
 /**

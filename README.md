@@ -172,7 +172,7 @@ The migrated Kanban and Backlog screens are React 18; every other screen is stil
 
     ```
     protractor conf.e2e.js --suite=auth     # To tests authentication
-    protractor conf.e2e.js --suite=full     # To test all the platform authenticated
+    protractor conf.e2e.js --suite=auth,public,wiki,admin,issues,epics,tasks,userProfile,userStories,home,projectHome,search,team,discover     # To test all the platform authenticated
     ```
 
     The Protractor harness (`conf.e2e.js`, `run-e2e.js`) and the 16 remaining

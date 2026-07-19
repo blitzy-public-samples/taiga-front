@@ -65,7 +65,8 @@ import {
     BacklogStats,
 } from './backlogReducer';
 import type { Project, UserStory, Milestone } from '../../shared/types';
-import { api, ApiError } from '../../shared/api/client';
+import { api } from '../../shared/api/client';
+import { parseApiErrorMessage, describeReorderError } from '../../shared/apiError';
 import {
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
@@ -176,48 +177,14 @@ function eventsConnected(): boolean {
 }
 
 /**
- * Build a user-facing message for a rejected reorder write (F-AAP-03).
- *
- * Prefers a server-supplied message — `ApiError.body._error_message` or
- * `__all__` (the same Django error envelope `CreateEditSprintLightbox` reads),
- * then a plain `Error.message` — and otherwise falls back to a clear generic
- * sentence. The board is reconciled to server truth regardless; this string
- * only tells the user WHY their move did not stick.
- */
-/**
- * Extract a human-readable message from a rejected `/api/v1/` call. Parses the
- * Django REST error envelope (`_error_message` / `__all__`, string or array)
- * carried on {@link ApiError.body}, then falls back to a plain `Error.message`,
- * and finally returns `null` so the caller can supply its own default.
- */
-function parseApiErrorMessage(err: unknown): string | null {
-    if (err instanceof ApiError && err.body !== null && typeof err.body === 'object') {
-        const body = err.body as Record<string, unknown>;
-        const detail = body._error_message ?? body.__all__;
-        if (typeof detail === 'string' && detail.trim() !== '') {
-            return detail;
-        }
-        if (Array.isArray(detail) && typeof detail[0] === 'string' && detail[0].trim() !== '') {
-            return detail[0];
-        }
-    }
-
-    if (err instanceof Error && err.message.trim() !== '') {
-        return err.message;
-    }
-
-    return null;
-}
-
-function describeReorderError(err: unknown): string {
-    const fallback = 'The story order could not be saved. The board has been refreshed to the latest server state.';
-    return parseApiErrorMessage(err) ?? fallback;
-}
-
-/**
  * F-CQ-03 — describe a failed single-story mutation (delete / status / points).
- * Surfaces the backend field error when present, otherwise the supplied
- * operation-specific fallback.
+ *
+ * Surfaces the backend field error when present (via the shared
+ * {@link parseApiErrorMessage}, which parses the Django REST `_error_message` /
+ * `__all__` envelope without leaking internal details), otherwise the supplied
+ * operation-specific fallback. Reorder / move failures use the shared
+ * {@link describeReorderError} directly; this local wrapper only exists to thread
+ * a per-operation fallback sentence.
  */
 function describeUsMutationError(err: unknown, fallback: string): string {
     return parseApiErrorMessage(err) ?? fallback;
@@ -586,17 +553,42 @@ export function useBacklog(projectId: number) {
                 // are not actually connected (main.coffee:633-637, now using the
                 // REAL socket state via `eventsConnected()`). Reset the failure
                 // latch for the next batch before deciding.
-                const reconcileNeeded = moveFailedRef.current || !eventsConnected();
+                const moveFailed = moveFailedRef.current;
+                const reconcileNeeded = moveFailed || !eventsConnected();
                 moveFailedRef.current = false;
 
                 if (reconcileNeeded) {
                     void reloadSprints();
                     void reloadClosedSprints();
                     void reloadStats();
+
+                    // F-AAP-03 (dest#8) — REVERT the rejected optimistic reorder.
+                    // The reloads above cover the sprint sidebar + stats
+                    // (main.coffee:633-637 parity), but the DRAGGED backlog
+                    // user-story keeps its optimistic position because a failed
+                    // write emits no live `userstories` event to correct it —
+                    // leaving the list visibly stale beneath the error toast,
+                    // contradicting this block's own reconciliation intent.
+                    // ONLY on an actual failure (never on the events-disconnected
+                    // success path, which stays byte-for-byte AngularJS-faithful)
+                    // do we additionally refetch the backlog list to server truth
+                    // via the SAME loader the live `onUserstories` handler uses,
+                    // so the optimistic move is visibly reverted (matching the
+                    // Kanban screen's board-reload revert). This keeps the
+                    // Suggested Fix's "reconcile the optimistic state visibly".
+                    if (moveFailed) {
+                        void reloadAllPaginatedUserstories();
+                    }
                 }
             }
         }
-    }, [projectId, reloadSprints, reloadClosedSprints, reloadStats]);
+    }, [
+        projectId,
+        reloadSprints,
+        reloadClosedSprints,
+        reloadStats,
+        reloadAllPaginatedUserstories,
+    ]);
 
     // Keep the stable ref pointed at the latest processor so `moveUs` and the
     // recursive drain can invoke it without a use-before-declaration cycle.
@@ -1253,6 +1245,18 @@ export function useBacklog(projectId: number) {
      */
     const reload = useCallback((): Promise<void> => loadBacklogData(), [loadBacklogData]);
 
+    /**
+     * F-AAP-03 — dismiss the drag-and-drop / mutation error banner.
+     *
+     * Clears `state.moveError` back to `null` so the `NotificationError` toast
+     * rendered by `BacklogApp` disappears. The board itself was already
+     * reconciled to server truth at failure time (each mutation reloads on
+     * error), so this only removes the user-facing message.
+     */
+    const clearMoveError = useCallback((): void => {
+        dispatch({ type: 'setMoveError', message: null });
+    }, []);
+
     /* ---------------------------------------------------------------------- *
      * Phase 6c — The memoized `actions` object
      *
@@ -1285,6 +1289,7 @@ export function useBacklog(projectId: number) {
             deleteUs,
             updateUsStatus,
             updateUsPoints,
+            clearMoveError,
         }),
         [
             moveUs,
@@ -1309,6 +1314,7 @@ export function useBacklog(projectId: number) {
             deleteUs,
             updateUsStatus,
             updateUsPoints,
+            clearMoveError,
         ],
     );
 

@@ -64,6 +64,7 @@ import { reducer, initialState, getMovePayload } from './boardReducer';
 import type { State, Action } from './boardReducer';
 import { api } from '../../shared/api/client';
 import { bulkUpdateKanbanOrder } from '../../shared/api/userstories';
+import { describeReorderError } from '../../shared/apiError';
 import { subscribeProjectChanges } from '../../shared/events';
 import type { ProjectChangeHandlers } from '../../shared/events';
 import { isBoardDraggable, canMutate } from '../../shared/permissions';
@@ -144,6 +145,15 @@ export type UseKanbanBoardResult = {
     loadError: boolean;
     /** `true` when an active filter/search produced zero stories. */
     notFoundUserstories: boolean;
+    /**
+     * F-AAP-03 (dest#8): user-facing message set when a drag-and-drop reorder
+     * write (`bulk_update_kanban_order`) is REJECTED. Previously the `move()`
+     * catch reconciled the board silently, so a failed move produced NO
+     * feedback. `null` when there is no error. Rendered by `KanbanApp` as a
+     * dismissible <NotificationError> toast; the board is already reconciled to
+     * server truth (reload-on-error), so this only tells the user WHY it reverted.
+     */
+    moveError: string | null;
     // Actions.
     /**
      * Persist a drag-and-drop move. Optimistically updates the board, then calls
@@ -172,6 +182,12 @@ export type UseKanbanBoardResult = {
      * reload-on-error reconciliation. The confirm dialog is owned by the container.
      */
     deleteUserStory: (usId: number) => Promise<void>;
+    /**
+     * F-AAP-03 (dest#8): dismiss the drag-and-drop error toast, clearing
+     * `moveError` back to `null`. The board was already reconciled to server
+     * truth at failure time, so this only removes the user-facing message.
+     */
+    clearMoveError: () => void;
 };
 
 /* ========================================================================== *
@@ -216,6 +232,10 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     // F-AAP-10: initial/refresh load-failure flag (distinct from empty).
     const [loadError, setLoadError] = useState(false);
     const [notFoundUserstories, setNotFoundUserstories] = useState(false);
+    // F-AAP-03 (dest#8): user-facing drag-and-drop reorder error. Set when
+    // `bulk_update_kanban_order` rejects; cleared at the start of each move()
+    // and when the user dismisses the toast.
+    const [moveError, setMoveError] = useState<string | null>(null);
     const [project, setProject] = useState<Project | null>(null);
     const [usStatusList, setUsStatusList] = useState<Status[]>([]);
     const [swimlanesStatuses, setSwimlanesStatuses] = useState<Record<string, Status[]>>({});
@@ -510,6 +530,10 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                 return;
             }
 
+            // F-AAP-03: clear any stale error from a previous failed move so the
+            // toast reflects only the outcome of THIS attempt.
+            setMoveError(null);
+
             // SOURCE 606-608: the synthetic unclassified swimlane (-1) is the API `null`.
             // F-AAP-09 (data integrity): also coerce a NaN swimlane to `null`. The
             // primary normalization lives at the DnD boundary, but move() may be
@@ -552,9 +576,13 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                     payload.beforeUserstoryId,
                     payload.bulkUserstories,
                 );
-            } catch {
+            } catch (err) {
+                // F-AAP-03 (dest#8): surface an ACTIONABLE, user-facing error
+                // (no internal details) so a rejected move is no longer silent.
+                setMoveError(describeReorderError(err));
                 // On persistence failure, reconcile the board with the server so
-                // the optimistic update cannot leave the UI out of sync.
+                // the optimistic update cannot leave the UI out of sync (the
+                // toast tells the user WHY the card visibly snapped back).
                 const proj = projectRef.current;
                 if (proj) {
                     void loadUserstoriesRef.current(proj);
@@ -705,6 +733,17 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     // -> initialLoad = true. Cancellable, and wrapped so it never throws from the
     // effect (a failure clears `loading` and leaves the safe empty board).
     useEffect(() => {
+        // A2 (F-REG-02): do NOT fetch with an invalid/placeholder project id.
+        // While `useResolvedProjectId` resolves (projectId === 0), or if the id is
+        // otherwise not a positive integer, skip the load entirely so NO
+        // `GET /projects/0` (or `/projects/NaN`) probe is ever issued — aligning
+        // Kanban with the Backlog hook's existing `if (!projectId) return` guard.
+        // The effect re-runs (dep `[projectId]`) the moment a real id resolves, at
+        // which point the full load below fires against the correct project.
+        if (!Number.isInteger(projectId) || projectId <= 0) {
+            return undefined;
+        }
+
         let cancelled = false;
         setLoading(true);
         // F-AAP-10: clear any prior failure at the start of a fresh load so the
@@ -751,6 +790,16 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     // effect never re-subscribes on a filter change — matching the source, which
     // subscribes exactly once.
     useEffect(() => {
+        // A2 (F-REG-02): never subscribe with an invalid/placeholder project id —
+        // a `subscribeProjectChanges(0, …)` would register bogus
+        // `changes.project.0.*` routing keys. Skip while resolving (projectId ===
+        // 0) or when the id is not a positive integer; the effect re-runs and
+        // subscribes with the correct id once it resolves (mirrors the Backlog
+        // hook's `if (!projectId) return` subscribe guard).
+        if (!Number.isInteger(projectId) || projectId <= 0) {
+            return undefined;
+        }
+
         const handlers: ProjectChangeHandlers = {
             onUserstories: () => {
                 void handleUserstoriesEvent();
@@ -786,6 +835,15 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
         void loadUserstoriesRef.current(proj);
     }, [filtersKey]);
 
+    /**
+     * F-AAP-03 (dest#8): dismiss the drag-and-drop error toast, clearing
+     * `moveError` back to `null`. The board was already reconciled to server
+     * truth at failure time, so this only removes the user-facing message.
+     */
+    const clearMoveError = useCallback((): void => {
+        setMoveError(null);
+    }, []);
+
     /* ---------------------------------------------------------------------- *
      * Returned view-model + actions (exact key set)
      * ---------------------------------------------------------------------- */
@@ -801,12 +859,14 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
         loading,
         loadError,
         notFoundUserstories,
+        moveError,
         move,
         toggleFold,
         showArchivedStatus,
         hideArchivedStatus,
         reload,
         deleteUserStory,
+        clearMoveError,
     };
 }
 

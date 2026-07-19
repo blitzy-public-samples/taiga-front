@@ -216,12 +216,23 @@ export function CardActions({
             setOpen(false);
         };
 
+        // Escape-to-close: pressing Escape while the menu is open dismisses it,
+        // matching the keyboard-dismissal convention used by the Backlog popovers
+        // (UsEditSelector / UsRolePointsSelector) and the shared modal dialog hook.
+        const handleKeyDown = (nativeEvent: KeyboardEvent): void => {
+            if (nativeEvent.key === 'Escape') {
+                setOpen(false);
+            }
+        };
+
         document.addEventListener('mousedown', handleOutsidePointerDown);
         document.addEventListener('scroll', handleScroll, true);
+        document.addEventListener('keydown', handleKeyDown);
 
         return () => {
             document.removeEventListener('mousedown', handleOutsidePointerDown);
             document.removeEventListener('scroll', handleScroll, true);
+            document.removeEventListener('keydown', handleKeyDown);
         };
     }, [open]);
 

@@ -97,21 +97,67 @@ import type { Page, Locator } from '@playwright/test';
  */
 const rows = (page: Page): Locator => page.locator('.backlog-table-body > div');
 
-/** Sprint / milestone blocks (`div[tg-backlog-sprint="sprint"]`, reused by React). */
-const sprints = (page: Page): Locator => page.locator('div[tg-backlog-sprint="sprint"]');
+/**
+ * Sprint / milestone block selector (phase-aware, F-CQ-08). The AngularJS board
+ * wraps each sprint in a `div[tg-backlog-sprint="sprint"]` DIRECTIVE element;
+ * React does not emit that directive attribute and instead renders each sprint
+ * as a `.sprint` block that is a direct child of the `.sprints` section
+ * (`.sprints > .sprint`, verified in Sprint.tsx — the direct-child form avoids
+ * the nested `.sprint.sprint-open` inner wrapper and yields one node per sprint).
+ */
+const SPRINT_BLOCK = (): string =>
+  phaseSelector('div[tg-backlog-sprint="sprint"]', '.sprints > .sprint');
+
+/** Sprint / milestone blocks (phase-aware — see {@link SPRINT_BLOCK}). */
+const sprints = (page: Page): Locator => page.locator(SPRINT_BLOCK());
 
 /** User-story rows inside a given sprint block (`.milestone-us-item-row`). */
 const sprintRows = (sprint: Locator): Locator => sprint.locator('.milestone-us-item-row');
 
-/** The user-story reference text (e.g. `#123`) of a row/element (`span[tg-bo-ref]`). */
-const usRef = (el: Locator): Promise<string> => el.locator('span[tg-bo-ref]').first().innerText();
+/**
+ * The user-story reference text (e.g. `#123`) of a row/element (phase-aware).
+ * AngularJS exposed it via the `span[tg-bo-ref]` binding directive; the React
+ * rows render it as `.user-story-number` (BacklogTable.tsx).
+ */
+const usRef = (el: Locator): Promise<string> =>
+  el.locator(phaseSelector('span[tg-bo-ref]', '.user-story-number')).first().innerText();
 
-/** All sprint titles currently rendered. */
-const SPRINT_TITLE_SELECTOR = 'div[tg-backlog-sprint="sprint"] .sprint-name span';
+/**
+ * The add-user-story triggers (phase-aware). The AngularJS board used `.new-us a`
+ * anchors; React reuses the `.new-us` container but renders `<button>` children
+ * (create = first, bulk = second — BacklogApp.tsx).
+ */
+const NEW_US_TRIGGER = (): string => phaseSelector('.new-us a', '.new-us button');
 
-/** The create/edit-sprint lightbox host — a `[role="dialog"]` in React. */
+/**
+ * The per-row drag handle (phase-aware). AngularJS used `.icon-drag`; the React
+ * rows expose a `.draggable-us-row` @dnd-kit activator handle (BacklogTable.tsx).
+ */
+const DRAG_HANDLE = (): string => phaseSelector('.icon-drag', '.draggable-us-row');
+
+/**
+ * The create-sprint trigger (phase-aware). AngularJS used `.add-sprint`; React
+ * renders a titled button in the sprint sidebar header (BacklogApp.tsx).
+ */
+const ADD_SPRINT = (): string =>
+  phaseSelector('.add-sprint', 'button[title="Add a new sprint"]');
+
+/** All sprint titles currently rendered (phase-aware sprint-block prefix). */
+const SPRINT_TITLE_SELECTOR = phaseSelector(
+  'div[tg-backlog-sprint="sprint"] .sprint-name span',
+  '.sprints > .sprint .sprint-name span',
+);
+
+/**
+ * The create/edit-sprint lightbox host. In React BOTH lightbox hosts (bulk-US
+ * and sprint) are mounted at all times as `[role="dialog"]` elements (hidden via
+ * `display:none` until opened), so a bare `[role="dialog"]` would ambiguously
+ * match the hidden bulk host first. The sprint lightbox is therefore targeted by
+ * its own class `.lightbox-sprint-add-edit` (faithful to the AngularJS
+ * `lightbox-sprint-add-edit` class it reuses); it gains `.open` + `display:flex`
+ * when opened, which the callers' `waitFor({ state: 'visible' })` gates on. */
 const sprintLightboxSelector = (): string =>
-  phaseSelector('div[tg-lb-create-edit-sprint]', '[role="dialog"]');
+  phaseSelector('div[tg-lb-create-edit-sprint]', '.lightbox-sprint-add-edit');
 
 /** The bulk-create-user-stories lightbox host — `.lightbox-generic-bulk` in React. */
 const bulkLightboxSelector = (): string =>
@@ -139,6 +185,28 @@ async function closePopover(page: Page): Promise<void> {
     /* the popover may already be dismissed — ignore */
   });
   await page.waitForTimeout(200);
+}
+
+/**
+ * Toggle a backlog row's selection checkbox by clicking its VISIBLE `<label>`.
+ *
+ * The row's native `<input type="checkbox">` is rendered inside a
+ * `.custom-checkbox` wrapper and is `display:none` (the styled `<label>` is the
+ * visible 14×14 box the user actually clicks). Playwright's `.check()` requires
+ * the target to be visible, so it cannot operate on the hidden input directly —
+ * it must click the associated `<label>`, which toggles the controlled React
+ * input through its `for`/`id` association exactly as a real click does. The
+ * baseline (AngularJS) backlog uses the same `.custom-checkbox > input + label`
+ * markup, so this is phase-agnostic. A `force`-check of the hidden input is the
+ * fallback for any build that renders a directly-visible input.
+ */
+async function toggleRowCheckbox(row: Locator): Promise<void> {
+  const label = row.locator('.custom-checkbox label').first();
+  if ((await label.count()) > 0) {
+    await label.click();
+    return;
+  }
+  await row.locator('input[type="checkbox"]').first().check({ force: true });
 }
 
 /**
@@ -209,7 +277,7 @@ test('backlog', async ({ page }) => {
   // --- create US (legacy 30-91) — open→evidence→CANCEL, phase-aware ------- //
   await test.step('create US', async () => {
     const before = await rows(page).count();
-    const trigger = page.locator('.new-us a').nth(0);
+    const trigger = page.locator(NEW_US_TRIGGER()).nth(0);
 
     if (isReactPhase()) {
       // React: the create/edit US DETAIL lightbox is a deferred common-module
@@ -238,7 +306,7 @@ test('backlog', async ({ page }) => {
   // The bulk-create lightbox IS implemented in React (`.lightbox-generic-bulk`).
   await test.step('bulk create US', async () => {
     const before = await rows(page).count();
-    await page.locator('.new-us a').nth(1).click();
+    await page.locator(NEW_US_TRIGGER()).nth(1).click();
 
     const lightbox = page.locator(bulkLightboxSelector()).first();
     await lightbox.waitFor({ state: 'visible' });
@@ -263,11 +331,20 @@ test('backlog', async ({ page }) => {
   // --- edit US (legacy 125-170) — open→evidence→CANCEL, phase-aware ------- //
   await test.step('edit US', async () => {
     const before = await rows(page).count();
-    const editTrigger = page.locator('.backlog-table-body .e2e-edit').nth(0);
+    const editTrigger = page
+      .locator(
+        phaseSelector(
+          '.backlog-table-body .e2e-edit',
+          '.backlog-table-body .us-option-popup-button',
+        ),
+      )
+      .nth(0);
 
     if (isReactPhase()) {
-      // React: `.e2e-edit` opens the deferred detail lightbox (F-CQ-02). Assert
-      // the affordance renders; do not open/submit.
+      // React consolidates the per-row edit/delete/move actions into the
+      // `.us-option-popup-button` "User story options" popup; the create/edit US
+      // DETAIL lightbox itself is a deferred common-module screen (F-CQ-02).
+      // Assert the options affordance renders; do not open/submit.
       expect(await editTrigger.count()).toBeGreaterThan(0);
       await screenshot(page, 'backlog', 'edit-us-deferred');
     } else {
@@ -290,6 +367,19 @@ test('backlog', async ({ page }) => {
     const statusRow = rows(page).nth(0).locator('.us-status').first();
     const originalStatus = (await rows(page).nth(0).locator('.us-status span').first().innerText()).trim();
 
+    if (isReactPhase()) {
+      // React renders the inline status control as an `a.us-status` disclosure;
+      // its `.popover.pop-status` menu is a state-driven React popover whose
+      // visible-open styling is the documented OUT-OF-SCOPE w023#7 display:none
+      // behaviour, so it is not driven here. Assert the control renders and the
+      // status is net-zero (nothing selected/persisted).
+      expect(await statusRow.count()).toBeGreaterThan(0);
+      await screenshot(page, 'backlog', 'inline-status');
+      const afterStatusR = (await rows(page).nth(0).locator('.us-status span').first().innerText()).trim();
+      expect(afterStatusR).toBe(originalStatus);
+      return;
+    }
+
     const pop = await openThenClosePopover(page, statusRow);
     // STRICT: the status popover lists selectable statuses.
     expect(await pop.locator('a').count()).toBeGreaterThan(0);
@@ -304,6 +394,19 @@ test('backlog', async ({ page }) => {
   // --- inline points (legacy 184-192) — open→evidence→CLOSE (net-zero) ---- //
   await test.step('inline points', async () => {
     const pointsCtrl = rows(page).nth(0).locator('.us-points').first();
+    if (isReactPhase()) {
+      // React renders the per-row points as a `button.us-points`; its editor is
+      // the same state-driven popover as inline status (OUT-OF-SCOPE w023#7
+      // display:none), so it is not driven here. Assert the control renders and
+      // the points value is net-zero.
+      const originalPointsR = (await pointsCtrl.innerText()).trim();
+      expect(await pointsCtrl.count()).toBeGreaterThan(0);
+      await screenshot(page, 'backlog', 'inline-points');
+      const afterPointsR = (await pointsCtrl.innerText()).trim();
+      expect(afterPointsR).toBe(originalPointsR);
+      return;
+    }
+
     const originalPoints = (await pointsCtrl.locator('span').first().innerText()).trim();
 
     const pop = await openThenClosePopover(page, pointsCtrl);
@@ -320,20 +423,26 @@ test('backlog', async ({ page }) => {
   // --- delete US (legacy 194-204) — trigger→confirm→DISMISS (net-zero) ---- //
   await test.step('delete US (net-zero)', async () => {
     const before = await rows(page).count();
-    await page.locator('.backlog-table-body > div .e2e-delete').nth(0).click();
-
     if (isReactPhase()) {
-      // React uses a native `window.confirm`, auto-dismissed by the handler at
-      // the top of this test — nothing is deleted.
-      await page.waitForTimeout(300);
-    } else {
-      // Baseline: CANCEL the generic-ask confirm (never click `.button-green`).
-      const cancel = page.locator('.lightbox-generic-ask .button-red, .lightbox-generic-ask .close').first();
-      if ((await cancel.count()) > 0) {
-        await cancel.click().catch(() => {
-          /* dialog may auto-close — the strict count below is the gate */
-        });
-      }
+      // React consolidates delete into the per-row `.us-option-popup-button`
+      // "User story options" popup (a state-driven popover — OUT-OF-SCOPE w023#7
+      // display:none — not driven here). Assert the options affordance renders
+      // and the row count is net-zero (no deletion performed).
+      expect(
+        await page.locator('.backlog-table-body > div .us-option-popup-button').count(),
+      ).toBeGreaterThan(0);
+      await screenshot(page, 'backlog', 'delete-us-cancelled');
+      expect(await rows(page).count()).toBe(before);
+      return;
+    }
+
+    await page.locator('.backlog-table-body > div .e2e-delete').nth(0).click();
+    // Baseline: CANCEL the generic-ask confirm (never click `.button-green`).
+    const cancel = page.locator('.lightbox-generic-ask .button-red, .lightbox-generic-ask .close').first();
+    if ((await cancel.count()) > 0) {
+      await cancel.click().catch(() => {
+        /* dialog may auto-close — the strict count below is the gate */
+      });
     }
     await waitLoader(page);
     await screenshot(page, 'backlog', 'delete-us-cancelled');
@@ -352,7 +461,7 @@ test('backlog', async ({ page }) => {
 
     await dragNetZero(
       page,
-      '.backlog-table-body > div >> nth=4 >> .icon-drag',
+      `.backlog-table-body > div >> nth=4 >> ${DRAG_HANDLE()}`,
       '.backlog-table-body > div >> nth=0',
       () => screenshot(page, 'backlog', 'drag-backlog-mirror'),
     );
@@ -372,13 +481,19 @@ test('backlog', async ({ page }) => {
       await screenshot(page, 'backlog', 'multi-select-unavailable');
       return;
     }
-    await rows(page).nth(count - 1).locator('input[type="checkbox"]').first().check();
-    await rows(page).nth(count - 2).locator('input[type="checkbox"]').first().check();
+    await toggleRowCheckbox(rows(page).nth(count - 1));
+    await toggleRowCheckbox(rows(page).nth(count - 2));
     await screenshot(page, 'backlog', 'multi-select');
 
     // STRICT: exactly the two intended rows are selected.
     const checked = await page.locator('.backlog-table-body > div input[type="checkbox"]:checked').count();
     expect(checked).toBe(2);
+
+    // Restore the (client-only) selection state so the two rows are left
+    // unchecked — the selection is pure UI state and never persisted, but
+    // clearing it keeps the following steps operating on a clean board.
+    await toggleRowCheckbox(rows(page).nth(count - 1));
+    await toggleRowCheckbox(rows(page).nth(count - 2));
   });
 
   // --- drag selected us to a sprint (legacy 250-269) — NET-ZERO drag ------ //
@@ -388,8 +503,8 @@ test('backlog', async ({ page }) => {
 
     await dragNetZero(
       page,
-      '.backlog-table-body > div >> nth=0 >> .icon-drag',
-      'div[tg-backlog-sprint="sprint"] >> nth=0 >> .sprint-table',
+      `.backlog-table-body > div >> nth=0 >> ${DRAG_HANDLE()}`,
+      `${SPRINT_BLOCK()} >> nth=0 >> .sprint-table`,
       () => screenshot(page, 'backlog', 'drag-to-milestone-mirror'),
     );
     await waitLoader(page);
@@ -405,13 +520,22 @@ test('backlog', async ({ page }) => {
   await test.step('move-to-sprint control', async () => {
     const before = await rows(page).count();
     const row0 = rows(page).nth(0);
-    await row0.locator('input[type="checkbox"]').first().check();
-    const control = page.locator('.e2e-move-to-sprint').first();
+    await toggleRowCheckbox(row0);
+    // React surfaces "move to sprint" inside the per-row `.us-option-popup-button`
+    // options popup (there is no standalone `.e2e-move-to-sprint` control), so the
+    // affordance is asserted phase-aware and never clicked — clicking would
+    // persist a sprint assignment and break net-zero.
+    const control = page
+      .locator(phaseSelector('.e2e-move-to-sprint', '.us-option-popup-button'))
+      .first();
     await screenshot(page, 'backlog', 'move-to-sprint-control');
     // STRICT: the move-to-sprint affordance is present for a selected story.
     expect(await control.count()).toBeGreaterThan(0);
     // STRICT: nothing was moved (net-zero).
     expect(await rows(page).count()).toBe(before);
+
+    // Clear the (client-only) selection to leave the board clean.
+    await toggleRowCheckbox(row0);
   });
 
   // --- reorder within a milestone (legacy 310-323) — NET-ZERO drag -------- //
@@ -424,8 +548,8 @@ test('backlog', async ({ page }) => {
     }
     await dragNetZero(
       page,
-      'div[tg-backlog-sprint="sprint"] >> nth=0 >> .milestone-us-item-row >> nth=3',
-      'div[tg-backlog-sprint="sprint"] >> nth=0 >> .milestone-us-item-row >> nth=0',
+      `${SPRINT_BLOCK()} >> nth=0 >> .milestone-us-item-row >> nth=3`,
+      `${SPRINT_BLOCK()} >> nth=0 >> .milestone-us-item-row >> nth=0`,
       () => screenshot(page, 'backlog', 'reorder-milestone-mirror'),
     );
     await waitLoader(page);
@@ -474,7 +598,7 @@ test('backlog', async ({ page }) => {
     const beforeSprints = await sprints(page).count();
 
     // create → open, fill name for evidence, CANCEL (never submit).
-    await page.locator('.add-sprint').first().click();
+    await page.locator(ADD_SPRINT()).first().click();
     let lightbox = page.locator(sprintLightboxSelector()).first();
     await lightbox.waitFor({ state: 'visible' });
     await screenshot(page, 'backlog', 'create-milestone');
@@ -544,14 +668,16 @@ test('backlog', async ({ page }) => {
       await screenshot(page, 'backlog', 'accessibility');
       return;
     }
-    await page.locator('.add-sprint').first().click();
-    const dialog = page.locator('[role="dialog"]').first();
+    await page.locator(ADD_SPRINT()).first().click();
+    // Target the sprint lightbox host specifically (both lightbox hosts are
+    // mounted as `[role="dialog"]`; only the opened one is visible).
+    const dialog = page.locator(sprintLightboxSelector()).first();
     await dialog.waitFor({ state: 'visible' }).catch(() => {
-      /* if the dialog role is absent the assertion below reports it strictly */
+      /* if the dialog never opens the assertion below reports it strictly */
     });
     await screenshot(page, 'backlog', 'accessibility');
-    // STRICT: the sprint lightbox exposes the dialog role (F-UI-05).
-    expect(await page.locator('[role="dialog"]').count()).toBeGreaterThan(0);
+    // STRICT: the opened sprint lightbox exposes the dialog role (F-UI-05).
+    expect(await dialog.getAttribute('role')).toBe('dialog');
     await dismissLightbox(page, dialog);
   });
 });

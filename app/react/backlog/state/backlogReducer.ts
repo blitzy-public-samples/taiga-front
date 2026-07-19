@@ -59,6 +59,28 @@ import type {
  * ========================================================================== */
 
 /**
+ * A single milestone/sprint entry inside the project-stats `milestones` array
+ * (`GET /projects/{id}/stats`). This is the EXACT shape the AngularJS burndown
+ * directive consumed (`tgBurndownBacklogGraph`, retired
+ * `app/coffee/modules/backlog/main.coffee`): each row carries the sprint
+ * `name`, the `optimal` (ideal) pending-points value, the `evolution`
+ * (real/actual pending points; `null` for sprints that have not happened yet),
+ * and the team/client scope-increment deltas (hyphenated keys exactly as the
+ * backend serializes them). Consumed only by the render-only `BurndownChart`.
+ */
+export interface BurndownMilestoneStat {
+    name: string;
+    /** Optimal (ideal-line) pending points at this sprint. */
+    optimal: number;
+    /** Real (actual) pending points; `null` for future sprints (no data yet). */
+    evolution: number | null;
+    /** Points added by team-driven scope changes (plotted below the baseline). */
+    'team-increment': number;
+    /** Points added by client-driven scope changes (plotted below the baseline). */
+    'client-increment': number;
+}
+
+/**
  * Project statistics payload (`GET /projects/{id}/stats`) plus the two derived
  * view fields the AngularJS controller stored alongside it
  * (`loadProjectStats`, main.coffee L256-268).
@@ -80,6 +102,13 @@ export interface BacklogStats {
     closed_points?: number;
     assigned_points?: number;
     total_milestones?: number;
+    /**
+     * Per-sprint burndown series (`GET /projects/{id}/stats` → `milestones`).
+     * Passed verbatim to the render-only `BurndownChart`, which reproduces the
+     * legacy Flot burndown plot. Optional because it is absent until the stats
+     * payload has loaded.
+     */
+    milestones?: BurndownMilestoneStat[];
     /** Forward-compatible catch-all for the remaining stats keys. */
     [key: string]: unknown;
 }

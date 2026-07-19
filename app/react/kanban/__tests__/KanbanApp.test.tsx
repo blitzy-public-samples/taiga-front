@@ -77,7 +77,8 @@ import { render, screen, within, fireEvent, act } from '@testing-library/react';
 
 import { KanbanApp } from '../KanbanApp';
 import { useKanbanBoard } from '../state/useKanbanBoard';
-import { filtersData } from '../../shared/api/userstories';
+import { useResolvedProjectId } from '../../shared/useResolvedProjectId';
+import { filtersData, createUserStory } from '../../shared/api/userstories';
 import { makeProject, makeStatus, makeSwimlane, makeUserStory, makeBoardCard, makeUsMap } from './factories';
 
 import type { UseKanbanBoardResult } from '../state/useKanbanBoard';
@@ -97,12 +98,14 @@ const mockCaptured: {
   swimlaneAddLink: any;
   swimlane: any[];
   column: any[];
+  bulkLightbox: any;
 } = {
   dnd: null,
   filters: null,
   swimlaneAddLink: null,
   swimlane: [],
   column: [],
+  bulkLightbox: null,
 };
 
 /* ========================================================================== *
@@ -130,6 +133,30 @@ jest.mock('../state/useKanbanBoard', () => ({
 jest.mock('../../shared/api/userstories', () => ({
   __esModule: true,
   filtersData: jest.fn(() => Promise.resolve({})),
+  // C1 (dest#4): the single "+" add persists a story via `createUserStory`
+  // (`POST /userstories`). Mocked to resolve so the container's fire-and-forget
+  // create/reload chain settles without loading the real `/api/v1/` client.
+  createUserStory: jest.fn(() => Promise.resolve({})),
+}));
+
+/*
+ * `useResolvedProjectId` (F-REG-01) is replaced by a SYNCHRONOUS fast-path mock
+ * that reproduces the container-boundary contract: it coerces `props.projectId`
+ * to a number and reports `projectIdValid` via `Number.isInteger(id) && id > 0`,
+ * with `resolving: false`. This keeps the CONTAINER specs focused on rendering
+ * from a resolution RESULT (never loading the real `/projects/by_slug` client
+ * graph), exactly as `useKanbanBoard` is mocked. The real slug-resolution logic
+ * — URL parsing, the `by_slug` lookup, and the `resolving` window — is exercised
+ * by the dedicated `shared/__tests__/useResolvedProjectId.test.ts` spec. Tests
+ * that need the transient loading shell override this mock per-render.
+ */
+jest.mock('../../shared/useResolvedProjectId', () => ({
+  __esModule: true,
+  useResolvedProjectId: jest.fn((props?: { projectId?: string }) => {
+    const id = Number(props?.projectId);
+    const valid = Number.isInteger(id) && id > 0;
+    return { projectId: valid ? id : 0, projectIdValid: valid, resolving: false };
+  }),
 }));
 
 jest.mock('../dnd/KanbanDndContext', () => ({
@@ -168,6 +195,31 @@ jest.mock('../components/FiltersSidebar', () => ({
   },
 }));
 
+/*
+ * C1 (dest#4): the "+=" bulk add HOSTS the shared `BulkCreateUsLightbox`
+ * (legitimately reused — `lightbox-us-bulk.jade` was shared by both in-scope
+ * screens, AAP §0.2.1). It is stubbed here as a leaf that records its props and
+ * exposes an `open` flag, matching this folder's mocking philosophy (the real
+ * lightbox's own behaviour is covered by its dedicated backlog spec). This also
+ * keeps the CONTAINER spec from loading the real lightbox's validation /
+ * `/api/v1/` graph. The stub renders a `data-testid` only when `open` so tests
+ * can assert the open/closed transition driven by `handleAddBulk` / the success
+ * & close callbacks.
+ */
+jest.mock('../../backlog/components/BulkCreateUsLightbox', () => ({
+  __esModule: true,
+  BulkCreateUsLightbox: (props: any) => {
+    mockCaptured.bulkLightbox = props;
+    return props.open ? (
+      <div
+        data-testid="bulk-create-lightbox"
+        data-default-status={String(props.defaultStatusId)}
+        data-project-id={String(props.projectId)}
+      />
+    ) : null;
+  },
+}));
+
 /**
  * Strongly-typed handle onto the factory-mocked hook. `jest.MockedFunction`
  * preserves the original signature (resolved from the real module's types,
@@ -176,6 +228,10 @@ jest.mock('../components/FiltersSidebar', () => ({
  */
 const mockUseKanbanBoard = useKanbanBoard as jest.MockedFunction<typeof useKanbanBoard>;
 const mockFiltersData = filtersData as jest.MockedFunction<typeof filtersData>;
+const mockCreateUserStory = createUserStory as jest.MockedFunction<typeof createUserStory>;
+const mockUseResolvedProjectId = useResolvedProjectId as jest.MockedFunction<
+  typeof useResolvedProjectId
+>;
 
 /* ========================================================================== *
  * Board view-model builder
@@ -202,12 +258,16 @@ function makeBoard(overrides: Partial<UseKanbanBoardResult> = {}): UseKanbanBoar
     loading: false,
     loadError: false,
     notFoundUserstories: false,
+    // F-AAP-03 (dest#8): drag reorder error surface (null = no error by default).
+    moveError: null,
     move: jest.fn(() => Promise.resolve()),
     toggleFold: jest.fn(),
     showArchivedStatus: jest.fn(),
     hideArchivedStatus: jest.fn(),
     reload: jest.fn(),
     deleteUserStory: jest.fn(() => Promise.resolve()),
+    // F-AAP-03 (dest#8): dismiss the drag error toast.
+    clearMoveError: jest.fn(),
     ...overrides,
   };
 }
@@ -292,8 +352,18 @@ beforeEach(() => {
   mockCaptured.swimlaneAddLink = null;
   mockCaptured.swimlane = [];
   mockCaptured.column = [];
+  mockCaptured.bulkLightbox = null;
   mockFiltersData.mockReset();
   mockFiltersData.mockResolvedValue({});
+  mockCreateUserStory.mockReset();
+  mockCreateUserStory.mockResolvedValue({} as never);
+  // Re-establish the synchronous fast-path resolution default (a per-test
+  // override for the loading shell must not leak into later specs).
+  mockUseResolvedProjectId.mockImplementation((props?: { projectId?: string }) => {
+    const id = Number(props?.projectId);
+    const valid = Number.isInteger(id) && id > 0;
+    return { projectId: valid ? id : 0, projectIdValid: valid, resolving: false };
+  });
   // Default: nothing loaded yet (initialLoad === false, project === null).
   primeBoard();
 });
@@ -401,6 +471,51 @@ describe('KanbanApp', () => {
     });
   });
 
+  describe('project-id resolution (F-REG-01)', () => {
+    it('renders a transient loading shell (not the blank invalid host) while the slug is resolving', async () => {
+      // While `useResolvedProjectId` is resolving the project from the URL slug
+      // (`resolving: true`, id not yet valid), the container must show an
+      // accessible LOADING shell rather than the inert invalid host or a blank
+      // board — the fix for the permanently-blank board (F-REG-01).
+      mockUseResolvedProjectId.mockReturnValue({
+        projectId: 0,
+        projectIdValid: false,
+        resolving: true,
+      });
+
+      const { container } = await renderApp(undefined, undefined);
+
+      const resolving = container.querySelector('[data-tg-react-kanban="resolving"]');
+      expect(resolving).not.toBeNull();
+      expect(resolving?.getAttribute('aria-busy')).toBe('true');
+      expect(screen.getByRole('status')).toBeInTheDocument();
+      // Neither the inert invalid host nor the board renders while resolving.
+      expect(container.querySelector('[data-tg-react-kanban="invalid-project"]')).toBeNull();
+      expect(screen.queryByTestId('dnd-context')).toBeNull();
+    });
+
+    it('renders the board once the slug resolves to a valid project id', async () => {
+      // A resolved valid id (from the by_slug lookup) drives a normal board
+      // render even though NO numeric `project-id` attribute was supplied.
+      mockUseResolvedProjectId.mockReturnValue({
+        projectId: 7,
+        projectIdValid: true,
+        resolving: false,
+      });
+      primeLoadedNoSwimlane();
+
+      const { container } = await renderApp(undefined, 'proj-7');
+
+      expect(container.querySelector('[data-tg-react-kanban="resolving"]')).toBeNull();
+      expect(container.querySelector('[data-tg-react-kanban="invalid-project"]')).toBeNull();
+      expect(screen.getByTestId('dnd-context')).toBeInTheDocument();
+      // The resolved id flows into the board hook.
+      expect(mockUseKanbanBoard).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: 7 }),
+      );
+    });
+  });
+
   describe('board render gating (initialLoad && project)', () => {
     it('renders the shell but gates the board off before the first load resolves', async () => {
       // A loaded project but initialLoad still false -> shell yes, board no.
@@ -477,6 +592,54 @@ describe('KanbanApp', () => {
       const { container } = await renderApp();
 
       expect(container.querySelectorAll('.task-colum-name')).toHaveLength(2);
+    });
+  });
+
+  describe('drag error toast (F-AAP-03, dest#8)', () => {
+    const MOVE_ERR =
+      'The story order could not be saved. The board has been refreshed to the latest server state.';
+
+    it('does NOT render the error toast when moveError is null', async () => {
+      primeBoard({
+        project: makeProject(),
+        initialLoad: true,
+        usStatusList: [makeStatus({ id: 100, name: 'New', order: 1 })],
+        usByStatus: { '100': [] },
+        usMap: {},
+        moveError: null,
+      });
+      const { container } = await renderApp();
+      expect(container.querySelector('.notification-message-error')).toBeNull();
+    });
+
+    it('renders a dismissible error toast with the message when moveError is set', async () => {
+      primeBoard({
+        project: makeProject(),
+        initialLoad: true,
+        usStatusList: [makeStatus({ id: 100, name: 'New', order: 1 })],
+        usByStatus: { '100': [] },
+        usMap: {},
+        moveError: MOVE_ERR,
+      });
+      const { container } = await renderApp();
+
+      expect(container.querySelector('.notification-message-error')).not.toBeNull();
+      expect(screen.getByText(MOVE_ERR)).toBeInTheDocument();
+    });
+
+    it('clears the error via the hook when the toast is dismissed', async () => {
+      const board = primeBoard({
+        project: makeProject(),
+        initialLoad: true,
+        usStatusList: [makeStatus({ id: 100, name: 'New', order: 1 })],
+        usByStatus: { '100': [] },
+        usMap: {},
+        moveError: MOVE_ERR,
+      });
+      await renderApp();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }));
+      expect(board.clearMoveError).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -869,15 +1032,38 @@ describe('KanbanApp', () => {
   });
 
   describe('status-column add actions (permission-gated)', () => {
-    it('renders the add / bulk buttons when the project grants add_us', async () => {
+    /*
+     * C1 (dest#4): the "+" / "+=" column actions were previously permission-gated
+     * NO-OPS (the AngularJS "+" broadcast `genericform:new` / `usform:bulk` to open
+     * the COMMON module's dialogs, deleted with that module). The AUTHORITATIVE
+     * `dest_` QA report (Issue 4) requires them WIRED: "Add opens an inline create;
+     * Bulk opens the bulk-create lightbox." The container now OWNS both — the single
+     * "+" captures a subject via `window.prompt` and persists it with
+     * `createUserStory` (`POST /userstories`) under the clicked column's status +
+     * the project's default swimlane (when kanban is activated), then reloads the
+     * board; the "+=" opens the hosted `BulkCreateUsLightbox`
+     * (`/userstories/bulk_create`, contract unchanged). These specs assert THAT
+     * behaviour (aligned to the corrected implementation per the report).
+     */
+    let promptSpy: jest.SpyInstance | undefined;
+    afterEach(() => {
+      promptSpy?.mockRestore();
+      promptSpy = undefined;
+    });
+
+    function primeAddBoard(): UseKanbanBoardResult {
       const s100 = makeStatus({ id: 100, name: 'New', order: 1, is_archived: false });
-      const board = primeBoard({
+      return primeBoard({
         project: makeProject({ my_permissions: ['view_us', 'add_us', 'modify_us'] }),
         initialLoad: true,
         usStatusList: [s100],
         usByStatus: { '100': [] },
         usMap: {},
       });
+    }
+
+    it('renders the add / bulk buttons when the project grants add_us', async () => {
+      primeAddBoard();
 
       const { container } = await renderApp();
 
@@ -887,27 +1073,97 @@ describe('KanbanApp', () => {
       expect(addBtn).toBeInTheDocument();
       expect(bulkBtn).toBeInTheDocument();
 
-      // AUTHORITATIVE CONTRACT (stronger than "does not throw"): the add / bulk
-      // create dialogs are the AngularJS COMMON module's `lightbox-us-bulk` /
-      // `genericform` directives. The AAP places the common module OUT OF SCOPE
-      // (§0.2.2 "the ... common ... modules are ... out of scope") and the AAP
-      // React file manifest (§0.4.1) defines NO Kanban lightbox component — only
-      // the two BACKLOG lightboxes. The SOURCE `KanbanController` never owned
-      // these dialogs either; it merely REACTED to their `usform:new:success` /
-      // `usform:bulk:success` outcomes, which the React screen now receives via the
-      // shared events bridge + `useKanbanBoard`. So `handleAddNewUs` /
-      // `handleAddBulk` must SAFELY DELEGATE: after their `add_us` permission check
-      // they perform NO board mutation of their own. Assert clicking them neither
-      // throws NOR moves / reloads / folds / toggles-archived on the board.
-      expect(() => {
+      // Merely RENDERING the header must not create anything or mutate the board.
+      expect(mockCreateUserStory).not.toHaveBeenCalled();
+      expect(mockCaptured.bulkLightbox?.open).toBe(false);
+    });
+
+    it('"+" prompts for a subject, POSTs /userstories with the column status + default swimlane, then reloads', async () => {
+      // `makeProject` defaults `is_kanban_activated: true`, `default_swimlane: null`,
+      // so the computed swimlane is `null`; `renderApp()` resolves projectId -> 7.
+      const board = primeAddBoard();
+      promptSpy = jest.spyOn(window, 'prompt').mockReturnValue('  My new story  ');
+
+      const { container } = await renderApp();
+      const header = container.querySelector('.task-colum-name') as HTMLElement;
+      const addBtn = within(header).getByTitle('Add new user story');
+
+      await act(async () => {
         fireEvent.click(addBtn);
-        fireEvent.click(bulkBtn);
-      }).not.toThrow();
+        // Settle the container's fire-and-forget create -> finally(reload) chain.
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      // Subject is trimmed; payload carries the resolved project, clicked status
+      // (100) and the (null) default swimlane — the frozen create contract.
+      expect(mockCreateUserStory).toHaveBeenCalledTimes(1);
+      expect(mockCreateUserStory).toHaveBeenCalledWith({
+        project: 7,
+        subject: 'My new story',
+        status: 100,
+        swimlane: null,
+      });
+      // The board reloads so the new card appears (parity with `usform:new:success`).
+      expect(board.reload).toHaveBeenCalledTimes(1);
+      // No drag/fold/archived side-effects.
       expect(board.move).not.toHaveBeenCalled();
-      expect(board.reload).not.toHaveBeenCalled();
       expect(board.toggleFold).not.toHaveBeenCalled();
       expect(board.showArchivedStatus).not.toHaveBeenCalled();
       expect(board.hideArchivedStatus).not.toHaveBeenCalled();
+    });
+
+    it('"+" is a safe no-op when the prompt is cancelled or empty', async () => {
+      const board = primeAddBoard();
+      // `null` models a real-browser cancel; the container also coalesces the
+      // `undefined` some non-browser hosts return, and ignores empty/whitespace.
+      promptSpy = jest.spyOn(window, 'prompt').mockReturnValue(null);
+
+      const { container } = await renderApp();
+      const header = container.querySelector('.task-colum-name') as HTMLElement;
+      const addBtn = within(header).getByTitle('Add new user story');
+
+      await act(async () => {
+        fireEvent.click(addBtn);
+        await Promise.resolve();
+      });
+
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      expect(mockCreateUserStory).not.toHaveBeenCalled();
+      expect(board.reload).not.toHaveBeenCalled();
+    });
+
+    it('"+=" opens the hosted bulk-create lightbox pre-selecting the clicked status, and closes on success/cancel', async () => {
+      primeAddBoard();
+
+      const { container } = await renderApp();
+      const header = container.querySelector('.task-colum-name') as HTMLElement;
+      const bulkBtn = within(header).getByTitle('Add new bulk');
+
+      // Closed initially.
+      expect(mockCaptured.bulkLightbox?.open).toBe(false);
+      expect(screen.queryByTestId('bulk-create-lightbox')).toBeNull();
+
+      // "+=" opens the lightbox pre-selecting the clicked column's status (100),
+      // WITHOUT creating anything itself and WITHOUT mutating the board.
+      await act(async () => {
+        fireEvent.click(bulkBtn);
+      });
+      expect(mockCaptured.bulkLightbox.open).toBe(true);
+      expect(mockCaptured.bulkLightbox.defaultStatusId).toBe(100);
+      expect(mockCaptured.bulkLightbox.projectId).toBe(7);
+      const lb = screen.getByTestId('bulk-create-lightbox');
+      expect(lb).toHaveAttribute('data-default-status', '100');
+      expect(mockCreateUserStory).not.toHaveBeenCalled();
+
+      // onSuccess reloads the board and closes; onClose just closes.
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess([], 'bottom');
+      });
+      expect(currentBoard.reload).toHaveBeenCalledTimes(1);
+      expect(mockCaptured.bulkLightbox.open).toBe(false);
+      expect(screen.queryByTestId('bulk-create-lightbox')).toBeNull();
     });
 
     it('omits the add / bulk buttons when the project lacks add_us', async () => {

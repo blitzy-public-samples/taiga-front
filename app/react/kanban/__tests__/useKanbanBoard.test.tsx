@@ -51,7 +51,7 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 
 import { useKanbanBoard } from '../state/useKanbanBoard';
-import { api } from '../../shared/api/client';
+import { api, ApiError } from '../../shared/api/client';
 import { bulkUpdateKanbanOrder, filtersData } from '../../shared/api/userstories';
 import { subscribeProjectChanges } from '../../shared/events';
 import {
@@ -81,6 +81,11 @@ jest.mock('../../shared/api/client', () => ({
         put: jest.fn(),
         del: jest.fn(),
     },
+    // Preserve the REAL ApiError class so `describeReorderError` /
+    // `parseApiErrorMessage` (shared/apiError.ts) can still do
+    // `err instanceof ApiError` and parse the server error envelope
+    // (F-AAP-03, dest#8). Only the `api` singleton needs stubbing.
+    ApiError: jest.requireActual('../../shared/api/client').ApiError,
 }));
 
 jest.mock('../../shared/api/userstories', () => ({
@@ -593,6 +598,60 @@ describe('move — reconcile on persistence failure', () => {
             ),
         );
         expect(result.current.usMap[1]).toBeDefined();
+        // F-AAP-03 (dest#8): the failure is no longer silent — a user-facing
+        // moveError is surfaced (the plain Error.message here).
+        await waitFor(() =>
+            expect(result.current.moveError).toBe('server rejected the move'),
+        );
+    });
+
+    it('surfaces the server envelope message and clears moveError on the next successful move (F-AAP-03, dest#8)', async () => {
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_ID })],
+            my_permissions: ['view_us', 'modify_us'],
+        });
+        // First move rejects with a Django REST error envelope; the shared
+        // `describeReorderError` must surface `_error_message` verbatim.
+        bulkUpdateKanbanOrderMock.mockRejectedValueOnce(
+            new ApiError(400, { _error_message: 'Story is blocked' }),
+        );
+
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            await result.current.move([1], STATUS_ID, -1, 0, null, null);
+        });
+        await waitFor(() => expect(result.current.moveError).toBe('Story is blocked'));
+
+        // The next move succeeds (default mock resolves) and must clear the error.
+        await act(async () => {
+            await result.current.move([1], STATUS_ID, -1, 0, null, null);
+        });
+        await waitFor(() => expect(result.current.moveError).toBeNull());
+    });
+
+    it('clearMoveError() dismisses a surfaced error (F-AAP-03, dest#8)', async () => {
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_ID })],
+            my_permissions: ['view_us', 'modify_us'],
+        });
+        bulkUpdateKanbanOrderMock.mockRejectedValueOnce(new Error('nope'));
+
+        const { result } = await renderLoaded();
+
+        await act(async () => {
+            await result.current.move([1], STATUS_ID, -1, 0, null, null);
+        });
+        await waitFor(() => expect(result.current.moveError).toBe('nope'));
+
+        act(() => {
+            result.current.clearMoveError();
+        });
+        expect(result.current.moveError).toBeNull();
     });
 });
 

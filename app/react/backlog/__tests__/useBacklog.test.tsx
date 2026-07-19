@@ -1029,6 +1029,15 @@ describe('useBacklog', () => {
             await waitFor(() => expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: false }));
             expect(listMilestonesMock).toHaveBeenCalledWith(PID, { closed: true });
             expect(getMock).toHaveBeenCalledWith(`/projects/${PID}/stats`);
+
+            // F-AAP-03 (dest#8) REVERT: a failed reorder ALSO refetches the
+            // backlog user-story list to server truth (via the same
+            // `reloadAllPaginatedUserstories` loader the live `onUserstories`
+            // handler uses) so the rejected optimistic move is visibly reverted
+            // rather than left stale beneath the error toast.
+            await waitFor(() =>
+                expect(requestMock).toHaveBeenCalledWith('GET', '/userstories', expect.anything()),
+            );
         });
 
         it('surfaces a moveError from the server envelope on a failed reorder, then clears it on the next success', async () => {

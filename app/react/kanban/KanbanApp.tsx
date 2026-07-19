@@ -44,8 +44,18 @@ import type {
     CustomFilter,
 } from './components/FiltersSidebar';
 import { UNCLASSIFIED_SWIMLANE_ID } from './state/boardReducer';
+// C1 fix (dest#4): the bulk-create lightbox. `lightbox-us-bulk.jade` was shared
+// by BOTH in-scope screens in AngularJS (AAP §0.2.1 — "consumed only by the two
+// in-scope screens [kanban.jade:69],[backlog.jade:199]"), so the migrated
+// `BulkCreateUsLightbox` component is legitimately reused by the Kanban "+="
+// action here (it is purely presentational — "props down, events up").
+import { BulkCreateUsLightbox } from '../backlog/components/BulkCreateUsLightbox';
 import { canModifyUs, canAddUs, canMutate } from '../shared/permissions';
-import { filtersData } from '../shared/api/userstories';
+import { NotificationError } from '../shared/NotificationError';
+// C1 fix (dest#4): `createUserStory` powers the single "+" add; `filtersData`
+// is the pre-existing filter loader.
+import { filtersData, createUserStory } from '../shared/api/userstories';
+import { useResolvedProjectId } from '../shared/useResolvedProjectId';
 import { translate } from '../shared/i18n';
 import type { Project, Status, FiltersData, FilterOption } from '../shared/types';
 
@@ -563,15 +573,17 @@ export interface KanbanAppProps {
  * drag-and-drop, and rendering to the hook and presentational children.
  */
 export function KanbanApp(props: KanbanAppProps): JSX.Element {
-    // `project-id` arrives as a string; coerce and guard so a mis-mounted element
-    // (missing/NaN id) renders a minimal empty state instead of throwing. A valid
-    // project id must be a POSITIVE INTEGER (F-REG-01): `Number.isInteger(...) &&
-    // > 0` rejects the literal `"{{project.id}}"` snapshot (NaN), a blank/absent
-    // attribute (`Number("")` -> 0) and any non-positive/fractional value. When
-    // AngularJS later resolves the interpolation, `attributeChangedCallback` in
-    // shared/mount.tsx re-renders with the real id and this guard then passes.
-    const projectId = Number(props.projectId);
-    const projectIdValid = Number.isInteger(projectId) && projectId > 0;
+    // F-REG-01 (blank board): the host `<tg-react-kanban project-id="{{project.id}}"
+    // project-slug="{{project.slug}}">` receives EMPTY attributes because the deleted
+    // Kanban controller no longer populates the AngularJS `project` scope var (AAP
+    // §0.2.1). `useResolvedProjectId` therefore SELF-RESOLVES the project: it uses a
+    // valid `project-id` attribute directly when present, otherwise derives the slug
+    // from the URL (`/project/<slug>/kanban`) and resolves it via `GET
+    // /projects/by_slug` — the same endpoint the AngularJS shell uses. A valid
+    // project id is a POSITIVE INTEGER; `resolving` is true only while the lookup is
+    // in flight so the render below shows a loading shell instead of a blank board.
+    const { projectId, projectIdValid, resolving: projectResolving } =
+        useResolvedProjectId(props);
 
     // F-UI-06: resolve the toolbar/column visible copy through the shell locale
     // at render time (see `useLabels` for the load-order rationale). The same
@@ -705,6 +717,13 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         setFiltersRefreshTick((tick) => tick + 1);
     }, []);
 
+    /* ---- Bulk-create lightbox (C1 fix, dest#4) --------------------------- */
+
+    // The status column whose "+=" button opened the bulk-create lightbox, or
+    // `null` when the lightbox is closed. Set by `handleAddBulk(statusId)` so the
+    // lightbox pre-selects the clicked column's status; cleared on close/success.
+    const [bulkStatusId, setBulkStatusId] = useState<number | null>(null);
+
     /* ---- Multi-select + moved-card highlight ----------------------------- */
 
     const [selectedUss, setSelectedUss] = useState<Record<number, boolean>>({});
@@ -737,6 +756,23 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     const [foldedSwimlane, setFoldedSwimlane] = useState<Record<number, boolean>>(() =>
         readBoolMap(swimlaneModesStorageKey(projectId)),
     );
+
+    // F-REG-01 companion: the two fold-state `useState` initializers above run
+    // ONCE at mount, when `useResolvedProjectId` may still be resolving the id
+    // (projectId === 0) — so they read the empty `_0` localStorage keys. Rehydrate
+    // the persisted per-project fold state once the real id arrives (and on any
+    // later project change), so a returning user's manually-folded columns/
+    // swimlanes are restored. Guarded by a ref so it fires only on an ACTUAL change,
+    // never clobbering in-session fold edits on unrelated re-renders.
+    const foldsProjectRef = useRef<number>(projectId);
+    useEffect(() => {
+        if (foldsProjectRef.current !== projectId) {
+            foldsProjectRef.current = projectId;
+            setFolds(readBoolMap(foldsStorageKey(projectId)));
+            setFoldedSwimlane(readBoolMap(swimlaneModesStorageKey(projectId)));
+        }
+    }, [projectId]);
+
     const archivedFoldsInit = useRef(false);
 
     // On the first successful load, force every archived status column folded
@@ -1010,16 +1046,54 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
     const handleAddNewUs = useCallback(
         (statusId: number) => {
-            if (!canAddUs(board.project)) {
+            const project = board.project;
+            if (!canAddUs(project) || !project || !projectIdValid) {
                 return;
             }
-            // DELEGATED (deferred): the new-story dialog is the common module's
-            // `genericform:new` lightbox (AAP §0.2.2 OOS; §0.4.1 defines no
-            // Kanban create component). The controller only reacted to
-            // `usform:new:success`; the events bridge reflects the new story.
-            void statusId;
+            // C1 fix (dest#4): single "+" add. The AngularJS "+" broadcast
+            // `genericform:new` to open the COMMON-module US form (OOS,
+            // AAP §0.2.2; its Jade/controller were deleted). Following the
+            // established React stand-in for that module's deleted dialogs
+            // (`window.confirm` replaces `$confirm.askOnDelete` in
+            // `handleClickDelete` above), the subject is captured with
+            // `window.prompt`, then persisted with `POST /userstories` under the
+            // clicked column's status and — when kanban swimlanes are active —
+            // the project's default swimlane (faithful to the legacy create
+            // model, `common/lightboxes.coffee:552-560`). The board is reloaded
+            // so the new card appears, exactly as the controller reacted to
+            // `usform:new:success`.
+            const raw = window.prompt('New user story subject:');
+            // `window.prompt` returns `null` when the user cancels; some
+            // non-browser hosts (e.g. jsdom under Jest) return `undefined`.
+            // Coalesce both to an empty string so a cancelled/unavailable prompt
+            // is a safe no-op rather than a `TypeError` on `.trim()`.
+            const subject = (raw ?? '').trim();
+            if (!subject) {
+                return; // cancelled, unavailable, or empty/whitespace subject
+            }
+            // `swimlane: if project.is_kanban_activated then default_swimlane else null`
+            // (common/lightboxes.coffee:558). `is_kanban_activated` is read via the
+            // Project index signature (not a first-class typed field).
+            const swimlane = Boolean(project.is_kanban_activated)
+                ? project.default_swimlane ?? null
+                : null;
+            void (async () => {
+                try {
+                    await createUserStory({
+                        project: projectId,
+                        subject,
+                        status: statusId,
+                        swimlane,
+                    });
+                } finally {
+                    // Reload on both success and failure: on success the new card
+                    // appears; on failure the board reconciles with server truth
+                    // (parity with the board's other mutation error paths).
+                    board.reload();
+                }
+            })();
         },
-        [board.project],
+        [board, projectId, projectIdValid],
     );
 
     const handleAddBulk = useCallback(
@@ -1027,14 +1101,29 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canAddUs(board.project)) {
                 return;
             }
-            // DELEGATED (deferred): bulk-create is the common module's
-            // `usform:bulk` lightbox (`lightbox-us-bulk`) (AAP §0.2.2 OOS; the
-            // Backlog bulk lightbox in §0.4.1 is a distinct component). The
-            // events bridge reflects the created stories onto the board.
-            void statusId;
+            // C1 fix (dest#4): "+=" opens the shared bulk-create lightbox
+            // (`BulkCreateUsLightbox`), pre-selecting the clicked column's
+            // status. Replaces the deleted `usform:bulk` common dialog; the
+            // lightbox posts to `/userstories/bulk_create` (contract unchanged).
+            setBulkStatusId(statusId);
         },
         [board.project],
     );
+
+    // C1 fix (dest#4): after a successful bulk create, reload the board so the
+    // new cards appear (parity with the AngularJS `usform:bulk:success` refresh)
+    // and close the lightbox. The created stories + insert position are provided
+    // by the lightbox but the Kanban board reloads wholesale (the board reducer
+    // is keyed by status/swimlane, not an append position).
+    const handleBulkSuccess = useCallback(() => {
+        setBulkStatusId(null);
+        board.reload();
+    }, [board]);
+
+    // C1 fix (dest#4): dismiss the bulk-create lightbox without creating.
+    const handleCloseBulk = useCallback(() => {
+        setBulkStatusId(null);
+    }, []);
 
     /* ---- Filter interactions --------------------------------------------- */
 
@@ -1153,8 +1242,21 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     /* ---- Render ---------------------------------------------------------- */
 
     if (!projectIdValid) {
-        // A mis-mounted `<tg-react-kanban>` without a valid `project-id` renders an
-        // inert empty shell rather than throwing (mirrors BacklogApp's guard).
+        if (projectResolving) {
+            // F-REG-01: the project id is being resolved from the URL slug via
+            // `GET /projects/by_slug`. Render a transient, accessible LOADING shell
+            // (never the inert invalid host) so the screen is never a permanent
+            // blank while the lookup is in flight.
+            return (
+                <div className="wrapper" data-tg-react-kanban="resolving" aria-busy="true">
+                    <div className="loading-spinner" role="status" aria-live="polite">
+                        <span>{translate('COMMON.LOADING', undefined, 'Loading...')}</span>
+                    </div>
+                </div>
+            );
+        }
+        // A mis-mounted `<tg-react-kanban>` without a resolvable `project-id`
+        // renders an inert empty shell rather than throwing (mirrors BacklogApp).
         return <div className="wrapper" data-tg-react-kanban="invalid-project" />;
     }
 
@@ -1192,6 +1294,17 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     return (
         <div className="wrapper">
             <section className={sectionClass}>
+                {/*
+                  F-AAP-03 (dest#8): dismissible error toast for a REJECTED drag
+                  reorder (`bulk_update_kanban_order`). Previously `move()`
+                  reconciled the board silently, so a failed drag produced NO
+                  user feedback. Reuses Taiga's global error-banner SCSS
+                  (.notification-message-error, fixed-positioned so its placement
+                  is layout-neutral) and renders nothing while `moveError` is null.
+                  Dismiss clears the state (board already reconciled to server
+                  truth via reload-on-error).
+                */}
+                <NotificationError message={board.moveError} onClose={board.clearMoveError} />
                 <div className="kanban-header">
                     <header>
                         <h1>{SECTION_NAME}</h1>
@@ -1233,20 +1346,33 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                         <div className="kanban-table-options-end">
                             <div className="board-zoom">
                                 <div className="board-zoom-title">{ZOOM_TITLE}</div>
-                                {ZOOM_LEVELS.map((lvl) => (
-                                    <label className="zoom-radio" key={lvl.value} title={lvl.label}>
-                                        <input
-                                            type="radio"
-                                            name="kanban-zoom"
-                                            value={lvl.value}
-                                            checked={zoomLevel === lvl.value}
-                                            onChange={() => setZoom(lvl.value)}
-                                        />
-                                        <div className="checkmark">
-                                            <span>{lvl.label}</span>
-                                        </div>
-                                    </label>
-                                ))}
+                                {ZOOM_LEVELS.map((lvl) => {
+                                    // Unique per-radio id so the browser autofill
+                                    // heuristic can distinguish radios that share the
+                                    // `kanban-zoom` group name, and so the wrapping
+                                    // <label> has an explicit htmlFor association.
+                                    const zoomInputId = `kanban-zoom-${lvl.value}`;
+                                    return (
+                                        <label
+                                            className="zoom-radio"
+                                            key={lvl.value}
+                                            htmlFor={zoomInputId}
+                                            title={lvl.label}
+                                        >
+                                            <input
+                                                type="radio"
+                                                id={zoomInputId}
+                                                name="kanban-zoom"
+                                                value={lvl.value}
+                                                checked={zoomLevel === lvl.value}
+                                                onChange={() => setZoom(lvl.value)}
+                                            />
+                                            <div className="checkmark">
+                                                <span>{lvl.label}</span>
+                                            </div>
+                                        </label>
+                                    );
+                                })}
                             </div>
                             {zoomLoading ? <div className="zoom-loading" /> : null}
                         </div>
@@ -1389,6 +1515,27 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                     ) : null}
                 </div>
             </section>
+
+            {/* C1 fix (dest#4): the shared bulk-create lightbox, hosted by Kanban
+                for the "+=" column action. Rendered WITHOUT an outer `.lightbox`
+                wrapper (Group D lesson, dest#7): the component owns its own
+                `.lightbox … open` root, and a static outer wrapper would place a
+                `display:none` ancestor over it and collapse it to 0×0. Opened by
+                `handleAddBulk(statusId)` (pre-selecting the clicked column's
+                status); the component posts to `/userstories/bulk_create`. */}
+            {project && (
+                <BulkCreateUsLightbox
+                    open={bulkStatusId !== null}
+                    projectId={projectId}
+                    defaultStatusId={bulkStatusId ?? board.usStatusList[0]?.id ?? 0}
+                    statuses={board.usStatusList}
+                    swimlanes={board.swimlanesList}
+                    isKanbanActivated={Boolean(project.is_kanban_activated)}
+                    defaultSwimlane={project.default_swimlane ?? null}
+                    onSuccess={handleBulkSuccess}
+                    onClose={handleCloseBulk}
+                />
+            )}
         </div>
     );
 }

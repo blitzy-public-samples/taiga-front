@@ -45,9 +45,12 @@
  *       loaded (`project && !isBacklogActivated`, BacklogApp.tsx L565 — note it
  *       reads the reducer-derived STATE flag, which mirrors the source
  *       `loadProject`/`main.coffee:472` `is_backlog_activated` gate); and
- *       (3) otherwise the full board, where `BacklogDndContext` (gated on a
- *       loaded `project`) wraps `BacklogTable`, the open/closed `Sprint`s render,
- *       and both lightboxes mount (each toggled by an `open` prop).
+ *       (3) otherwise the full board. Group B fix (dest#3): a SINGLE lifted
+ *       `BacklogDndContext` provider now encloses BOTH `BacklogTable` AND the
+ *       open/closed `Sprint`s (so sprint drop zones are reachable), and both
+ *       lightboxes mount (each toggled by an `open` prop). The provider itself is
+ *       no longer gated on a loaded `project` — it renders inert during the
+ *       pre-load window while its draggable/droppable CONSUMERS stay gated.
  *     - The authored container has NO dedicated `loading` affordance (it never
  *       reads `state.loading`). Before the project has loaded (`project === null`)
  *       it simply gates the board/DnD/sprints/bulk-lightbox off; the
@@ -75,10 +78,12 @@
  *     be asserted without importing the real children.
  */
 
-import { render, screen, within, fireEvent } from '@testing-library/react';
+import { render, screen, within, fireEvent, act } from '@testing-library/react';
 
 import { BacklogApp } from '../BacklogApp';
 import { useBacklog } from '../state/useBacklog';
+import { useResolvedProjectId } from '../../shared/useResolvedProjectId';
+import { createUserStory } from '../../shared/api/userstories';
 import {
   makeProject,
   makeUserStory,
@@ -132,6 +137,39 @@ const mockCaptured: {
  * ========================================================================== */
 
 jest.mock('../state/useBacklog');
+
+/*
+ * `useResolvedProjectId` (F-REG-01) is replaced by a SYNCHRONOUS fast-path mock
+ * that reproduces the container-boundary contract: it coerces `props.projectId`
+ * to a number and reports `projectIdValid` via `Number.isInteger(id) && id > 0`,
+ * with `resolving: false`. This keeps the CONTAINER specs focused on rendering
+ * from a resolution RESULT (never loading the real `/projects/by_slug` client
+ * graph), exactly as `useBacklog` is auto-mocked. The real slug-resolution logic
+ * — URL parsing, the `by_slug` lookup, and the `resolving` window — is exercised
+ * by the dedicated `shared/__tests__/useResolvedProjectId.test.ts` spec. Tests
+ * that need the transient loading shell override this mock per-render.
+ */
+jest.mock('../../shared/useResolvedProjectId', () => ({
+  __esModule: true,
+  useResolvedProjectId: jest.fn((props?: { projectId?: string }) => {
+    const id = Number(props?.projectId);
+    const valid = Number.isInteger(id) && id > 0;
+    return { projectId: valid ? id : 0, projectIdValid: valid, resolving: false };
+  }),
+}));
+
+/*
+ * C2 (dest#5): the standard "Add" reveals an inline create input that persists a
+ * single story via `createUserStory` (`POST /userstories`). Mocked to resolve so
+ * the container's async submit -> refresh chain settles without loading the real
+ * `/api/v1/` client / session reader. (`BacklogApp` imports ONLY `createUserStory`
+ * from this module; `filtersData` reaches it via the `useBacklog` state, not this
+ * import, so no other export needs stubbing.)
+ */
+jest.mock('../../shared/api/userstories', () => ({
+  __esModule: true,
+  createUserStory: jest.fn(() => Promise.resolve({})),
+}));
 
 jest.mock('../dnd/BacklogDndContext', () => ({
   __esModule: true,
@@ -202,6 +240,10 @@ jest.mock('../../kanban/components/FiltersSidebar', () => ({
  * `toHaveBeenCalledWith(...)` assertions remain type-checked.
  */
 const mockUseBacklog = useBacklog as jest.MockedFunction<typeof useBacklog>;
+const mockUseResolvedProjectId = useResolvedProjectId as jest.MockedFunction<
+  typeof useResolvedProjectId
+>;
+const mockCreateUserStory = createUserStory as jest.MockedFunction<typeof createUserStory>;
 
 /* ========================================================================== *
  * State + actions builders
@@ -283,6 +325,8 @@ function makeActions() {
     deleteUs: jest.fn(() => Promise.resolve()),
     updateUsStatus: jest.fn(() => Promise.resolve()),
     updateUsPoints: jest.fn(() => Promise.resolve()),
+    // F-AAP-03 (dest#8): dismiss the drag/mutation error toast.
+    clearMoveError: jest.fn(),
   };
 }
 
@@ -326,6 +370,15 @@ beforeEach(() => {
   mockCaptured.bulkCreateUsLightbox = null;
   mockCaptured.filtersSidebar = null;
   mockCaptured.sprint = [];
+  mockCreateUserStory.mockReset();
+  mockCreateUserStory.mockResolvedValue({} as never);
+  // Re-establish the synchronous fast-path resolution default (a per-test
+  // override for the loading shell must not leak into later specs).
+  mockUseResolvedProjectId.mockImplementation((props?: { projectId?: string }) => {
+    const id = Number(props?.projectId);
+    const valid = Number.isInteger(id) && id > 0;
+    return { projectId: valid ? id : 0, projectIdValid: valid, resolving: false };
+  });
   // Default: the project has NOT loaded yet (project === null).
   primeHook();
 });
@@ -402,16 +455,64 @@ describe('BacklogApp', () => {
     });
   });
 
+  describe('project-id resolution (F-REG-01)', () => {
+    it('renders a transient loading shell (not the blank invalid host) while the slug is resolving', () => {
+      // While `useResolvedProjectId` is resolving the project from the URL slug
+      // (`resolving: true`, id not yet valid), the container must show an
+      // accessible LOADING shell rather than the inert invalid host or a blank
+      // backlog — the fix for the permanently-blank board (F-REG-01).
+      mockUseResolvedProjectId.mockReturnValue({
+        projectId: 0,
+        projectIdValid: false,
+        resolving: true,
+      });
+
+      const { container } = renderApp(undefined as unknown as string, undefined);
+
+      const resolving = container.querySelector('[data-tg-react-backlog="resolving"]');
+      expect(resolving).not.toBeNull();
+      expect(resolving?.getAttribute('aria-busy')).toBe('true');
+      expect(screen.getByRole('status')).toBeInTheDocument();
+      // Neither the inert invalid host nor the board renders while resolving.
+      expect(container.querySelector('[data-tg-react-backlog="invalid-project"]')).toBeNull();
+      expect(screen.queryByTestId('dnd-context')).toBeNull();
+    });
+
+    it('renders the board once the slug resolves to a valid project id', () => {
+      // A resolved valid id (from the by_slug lookup) drives a normal render
+      // even though NO numeric `project-id` attribute was supplied.
+      mockUseResolvedProjectId.mockReturnValue({
+        projectId: 7,
+        projectIdValid: true,
+        resolving: false,
+      });
+
+      renderApp(undefined as unknown as string, 'proj-7');
+
+      // The resolved id flows into the backlog hook, and the invalid/resolving
+      // hosts are absent.
+      expect(useBacklog).toHaveBeenCalledWith(7);
+    });
+  });
+
   describe('project not yet loaded (project === null)', () => {
-    // The authored container has NO dedicated loading affordance; while the
-    // project is still loading (`project === null`) it simply gates the board,
-    // DnD context, sprints and bulk-create lightbox off. This asserts that
-    // authored gating rather than inventing a loading spinner.
-    it('gates the DnD context, table, sprints and bulk lightbox off', () => {
+    // Group B fix (dest#3): the <BacklogDndContext> provider was lifted up to
+    // <main> so a SINGLE provider encloses BOTH the backlog list AND the sprint
+    // sidebar, which is what makes the sprint drop zones reachable. As a
+    // consequence the provider now renders even during the pre-load window
+    // (`project === null`) — but it is INERT then: every draggable/droppable
+    // CONSUMER (the table, the sprints, the bulk-create lightbox) keeps its own
+    // `{project && …}` guard and stays gated off until the project loads. This
+    // asserts that corrected behavior rather than the pre-fix "provider gated on
+    // project" behavior.
+    it('renders an inert DnD provider but gates table, sprints and bulk lightbox off', () => {
       // beforeEach already primed the default state with project === null.
       renderApp();
 
-      expect(screen.queryByTestId('dnd-context')).toBeNull();
+      // The lifted provider renders even before the project loads...
+      expect(screen.queryByTestId('dnd-context')).not.toBeNull();
+      // ...but every draggable/droppable consumer remains gated off, so nothing
+      // is actually draggable until the project (and its data) has loaded.
       expect(screen.queryByTestId('backlog-table')).toBeNull();
       expect(screen.queryAllByTestId('sprint')).toHaveLength(0);
       expect(screen.queryByTestId('bulk-create-us-lightbox')).toBeNull();
@@ -483,6 +584,56 @@ describe('BacklogApp', () => {
 
       expect(() => renderApp()).not.toThrow();
       expect(screen.getAllByTestId('sprint')).toHaveLength(2);
+    });
+  });
+
+  describe('drag/mutation error toast (F-AAP-03, dest#8)', () => {
+    const MOVE_ERR =
+      'The story order could not be saved. The board has been refreshed to the latest server state.';
+
+    it('does NOT render the error toast when moveError is null', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        sprints: [makeMilestone()],
+        moveError: null,
+      });
+
+      const { container } = renderApp();
+      expect(container.querySelector('.notification-message-error')).toBeNull();
+    });
+
+    it('renders a dismissible error toast with the message when moveError is set', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        sprints: [makeMilestone()],
+        moveError: MOVE_ERR,
+      });
+
+      const { container } = renderApp();
+
+      const toast = container.querySelector('.notification-message-error');
+      expect(toast).not.toBeNull();
+      // The user-facing message is shown verbatim.
+      expect(screen.getByText(MOVE_ERR)).toBeInTheDocument();
+    });
+
+    it('clears the error via the hook when the toast is dismissed', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        sprints: [makeMilestone()],
+        moveError: MOVE_ERR,
+      });
+
+      renderApp();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }));
+      expect(stubActions.clearMoveError).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -674,21 +825,94 @@ describe('BacklogApp', () => {
       ).toHaveAttribute('data-open', 'true');
     });
 
-    it('the standard "Add" button is a deferred no-op (does NOT open the bulk lightbox)', () => {
-      renderEditable({
-        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
-      });
-
-      // The first `.new-us` button is the standard "Add" (genericform:new, OOS).
+    /*
+     * C2 (dest#5): the standard "Add" is NO LONGER a no-op. It reveals an inline
+     * single-story create input (distinct from the bulk lightbox) that POSTs to
+     * `/userstories` on submit. These specs assert THAT corrected behaviour
+     * (aligned to the authoritative `dest_` report Issue 5). The two create paths
+     * stay distinct: standard reveals the inline form; only bulk opens the lightbox.
+     */
+    /** Click the standard "Add" button (the first button in `.new-us`). */
+    function clickStandardAdd(): void {
       const addButton = within(
         document.querySelector('.new-us') as HTMLElement,
       ).getAllByRole('button')[0];
       fireEvent.click(addButton);
+    }
 
-      // Standard create must NOT hijack the bulk lightbox (the prior-cut bug).
-      expect(
-        screen.getByTestId('bulk-create-us-lightbox'),
-      ).toHaveAttribute('data-open', 'false');
+    it('the standard "Add" button reveals the inline create form WITHOUT opening the bulk lightbox', () => {
+      renderEditable({
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
+      });
+
+      // No inline form until "Add" is clicked.
+      expect(document.querySelector('form.new-us-inline')).toBeNull();
+
+      clickStandardAdd();
+
+      // The inline create input is now revealed…
+      expect(document.querySelector('form.new-us-inline')).not.toBeNull();
+      expect(screen.getByLabelText('New user story subject')).toBeInTheDocument();
+      // …and standard create must NOT hijack the bulk lightbox (paths stay distinct).
+      expect(screen.getByTestId('bulk-create-us-lightbox')).toHaveAttribute(
+        'data-open',
+        'false',
+      );
+      expect(mockCreateUserStory).not.toHaveBeenCalled();
+    });
+
+    it('submitting the inline form POSTs a single story to /userstories, then refreshes the list + stats and closes', async () => {
+      renderEditable({
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
+      });
+
+      clickStandardAdd();
+      const input = screen.getByLabelText('New user story subject') as HTMLInputElement;
+      fireEvent.change(input, { target: { value: '  New story from React  ' } });
+
+      await act(async () => {
+        fireEvent.submit(document.querySelector('form.new-us-inline') as HTMLElement);
+        // Settle the async create -> refresh chain (createUserStory is mocked to resolve).
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // The subject is trimmed and the payload carries the resolved project id (7).
+      expect(mockCreateUserStory).toHaveBeenCalledTimes(1);
+      expect(mockCreateUserStory).toHaveBeenCalledWith({
+        project: 7,
+        subject: 'New story from React',
+      });
+      // The list + stats refresh so the new row appears (parity with `usform:new:success`).
+      expect(stubActions.reloadUserstories).toHaveBeenCalledTimes(1);
+      expect(stubActions.reloadStats).toHaveBeenCalledTimes(1);
+      // The inline form closes on success; the bulk lightbox was never opened.
+      expect(document.querySelector('form.new-us-inline')).toBeNull();
+      expect(screen.getByTestId('bulk-create-us-lightbox')).toHaveAttribute(
+        'data-open',
+        'false',
+      );
+    });
+
+    it('the inline create form is dismissed by Cancel and by Escape without posting', () => {
+      renderEditable({
+        my_permissions: ['view_project', 'view_us', 'modify_us', 'add_us'],
+      });
+
+      // Cancel button dismisses the form.
+      clickStandardAdd();
+      expect(document.querySelector('form.new-us-inline')).not.toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(document.querySelector('form.new-us-inline')).toBeNull();
+
+      // Escape on the subject input also dismisses it.
+      clickStandardAdd();
+      const input = screen.getByLabelText('New user story subject');
+      fireEvent.keyDown(input, { key: 'Escape' });
+      expect(document.querySelector('form.new-us-inline')).toBeNull();
+
+      // Neither dismissal posted anything.
+      expect(mockCreateUserStory).not.toHaveBeenCalled();
     });
   });
 
@@ -820,6 +1044,46 @@ describe('BacklogApp', () => {
       const { container } = renderApp();
 
       expect(container.querySelector('.empty-burndown')).not.toBeNull();
+    });
+
+    it('renders the BurndownChart SVG inside .burndown once stats.milestones arrive (dest#6)', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats({
+          showGraphPlaceholder: false,
+          milestones: [
+            { name: 'Sprint A', optimal: 100, evolution: 100, 'team-increment': 0, 'client-increment': 0 },
+            { name: 'Sprint B', optimal: 50, evolution: 60, 'team-increment': 0, 'client-increment': 0 },
+          ],
+        }),
+      });
+      const { container } = renderApp();
+
+      // The chart mounts inside the retained `.burndown` container — no longer
+      // an empty placeholder (QA dest#6 / w023#4).
+      const burndown = container.querySelector('.js-burndown-graph .burndown');
+      expect(burndown).not.toBeNull();
+      const svg = burndown?.querySelector('svg.burndown-graph');
+      expect(svg).not.toBeNull();
+      // Optimal series has one marker per milestone (2).
+      expect(svg?.querySelectorAll('.burndown-series-optimal circle')).toHaveLength(2);
+    });
+
+    it('leaves .burndown empty (no SVG) while stats.milestones is absent', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        stats: makeStats({ showGraphPlaceholder: false }),
+      });
+      const { container } = renderApp();
+
+      const burndown = container.querySelector('.js-burndown-graph .burndown');
+      expect(burndown).not.toBeNull();
+      // No milestones in this fixture → the chart renders nothing (guard parity).
+      expect(burndown?.querySelector('svg')).toBeNull();
     });
   });
 

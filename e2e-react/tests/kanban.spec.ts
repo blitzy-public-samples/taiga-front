@@ -95,8 +95,20 @@ const columns = (page: Page): Locator =>
 /** The `tg-card`s inside a given column index (legacy `kanbanHelper.getBoxUss`). */
 const columnCards = (page: Page, i: number): Locator => columns(page).nth(i).locator('tg-card');
 
-/** Every `tg-card` on the board (legacy `kanbanHelper.getUss`; React reuses `tg-card`). */
-const allCards = (page: Page): Locator => page.locator('tg-card');
+/**
+ * Every `tg-card` ON THE BOARD (legacy `kanbanHelper.getUss`; React reuses
+ * `tg-card`). Scoped to cards INSIDE a status column (via the phase-aware
+ * `columns` locator) rather than a document-wide `tg-card` query. This is both
+ * semantically correct ("cards rendered on the board") and robust to the
+ * transient @dnd-kit `DragOverlay` clone: while a card is being dragged, dnd-kit
+ * portals a `tg-card` CLONE to `document.body` (outside every column) so it can
+ * escape the columns' overflow clipping. A document-wide count would therefore
+ * momentarily read one extra card immediately after a drag (the clone is removed
+ * on the next React tick), spuriously inflating a following net-zero assertion.
+ * Restricting the count to in-column cards excludes that ephemeral clone while
+ * still reflecting exactly the cards a user sees on the board.
+ */
+const allCards = (page: Page): Locator => columns(page).locator('tg-card');
 
 /** Vertically-folded columns (`.vfold` on the column header, both phases). */
 const foldedColumns = (page: Page): Locator => page.locator('.task-colum-name.vfold');

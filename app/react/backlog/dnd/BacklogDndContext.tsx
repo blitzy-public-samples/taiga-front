@@ -92,7 +92,13 @@ export type BacklogDroppableData =
   | { type: 'sprint'; sprintId: number };
 
 export interface BacklogDndContextProps {
-  project: Project;
+  // Group B fix (dest#3): widened to `Project | null` so the single lifted
+  // <BacklogDndContext> provider (which now encloses BOTH the backlog list and
+  // the sprint sidebar) can render during the pre-load window when `project` is
+  // still null. No draggables/droppables exist until data arrives, and the
+  // `draggable` gate below (isBoardDraggable) already accepts null, so an inert
+  // provider is safe. Individual consumers keep their own `{project && …}` guards.
+  project: Project | null;
   canModifyUs: boolean; // BacklogApp passes canModifyUs(project); also gated by isBoardDraggable below
   userstories: UserStory[]; // backlog-order user stories (the backlog container list)
   sprints: Milestone[]; // sprints rendered as droppable containers (each has user_stories in sprint_order)
@@ -266,9 +272,22 @@ export function BacklogDndContext(props: BacklogDndContextProps) {
     [userstories, sprints],
   );
 
-  // Sensors are ALWAYS constructed (hook-rules); pass [] to DndContext when the
-  // board is read-only so no drag can start. PointerSensor distance:8 preserves
-  // click-vs-drag; KeyboardSensor is the sole net-new (accessibility) behavior.
+  // Sensors are ALWAYS constructed (hook-rules) and ALWAYS passed to DndContext
+  // as a CONSTANT-LENGTH array. Group B fix (dest#3): the provider is now lifted
+  // to enclose the sprint sidebar and therefore also renders during the pre-load
+  // window (project === null → draggable false). The previous code switched the
+  // `sensors` prop between `[]` and the 2-sensor array based on `draggable`;
+  // once the provider rendered before load, that made the array length flip 0→2
+  // when the project arrived, which @dnd-kit's DndContext feeds into an internal
+  // useEffect dependency list — React then warns "the final argument passed to
+  // useEffect changed size between renders". Passing a constant-length array
+  // eliminates that warning. Read-only gating is fully preserved WITHOUT the
+  // switch: every draggable row is `disabled: !canMutate(project,'modify_us')`
+  // (archive-aware, BacklogTable.tsx / Sprint.tsx), which is IDENTICAL to the
+  // board-level `draggable` below, so no drag can start on a read-only/archived
+  // board; `handleDragEnd` also early-returns on `!draggable` as defense in depth.
+  // PointerSensor distance:8 preserves click-vs-drag; KeyboardSensor is the sole
+  // net-new (accessibility) behavior.
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor),
@@ -329,6 +348,13 @@ export function BacklogDndContext(props: BacklogDndContextProps) {
       const dragged = draggedIds;
       setActiveId(null);
       setDraggedIds([]);
+      // Board-level read-only gate (defense in depth). Now that `sensors` is a
+      // constant-length array (see comment above), this preserves the explicit
+      // board-level gate the old `sensors={draggable ? sensors : []}` switch
+      // provided: on a read-only/archived board (`!draggable`) no move is
+      // persisted. In practice disabled rows never start a drag, so this is a
+      // belt-and-suspenders guard that keeps `modify_us`/archived parity exact.
+      if (!draggable) return;
       if (!over) return; // dropped outside any container
 
       const activeData = active.data.current as BacklogDraggableData | undefined;
@@ -364,7 +390,7 @@ export function BacklogDndContext(props: BacklogDndContextProps) {
 
       onMove(payload);
     },
-    [draggedIds, selectedUsIds, orderedIdsFor, usById, onMove],
+    [draggable, draggedIds, selectedUsIds, orderedIdsFor, usById, onMove],
   );
 
   const handleDragCancel = useCallback(() => {
@@ -383,7 +409,7 @@ export function BacklogDndContext(props: BacklogDndContextProps) {
   // hook class so it stays decoupled from the row component.
   return (
     <DndContext
-      sensors={draggable ? sensors : []}
+      sensors={sensors}
       collisionDetection={collisionDetection}
       autoScroll={{ enabled: true }}
       onDragStart={handleDragStart}

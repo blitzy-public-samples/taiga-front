@@ -50,7 +50,7 @@
  */
 
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import type { FC, ChangeEvent } from 'react';
+import type { FC, ChangeEvent, FormEvent, KeyboardEvent } from 'react';
 
 import { useBacklog } from './state/useBacklog';
 import { BacklogDndContext } from './dnd/BacklogDndContext';
@@ -58,6 +58,7 @@ import type { BacklogMovePayload } from './dnd/BacklogDndContext';
 import { BacklogTable } from './components/BacklogTable';
 import { Sprint } from './components/Sprint';
 import { ProgressBar } from './components/ProgressBar';
+import { BurndownChart } from './components/BurndownChart';
 import { CreateEditSprintLightbox } from './components/CreateEditSprintLightbox';
 import { BulkCreateUsLightbox } from './components/BulkCreateUsLightbox';
 // F-CQ-06: the sidebar filter panel. `FiltersSidebar` is the presentational port
@@ -77,9 +78,15 @@ import {
 } from '../shared/filters';
 import type { FilterCategory, SelectedFilter } from '../shared/filters';
 import { canModifyUs, canAddUs, canAddMilestone, canMutate } from '../shared/permissions';
+// C2 fix (dest#5): the standard single-story create action. The deleted Backlog
+// controller delegated `genericform:new` to the common-module lightbox (OOS,
+// AAP §0.2.2); we call the same `/api/v1/userstories` endpoint directly.
+import { createUserStory } from '../shared/api/userstories';
+import { useResolvedProjectId } from '../shared/useResolvedProjectId';
 // F-UI-02: the ONE shared SVG-sprite icon primitive (replaces the container's
 // broken empty-span placeholder).
 import { TgIcon } from '../shared/icon';
+import { NotificationError } from '../shared/NotificationError';
 import type { Project, UserStory, Milestone, Status, FilterOption } from '../shared/types';
 
 /* ========================================================================== *
@@ -182,15 +189,18 @@ function formatNumber(value: unknown): string {
  * ========================================================================== */
 
 export const BacklogApp: FC<BacklogAppProps> = (props) => {
-    // Coerce the string `project-id` attribute to a number ONCE (mount passes
-    // strings). A valid project id must be a POSITIVE INTEGER (F-REG-01):
-    // `Number.isInteger(...) && > 0` rejects the literal `"{{project.id}}"`
-    // snapshot (NaN), a blank/absent attribute (`Number("")` -> 0) and any
-    // non-positive/fractional value. When AngularJS later resolves the
-    // interpolation, `attributeChangedCallback` in shared/mount.tsx re-renders
-    // with the real id and this guard then passes.
-    const projectId = Number(props.projectId);
-    const projectIdValid = Number.isInteger(projectId) && projectId > 0;
+    // F-REG-01 (blank board): the host `<tg-react-backlog project-id="{{project.id}}"
+    // project-slug="{{project.slug}}">` receives EMPTY attributes because the deleted
+    // Backlog controller no longer populates the AngularJS `project` scope var (AAP
+    // §0.2.1) — exactly what the `backlog.jade` host comment anticipates ("React
+    // self-resolves the project from URL/session"). `useResolvedProjectId` performs
+    // that resolution: a valid `project-id` attribute is used directly; otherwise the
+    // slug is derived from the URL (`/project/<slug>/backlog`) and resolved via `GET
+    // /projects/by_slug` (the same endpoint the AngularJS shell uses). `resolving` is
+    // true only while the lookup is in flight so the render below shows a loading
+    // shell instead of a permanent blank backlog.
+    const { projectId, projectIdValid, resolving: projectResolving } =
+        useResolvedProjectId(props);
 
     // The effectful Backlog state hook (data load + WebSocket subscription +
     // thunks). Called UNCONDITIONALLY (Rules of Hooks); when `projectId` is not
@@ -223,6 +233,11 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         // F-AAP-10: distinguish a genuine load FAILURE from a legitimately empty
         // backlog so the container can render an error state (with retry).
         loadError,
+        // F-AAP-03 (dest#8): the user-facing message set when a drag reorder /
+        // move / single-story mutation write is rejected. Rendered as a
+        // dismissible <NotificationError> toast; the hook has already reconciled
+        // the board to server truth, so this only tells the user WHY it reverted.
+        moveError,
     } = state;
 
     /* ---- Local UI state (the ephemeral view state the AngularJS controller
@@ -231,6 +246,16 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     // Which lightbox is open + the sprint being edited (edit mode only).
     const [lightbox, setLightbox] = useState<LightboxKind>('none');
     const [editingSprint, setEditingSprint] = useState<Milestone | null>(null);
+
+    // C2 fix (dest#5): standard single-story create. `addNewUs('standard')` now
+    // reveals a visible inline create input (the dest report's required UX;
+    // `standardCreateOpen`), whose subject is submitted to `POST /userstories`.
+    // `creatingUs` guards against re-entrant submits; `createUsError` surfaces a
+    // backend rejection inline without closing the input.
+    const [standardCreateOpen, setStandardCreateOpen] = useState(false);
+    const [newUsSubject, setNewUsSubject] = useState('');
+    const [creatingUs, setCreatingUs] = useState(false);
+    const [createUsError, setCreateUsError] = useState<string | null>(null);
 
     // Checked backlog rows (drives the move-to-sprint toolbar + multi-drag).
     const [checkedIds, setCheckedIds] = useState<number[]>([]);
@@ -349,20 +374,87 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
      * ====================================================================== */
 
     // addNewUs (main.coffee:683-691). F-CQ-03 — the two create paths are NOT
-    // interchangeable:
+    // interchangeable and must open DISTINCT surfaces (routing 'standard' to the
+    // bulk lightbox — the prior cut — was WRONG):
     //   - 'standard' broadcast `genericform:new` -> the COMMON module's generic
-    //     US form (AAP §0.2.2 common OOS; §0.4.1 defines no React standard-create
-    //     component). It is a DEFERRED no-op; the still-AngularJS shell provides
-    //     the standard create dialog. Routing it to the bulk lightbox (the prior
-    //     cut) was WRONG — the two dialogs are distinct.
+    //     US form (AAP §0.2.2 common OOS; its Jade/controller were deleted). C2
+    //     fix (dest#5) reveals an in-scope inline create input that POSTs a single
+    //     story to the SAME `/userstories` endpoint (contract unchanged).
     //   - 'bulk' broadcast `usform:bulk` -> the in-scope `BulkCreateUsLightbox`
-    //     (AAP §0.4.1), the ONLY migrated create surface.
+    //     (AAP §0.4.1), posting to `/userstories/bulk_create`.
     const addNewUs = useCallback((type: 'standard' | 'bulk') => {
         if (type === 'bulk') {
             setLightbox('bulk-us');
+            return;
         }
-        // 'standard' is a deferred no-op (genericform:new, common OOS).
+        // C2 fix (dest#5): 'standard' single-create. The AngularJS controller
+        // broadcast `genericform:new` to open the common-module US form; that
+        // module is OOS (AAP §0.2.2) and its Jade/controller were deleted, so we
+        // reveal an inline create input in React and POST to the same
+        // `/userstories` endpoint on submit (contract unchanged).
+        setCreateUsError(null);
+        setNewUsSubject('');
+        setStandardCreateOpen(true);
     }, []);
+
+    // C2 fix (dest#5): submit the inline standard-create form. Posts a single
+    // user story to `/userstories` (project + subject; the backend applies the
+    // project's `default_us_status`), then refreshes the backlog list + stats —
+    // the React equivalent of the AngularJS `usform:new:success` handler which
+    // reloaded the backlog so the new row appears with its server-assigned
+    // fields (ref, status, order, points). Empty/whitespace subjects are ignored
+    // and `creatingUs` debounces re-entrant submits (mirrors the legacy 2s
+    // submit debounce).
+    const handleSubmitStandardUs = useCallback(
+        async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+            event.preventDefault();
+            const subject = newUsSubject.trim();
+            if (!subject || creatingUs) {
+                return;
+            }
+            if (!Number.isInteger(projectId) || projectId <= 0) {
+                return;
+            }
+            setCreatingUs(true);
+            setCreateUsError(null);
+            try {
+                await createUserStory({ project: projectId, subject });
+                actions.reloadUserstories();
+                actions.reloadStats();
+                setNewUsSubject('');
+                setStandardCreateOpen(false);
+            } catch (err) {
+                setCreateUsError(
+                    err instanceof Error
+                        ? err.message
+                        : 'Could not create the user story.',
+                );
+            } finally {
+                setCreatingUs(false);
+            }
+        },
+        [newUsSubject, creatingUs, projectId, actions],
+    );
+
+    // C2 fix (dest#5): dismiss the inline create input without submitting
+    // (Cancel button / Escape key).
+    const handleCancelStandardCreate = useCallback(() => {
+        setStandardCreateOpen(false);
+        setNewUsSubject('');
+        setCreateUsError(null);
+    }, []);
+
+    // C2 fix (dest#5): Escape closes the inline create input (parity with the
+    // lightboxes' Escape-to-close afforded by `useModalDialog`).
+    const handleStandardCreateKeyDown = useCallback(
+        (event: KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                handleCancelStandardCreate();
+            }
+        },
+        [handleCancelStandardCreate],
+    );
 
     // addNewSprint (main.coffee:693-694) -> open the sprint lightbox in create mode.
     const addNewSprint = useCallback(() => {
@@ -738,7 +830,20 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
      * Guards (rendered AFTER every hook so hook order stays stable)
      * ====================================================================== */
 
-    // A malformed `project-id` attribute: render a minimal, inert host.
+    // F-REG-01: while the project id is being resolved from the URL slug via `GET
+    // /projects/by_slug`, render a transient, accessible LOADING shell so the
+    // backlog is never a permanent blank during the lookup.
+    if (!projectIdValid && projectResolving) {
+        return (
+            <div className="wrapper" data-tg-react-backlog="resolving" aria-busy="true">
+                <div className="loading-spinner" role="status" aria-live="polite">
+                    <span>Loading...</span>
+                </div>
+            </div>
+        );
+    }
+
+    // A malformed / unresolvable `project-id`: render a minimal, inert host.
     if (!projectIdValid) {
         return <div className="wrapper" data-tg-react-backlog="invalid-project" />;
     }
@@ -797,6 +902,40 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     return (
         <div className="wrapper">
             <main className="main scrum">
+                {/*
+                  F-AAP-03 (dest#8): dismissible error toast for a REJECTED drag
+                  reorder / move / single-story mutation. Previously the hook set
+                  `moveError` and silently reconciled the board, so the user got no
+                  feedback. It reuses Taiga's existing global error-banner SCSS
+                  (.notification-message-error) and is fixed-positioned, so its
+                  placement in the tree is layout-neutral; it renders nothing while
+                  `moveError` is null. Dismiss clears the state (board already
+                  reconciled to server truth at failure time).
+                */}
+                <NotificationError message={moveError} onClose={actions.clearMoveError} />
+                {/*
+                  Group B fix (dest#3): a SINGLE <BacklogDndContext> provider now
+                  encloses BOTH the backlog <section> (draggable story rows via
+                  <BacklogTable>) AND the sprint sidebar (<Sprint> drop zones of
+                  type:'sprint';sprintId). Previously the provider wrapped only
+                  <BacklogTable>, so the sprint drop targets had no @dnd-kit
+                  ancestor at runtime and dropping a story into a sprint
+                  (bulk_update_milestone) was unreachable. Lifting the boundary is
+                  layout-neutral: @dnd-kit's <DndContext> renders no DOM wrapper and
+                  <DragOverlay> is a portal/overlay. `project` may be null before
+                  load (prop widened to Project|null); the provider is inert then
+                  (no draggables/droppables exist yet). Each consumer keeps its own
+                  `{project && …}` guard, so BacklogTable/Sprint still receive a
+                  non-null project.
+                */}
+                <BacklogDndContext
+                    project={project}
+                    canModifyUs={mayModifyUs}
+                    userstories={userstories}
+                    sprints={sprints}
+                    selectedUsIds={checkedIds}
+                    onMove={handleMove}
+                >
                 <section className="backlog">
                     {/*
                       Burndown / summary region (tg-toggle-burndown-visibility).
@@ -875,35 +1014,30 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                         )}
 
                         {/*
-                          Burndown CHART (the plotted graph) — DEFERRED per the
-                          frozen AAP, not an omission:
-                            - The AAP React component manifest (§0.3.1) lists the
-                              backlog components explicitly (BacklogTable, Sprint,
-                              SprintHeader, ProgressBar, UsEditSelector,
-                              UsRolePointsSelector, CreateEditSprintLightbox,
-                              BulkCreateUsLightbox) — there is NO burndown-chart
-                              component among them.
-                            - The legacy chart (`tgBurndownBacklogGraph`, retired
-                              backlog/main.coffee:1217-1338) rendered via the
-                              jQuery Flot plugin (`element.plot(data, options)`).
-                              Flot / any charting library is NOT in the AAP React
-                              dependency inventory (§0.5.1), and the Minimal Change
-                              Clause (§0.7.1) forbids adding dependencies beyond
-                              the migration requirements.
-                            - `burndown.scss` is retained as REFERENCE (§0.2.1),
-                              so the collapsible container, the toggle button, the
-                              admin `empty-burndown` hint and the collapse state
-                              (F-CQ-04 collapse) are all reproduced faithfully for
-                              layout parity; only the plotted series are absent.
-                          The collapse classes (`shown open`) and the toggle above
-                          remain fully functional.
+                          Burndown CHART (the plotted graph). QA dest#6 / w023#4:
+                          the legacy chart (`tgBurndownBacklogGraph`, retired
+                          backlog/main.coffee) plotted five series via the jQuery
+                          Flot plugin (`element.plot(data, options)`). Flot — or
+                          any charting library — is NOT in the AAP React dependency
+                          inventory (§0.5.1) and the Minimal Change Clause (§0.7.1)
+                          forbids adding one, so `BurndownChart` reproduces the SAME
+                          five series (zero baseline, optimal, evolution, client &
+                          team increments) as a dependency-free inline SVG. It reads
+                          the ALREADY-fetched `stats.milestones` slice
+                          (`useBacklog.reloadStats` → GET /projects/{id}/stats), so
+                          no new burndown-data request and no contract change are
+                          introduced. `burndown.scss` is retained as REFERENCE
+                          (§0.2.1); the collapse classes (`shown open`) + toggle
+                          above and the admin `empty-burndown` hint remain intact.
                         */}
                         <div
                             className={`graphics-container js-burndown-graph${
                                 burndownCollapsed ? '' : ' shown open'
                             }`}
                         >
-                            <div className="burndown" />
+                            <div className="burndown">
+                                <BurndownChart milestones={stats?.milestones} />
+                            </div>
                         </div>
                     </div>
 
@@ -1059,6 +1193,59 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             </div>
                         </div>
 
+                        {/* C2 fix (dest#5): inline standard single-story create
+                            input. Revealed by the "Add" button
+                            (`addNewUs('standard')`) and the empty-state
+                            "Create your first user story" button; the subject is
+                            submitted to `POST /userstories` on Enter / Create.
+                            This is the visible React create input that replaces
+                            the deleted common-module `genericform:new` lightbox
+                            (OOS, AAP §0.2.2) while preserving the create behavior
+                            the AngularJS Backlog offered. */}
+                        {standardCreateOpen && (
+                            <form
+                                className="new-us-inline"
+                                onSubmit={handleSubmitStandardUs}
+                            >
+                                <input
+                                    type="text"
+                                    className="new-us-inline-subject"
+                                    name="new-us-subject"
+                                    aria-label="New user story subject"
+                                    placeholder="New user story subject"
+                                    value={newUsSubject}
+                                    onChange={(e) => setNewUsSubject(e.target.value)}
+                                    onKeyDown={handleStandardCreateKeyDown}
+                                    disabled={creatingUs}
+                                    autoFocus
+                                />
+                                <button
+                                    type="submit"
+                                    className="btn-small"
+                                    disabled={
+                                        creatingUs || newUsSubject.trim().length === 0
+                                    }
+                                >
+                                    <span className="text">
+                                        {creatingUs ? 'Creating…' : 'Create'}
+                                    </span>
+                                </button>
+                                <button
+                                    type="button"
+                                    className="btn-small btn-cancel"
+                                    onClick={handleCancelStandardCreate}
+                                    disabled={creatingUs}
+                                >
+                                    <span className="text">Cancel</span>
+                                </button>
+                                {createUsError && (
+                                    <span className="new-us-inline-error" role="alert">
+                                        {createUsError}
+                                    </span>
+                                )}
+                            </form>
+                        )}
+
                         <div className={`backlog-manager${filtersSidebarOpen ? '' : ' expanded'}`}>
                             {filtersSidebarOpen && (
                                 <div className="backlog-filter" id="backlog-filter">
@@ -1091,15 +1278,12 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             <section
                                 className={`backlog-table${userstories.length === 0 ? ' hidden' : ''}`}
                             >
+                                {/* Group B fix (dest#3): the <BacklogDndContext>
+                                    provider was lifted up to <main> (see comment
+                                    there) so it also encloses the sprint sidebar.
+                                    <BacklogTable> keeps its own `{project && …}`
+                                    guard so it still receives a non-null project. */}
                                 {project && (
-                                    <BacklogDndContext
-                                        project={project}
-                                        canModifyUs={mayModifyUs}
-                                        userstories={userstories}
-                                        sprints={sprints}
-                                        selectedUsIds={checkedIds}
-                                        onMove={handleMove}
-                                    >
                                         <BacklogTable
                                             userstories={userstories}
                                             statuses={usStatusList}
@@ -1129,7 +1313,6 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                             onUpdateStatus={handleUpdateStatus}
                                             onUpdatePoints={handleUpdatePoints}
                                         />
-                                    </BacklogDndContext>
                                 )}
 
                                 {displayVelocity && (
@@ -1263,39 +1446,53 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             ))}
                     </section>
                 </div>
+                </BacklogDndContext>
             </main>
 
-            {/* Lightboxes (hosted at the wrapper level, toggled by container state). */}
-            <div className="lightbox lightbox-generic-bulk">
-                {project && (
-                    <BulkCreateUsLightbox
-                        open={lightbox === 'bulk-us'}
-                        projectId={projectId}
-                        defaultStatusId={defaultUsStatus}
-                        statuses={usStatusList}
-                        swimlanes={swimlanesList}
-                        isKanbanActivated={isKanbanActivated}
-                        defaultSwimlane={defaultSwimlane}
-                        onSuccess={handleBulkSuccess}
-                        onClose={closeLightbox}
-                    />
-                )}
-            </div>
-
-            <div className="lightbox lightbox-sprint-add-edit">
-                <CreateEditSprintLightbox
-                    open={lightbox === 'sprint-create' || lightbox === 'sprint-edit'}
-                    mode={lightbox === 'sprint-edit' ? 'edit' : 'create'}
-                    sprint={editingSprint}
+            {/*
+             * Lightboxes (toggled by container state via the `lightbox` value).
+             *
+             * Group D fix (dest#7 / w023#5): each inner lightbox component already
+             * renders its OWN `.lightbox lightbox-<type>` root element, toggling the
+             * `open` class itself (`className={`lightbox …${open ? ' open' : ''}`}`)
+             * and wiring `role="dialog"` + `aria-modal` + `useModalDialog` (focus
+             * trap, Escape-to-close, focus restoration). Previously these components
+             * were wrapped in a STATIC outer `<div className="lightbox lightbox-…">`
+             * that carried the `lightbox` class WITHOUT `open`. Per the shared
+             * `@mixin lightbox` (styles/dependencies/mixins/lightbox.scss) a bare
+             * `.lightbox` is `display:none`, and a `display:none` ancestor removes its
+             * whole subtree from layout — so even though the inner element correctly
+             * became `.lightbox.open` (`display:flex`), it was collapsed to a 0×0,
+             * invisible box and could never be seen or interacted with. Removing the
+             * redundant outer wrappers lets each inner component's own `.lightbox.open`
+             * root be the top-level lightbox element and render full-screen as designed.
+             */}
+            {project && (
+                <BulkCreateUsLightbox
+                    open={lightbox === 'bulk-us'}
                     projectId={projectId}
-                    canDeleteMilestone={mayDeleteMilestone}
-                    lastSprint={lastSprint}
-                    onCreated={handleSprintCreated}
-                    onSaved={handleSprintSaved}
-                    onRemoved={handleSprintRemoved}
+                    defaultStatusId={defaultUsStatus}
+                    statuses={usStatusList}
+                    swimlanes={swimlanesList}
+                    isKanbanActivated={isKanbanActivated}
+                    defaultSwimlane={defaultSwimlane}
+                    onSuccess={handleBulkSuccess}
                     onClose={closeLightbox}
                 />
-            </div>
+            )}
+
+            <CreateEditSprintLightbox
+                open={lightbox === 'sprint-create' || lightbox === 'sprint-edit'}
+                mode={lightbox === 'sprint-edit' ? 'edit' : 'create'}
+                sprint={editingSprint}
+                projectId={projectId}
+                canDeleteMilestone={mayDeleteMilestone}
+                lastSprint={lastSprint}
+                onCreated={handleSprintCreated}
+                onSaved={handleSprintSaved}
+                onRemoved={handleSprintRemoved}
+                onClose={closeLightbox}
+            />
         </div>
     );
 };

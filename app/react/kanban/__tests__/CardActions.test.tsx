@@ -302,6 +302,47 @@ describe('popover open/close', () => {
         expect(queryPopover()).toBeNull();
         expect(trigger).not.toHaveClass('popover-open');
     });
+
+    it('dismisses on an Escape keydown', () => {
+        // Escape-to-close: the React port registers a document-level `keydown`
+        // listener while open (matching the Backlog popovers' keyboard-dismiss
+        // convention). Pressing Escape closes the menu and clears popover-open.
+        const item = makeBoardCard();
+        const project = makeProject({ my_permissions: ['modify_us'] });
+
+        const { container } = render(
+            <CardActions item={item} project={project} zoomLevel={1} />,
+        );
+
+        const trigger = getTrigger(container);
+        fireEvent.click(trigger);
+        expect(queryPopover()).toBeInTheDocument();
+
+        fireEvent.keyDown(document, { key: 'Escape' });
+
+        expect(queryPopover()).toBeNull();
+        expect(trigger).not.toHaveClass('popover-open');
+    });
+
+    it('keeps the popover open on a non-Escape keydown', () => {
+        // Only Escape dismisses; other keys (e.g. ArrowDown) must leave the
+        // menu open so the listener does not over-trigger.
+        const item = makeBoardCard();
+        const project = makeProject({ my_permissions: ['modify_us'] });
+
+        const { container } = render(
+            <CardActions item={item} project={project} zoomLevel={1} />,
+        );
+
+        const trigger = getTrigger(container);
+        fireEvent.click(trigger);
+        expect(queryPopover()).toBeInTheDocument();
+
+        fireEvent.keyDown(document, { key: 'ArrowDown' });
+
+        expect(queryPopover()).toBeInTheDocument();
+        expect(trigger).toHaveClass('popover-open');
+    });
 });
 
 /* ========================================================================== *
