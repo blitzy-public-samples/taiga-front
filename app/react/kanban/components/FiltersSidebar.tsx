@@ -313,6 +313,8 @@ export function FiltersSidebar(props: FiltersSidebarProps): ReactElement {
             }}
           >
             <input
+              id="custom-filter-name"
+              name="custom-filter-name"
               className={`add-filter-input e2e-filter-name-input${
                 lengthZeroError || repeatedFilterError ? ' checksley-error' : ''
               }`}

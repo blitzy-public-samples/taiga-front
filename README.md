@@ -130,6 +130,10 @@ The migrated Kanban and Backlog screens are React 18; every other screen is stil
     engines at once, keeping the primary before/after evidence single-engine and
     deterministic.
 
+    On a clean host, provision the Playwright browser once before the first run
+    with `npx playwright install firefox` (Firefox is the primary engine; add
+    `chromium` if you intend to use the opt-in fallback).
+
     The e2e layer requires the full Taiga stack running (`taiga-back` plus the
     built `taiga-front` served by nginx on host port 9000). It reads the login
     credential from the `TAIGA_ADMIN_PASSWORD` environment variable, falling back

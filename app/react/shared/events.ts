@@ -180,6 +180,18 @@ class EventsBridge {
      */
     private readonly subscriptions = new Map<string, Set<EventCallback>>();
 
+    /**
+     * Routing key → the subscription `options` supplied by its FIRST subscriber
+     * (e.g. `{ selfNotification: true }` for the backlog `.milestones` key).
+     * Retained ALONGSIDE {@link subscriptions} so that, on an automatic
+     * reconnect, {@link onOpen} can re-emit each `subscribe` frame with its
+     * original options — the server treats a reconnect as a brand-new
+     * connection and has no memory of the prior subscriptions. Kept in lock-step
+     * with {@link subscriptions}: an entry is written when a key's first
+     * listener registers and deleted when its last listener leaves.
+     */
+    private readonly subscriptionOptions = new Map<string, Record<string, unknown>>();
+
     /* -------------------------------------------------------------------- *
      * Phase 2 — Connection lifecycle
      * -------------------------------------------------------------------- */
@@ -324,9 +336,31 @@ class EventsBridge {
 
     /**
      * `open` handler — reproduces `events.coffee:235-247`. Marks the socket
-     * connected, sends the auth frame FIRST, starts the heartbeat and flushes
-     * any queued frames. The auth frame is unshifted to the front of the queue
-     * so a single {@link flush} drains everything in order with auth leading.
+     * connected, then rebuilds the outgoing burst from AUTHORITATIVE state: the
+     * auth frame FIRST, followed by exactly one `subscribe` frame per active
+     * routing key (each carrying its stored options). Finally starts the
+     * heartbeat and flushes so a single {@link flush} drains everything in order
+     * with auth leading.
+     *
+     * WHY REBUILD (rather than only unshift auth):
+     *   A WebSocket reconnect (see {@link scheduleReconnect}) opens a BRAND-NEW
+     *   connection the server has no subscription memory of. The AngularJS
+     *   `events.coffee` re-subscribed its channels on EVERY open
+     *   (`:235-247`); reproducing that here is what keeps live board refresh
+     *   working after an auto-reconnect (QA: "silent live-refresh loss after
+     *   reconnect"). The {@link subscriptions} Map is the single source of truth
+     *   — `subscribe` / `removeSubscription` keep it in sync regardless of
+     *   connection state — so re-emitting one frame per key restores exactly the
+     *   live subscription set.
+     *
+     * WHY REPLACE the queue (rather than append):
+     *   On the FIRST connect, `subscribe()` calls made while the socket was
+     *   still connecting queued their own `subscribe` frames. Rebuilding the
+     *   queue from the Map SUPERSEDES those, so each key is sent EXACTLY ONCE
+     *   (no first-connect duplicate). The only frames ever queued while
+     *   disconnected are subscribe / unsubscribe frames — both are superseded by
+     *   the authoritative Map — and the heartbeat is stopped while disconnected,
+     *   so no legitimate frame is dropped.
      */
     private onOpen = (): void => {
         this.connected = true;
@@ -338,7 +372,20 @@ class EventsBridge {
                 sessionId: getSessionId(),
             },
         };
-        this.pendingMessages.unshift(authFrame);
+
+        const subscribeFrames = Array.from(this.subscriptions.keys()).map((routingKey) => {
+            const frame: Record<string, unknown> = {
+                cmd: 'subscribe',
+                routing_key: routingKey,
+            };
+            const options = this.subscriptionOptions.get(routingKey);
+            if (options !== undefined) {
+                frame.options = options;
+            }
+            return frame;
+        });
+
+        this.pendingMessages = [authFrame, ...subscribeFrames];
 
         this.startHeartbeat();
         this.flush();
@@ -637,6 +684,11 @@ class EventsBridge {
         handlers.add(callback);
 
         if (isNewRoutingKey) {
+            // Retain the first subscriber's options so a reconnect can replay the
+            // exact same `subscribe` frame (see {@link onOpen}).
+            if (options !== undefined) {
+                this.subscriptionOptions.set(routingKey, options);
+            }
             const message: Record<string, unknown> = {
                 cmd: 'subscribe',
                 routing_key: routingKey,
@@ -684,6 +736,9 @@ class EventsBridge {
 
         if (handlers.size === 0) {
             this.subscriptions.delete(routingKey);
+            // Drop the retained options in lock-step so a later reconnect never
+            // resurrects a subscription whose last listener has left.
+            this.subscriptionOptions.delete(routingKey);
             this.sendMessage({
                 cmd: 'unsubscribe',
                 routing_key: routingKey,

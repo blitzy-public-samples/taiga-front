@@ -239,6 +239,11 @@ describe('BulkCreateUsLightbox', () => {
       const textarea = getTextarea(container);
       expect(textarea).toBeInTheDocument();
       expect(textarea).toHaveAttribute('placeholder', 'One item per line...');
+      // M1 (accessibility): the bulk textarea must carry BOTH an id and a name so
+      // it is never flagged as "a form field element should have an id or name
+      // attribute". Regression guard for the QA form-field finding.
+      expect(textarea).toHaveAttribute('id', 'bulk-create-userstories');
+      expect(textarea).toHaveAttribute('name', 'bulk-create-userstories');
     });
 
     it('renders the INVERTED position radios (#top-backlog="bottom" default checked, #bottom-backlog="top")', () => {
@@ -432,6 +437,10 @@ describe('BulkCreateUsLightbox', () => {
       // Both swimlanes are rendered as <option> entries.
       const select = container.querySelector<HTMLSelectElement>('.swimlane-select-input');
       expect(select).toBeInTheDocument();
+      // M1 (accessibility): the swimlane <select> must carry BOTH an id and a
+      // name. Regression guard for the QA form-field finding.
+      expect(select).toHaveAttribute('id', 'bulk-create-swimlane');
+      expect(select).toHaveAttribute('name', 'bulk-create-swimlane');
       expect(within(select as HTMLSelectElement).getAllByRole('option')).toHaveLength(2);
 
       // Choose "Lane A" (id 5); the value flows through as the 4th argument.

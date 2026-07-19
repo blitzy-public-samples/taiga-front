@@ -63,7 +63,7 @@ import type { Reducer } from 'react';
 import { reducer, initialState, getMovePayload } from './boardReducer';
 import type { State, Action } from './boardReducer';
 import { api } from '../../shared/api/client';
-import { bulkUpdateKanbanOrder, filtersData } from '../../shared/api/userstories';
+import { bulkUpdateKanbanOrder } from '../../shared/api/userstories';
 import { subscribeProjectChanges } from '../../shared/events';
 import type { ProjectChangeHandlers } from '../../shared/events';
 import { isBoardDraggable, canMutate } from '../../shared/permissions';
@@ -73,7 +73,6 @@ import type {
     Swimlane,
     Status,
     AssignedUser,
-    FiltersData,
     UsMap,
 } from '../../shared/types';
 
@@ -230,9 +229,6 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     const lastSearchRef = useRef<string | undefined>(undefined);
     // Member id -> resolved member, built in loadProject (SOURCE `fillUsersAndRoles` 587).
     const usersByIdRef = useRef<Record<number, AssignedUser>>({});
-    // Sidebar filter facets fetched for parity (SOURCE `generateFilters` 594). Held
-    // for the container's benefit; not part of the returned view-model.
-    const filtersDataRef = useRef<FiltersData | null>(null);
 
     /* ---------------------------------------------------------------------- *
      * Data-loading closures (recreated when their filter/zoom inputs change)
@@ -705,7 +701,7 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
      * ---------------------------------------------------------------------- */
 
     // (1) Initial load — SOURCE `loadInitialData` 582-594. Runs once per project:
-    // loadProject -> loadUserstories (parallel list + swimlanes) -> filtersData
+    // loadProject -> loadUserstories (parallel list + swimlanes)
     // -> initialLoad = true. Cancellable, and wrapped so it never throws from the
     // effect (a failure clears `loading` and leaves the safe empty board).
     useEffect(() => {
@@ -725,15 +721,8 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                 if (cancelled) {
                     return;
                 }
-                // SOURCE 594 generateFilters — non-critical; stored for the container.
-                try {
-                    const fd = await filtersData(projectId, buildParamsRef.current());
-                    if (!cancelled) {
-                        filtersDataRef.current = fd;
-                    }
-                } catch {
-                    /* filters are non-critical; ignore */
-                }
+                // Sidebar filters-data is fetched by the container (KanbanApp) for
+                // the sidebar facets; the hook no longer duplicates that request.
             } catch {
                 // F-AAP-10: SURFACE the failure instead of silently leaving a
                 // "successful empty board". Guarded by `cancelled` so a

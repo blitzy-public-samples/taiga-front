@@ -264,6 +264,17 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         }
     }, [showGraphPlaceholder]);
 
+    // Browser-tab title parity: the deleted `BacklogController` set the document
+    // title through `appMetaService` once the project loaded. Reproduce it here so
+    // the tab reads "Backlog - <project name>" as before. Runs whenever the
+    // resolved project changes.
+    useEffect(() => {
+        const projectName = project?.name;
+        if (projectName) {
+            document.title = `Backlog - ${projectName}`;
+        }
+    }, [project]);
+
     // F-CQ-04 summary loading/error signals. `stats` is populated by the initial
     // load and every `reloadStats`; until it first arrives the summary meter has
     // no data. `statsLoading` marks that pre-data window so the region renders a
@@ -967,6 +978,8 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                         </button>
 
                                         <input
+                                            id="backlog-search"
+                                            name="backlog-search"
                                             type="text"
                                             className="tg-input-search"
                                             value={filterQ}

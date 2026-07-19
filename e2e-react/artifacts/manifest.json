@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "manifest_version": "1.0",
+  "title": "Kanban/Backlog AngularJS-to-React migration — before/after visual evidence",
+  "description": "Committed before/after screenshots proving visual fidelity of the two migrated screens (Kanban, Backlog) as AngularJS is replaced by React in-place. Baseline captures are of the AngularJS screens; react captures are of the React screens rendered against the identical, unchanged PostgreSQL sample_data volume. Fulfils AAP sub-sections 0.2.1 and 0.6.3.",
+  "generated_by": "QA remediation agent (blitzy-8e6b85a0-...-w-022) — resolves QA finding CF-1",
+  "capture_viewport": { "width": 1280, "height": 800, "device_pixel_ratio": 1 },
+  "gateway": "http://localhost:9000",
+  "credentials": {
+    "user": "admin",
+    "password_source": "TAIGA_ADMIN_PASSWORD (dev default 'admin123' when unset) — identical value at createsuperuser time and at every test login, per the setup Consistency rule"
+  },
+  "data": {
+    "seed": "./taiga-manage.sh sample_data — seeded exactly once before the baseline pass",
+    "postgres_volume": "preserved unchanged across both passes; never reseeded or recreated between baseline and react captures",
+    "projects_used": {
+      "project-3": "swimlane board (5 swimlanes) + populated backlog (13 stories, 5 sprints)",
+      "project-4": "flat Kanban board (no swimlanes)",
+      "project-6": "empty Kanban board and empty backlog (empty-state rendering)"
+    }
+  },
+  "capture_order_note": "The AAP mandates an irreversible two-phase order: the AngularJS screens can be captured ONLY while they still exist, so the baseline pass must precede AngularJS removal. In this repository the AngularJS Kanban/Backlog source was already removed at commit 16f4663ae ('Begin Kanban/Backlog React migration ...') — a stage that ran before this QA-remediation stage. The baseline PNGs committed here are the GENUINE AngularJS renders captured by the QA capture stage BEFORE that removal (identical seeded data, same 1280x800 viewport, same gateway). They are reused verbatim as the committed baseline set; they are not reconstructions. The react PNGs were captured by this QA-remediation stage AFTER the F1/F1-B/F2/M1 source fixes were applied and the fixed react.js bundle (md5 fea06cf1d8a9444266aeadf3e43e75f6) was deployed, against the same unchanged sample_data volume.",
+  "video_note": "No screen recordings are included: ffmpeg is ABSENT from this environment, so Playwright/Chrome DevTools video capture is not possible here. Screenshots are the committed evidence. This matches the environment constraint recorded in the QA report (screencasts unavailable).",
+  "tooling_note": "ImageMagick is also ABSENT, so a pre-composed side-by-side image is not generated in-repo; the side-by-side comparison is composed afterward from the two committed artifact sets, exactly as AAP sub-section 0.6.3 specifies ('composed afterward from the two committed artifact sets').",
+  "git": {
+    "taiga_front_head_at_capture": "8a2539a38",
+    "angularjs_removal_commit": "16f4663ae",
+    "tracked": "All files under e2e-react/artifacts/ are git-tracked; .gitignore intentionally does not list e2e-react/."
+  },
+  "pairs": [
+    {
+      "id": "kanban_p3_swimlanes",
+      "screen": "Kanban",
+      "route": "/project/project-3/kanban",
+      "state": "populated board with swimlanes (5 swimlanes: voluptate, quisquam itaque, iure, impedit libero, facere) and WIP-limit coloring",
+      "project_slug": "project-3",
+      "project_id": 3,
+      "viewport": "1280x800",
+      "baseline": {
+        "file": "baseline/kanban_p3_swimlanes_1280.png",
+        "framework": "AngularJS 1.5.10",
+        "bytes": 185116,
+        "sha256": "074cad3fdbcd99a0a05ff556f62fd8520188a3cc20ef891186397b01a595ef2a",
+        "provenance": "Genuine AngularJS render captured before commit 16f4663ae removed the AngularJS screens."
+      },
+      "react": {
+        "file": "react/kanban_p3_swimlanes_1280.png",
+        "framework": "React 18",
+        "bytes": 160322,
+        "sha256": "fb3797d3f712b480b8aa6222b6be14f9c82f1fa18646a3423ce07911fc1fabc6",
+        "provenance": "React render captured after F1/F1-B/F2/M1 fixes; fixed bundle md5 fea06cf1d8a9444266aeadf3e43e75f6."
+      }
+    },
+    {
+      "id": "kanban_p4_flat",
+      "screen": "Kanban",
+      "route": "/project/project-4/kanban",
+      "state": "populated board in flat mode (no swimlanes); columns NEW/READY/IN PROGRESS/READY FOR TEST with cards directly under columns",
+      "project_slug": "project-4",
+      "project_id": 4,
+      "viewport": "1280x800",
+      "baseline": {
+        "file": "baseline/kanban_p4_flat_1280.png",
+        "framework": "AngularJS 1.5.10",
+        "bytes": 182049,
+        "sha256": "f77753f92b126bcb524de7e42107eaf40edc5d25be4169a7edb69c7869c378ae",
+        "provenance": "Genuine AngularJS render captured before commit 16f4663ae removed the AngularJS screens."
+      },
+      "react": {
+        "file": "react/kanban_p4_flat_1280.png",
+        "framework": "React 18",
+        "bytes": 176929,
+        "sha256": "bc70c226dfe4aaf55fcc956dc3f0b47c87b9f13f25fa86df2af3d2e28402855d",
+        "provenance": "React render captured after F1/F1-B/F2/M1 fixes; fixed bundle md5 fea06cf1d8a9444266aeadf3e43e75f6."
+      }
+    },
+    {
+      "id": "kanban_p6_empty",
+      "screen": "Kanban",
+      "route": "/project/project-6/kanban",
+      "state": "empty board — all columns count 0, 'This could be a user story' empty-state placeholder in NEW column",
+      "project_slug": "project-6",
+      "project_id": 6,
+      "viewport": "1280x800",
+      "baseline": {
+        "file": "baseline/kanban_p6_empty_1280.png",
+        "framework": "AngularJS 1.5.10",
+        "bytes": 74569,
+        "sha256": "8f2b07bff01cda8135e2f5187e7f9fea595cb969701b2ac1804721d6082344b5",
+        "provenance": "Genuine AngularJS render captured before commit 16f4663ae removed the AngularJS screens."
+      },
+      "react": {
+        "file": "react/kanban_p6_empty_1280.png",
+        "framework": "React 18",
+        "bytes": 74776,
+        "sha256": "e752caf619500c43a4b8f5a1c8c744b45eaa123dc7a03824069b8dd5fd1a1453",
+        "provenance": "React render captured after F1/F1-B/F2/M1 fixes; fixed bundle md5 fea06cf1d8a9444266aeadf3e43e75f6."
+      }
+    },
+    {
+      "id": "backlog_p3",
+      "screen": "Backlog",
+      "route": "/project/project-3/backlog",
+      "state": "populated backlog — 13 user stories (#71-#83), 5 sprints, stats bar, sprint cards with points",
+      "project_slug": "project-3",
+      "project_id": 3,
+      "viewport": "1280x800",
+      "baseline": {
+        "file": "baseline/backlog_p3_1280.png",
+        "framework": "AngularJS 1.5.10",
+        "bytes": 198014,
+        "sha256": "36205f3a567305158ca09538e2454ddad0bb020beb56557d07a4640f1fa9b8b8",
+        "provenance": "Genuine AngularJS render captured before commit 16f4663ae removed the AngularJS screens."
+      },
+      "react": {
+        "file": "react/backlog_p3_1280.png",
+        "framework": "React 18",
+        "bytes": 195535,
+        "sha256": "8ea46f8ea1b22aef9cefa30dcea19048af0de83929ba792265b5cb9298ed6974",
+        "provenance": "React render captured after F1/F1-B/F2/M1 fixes; fixed bundle md5 fea06cf1d8a9444266aeadf3e43e75f6."
+      }
+    },
+    {
+      "id": "backlog_p6_empty",
+      "screen": "Backlog",
+      "route": "/project/project-6/backlog",
+      "state": "empty backlog — 0 stories ('Your backlog is empty.'), 0 sprints ('You have no sprints yet.'), all stats 0",
+      "project_slug": "project-6",
+      "project_id": 6,
+      "viewport": "1280x800",
+      "baseline": {
+        "file": "baseline/backlog_p6_empty_1280.png",
+        "framework": "AngularJS 1.5.10",
+        "bytes": 93562,
+        "sha256": "f142b1ce1333034934988c69ab8ba2c0940746de1e54a393954d6c9ee0f6a483",
+        "provenance": "Genuine AngularJS render captured before commit 16f4663ae removed the AngularJS screens."
+      },
+      "react": {
+        "file": "react/backlog_p6_empty_1280.png",
+        "framework": "React 18",
+        "bytes": 75571,
+        "sha256": "4915021f6354372226a95393024df5b9fc4edb45ff8d8fcb70c8906a5360de26",
+        "provenance": "React render captured after F1/F1-B/F2/M1 fixes; fixed bundle md5 fea06cf1d8a9444266aeadf3e43e75f6."
+      }
+    }
+  ]
+}

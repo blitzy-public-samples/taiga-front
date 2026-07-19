@@ -272,6 +272,11 @@ describe('custom filter — save validation', () => {
 
     const input = container.querySelector<HTMLInputElement>('.e2e-filter-name-input');
     expect(input).not.toBeNull();
+    // M1 (accessibility): the custom-filter name input must carry BOTH an id and
+    // a name so it is never flagged as "a form field element should have an id or
+    // name attribute". Regression guard for the QA form-field finding.
+    expect(input).toHaveAttribute('id', 'custom-filter-name');
+    expect(input).toHaveAttribute('name', 'custom-filter-name');
     fireEvent.change(input as HTMLInputElement, { target: { value: 'Fresh Filter' } });
 
     fireEvent.click(

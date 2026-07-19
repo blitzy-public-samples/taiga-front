@@ -469,6 +469,8 @@ export function BulkCreateUsLightbox({
               {translate('LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE', undefined, 'Select swimlane')}
             </div>
             <select
+              id="bulk-create-swimlane"
+              name="bulk-create-swimlane"
               className="swimlane-select-input"
               /* F-UI-04: the native select is named by its section label. */
               aria-labelledby={`${titleId}-swimlane-label`}
@@ -490,6 +492,8 @@ export function BulkCreateUsLightbox({
         {/* Bulk textarea — the single required field. */}
         <fieldset>
           <textarea
+            id="bulk-create-userstories"
+            name="bulk-create-userstories"
             cols={200}
             wrap="off"
             className={bulkError ? 'checksley-error' : undefined}

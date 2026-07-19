@@ -169,22 +169,51 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
   const titleId = useId();
 
   /*
+   * Latest-value refs for `sprint` / `lastSprint`. The prefill effect below
+   * reads the CURRENT prop values through these refs WITHOUT depending on their
+   * object identity.
+   *
+   * Why this matters (QA MAJOR — unsaved edits wiped by a live event): a
+   * background `reloadSprints()` in the container rebuilds the `sprints` array,
+   * which yields a brand-new `lastSprint` memo object and a brand-new `sprint`
+   * object for the very milestone being edited — a different identity carrying
+   * the SAME `sprint.id`. If the prefill effect depended on those objects, that
+   * identity churn would re-run it and `setName(sprint.name)` would clobber the
+   * user's in-progress typing. By keying the effect on the STABLE `sprint?.id`
+   * (plus `open`/`mode`) and reading the objects via refs, an identity-only
+   * change never re-runs prefill. Assigned during render so the refs are always
+   * current before any effect fires.
+   */
+  const sprintRef = useRef(sprint);
+  sprintRef.current = sprint;
+  const lastSprintRef = useRef(lastSprint);
+  lastSprintRef.current = lastSprint;
+
+  /*
    * Prefill on open, reproducing the directive's `sprintform:create` /
    * `sprintform:edit` handlers. Only runs while `open` is true.
    *   - create: name cleared; start = lastSprint.estimated_finish || now;
    *     finish = start + 2 weeks (cloned moment so `start` is not mutated).
    *   - edit:   name + dates seeded from the sprint (dates reformatted from the
    *     'YYYY-MM-DD' wire values to the 'DD MMM YYYY' display format).
+   *
+   * Keyed on [open, mode, sprint?.id] ONLY. `sprint` / `lastSprint` are read via
+   * refs (see above) so prefill fires exactly on an open-transition, a mode
+   * change, or a switch to a different sprint id — never on a background reload
+   * that merely replaces the objects' identity while the id is unchanged.
    */
   useEffect(() => {
     if (!open) {
       return;
     }
 
+    const currentSprint = sprintRef.current;
+    const currentLastSprint = lastSprintRef.current;
+
     if (mode === 'create') {
       setName('');
-      const base = lastSprint?.estimated_finish
-        ? moment(lastSprint.estimated_finish)
+      const base = currentLastSprint?.estimated_finish
+        ? moment(currentLastSprint.estimated_finish)
         : moment();
       setEstimatedStart(base.format(PICKER_DATE_FORMAT));
       // estimated_finish = start + 2 weeks (directive parity). Clone so the
@@ -193,15 +222,15 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
       setErrors({});
       setGeneralError(null);
       setHasErrors(false);
-    } else if (sprint) {
-      setName(sprint.name);
-      setEstimatedStart(moment(sprint.estimated_start).format(PICKER_DATE_FORMAT));
-      setEstimatedFinish(moment(sprint.estimated_finish).format(PICKER_DATE_FORMAT));
+    } else if (currentSprint) {
+      setName(currentSprint.name);
+      setEstimatedStart(moment(currentSprint.estimated_start).format(PICKER_DATE_FORMAT));
+      setEstimatedFinish(moment(currentSprint.estimated_finish).format(PICKER_DATE_FORMAT));
       setErrors({});
       setGeneralError(null);
       setHasErrors(false);
     }
-  }, [open, mode, sprint, lastSprint]);
+  }, [open, mode, sprint?.id]);
 
   /*
    * Focus the name input when the lightbox opens (optional fidelity). In edit

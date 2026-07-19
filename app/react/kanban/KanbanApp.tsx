@@ -641,6 +641,17 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     // by the guarded render below; the hook tolerates a non-finite id.
     const board = useKanbanBoard({ projectId, zoomLevel, filterQ, filterParams });
 
+    // Browser-tab title parity: the deleted `KanbanController` set the document
+    // title through `appMetaService` once the project loaded. Reproduce it here so
+    // the tab reads "<Kanban section> - <project name>" as before. Runs whenever
+    // the resolved project changes.
+    useEffect(() => {
+        const projectName = board.project?.name;
+        if (projectName) {
+            document.title = `${SECTION_NAME} - ${projectName}`;
+        }
+    }, [board.project, SECTION_NAME]);
+
     // Card viewport gate: the container has no virtualization, so every loaded
     // card is in view (a `false` here makes `Card` render empty). Build from the
     // current `usMap` so it stays in sync with the board.
@@ -1208,6 +1219,8 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                                 given an accessible name (was placeholder-only). */}
                             <tg-input-search>
                                 <input
+                                    id="kanban-board-search"
+                                    name="kanban-board-search"
                                     type="search"
                                     aria-label={SEARCH_PLACEHOLDER}
                                     placeholder={SEARCH_PLACEHOLDER}

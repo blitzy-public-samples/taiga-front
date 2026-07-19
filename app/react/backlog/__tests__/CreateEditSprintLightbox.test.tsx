@@ -424,6 +424,253 @@ describe('CreateEditSprintLightbox', () => {
     });
   });
 
+  /* ======================================================================== *
+   * QA MAJOR — a live event must NOT wipe unsaved sprint-lightbox edits.
+   *
+   * Repro: while the user is editing a sprint, a WebSocket
+   * `changes.project.*.milestones` / `.userstories` event fires
+   * `reloadSprints()` in the container. That rebuilds the `sprints` array, so
+   * the SAME milestone (same `sprint.id`) and the `lastSprint` memo are handed
+   * to the lightbox as BRAND-NEW object identities. The prefill effect used to
+   * depend on those objects, so the identity churn re-ran it and
+   * `setName(sprint.name)` clobbered the user's in-progress typing.
+   *
+   * Fix under test: the prefill effect is keyed on the STABLE `[open, mode,
+   * sprint?.id]` and reads `sprint` / `lastSprint` through latest-value refs, so
+   * an identity-only change never re-runs prefill — while a genuine
+   * open-transition, mode change, or a switch to a different sprint id still
+   * does (fidelity preserved). These specs render the component directly so
+   * `rerender` can hand it fresh prop identities the way the container would.
+   * ======================================================================== */
+  describe('edit mode — prefill stability under a background live reload (QA MAJOR)', () => {
+    /** Fresh callback spies; identity is irrelevant to these specs. */
+    function spies(): Spies {
+      return {
+        onCreated: jest.fn(),
+        onSaved: jest.fn(),
+        onRemoved: jest.fn(),
+        onClose: jest.fn(),
+      };
+    }
+
+    it('preserves unsaved edits when a background reload swaps sprint/lastSprint for new identities carrying the SAME id', () => {
+      const s = spies();
+      const sprint = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+      const lastSprint = makeMilestone({ id: 42, name: 'Sprint 8', estimated_finish: '2021-01-31' });
+
+      const { container, rerender } = render(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprint}
+          projectId={7}
+          lastSprint={lastSprint}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+
+      // Prefill seeds the fields from the sprint on open.
+      expect(get(container, NAME)).toHaveValue('Sprint 9');
+
+      // The user starts editing — unsaved, in-progress typing across fields.
+      typeInto(container, NAME, 'Sprint 9 WIP');
+      typeInto(container, DATE_START, '05 Feb 2021');
+      expect(get(container, NAME)).toHaveValue('Sprint 9 WIP');
+      expect(get(container, DATE_START)).toHaveValue('05 Feb 2021');
+
+      // A live milestones/userstories event triggers reloadSprints(): the SAME
+      // milestone (id 99) and lastSprint (id 42) arrive as NEW object identities
+      // with identical content, exactly as a rebuilt `sprints` array would.
+      const reloadedSprint = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+      const reloadedLastSprint = makeMilestone({
+        id: 42,
+        name: 'Sprint 8',
+        estimated_finish: '2021-01-31',
+      });
+      // Different identity …
+      expect(reloadedSprint).not.toBe(sprint);
+      expect(reloadedLastSprint).not.toBe(lastSprint);
+      // … but the same STABLE id the effect is keyed on.
+      expect(reloadedSprint.id).toBe(sprint.id);
+
+      rerender(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={reloadedSprint}
+          projectId={7}
+          lastSprint={reloadedLastSprint}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+
+      // The in-progress edits are intact — the live event did NOT re-run
+      // prefill and did NOT clobber the user's typing.
+      expect(get(container, NAME)).toHaveValue('Sprint 9 WIP');
+      expect(get(container, DATE_START)).toHaveValue('05 Feb 2021');
+    });
+
+    it('re-prefills when the edited sprint changes to a DIFFERENT id while open', () => {
+      const s = spies();
+      const sprintA = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+
+      const { container, rerender } = render(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprintA}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+      expect(get(container, NAME)).toHaveValue('Sprint 9');
+
+      // Switch which sprint is being edited (different id) → prefill must re-run.
+      const sprintB = makeMilestone({
+        id: 7,
+        name: 'Sprint 7',
+        estimated_start: '2021-03-01',
+        estimated_finish: '2021-03-15',
+      });
+      rerender(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprintB}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+
+      expect(get(container, NAME)).toHaveValue('Sprint 7');
+      expect(get(container, DATE_START)).toHaveValue('01 Mar 2021');
+      expect(get(container, DATE_END)).toHaveValue('15 Mar 2021');
+    });
+
+    it('re-prefills on an open transition: reopening re-seeds from the sprint, discarding a prior unsaved edit', () => {
+      const s = spies();
+      const sprint = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+
+      const { container, rerender } = render(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprint}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+      expect(get(container, NAME)).toHaveValue('Sprint 9');
+
+      typeInto(container, NAME, 'unsaved edit');
+      expect(get(container, NAME)).toHaveValue('unsaved edit');
+
+      // Close (open=false hides the form) …
+      rerender(
+        <CreateEditSprintLightbox
+          open={false}
+          mode="edit"
+          sprint={sprint}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+      // … then reopen: the open false→true transition re-runs prefill.
+      rerender(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprint}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+
+      expect(get(container, NAME)).toHaveValue('Sprint 9');
+    });
+
+    it('re-prefills on a mode change while open: edit → create clears the name', () => {
+      const s = spies();
+      const sprint = makeMilestone({
+        id: 99,
+        name: 'Sprint 9',
+        estimated_start: '2021-02-01',
+        estimated_finish: '2021-02-15',
+      });
+
+      const { container, rerender } = render(
+        <CreateEditSprintLightbox
+          open
+          mode="edit"
+          sprint={sprint}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+      expect(get(container, NAME)).toHaveValue('Sprint 9');
+
+      // Mode flips to 'create' → prefill re-runs and clears the name.
+      rerender(
+        <CreateEditSprintLightbox
+          open
+          mode="create"
+          sprint={sprint}
+          projectId={7}
+          onCreated={s.onCreated}
+          onSaved={s.onSaved}
+          onRemoved={s.onRemoved}
+          onClose={s.onClose}
+        />,
+      );
+
+      expect(get(container, NAME)).toHaveValue('');
+    });
+  });
+
   describe('delete', () => {
     it('confirms and calls onRemoved(sprint) + onClose when window.confirm returns true', () => {
       const confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(true);
