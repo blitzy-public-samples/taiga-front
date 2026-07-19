@@ -395,6 +395,13 @@ interface BacklogStoryRowProps {
     onToggleSelection: (ref: number, checked: boolean, shiftKey: boolean) => void;
     /** Pre-formatted points display string computed by the parent table. */
     pointsDisplay: string;
+    /**
+     * [BL-07] The header role filter (`activeRoleId`). When set, the points
+     * popover opens directly on that role's options (mirrors the AngularJS
+     * `selectedRoleId`, which tracks the header role selector); when `null`, the
+     * popover opens on the compact role list.
+     */
+    headerRoleId: Id | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -533,27 +540,37 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
             return;
         }
 
-        let skippedInitialCheck = false;
-        const observer = new IntersectionObserver((entries) => {
-            const entry = entries[0];
-            if (!entry) {
-                return;
-            }
-            // Mirror infinite-scroll-immediate-check='false': ignore the initial
-            // synchronous callback fired by observe() so we never load on mount.
-            if (!skippedInitialCheck) {
-                skippedInitialCheck = true;
-                return;
-            }
-            if (entry.isIntersecting && canLoadMoreRef.current && !loadingRef.current) {
-                onLoadMoreRef.current();
-            }
-        });
+        // A generous rootMargin makes the sentinel trigger *before* it is fully
+        // scrolled into view. Without it, a zero-height sentinel sitting exactly
+        // at the viewport's bottom edge (top === innerHeight) never registers as
+        // intersecting, so onLoadMore is never called and the list stays capped
+        // at the first page. Re-running the effect whenever the number of
+        // rendered rows changes (see the dependency array) re-evaluates the
+        // observer after every append: this both handles the "sentinel keeps
+        // intersecting after a load" case (IntersectionObserver does not fire
+        // again while continuously intersecting) and lets a short first page
+        // chain-load until the viewport is filled. The `loadingRef`/
+        // `canLoadMoreRef` guards keep this bounded to one in-flight request per
+        // page and stop it once the last page arrives. Combined with the
+        // non-zero sentinel height below, page 2+ reliably loads on scroll.
+        // [F-BACKLOG-INFINITE-SCROLL]
+        const observer = new IntersectionObserver(
+            (entries) => {
+                const entry = entries[0];
+                if (!entry) {
+                    return;
+                }
+                if (entry.isIntersecting && canLoadMoreRef.current && !loadingRef.current) {
+                    onLoadMoreRef.current();
+                }
+            },
+            { rootMargin: "200px 0px" },
+        );
         observer.observe(node);
         return () => {
             observer.disconnect();
         };
-    }, [canLoadMore]);
+    }, [canLoadMore, rows.length]);
 
     const bodyClassName =
         "backlog-table-body" +
@@ -670,12 +687,27 @@ export function BacklogTable(props: BacklogTableProps): JSX.Element {
                                 actions={actions}
                                 onToggleSelection={onToggleSelection}
                                 pointsDisplay={pointsDisplay}
+                                headerRoleId={activeRoleId}
                             />
                         </Fragment>
                     );
                 })}
-                {/* Infinite-scroll sentinel (replaces the AngularJS infinite-scroll directive). */}
-                <div ref={sentinelRef} className="infinite-scroll-sentinel" aria-hidden="true" />
+                {/* Infinite-scroll sentinel (replaces the AngularJS infinite-scroll directive).
+                    A non-zero height plus the observer's rootMargin ensures it reliably
+                    intersects the viewport near the bottom of the list so the next page
+                    loads as the user scrolls (Issue 1). */}
+                <div
+                    ref={sentinelRef}
+                    className="infinite-scroll-sentinel"
+                    aria-hidden="true"
+                    // A non-zero height gives the sentinel a real layout box the
+                    // IntersectionObserver can intersect. The compiled stylesheet
+                    // declares no rule for `.infinite-scroll-sentinel`, so without
+                    // this inline height the element collapses to 0px and the
+                    // observer never fires — page 2 would never load on scroll.
+                    // [F-BACKLOG-INFINITE-SCROLL]
+                    style={{ height: 1 }}
+                />
                 {/* tg-loading="loadingUserstories" */}
                 {loadingUserstories && <div className="loading-spinner" />}
             </div>
@@ -705,6 +737,7 @@ function BacklogStoryRow({
     actions,
     onToggleSelection,
     pointsDisplay,
+    headerRoleId,
 }: BacklogStoryRowProps): JSX.Element {
     // The whole row is the draggable node; the .draggable-us-row handle carries
     // the activator listeners. useDraggable MUST be called unconditionally.
@@ -766,6 +799,59 @@ function BacklogStoryRow({
 
     // Computable roles for the points popover (mirror _.filter(roles, "computable")).
     const computableRoles = project.roles.filter((role) => role.computable);
+
+    // [BL-07] Two-step points popover state, faithfully porting `tgBacklogUsPoints`
+    // (backlog/main.coffee) + `EstimationProcess` (common/estimation.coffee).
+    //
+    // The AngularJS popover was NEVER "all roles expanded". It rendered in two
+    // stages:
+    //   1. `.pop-role`  — a COMPACT list of the computable roles, each shown as
+    //      "<RoleName> (<currentPoint>)" (`us-points-roles-popover.jade`).
+    //   2. `.pop-points-open` — after a role is picked, the point options for THAT
+    //      role only (`us-estimation-points.jade`).
+    // `pointsRoleId === null` renders stage 1; a role id renders stage 2. When a
+    // project has a single computable role the directive preselects it
+    // (`roles.length == 1` branch), so we jump straight to stage 2 on open.
+    const [pointsRoleId, setPointsRoleId] = useState<Id | null>(null);
+
+    // pointId -> point NAME (e.g. "13", "½", "?"). The role list shows the point
+    // NAME next to each role (estimation.coffee `calculateRoles` sets
+    // `role.points = pointObj.name`), which is distinct from the numeric value.
+    const pointNameById = useMemo(() => {
+        const map: Record<string, string> = {};
+        for (const point of project.points) {
+            map[String(point.id)] = point.name;
+        }
+        return map;
+    }, [project.points]);
+
+    // [BL-07] `horizontal` flag mirrors estimation.coffee `renderPointsSelector`:
+    // `_.some(points, (p) => p.name.length > 5)` adds the `.horizontal` class.
+    const pointsHorizontal = useMemo(
+        () => project.points.some((point) => point.name.length > 5),
+        [project.points],
+    );
+
+    // [BL-07] Open/toggle the points popover, reproducing the directive's
+    // preselect-when-single-role behavior: opening resets to the role list unless
+    // there is exactly one computable role (then jump straight to its points).
+    // The trigger is inert when there are no computable roles (the directive adds
+    // `.not-clickable` and drops the arrow in the `roles.length == 0` branch).
+    const openOrTogglePoints = useCallback((): void => {
+        if (!canModifyUs || computableRoles.length === 0) {
+            return;
+        }
+        if (!pointsPopover.open) {
+            // Single computable role → preselect it (directive `roles.length == 1`
+            // branch). Otherwise honor the header role filter (`selectedRoleId`):
+            // when a role is filtered in the header, jump straight to its points;
+            // when none is (null), open the compact role list.
+            setPointsRoleId(
+                computableRoles.length === 1 ? computableRoles[0].id : headerRoleId,
+            );
+        }
+        pointsPopover.toggle();
+    }, [canModifyUs, computableRoles, pointsPopover, headerRoleId]);
 
     // [M-08] Project-level due-date threshold configuration (`us_duedates`),
     // falling back to the service defaults when the project doesn't define one
@@ -940,9 +1026,16 @@ function BacklogStoryRow({
                     // [S] reveal: inline `display:block` mirrors the AngularJS
                     // jQuery `fadeIn()` (the `.popover` mixin's base is `display:none`
                     // with no class-based reveal in the compiled CSS).
+                    // [BL-06] `textAlign:left`: the `.pop-status` popover is nested
+                    // inside the `.status` cell which is `text-align:right`, and the
+                    // backlog `.pop-status` mixin call omits `$align` so it compiles to
+                    // the ignored `text-align:""` and inherits the cell's right
+                    // alignment. The AngularJS baseline renders the option list
+                    // left-aligned, so we restore left alignment here (a structural
+                    // layout override, not a theme value).
                     <ul
                         className="popover pop-status"
-                        style={{ display: "block" }}
+                        style={{ display: "block", textAlign: "left" }}
                         id={`${rowMenuIds}-status`}
                         ref={statusMenu.menuRef}
                         role="menu"
@@ -986,25 +1079,28 @@ function BacklogStoryRow({
                     aria-label={t("US.POINTS_LABEL", "Points: {{points}}", { points: pointsDisplay })}
                     onClick={(event) => {
                         event.preventDefault();
-                        if (canModifyUs) {
-                            pointsPopover.toggle();
-                        }
+                        // [BL-07] Route through the two-step opener so the popover
+                        // starts on the compact role list (or the single role's
+                        // points) instead of rendering every role expanded.
+                        openOrTogglePoints();
                     }}
                     onKeyDown={(event) => {
                         if (event.key === " ") {
                             event.preventDefault();
-                            if (canModifyUs) {
-                                pointsPopover.toggle();
-                            }
+                            openOrTogglePoints();
                         }
                     }}
                 >
                     {pointsDisplay}
                 </a>
-                {pointsPopover.open && (
-                    // [S] reveal: inline `display:block` mirrors AngularJS `fadeIn()`.
+                {pointsPopover.open && pointsRoleId == null && (
+                    // [BL-07] STAGE 1 — compact role list (`.pop-role`,
+                    // `us-points-roles-popover.jade`). Each computable role is one
+                    // line "<RoleName> (<currentPoint>)". Picking a role advances to
+                    // stage 2. Inline `display:block` mirrors AngularJS `fadeIn()`
+                    // (the `.popover` mixin's base is `display:none`).
                     <ul
-                        className="popover pop-points"
+                        className="popover pop-role"
                         style={{ display: "block" }}
                         id={`${rowMenuIds}-points`}
                         ref={pointsMenu.menuRef}
@@ -1012,41 +1108,81 @@ function BacklogStoryRow({
                         aria-label={t("COMMON.FIELDS.POINTS", "Points")}
                         onKeyDown={pointsMenu.onKeyDown}
                     >
-                        {computableRoles.map((role) => (
-                            // [M-21] Each role is a `role="group"` of point choices,
-                            // labelled by its (visible) name span, so the grouped
-                            // menuitems keep their per-role heading while the menu's
-                            // roving focus (useMenuA11y) traverses every point option.
-                            <li key={role.id} role="none">
-                                <span
-                                    className="item-text"
-                                    id={`${rowMenuIds}-points-role-${role.id}`}
-                                >
-                                    {role.name}
-                                </span>
-                                <ul
-                                    role="group"
-                                    aria-labelledby={`${rowMenuIds}-points-role-${role.id}`}
-                                >
-                                    {project.points.map((point) => (
-                                        <li key={point.id} role="none">
-                                            <a
-                                                href=""
-                                                role="menuitem"
-                                                tabIndex={-1}
-                                                onClick={(event) => {
-                                                    event.preventDefault();
-                                                    actions.onChangePoints(us, role.id, point.id);
-                                                    pointsPopover.setOpen(false);
-                                                }}
-                                            >
-                                                {point.name}
-                                            </a>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </li>
-                        ))}
+                        {computableRoles.map((role) => {
+                            const currentPointId = us.points[String(role.id)];
+                            // estimation.coffee `calculateRoles`: role.points =
+                            // pointObj.name ?? "?".
+                            const currentPointName =
+                                currentPointId != null &&
+                                pointNameById[String(currentPointId)] != null
+                                    ? pointNameById[String(currentPointId)]
+                                    : "?";
+                            return (
+                                <li key={role.id} role="none">
+                                    <a
+                                        className="role"
+                                        href=""
+                                        role="menuitem"
+                                        tabIndex={-1}
+                                        data-role-id={role.id}
+                                        title={role.name}
+                                        onClick={(event) => {
+                                            event.preventDefault();
+                                            // Advance to this role's point options
+                                            // (renderPointsSelector(roleId)).
+                                            setPointsRoleId(role.id);
+                                        }}
+                                    >
+                                        <span className="item-text">
+                                            {role.name} ({currentPointName})
+                                        </span>
+                                    </a>
+                                </li>
+                            );
+                        })}
+                    </ul>
+                )}
+                {pointsPopover.open && pointsRoleId != null && (
+                    // [BL-07] STAGE 2 — the selected role's point options
+                    // (`.pop-points-open`, `us-estimation-points.jade`). The
+                    // CURRENTLY-selected point carries `.point.active` (SCSS
+                    // highlights it via `a.active`); every other option is plain
+                    // `.point`. This mirrors estimation.coffee's `point.selected`
+                    // inversion: `selected = (us.points[roleId] == point.id) ? false
+                    // : true`, and jade rendering `selected ? "point" : "point
+                    // active"`.
+                    <ul
+                        className={"popover pop-points-open" + (pointsHorizontal ? " horizontal" : "")}
+                        style={{ display: "block" }}
+                        id={`${rowMenuIds}-points`}
+                        ref={pointsMenu.menuRef}
+                        role="menu"
+                        aria-label={t("COMMON.FIELDS.POINTS", "Points")}
+                        onKeyDown={pointsMenu.onKeyDown}
+                    >
+                        {project.points.map((point) => {
+                            const isCurrent = us.points[String(pointsRoleId)] === point.id;
+                            return (
+                                <li key={point.id} role="none">
+                                    <a
+                                        href=""
+                                        className={"point" + (isCurrent ? " active" : "")}
+                                        role="menuitem"
+                                        tabIndex={-1}
+                                        data-point-id={point.id}
+                                        data-role-id={pointsRoleId}
+                                        title={point.name}
+                                        onClick={(event) => {
+                                            event.preventDefault();
+                                            actions.onChangePoints(us, pointsRoleId, point.id);
+                                            pointsPopover.setOpen(false);
+                                        }}
+                                    >
+                                        <span className="item-text">{point.name}</span>
+                                    </a>
+                                </li>
+                            );
+                        })}
                     </ul>
                 )}
             </div>

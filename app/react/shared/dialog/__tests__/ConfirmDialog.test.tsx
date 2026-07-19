@@ -46,6 +46,26 @@ describe("ConfirmDialog", () => {
         expect(container.querySelector(".icon-trash")).not.toBeNull();
     });
 
+    it("[BL-05] marks the delete confirm button variant=destructive (theme drives red)", () => {
+        // The confirm button's fill is chosen by the compiled theme's attribute
+        // selectors (`.btn-small[variant=destructive]{background:#e44057}` vs the
+        // default mint `.btn-small`). The delete variant must carry
+        // `variant="destructive"` so the DELETE button renders red, not mint.
+        const { container } = render(<ConfirmDialog {...baseProps} />);
+        expect(container.querySelector(".js-confirm")).toHaveAttribute(
+            "variant",
+            "destructive",
+        );
+    });
+
+    it("[BL-05] marks the ask confirm button variant=primary", () => {
+        const { container } = render(<ConfirmDialog {...baseProps} variant="ask" />);
+        expect(container.querySelector(".js-confirm")).toHaveAttribute(
+            "variant",
+            "primary",
+        );
+    });
+
     it("renders title, subtitle and message", () => {
         render(<ConfirmDialog {...baseProps} subtitle="This cannot be undone" />);
         expect(screen.getByText("Delete user story")).toBeInTheDocument();

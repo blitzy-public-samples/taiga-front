@@ -54,6 +54,23 @@ function openActionsMenu(container: HTMLElement): void {
     fireEvent.click(toggle!);
 }
 
+/*
+ * [KAN-05] The card-actions popover is rendered through `createPortal` into
+ * `document.body` (Card.tsx) — mirroring the legacy `taiga.globalPopover`, which
+ * appended the menu to <body> so the scrolling column's `overflow` never clips it.
+ * RTL's `container` therefore NEVER contains the popover; assertions must query it
+ * from `document.body`. Exactly one card renders per `it` and RTL auto-cleanup
+ * unmounts the portal between tests, and choosing an action closes the menu, so at
+ * most one `.popover.global-popover` is present in <body> at query time.
+ */
+const ACTIONS_MENU_SELECTOR = ".popover.global-popover";
+function actionsMenu(): HTMLElement | null {
+    return document.body.querySelector<HTMLElement>(ACTIONS_MENU_SELECTOR);
+}
+function actionItem(selector: string): HTMLElement | null {
+    return document.body.querySelector<HTMLElement>(selector);
+}
+
 function view(over: Partial<UserStoryModel> & { id: number }): UsView {
     const model = { status: 1, swimlane: null, kanban_order: 1, ...over } as UserStoryModel;
     return retrieveUserStoryData(model, usersById, {});
@@ -133,12 +150,12 @@ describe("Card assignee + actions", () => {
             <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} />,
         );
         // Closed by default: the action items are absent from the DOM.
-        expect(container.querySelector(".card-actions-menu")).toBeNull();
-        expect(container.querySelector(".card-action-edit")).toBeNull();
-        expect(container.querySelector(".card-action-delete")).toBeNull();
+        expect(actionsMenu()).toBeNull();
+        expect(actionItem(".card-action-edit")).toBeNull();
+        expect(actionItem(".card-action-delete")).toBeNull();
 
         openActionsMenu(container);
-        expect(container.querySelector(".card-actions-menu")).not.toBeNull();
+        expect(actionsMenu()).not.toBeNull();
     });
 
     it("fires onClickEdit with the story id when the Edit action is clicked", () => {
@@ -147,7 +164,7 @@ describe("Card assignee + actions", () => {
             <Card item={view({ id: 42, subject: "Hi" })} project={project} zoom={ZOOM[2]} zoomLevel={2} onClickEdit={onClickEdit} />,
         );
         openActionsMenu(container);
-        const edit = container.querySelector(".card-action-edit");
+        const edit = actionItem(".card-action-edit");
         expect(edit).not.toBeNull();
         fireEvent.click(edit!);
         expect(onClickEdit).toHaveBeenCalledTimes(1);
@@ -160,7 +177,7 @@ describe("Card assignee + actions", () => {
             <Card item={view({ id: 42, subject: "Hi" })} project={project} zoom={ZOOM[2]} zoomLevel={2} onClickAssignedTo={onClickAssignedTo} />,
         );
         openActionsMenu(container);
-        const assign = container.querySelector(".card-action-assigned-to");
+        const assign = actionItem(".card-action-assigned-to");
         expect(assign).not.toBeNull();
         fireEvent.click(assign!);
         expect(onClickAssignedTo).toHaveBeenCalledTimes(1);
@@ -173,7 +190,7 @@ describe("Card assignee + actions", () => {
             <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} onClickDelete={onClickDelete} />,
         );
         openActionsMenu(container);
-        const del = container.querySelector(".card-action-delete");
+        const del = actionItem(".card-action-delete");
         expect(del).not.toBeNull();
         fireEvent.click(del!);
         expect(onClickDelete).toHaveBeenCalledTimes(1);
@@ -186,9 +203,9 @@ describe("Card assignee + actions", () => {
         );
         openActionsMenu(container);
         // `project` grants modify_us but NOT delete_us: Edit/Assign present, Delete absent.
-        expect(container.querySelector(".card-action-edit")).not.toBeNull();
-        expect(container.querySelector(".card-action-assigned-to")).not.toBeNull();
-        expect(container.querySelector(".card-action-delete")).toBeNull();
+        expect(actionItem(".card-action-edit")).not.toBeNull();
+        expect(actionItem(".card-action-assigned-to")).not.toBeNull();
+        expect(actionItem(".card-action-delete")).toBeNull();
     });
 
     it("hides the card-actions trigger entirely on an archived project (QA-FUNC-11)", () => {
@@ -212,9 +229,9 @@ describe("Card assignee + actions", () => {
             <Card item={view({ id: 42, subject: "Hi" })} project={projectRW} zoom={ZOOM[2]} zoomLevel={2} onClickEdit={jest.fn()} />,
         );
         openActionsMenu(container);
-        expect(container.querySelector(".card-actions-menu")).not.toBeNull();
-        fireEvent.click(container.querySelector(".card-action-edit")!);
-        expect(container.querySelector(".card-actions-menu")).toBeNull();
+        expect(actionsMenu()).not.toBeNull();
+        fireEvent.click(actionItem(".card-action-edit")!);
+        expect(actionsMenu()).toBeNull();
     });
 
     // [M-13] "Move to top" card action, ported from the legacy card-actions
@@ -233,7 +250,7 @@ describe("Card assignee + actions", () => {
             />,
         );
         openActionsMenu(container);
-        const moveTop = container.querySelector(".card-action-move-to-top");
+        const moveTop = actionItem(".card-action-move-to-top");
         expect(moveTop).not.toBeNull();
         fireEvent.click(moveTop!);
         expect(onClickMoveToTop).toHaveBeenCalledTimes(1);
@@ -253,8 +270,8 @@ describe("Card assignee + actions", () => {
         );
         openActionsMenu(container);
         // `project` grants modify_us, but the card is first -> no move-to-top.
-        expect(container.querySelector(".card-action-edit")).not.toBeNull();
-        expect(container.querySelector(".card-action-move-to-top")).toBeNull();
+        expect(actionItem(".card-action-edit")).not.toBeNull();
+        expect(actionItem(".card-action-move-to-top")).toBeNull();
     });
 
     it("hides the Move-to-top action when the project lacks modify permission", () => {
@@ -321,6 +338,19 @@ describe("Card rich render at max zoom", () => {
         expect(container.querySelector(".card-estimation")!.textContent).toBe("N/E");
     });
 
+    it("shows '0 pts' for a zero-point estimation instead of 'N/E'", () => {
+        // Regression guard for F-KANBAN-ZERO-POINTS-NE: a legitimate 0-point
+        // estimation must render "0 pts", not be treated as an absent estimate.
+        const model = {
+            id: 202, status: 1, swimlane: null, kanban_order: 1, subject: "ZP",
+            total_points: 0,
+        } as UserStoryModel;
+        const { container } = render(
+            <Card item={retrieveUserStoryData(model, richUsers, {})} project={project} zoom={ZOOM[3]} zoomLevel={3} />,
+        );
+        expect(container.querySelector(".card-estimation")!.textContent).toBe("0 pts");
+    });
+
     it("fires onToggleFold with the story id from the unfold affordance", () => {
         const onToggleFold = jest.fn();
         const { container } = render(
@@ -363,21 +393,21 @@ describe("Card rich render at max zoom", () => {
             <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickEdit={onClickEdit} />,
         );
         fireEvent.click(edit.container.querySelector(".card-actions .js-popup-button")!);
-        fireEvent.click(edit.container.querySelector(".card-action-edit")!);
+        fireEvent.click(actionItem(".card-action-edit")!);
         expect(onClickEdit).toHaveBeenCalledWith(200);
 
         const assign = render(
             <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickAssignedTo={onClickAssignedTo} />,
         );
         fireEvent.click(assign.container.querySelector(".card-actions .js-popup-button")!);
-        fireEvent.click(assign.container.querySelector(".card-action-assigned-to")!);
+        fireEvent.click(actionItem(".card-action-assigned-to")!);
         expect(onClickAssignedTo).toHaveBeenCalledWith(200);
 
         const del = render(
             <Card item={richView()} project={projectRW} zoom={ZOOM[3]} zoomLevel={3} onClickDelete={onClickDelete} />,
         );
         fireEvent.click(del.container.querySelector(".card-actions .js-popup-button")!);
-        fireEvent.click(del.container.querySelector(".card-action-delete")!);
+        fireEvent.click(actionItem(".card-action-delete")!);
         expect(onClickDelete).toHaveBeenCalledWith(200);
     });
 
@@ -394,7 +424,7 @@ describe("Card rich render at max zoom", () => {
 
         fireEvent.click(trigger);
 
-        const menu = container.querySelector(".card-actions-menu") as HTMLElement;
+        const menu = actionsMenu() as HTMLElement;
         expect(menu).not.toBeNull();
         // Menu semantics + wiring.
         expect(menu.getAttribute("role")).toBe("menu");
@@ -425,7 +455,7 @@ describe("Card rich render at max zoom", () => {
 
         // Escape closes the menu and returns focus to the trigger.
         fireEvent.keyDown(menu, { key: "Escape" });
-        expect(container.querySelector(".card-actions-menu")).toBeNull();
+        expect(actionsMenu()).toBeNull();
         expect(trigger.getAttribute("aria-expanded")).toBe("false");
         expect(document.activeElement).toBe(trigger);
     });

@@ -112,6 +112,8 @@ function makeProps(
         open: true,
         project: makeProject(),
         defaultStatusId: DEFAULT_STATUS_ID,
+        swimlanes: [],
+        defaultSwimlaneId: null,
         onCreated: jest.fn(),
         onClose: jest.fn(),
         ...overrides,

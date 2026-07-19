@@ -71,13 +71,32 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useId } from "react";
 import type { FormEvent } from "react";
 
-import type { Project, UsStatus, Role, Point, Id, UserStory } from "./types";
+import type { Project, UsStatus, Role, Point, Id, UserStory, Swimlane } from "./types";
 import { t } from "../shared/i18n/translate";
 import { Icon } from "../shared/ui/Icon";
 import type { UserStoryAttachment } from "../shared/api/attachments";
 import { dueDateColor, dueDateTitle } from "../shared/duedate/dueDate";
 import type { DueDateAppearance } from "../shared/duedate/dueDate";
 import { useDialogA11y } from "../shared/dialog/useDialogA11y";
+import { resolveUserAvatar, unnamedAvatarUrl } from "../shared/ui/avatar";
+import { getCurrentUser } from "../shared/session/auth";
+
+/**
+ * Minimal shape of a project member / assignable user for the inline assignee
+ * widget (KAN-02). Declared LOCALLY (not imported from the Kanban root) to keep
+ * the Backlog and Kanban React modules cleanly decoupled. It is structurally
+ * compatible with `resolveUserAvatar`'s parameter (only `gravatar_id` / `photo`
+ * are read there), so member objects pass through without a cast.
+ */
+interface AssigneeUser {
+    id: Id;
+    full_name_display?: string;
+    username?: string;
+    photo?: string | null;
+    gravatar_id?: string;
+    is_active?: boolean;
+    [key: string]: unknown;
+}
 
 /* -------------------------------------------------------------------------- */
 /* i18n literals — English values pinned from app/locales/taiga/locale-en.json. */
@@ -96,23 +115,38 @@ const TITLE_EDIT = "Edit user story";
 const PLACEHOLDER_SUBJECT = "Subject";
 /** LIGHTBOX.CREATE_EDIT.SELECT_STATUS */
 const LABEL_SELECT_STATUS = "Select status";
+/** LIGHTBOX.CREATE_EDIT.SWIMLANE — the create/edit swimlane control label (BL-01). */
+const LABEL_SWIMLANE = "Swimlane";
+/** ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT — suffix on the default swimlane (BL-01). */
+const LABEL_SWIMLANE_DEFAULT = "Default";
 /** LIGHTBOX.CREATE_EDIT.LOCATION */
 const LABEL_LOCATION = "Location";
 /** LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM */
 const LABEL_CREATE_BOTTOM = "at the bottom";
 /** LIGHTBOX.CREATE_EDIT.CREATE_TOP */
 const LABEL_CREATE_TOP = "on top";
-/** COMMON.ASSIGNED_TO.NOT_ASSIGNED — the "no assignee" option. */
-const LABEL_NOT_ASSIGNED = "Not assigned";
 /** COMMON.FIELDS.POINTS */
 const LABEL_POINTS = "Points";
-/**
- * Section label for the assignee control. The generic-form template renders the
- * multi-assign inline widget (which supplies its own chrome) rather than a
- * labelled field, so this pins a plain English label for the focused
- * single-assignee select used here.
- */
+/** Section label for the assignee control. */
 const LABEL_ASSIGNED_TO = "Assigned to";
+/** COMMON.ASSIGNED_TO.ASSIGN — the "assign" link in the inline assignee widget. */
+const LABEL_ASSIGN = "Assign";
+/** COMMON.ASSIGNED_TO.SELF — the "assign to me" self-assign link. */
+const LABEL_SELF_ASSIGN = "Assign to me";
+/** COMMON.OR — the " or " conjunction between Assign and Assign-to-me. */
+const LABEL_OR = "or";
+/** COMMON.ASSIGNED_TO.TITLE_ACTION_EDIT_ASSIGNMENT — assign-link title. */
+const TITLE_EDIT_ASSIGNMENT = "Edit assignment";
+/** COMMON.ASSIGNED_TO.DELETE_ASSIGNMENT — remove-user control title. */
+const TITLE_DELETE_ASSIGNMENT = "Delete assignment";
+/** LIGHTBOX.ASSIGNED_TO.SEARCH — the assignee-picker search placeholder. */
+const PLACEHOLDER_SEARCH_USERS = "Search for users";
+/** COMMON.ASSIGNED_TO.TOO_MANY — shown when the member list is truncated. */
+const LABEL_TOO_MANY_USERS = "...too many users, keep filtering";
+/** US.TOTAL_POINTS — the estimation total row label (CSS upper-cases the first letter). */
+const LABEL_TOTAL_POINTS = "total points";
+/** ATTACHMENT.DROP — the empty-attachments dropzone hint. */
+const LABEL_ATTACHMENT_DROP = "Drop attachments here!";
 /** COMMON.CREATE — submit label in create mode. */
 const LABEL_CREATE = "Create";
 /** COMMON.SAVE — submit label in edit mode. */
@@ -140,6 +174,8 @@ const LABEL_DELETE = "Delete";
 const LABEL_DUE_DATE = "Due date";
 /** COMMON.CARD.DUE_DATE — due-date tooltip template (param `{{date}}`). */
 const DUE_DATE_TOOLTIP = "Due date: {{date}}";
+/** LIGHTBOX.SET_DUE_DATE.TITLE_ACTION_DELETE_DUE_DATE — clear-due-date control. */
+const LABEL_CLEAR_DUE_DATE = "Delete due date";
 /** COMMON.TEAM_REQUIREMENT — team-requirement toggle title/aria-label. */
 const TITLE_TEAM_REQUIREMENT =
     "A team requirement is a requirement that must exist in the project but should have no cost for the client";
@@ -219,6 +255,12 @@ export interface UserStoryCreateFields {
     team_requirement: boolean;
     /** Client-requirement flag (`obj.client_requirement`). */
     client_requirement: boolean;
+    /**
+     * Chosen swimlane id, or `null` for the unclassified swimlane (BL-01).
+     * Bound from the SELECT SWIMLANE control (`obj.swimlane`); `null` on a
+     * no-swimlane project.
+     */
+    swimlane: Id | null;
     /** New files to upload after the story is created (`attachmentsToAdd`). */
     attachmentsToAdd: File[];
 }
@@ -243,6 +285,11 @@ export interface UserStoryEditChanges {
     team_requirement: boolean;
     /** Client-requirement flag (`obj.client_requirement`). */
     client_requirement: boolean;
+    /**
+     * Chosen swimlane id, or `null` for the unclassified swimlane (BL-01).
+     * Bound from the SELECT SWIMLANE control (`obj.swimlane`).
+     */
+    swimlane: Id | null;
     /** New files to upload after the edit persists (`attachmentsToAdd`). */
     attachmentsToAdd: File[];
     /** Ids of existing attachments to delete on save (`attachmentsToDelete`). */
@@ -265,6 +312,16 @@ export interface UserStoryEditLightboxProps {
      * "Not assigned").
      */
     assignableUsers: AssignableUser[];
+    /**
+     * Project swimlanes for the SELECT SWIMLANE control (BL-01). Empty on a
+     * no-swimlane project, which hides the control. Fetched by `BacklogApp`.
+     */
+    swimlanes: Swimlane[];
+    /**
+     * Project default swimlane id — the swimlane pre-selected when creating a
+     * new story (BL-01). `null` on a no-swimlane project.
+     */
+    defaultSwimlaneId: Id | null;
     /**
      * Persist a new story. MUST resolve on success and REJECT on failure so the
      * lightbox can keep itself open and surface the error (mirrors the
@@ -303,6 +360,8 @@ export function UserStoryEditLightbox(
         project,
         us,
         assignableUsers,
+        swimlanes,
+        defaultSwimlaneId,
         onCreate,
         onEdit,
         onClose,
@@ -325,6 +384,9 @@ export function UserStoryEditLightbox(
     const [description, setDescription] = useState<string>("");
     const [tags, setTags] = useState<UsTag[]>([]);
     const [tagInput, setTagInput] = useState<string>("");
+    // Ports `vm.addTag` (tag-line-common controller): the tag input is hidden
+    // behind an "Add tag +" button and only revealed on click.
+    const [addTagOpen, setAddTagOpen] = useState<boolean>(false);
     const [dueDate, setDueDate] = useState<string>("");
     const [teamRequirement, setTeamRequirement] = useState<boolean>(false);
     const [clientRequirement, setClientRequirement] = useState<boolean>(false);
@@ -339,9 +401,28 @@ export function UserStoryEditLightbox(
     const [attachmentsToAdd, setAttachmentsToAdd] = useState<File[]>([]);
     const [attachmentsToDelete, setAttachmentsToDelete] = useState<number[]>([]);
 
+    // Inline-widget UI state (KAN-02): the assignee picker popover
+    // (`.pop-users.popover`) open flag + its search term, the estimation
+    // per-role points popover (`.pop-points-open`) open role id, and the
+    // due-date popover (`.date-picker-popover`) open flag. Each mirrors the
+    // transient open/close scope of its AngularJS directive; none is persisted.
+    const [assigneePopoverOpen, setAssigneePopoverOpen] = useState<boolean>(false);
+    const [assigneeSearch, setAssigneeSearch] = useState<string>("");
+    const [pointsPopoverRoleId, setPointsPopoverRoleId] = useState<Id | null>(null);
+    const [dueDatePopoverOpen, setDueDatePopoverOpen] = useState<boolean>(false);
+    // BL-01: the chosen swimlane (`obj.swimlane`) + the styled selector's
+    // open/close flag (ports `tg-swimlane-selector`). `null` = unclassified.
+    const [swimlaneId, setSwimlaneId] = useState<Id | null>(null);
+    const [displaySwimlaneSelector, setDisplaySwimlaneSelector] =
+        useState<boolean>(false);
+
     // Focus target for the required-subject error (ports checksley focusing the
     // invalid field).
     const subjectRef = useRef<HTMLInputElement>(null);
+    // Hidden file input, triggered by the attachments "+" (add-attachment-button).
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    // Autofocus target for the add-tag input once the "Add tag +" button reveals it.
+    const tagInputRef = useRef<HTMLInputElement>(null);
 
     /** `add_us` gates the add/delete-tag controls (`permissions="add_us"`). */
     const canAddTags = useMemo<boolean>(
@@ -387,6 +468,11 @@ export function UserStoryEditLightbox(
                     ? (us.attachments as UserStoryAttachment[])
                     : [],
             );
+            // BL-01: seed from the story's actual swimlane (`us.swimlane`, read
+            // via the index signature); `null` = unclassified.
+            setSwimlaneId(
+                typeof us.swimlane === "number" ? (us.swimlane as Id) : null,
+            );
         } else {
             setSubject("");
             setStatusId(project.default_us_status);
@@ -400,6 +486,10 @@ export function UserStoryEditLightbox(
             setIsBlocked(false);
             setBlockedNote("");
             setExistingAttachments([]);
+            // BL-01: pre-select the project default swimlane on a new story
+            // (baseline shows "voluptate (Default)"); fall back to the first
+            // swimlane when the project defines swimlanes but no explicit default.
+            setSwimlaneId(defaultSwimlaneId ?? swimlanes[0]?.id ?? null);
         }
         setUsPosition("bottom");
         setStatusOpen(false);
@@ -409,7 +499,14 @@ export function UserStoryEditLightbox(
         setTagInput("");
         setAttachmentsToAdd([]);
         setAttachmentsToDelete([]);
-    }, [open, mode, us, project.default_us_status]);
+        // Transient inline-widget popovers always start closed on (re)open.
+        setAddTagOpen(false);
+        setAssigneePopoverOpen(false);
+        setAssigneeSearch("");
+        setPointsPopoverRoleId(null);
+        setDueDatePopoverOpen(false);
+        setDisplaySwimlaneSelector(false);
+    }, [open, mode, us, project.default_us_status, defaultSwimlaneId, swimlanes]);
 
     // Hydrate the existing-attachment list from the loader (edit mode) when the
     // board model did not carry an `attachments` array. Ports the fact that the
@@ -442,6 +539,14 @@ export function UserStoryEditLightbox(
         };
     }, [open, mode, us, fetchAttachments]);
 
+    // Autofocus the add-tag input the moment the "Add tag +" button reveals it
+    // (ports the `tg-autofocus` directive on the add-tag input).
+    useEffect(() => {
+        if (open && addTagOpen) {
+            tagInputRef.current?.focus();
+        }
+    }, [open, addTagOpen]);
+
     // [M-09] Complete modal-dialog accessibility (role/aria-modal, focus
     // entry+trap+return, background inert, nested-Escape policy) via the shared
     // primitive. Escape closes the lightbox (equivalent to the ✕ close button)
@@ -472,6 +577,21 @@ export function UserStoryEditLightbox(
     const statusList = useMemo<UsStatus[]>(
         () => [...project.us_statuses].sort((a, b) => a.order - b.order),
         [project.us_statuses],
+    );
+
+    // BL-01: whether to render the SELECT SWIMLANE control, and the currently
+    // chosen swimlane object (for the button label). Ports the jade gate
+    // `project.is_kanban_activated && swimlanesList.size`.
+    const showSwimlaneSelector = useMemo<boolean>(
+        () => project.is_kanban_activated === true && swimlanes.length > 0,
+        [project.is_kanban_activated, swimlanes.length],
+    );
+    const currentSwimlane = useMemo<Swimlane | null>(
+        () =>
+            swimlaneId === null
+                ? null
+                : swimlanes.find((swimlane) => swimlane.id === swimlaneId) ?? null,
+        [swimlanes, swimlaneId],
     );
 
     // Ports `computableRoles = _.filter(project.roles, "computable")`, sorted by
@@ -595,6 +715,156 @@ export function UserStoryEditLightbox(
         [project.us_duedates],
     );
 
+    /* ---------------------------------------------------------------------- */
+    /* KAN-02 inline-assignee widget support (ports tg-assigned-users-inline)  */
+    /* ---------------------------------------------------------------------- */
+
+    // The current user id, read once from the shared session cache (ports
+    // `$currentUserService.getUser().get('id')`); drives "Assign to me".
+    const currentUserId = useMemo<Id | null>(() => {
+        const user = getCurrentUser();
+        return user ? user.id : null;
+    }, []);
+
+    // Active assignable users enriched with a resolved avatar, sorted by display
+    // name. Prefer the full `project.members` (which carry photos / gravatar
+    // seeds) when present; otherwise fall back to the filter-derived
+    // `assignableUsers` (id + name only -> default avatars). Ports the AngularJS
+    // active-user list + `$userListService` avatars.
+    const assigneeMembers = useMemo<
+        Array<{ user: AssigneeUser; avatar: { url: string; bg?: string } }>
+    >(() => {
+        const rawMembers = project.members;
+        const members: AssigneeUser[] = Array.isArray(rawMembers)
+            ? (rawMembers as AssigneeUser[])
+            : [];
+        const source: AssigneeUser[] =
+            members.length > 0
+                ? members.filter((m) => m.is_active !== false)
+                : assignableUsers.map(
+                      (u) =>
+                          ({
+                              id: u.id,
+                              full_name_display: u.name,
+                          }) as AssigneeUser,
+                  );
+        return source
+            .map((member) => ({
+                user: member,
+                avatar: resolveUserAvatar(member),
+            }))
+            .sort((a, b) =>
+                (a.user.full_name_display ?? "").localeCompare(
+                    b.user.full_name_display ?? "",
+                ),
+            );
+    }, [project.members, assignableUsers]);
+
+    // The currently-assigned user (for its avatar + display name). Falls back to
+    // the filter-derived {id,name} when not present in the members list.
+    const assignedMember = useMemo<{
+        user: AssigneeUser;
+        avatar: { url: string; bg?: string };
+    } | null>(() => {
+        if (assignedTo == null) {
+            return null;
+        }
+        const found = assigneeMembers.find((m) => m.user.id === assignedTo);
+        if (found) {
+            return found;
+        }
+        const fallbackName =
+            assignableUsers.find((u) => u.id === assignedTo)?.name ?? "";
+        return {
+            user: { id: assignedTo, full_name_display: fallbackName },
+            avatar: { url: unnamedAvatarUrl() },
+        };
+    }, [assignedTo, assigneeMembers, assignableUsers]);
+
+    // Picker list filtered by the search term and excluding the current
+    // assignee (single-assignee model). Ports getFilteredUsers.
+    const filteredAssigneeMembers = useMemo(() => {
+        const term = assigneeSearch.trim().toLowerCase();
+        return assigneeMembers.filter((m) => {
+            if (m.user.id === assignedTo) {
+                return false;
+            }
+            if (term === "") {
+                return true;
+            }
+            const name = (m.user.full_name_display ?? "").toLowerCase();
+            const uname = (m.user.username ?? "").toLowerCase();
+            return name.includes(term) || uname.includes(term);
+        });
+    }, [assigneeMembers, assigneeSearch, assignedTo]);
+
+    // Assign a user (single-assignee): set the assignee and close the picker.
+    const assignUser = useCallback((id: Id) => {
+        setAssignedTo(id);
+        setAssigneePopoverOpen(false);
+        setAssigneeSearch("");
+    }, []);
+
+    // "Assign to me": assign the current user (ports selfAssign()).
+    const selfAssign = useCallback(() => {
+        if (currentUserId != null) {
+            setAssignedTo(currentUserId);
+        }
+        setAssigneePopoverOpen(false);
+    }, [currentUserId]);
+
+    // Remove the assignment (ports unassign()).
+    const unassignUser = useCallback(() => {
+        setAssignedTo(null);
+        setAssigneePopoverOpen(false);
+    }, []);
+
+    /* ---------------------------------------------------------------------- */
+    /* KAN-02 estimation total + per-role display (ports tg-lb-us-estimation)  */
+    /* ---------------------------------------------------------------------- */
+
+    // Point id -> Point, for O(1) name/value lookup.
+    const pointsById = useMemo<Record<string, Point>>(() => {
+        const map: Record<string, Point> = {};
+        for (const point of pointsList) {
+            map[String(point.id)] = point;
+        }
+        return map;
+    }, [pointsList]);
+
+    // Ports calculateTotalPoints(): sum the selected point VALUES across the
+    // computable roles; "?" when nothing (numeric) is selected.
+    const totalPoints = useMemo<string>(() => {
+        const values: number[] = [];
+        for (const role of computableRoles) {
+            const pid = points[String(role.id)];
+            if (pid == null) {
+                continue;
+            }
+            const point = pointsById[String(pid)];
+            if (point && typeof point.value === "number") {
+                values.push(point.value);
+            }
+        }
+        if (values.length === 0) {
+            return "?";
+        }
+        return String(values.reduce((acc, num) => acc + num, 0));
+    }, [computableRoles, points, pointsById]);
+
+    // The selected point's display NAME for a role ("?" when unset). Ports
+    // calculateRoles() -> role.points.
+    const rolePointName = useCallback(
+        (roleId: Id): string => {
+            const pid = points[String(roleId)];
+            if (pid == null) {
+                return "?";
+            }
+            return pointsById[String(pid)]?.name ?? "?";
+        },
+        [points, pointsById],
+    );
+
     // Ports the debounced submit handler (lightboxes.coffee L773-820): validate,
     // persist through the parent, close on success, surface errors on failure.
     const handleSubmit = useCallback(
@@ -640,6 +910,7 @@ export function UserStoryEditLightbox(
                         blocked_note: blockedNote,
                         team_requirement: teamRequirement,
                         client_requirement: clientRequirement,
+                        swimlane: swimlaneId,
                         attachmentsToAdd,
                         attachmentsToDelete,
                     });
@@ -657,6 +928,7 @@ export function UserStoryEditLightbox(
                         blocked_note: blockedNote,
                         team_requirement: teamRequirement,
                         client_requirement: clientRequirement,
+                        swimlane: swimlaneId,
                         attachmentsToAdd,
                     });
                 }
@@ -685,6 +957,7 @@ export function UserStoryEditLightbox(
             blockedNote,
             teamRequirement,
             clientRequirement,
+            swimlaneId,
             attachmentsToAdd,
             attachmentsToDelete,
             onCreate,
@@ -782,9 +1055,29 @@ export function UserStoryEditLightbox(
                                             </div>
                                         </div>
                                     ))}
-                                    {canAddTags ? (
+                                    {/* "Add tag +" button (ports add-tag-button.jade,
+                                        `.add-tag-button` teal link + icon-add). Shown
+                                        only while the input is hidden. */}
+                                    {canAddTags && !addTagOpen ? (
+                                        <button
+                                            type="button"
+                                            className="add-tag-button e2e-show-tag-input"
+                                            title={t("COMMON.TAGS.ADD", LABEL_ADD_TAG)}
+                                            onClick={() => setAddTagOpen(true)}
+                                        >
+                                            <span className="add-tag-text">
+                                                {t("COMMON.TAGS.ADD", LABEL_ADD_TAG)}
+                                            </span>
+                                            <Icon name="icon-add" />
+                                        </button>
+                                    ) : null}
+                                    {/* Add-tag input (ports add-tag-input.jade), revealed
+                                        by the button; a `.save` icon appears once text is
+                                        typed (ports `tg-svg.save ng-show=name.length`). */}
+                                    {canAddTags && addTagOpen ? (
                                         <div className="add-tag-input">
                                             <input
+                                                ref={tagInputRef}
                                                 type="text"
                                                 className="tag-input e2e-add-tag-input"
                                                 value={tagInput}
@@ -803,9 +1096,33 @@ export function UserStoryEditLightbox(
                                                     if (e.key === "Enter") {
                                                         e.preventDefault();
                                                         addTag(tagInput);
+                                                    } else if (e.key === "Escape") {
+                                                        // Close the add-tag input on Escape
+                                                        // WITHOUT closing the whole lightbox.
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        setAddTagOpen(false);
+                                                        setTagInput("");
                                                     }
                                                 }}
                                             />
+                                            {tagInput.length > 0 ? (
+                                                <button
+                                                    type="button"
+                                                    className="save"
+                                                    title={t(
+                                                        "COMMON.TAGS.ADD",
+                                                        LABEL_ADD_TAG,
+                                                    )}
+                                                    aria-label={t(
+                                                        "COMMON.TAGS.ADD",
+                                                        LABEL_ADD_TAG,
+                                                    )}
+                                                    onClick={() => addTag(tagInput)}
+                                                >
+                                                    <Icon name="icon-save" />
+                                                </button>
+                                            ) : null}
                                         </div>
                                     ) : null}
                                 </div>
@@ -836,7 +1153,18 @@ export function UserStoryEditLightbox(
                             deletions are DEFERRED to save (the parent runs them
                             against `/userstories/attachments`). */}
                         <fieldset>
-                            <section className="attachments attachment-simple">
+                            <section
+                                className="attachments attachment-simple"
+                                // Ports `tg-attachments-drop`: accept files dropped
+                                // anywhere on the section.
+                                onDragOver={(e) => {
+                                    e.preventDefault();
+                                }}
+                                onDrop={(e) => {
+                                    e.preventDefault();
+                                    addAttachments(e.dataTransfer?.files ?? null);
+                                }}
+                            >
                                 <div className="attachments-header">
                                     <h3 className="attachments-title">
                                         <span className="attachments-num">
@@ -850,16 +1178,35 @@ export function UserStoryEditLightbox(
                                             )}
                                         </span>
                                     </h3>
-                                    <div className="add-attach">
-                                        <input
-                                            id={`${fieldIds}-add-attach`}
-                                            type="file"
-                                            multiple
+                                    {/* Ports attachments-simple.jade `.add-attach`:
+                                        a `.btn-icon.add-attachment-button` "+" that
+                                        triggers a visually-hidden file input (the raw
+                                        native file button is never shown). */}
+                                    <div className="add-attach" id={`${fieldIds}-add-attach`}>
+                                        <button
+                                            type="button"
+                                            className="btn-icon add-attachment-button"
                                             aria-label={t(
                                                 "ATTACHMENT.ADD",
                                                 LABEL_ADD_ATTACHMENT,
                                                 { maxFileSizeMsg: "" },
                                             )}
+                                            title={t(
+                                                "ATTACHMENT.ADD",
+                                                LABEL_ADD_ATTACHMENT,
+                                                { maxFileSizeMsg: "" },
+                                            )}
+                                            onClick={() => fileInputRef.current?.click()}
+                                        >
+                                            <Icon name="icon-add" />
+                                        </button>
+                                        <input
+                                            ref={fileInputRef}
+                                            type="file"
+                                            multiple
+                                            style={{ display: "none" }}
+                                            aria-hidden="true"
+                                            tabIndex={-1}
                                             onChange={(e) => {
                                                 addAttachments(e.target.files);
                                                 // Allow re-selecting the same file.
@@ -868,6 +1215,20 @@ export function UserStoryEditLightbox(
                                         />
                                     </div>
                                 </div>
+                                {/* Empty-state dropzone (ports `.attachments-empty`):
+                                    shown only when there are no attachments. */}
+                                {existingAttachments.length +
+                                    attachmentsToAdd.length ===
+                                0 ? (
+                                    <div className="attachments-empty">
+                                        <div>
+                                            {t(
+                                                "ATTACHMENT.DROP",
+                                                LABEL_ATTACHMENT_DROP,
+                                            )}
+                                        </div>
+                                    </div>
+                                ) : null}
                                 <div className="attachment-body attachment-list">
                                     {existingAttachments.map((att) => (
                                         <div
@@ -1008,6 +1369,96 @@ export function UserStoryEditLightbox(
                             ) : null}
                         </fieldset>
 
+                        {/* Swimlane — ports lb-create-edit-us.jade `.swimlane-select`
+                            (tg-swimlane-selector), gated on
+                            `project.is_kanban_activated && swimlanesList.size`
+                            (BL-01). A styled dropdown listing the project
+                            swimlanes with the default marked "(Default)"; the
+                            default is pre-selected on a new story. Reproduces the
+                            Kanban `.swimlane-selector` structure so the compiled
+                            SCSS themes it identically. */}
+                        {showSwimlaneSelector ? (
+                            <fieldset className="swimlane-select">
+                                <span className="label">
+                                    {t("LIGHTBOX.CREATE_EDIT.SWIMLANE", LABEL_SWIMLANE)}
+                                </span>
+                                <div className="swimlane-selector">
+                                    <button
+                                        type="button"
+                                        className="select"
+                                        aria-haspopup="listbox"
+                                        aria-expanded={displaySwimlaneSelector}
+                                        onClick={() =>
+                                            setDisplaySwimlaneSelector((o) => !o)
+                                        }
+                                    >
+                                        {currentSwimlane ? (
+                                            <span className="swimlane-select-text">
+                                                <span>{currentSwimlane.name}</span>
+                                                {currentSwimlane.id ===
+                                                    defaultSwimlaneId &&
+                                                swimlanes.length > 1 ? (
+                                                    <span className="swimlane-default">
+                                                        {" (" +
+                                                            t(
+                                                                "ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT",
+                                                                LABEL_SWIMLANE_DEFAULT,
+                                                            ) +
+                                                            ")"}
+                                                    </span>
+                                                ) : null}
+                                            </span>
+                                        ) : (
+                                            <span className="swimlane-select-text unclassified">
+                                                {swimlanes[0]?.name}
+                                            </span>
+                                        )}
+                                        <Icon name="icon-arrow-down" />
+                                    </button>
+                                    {displaySwimlaneSelector ? (
+                                        <div className="options" role="listbox">
+                                            {swimlanes.map((swimlane) => (
+                                                <button
+                                                    key={swimlane.id}
+                                                    type="button"
+                                                    role="option"
+                                                    aria-selected={
+                                                        swimlane.id === swimlaneId
+                                                    }
+                                                    className={
+                                                        "option" +
+                                                        (swimlane.id === swimlaneId
+                                                            ? " selected"
+                                                            : "")
+                                                    }
+                                                    onClick={() => {
+                                                        setSwimlaneId(swimlane.id);
+                                                        setDisplaySwimlaneSelector(
+                                                            false,
+                                                        );
+                                                    }}
+                                                >
+                                                    <span>{swimlane.name}</span>
+                                                    {defaultSwimlaneId ===
+                                                        swimlane.id &&
+                                                    swimlanes.length > 1 ? (
+                                                        <span className="swimlane-default">
+                                                            {" (" +
+                                                                t(
+                                                                    "ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT",
+                                                                    LABEL_SWIMLANE_DEFAULT,
+                                                                ) +
+                                                                ")"}
+                                                        </span>
+                                                    ) : null}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    ) : null}
+                                </div>
+                            </fieldset>
+                        ) : null}
+
                         {/* Creation position — jade `section.creation-position(ng-if="mode == 'new'")` */}
                         {mode === "create" ? (
                             <section className="creation-position">
@@ -1054,68 +1505,414 @@ export function UserStoryEditLightbox(
                             </section>
                         ) : null}
 
-                        {/* Assignee — ports section.ticket-assigned-to (a focused
-                            single-assignee select rather than the multi-assign
-                            inline widget). */}
-                        <section className="ticket-assigned-to">
+                        {/* Assignee — ports section.ticket-assigned-to +
+                            tg-assigned-users-inline (`.assigned-inline`): an
+                            avatar-based widget with "Assign / Assign to me" when
+                            unassigned, and avatar + name + remove when assigned.
+                            The picker (`.pop-users.popover`) opens inline. Single
+                            assignee (the story's `assigned_to`). */}
+                        <section className="ticket-assigned-to multiple-assign">
                             <span className="label">
                                 {t("COMMON.FIELDS.ASSIGNED_TO", LABEL_ASSIGNED_TO)}
                             </span>
-                            <select
-                                className="assigned-to-select"
-                                aria-label={t("COMMON.FIELDS.ASSIGNED_TO", LABEL_ASSIGNED_TO)}
-                                value={assignedTo === null ? "" : String(assignedTo)}
-                                onChange={(e) =>
-                                    setAssignedTo(
-                                        e.target.value === "" ? null : Number(e.target.value),
-                                    )
-                                }
-                            >
-                                <option value="">
-                                    {t("COMMON.ASSIGNED_TO.NOT_ASSIGNED", LABEL_NOT_ASSIGNED)}
-                                </option>
-                                {assignableUsers.map((u) => (
-                                    <option key={u.id} value={String(u.id)}>
-                                        {u.name}
-                                    </option>
-                                ))}
-                            </select>
+                            <div className="assigned-inline">
+                                {assignedMember ? (
+                                    // Assigned state — avatar + name + remove-user ×.
+                                    <div className="ticket-user-list">
+                                        <div className="user-list-single">
+                                            <div className="user-list-avatar">
+                                                <img
+                                                    src={assignedMember.avatar.url}
+                                                    style={
+                                                        assignedMember.avatar.bg
+                                                            ? {
+                                                                  background:
+                                                                      assignedMember
+                                                                          .avatar.bg,
+                                                              }
+                                                            : undefined
+                                                    }
+                                                    title={
+                                                        assignedMember.user
+                                                            .full_name_display ?? ""
+                                                    }
+                                                    alt={
+                                                        assignedMember.user
+                                                            .full_name_display ?? ""
+                                                    }
+                                                />
+                                            </div>
+                                            <div className="user-list-name">
+                                                <a
+                                                    className="users-dropdown user-assigned"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    title={t(
+                                                        "COMMON.ASSIGNED_TO.TITLE_ACTION_EDIT_ASSIGNMENT",
+                                                        TITLE_EDIT_ASSIGNMENT,
+                                                    )}
+                                                    onClick={() =>
+                                                        setAssigneePopoverOpen(
+                                                            (v) => !v,
+                                                        )
+                                                    }
+                                                    onKeyDown={(e) => {
+                                                        if (
+                                                            e.key === "Enter" ||
+                                                            e.key === " "
+                                                        ) {
+                                                            e.preventDefault();
+                                                            setAssigneePopoverOpen(
+                                                                (v) => !v,
+                                                            );
+                                                        }
+                                                    }}
+                                                >
+                                                    <span>
+                                                        {
+                                                            assignedMember.user
+                                                                .full_name_display
+                                                        }
+                                                    </span>
+                                                </a>
+                                            </div>
+                                            <span
+                                                className="remove-user"
+                                                role="button"
+                                                tabIndex={0}
+                                                title={t(
+                                                    "COMMON.ASSIGNED_TO.DELETE_ASSIGNMENT",
+                                                    TITLE_DELETE_ASSIGNMENT,
+                                                )}
+                                                aria-label={t(
+                                                    "COMMON.ASSIGNED_TO.DELETE_ASSIGNMENT",
+                                                    TITLE_DELETE_ASSIGNMENT,
+                                                )}
+                                                onClick={unassignUser}
+                                                onKeyDown={(e) => {
+                                                    if (
+                                                        e.key === "Enter" ||
+                                                        e.key === " "
+                                                    ) {
+                                                        e.preventDefault();
+                                                        unassignUser();
+                                                    }
+                                                }}
+                                            >
+                                                <Icon name="icon-close" />
+                                            </span>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    // Unassigned state — default avatar + Assign / Assign to me.
+                                    <div className="ticket-user-list">
+                                        <div className="user-list-single">
+                                            <div className="user-list-avatar">
+                                                <img
+                                                    src={unnamedAvatarUrl()}
+                                                    alt={t(
+                                                        "COMMON.ASSIGNED_TO.ASSIGN",
+                                                        LABEL_ASSIGN,
+                                                    )}
+                                                />
+                                            </div>
+                                            <div className="user-list-name">
+                                                <a
+                                                    className="users-dropdown user-assigned"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    title={t(
+                                                        "COMMON.ASSIGNED_TO.TITLE_ACTION_EDIT_ASSIGNMENT",
+                                                        TITLE_EDIT_ASSIGNMENT,
+                                                    )}
+                                                    onClick={() =>
+                                                        setAssigneePopoverOpen(
+                                                            (v) => !v,
+                                                        )
+                                                    }
+                                                    onKeyDown={(e) => {
+                                                        if (
+                                                            e.key === "Enter" ||
+                                                            e.key === " "
+                                                        ) {
+                                                            e.preventDefault();
+                                                            setAssigneePopoverOpen(
+                                                                (v) => !v,
+                                                            );
+                                                        }
+                                                    }}
+                                                >
+                                                    <span className="assigned-name">
+                                                        {t(
+                                                            "COMMON.ASSIGNED_TO.ASSIGN",
+                                                            LABEL_ASSIGN,
+                                                        )}
+                                                    </span>
+                                                </a>
+                                                {"\u00a0"}
+                                                <span className="read-only">
+                                                    {t("COMMON.OR", LABEL_OR)}
+                                                </span>
+                                                {"\u00a0"}
+                                                <a
+                                                    className="self-assign"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    title={t(
+                                                        "COMMON.ASSIGNED_TO.SELF",
+                                                        LABEL_SELF_ASSIGN,
+                                                    )}
+                                                    onClick={selfAssign}
+                                                    onKeyDown={(e) => {
+                                                        if (
+                                                            e.key === "Enter" ||
+                                                            e.key === " "
+                                                        ) {
+                                                            e.preventDefault();
+                                                            selfAssign();
+                                                        }
+                                                    }}
+                                                >
+                                                    <span>
+                                                        {t(
+                                                            "COMMON.ASSIGNED_TO.SELF",
+                                                            LABEL_SELF_ASSIGN,
+                                                        )}
+                                                    </span>
+                                                </a>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Picker popover (ports `.pop-users.popover`):
+                                    search + member list. Single-click assigns.
+                                    Reveal via inline display (the `.popover` mixin
+                                    base is display:none). */}
+                                {assigneePopoverOpen ? (
+                                    <div
+                                        className="pop-users popover"
+                                        style={{ display: "block" }}
+                                    >
+                                        <input
+                                            type="text"
+                                            className="users-search"
+                                            placeholder={t(
+                                                "LIGHTBOX.ASSIGNED_TO.SEARCH",
+                                                PLACEHOLDER_SEARCH_USERS,
+                                            )}
+                                            aria-label={t(
+                                                "LIGHTBOX.ASSIGNED_TO.SEARCH",
+                                                PLACEHOLDER_SEARCH_USERS,
+                                            )}
+                                            value={assigneeSearch}
+                                            onChange={(e) =>
+                                                setAssigneeSearch(e.target.value)
+                                            }
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Escape") {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    setAssigneePopoverOpen(false);
+                                                }
+                                            }}
+                                        />
+                                        {filteredAssigneeMembers.map((m) => (
+                                            <a
+                                                key={m.user.id}
+                                                className="user-list-single"
+                                                role="button"
+                                                tabIndex={0}
+                                                data-user-id={m.user.id}
+                                                title={
+                                                    m.user.full_name_display ?? ""
+                                                }
+                                                onClick={() =>
+                                                    assignUser(m.user.id)
+                                                }
+                                                onKeyDown={(e) => {
+                                                    if (
+                                                        e.key === "Enter" ||
+                                                        e.key === " "
+                                                    ) {
+                                                        e.preventDefault();
+                                                        assignUser(m.user.id);
+                                                    }
+                                                }}
+                                            >
+                                                <img
+                                                    className="user-list-avatar"
+                                                    src={m.avatar.url}
+                                                    style={
+                                                        m.avatar.bg
+                                                            ? {
+                                                                  background:
+                                                                      m.avatar.bg,
+                                                              }
+                                                            : undefined
+                                                    }
+                                                    alt={
+                                                        m.user.full_name_display ??
+                                                        ""
+                                                    }
+                                                />
+                                                <span
+                                                    className="user-list-name"
+                                                    title={
+                                                        m.user
+                                                            .full_name_display ?? ""
+                                                    }
+                                                >
+                                                    {m.user.full_name_display}
+                                                </span>
+                                            </a>
+                                        ))}
+                                        {filteredAssigneeMembers.length === 0 ? (
+                                            <div className="show-more">
+                                                <span>
+                                                    {t(
+                                                        "COMMON.ASSIGNED_TO.TOO_MANY",
+                                                        LABEL_TOO_MANY_USERS,
+                                                    )}
+                                                </span>
+                                            </div>
+                                        ) : null}
+                                    </div>
+                                ) : null}
+                            </div>
                         </section>
 
-                        {/* Estimation — ports .ticket-estimation (tg-lb-us-estimation):
-                            one point selector per computable role. */}
+                        {/* Estimation — ports .ticket-estimation (tg-lb-us-estimation)
+                            + us-estimation-points-per-role.jade: a striped
+                            `ul.points-per-role` of `li.ticket-role-points.total`
+                            rows (one per computable role, showing the selected
+                            point name) capped by a "total points" row. Clicking a
+                            role row opens the `ul.popover.pop-points-open` point
+                            selector (ports EstimationProcess.renderPointsSelector);
+                            the chosen point carries `.active` (matches
+                            us-estimation-points.jade's inverted `selected` flag). */}
                         {computableRoles.length > 0 ? (
                             <div className="ticket-estimation">
-                                <span className="label">{t("COMMON.FIELDS.POINTS", LABEL_POINTS)}</span>
-                                {computableRoles.map((role) => (
-                                    <div className="points-per-role" key={role.id}>
-                                        <span className="role-name">{role.name}</span>
-                                        <select
-                                            className="points-select"
+                                <div className="ticket-section-label">
+                                    <span>
+                                        {t("COMMON.FIELDS.POINTS", LABEL_POINTS)}
+                                    </span>
+                                </div>
+                                <ul className="points-per-role">
+                                    {computableRoles.map((role) => (
+                                        <li
+                                            className="ticket-role-points total clickable"
+                                            key={role.id}
+                                            data-role-id={role.id}
+                                            title={role.name}
+                                            role="button"
+                                            tabIndex={0}
                                             aria-label={`${t("COMMON.FIELDS.POINTS", LABEL_POINTS)} — ${role.name}`}
-                                            value={
-                                                points[String(role.id)] === undefined
-                                                    ? ""
-                                                    : String(points[String(role.id)])
-                                            }
-                                            onChange={(e) =>
-                                                setPointForRole(
-                                                    role.id,
-                                                    e.target.value === ""
-                                                        ? null
-                                                        : Number(e.target.value),
+                                            onClick={() =>
+                                                setPointsPopoverRoleId((cur) =>
+                                                    cur === role.id ? null : role.id,
                                                 )
                                             }
+                                            onKeyDown={(e) => {
+                                                if (
+                                                    e.key === "Enter" ||
+                                                    e.key === " "
+                                                ) {
+                                                    e.preventDefault();
+                                                    setPointsPopoverRoleId((cur) =>
+                                                        cur === role.id
+                                                            ? null
+                                                            : role.id,
+                                                    );
+                                                }
+                                            }}
                                         >
-                                            <option value="">?</option>
-                                            {pointsList.map((p) => (
-                                                <option key={p.id} value={String(p.id)}>
-                                                    {p.name}
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                ))}
+                                            <span className="role">{role.name}</span>
+                                            <span className="points">
+                                                {rolePointName(role.id)}
+                                            </span>
+                                            {pointsPopoverRoleId === role.id ? (
+                                                <ul
+                                                    className="popover pop-points-open"
+                                                    style={{ display: "block" }}
+                                                >
+                                                    {pointsList.map((p) => {
+                                                        const isChosen =
+                                                            points[
+                                                                String(role.id)
+                                                            ] === p.id;
+                                                        return (
+                                                            <li key={p.id}>
+                                                                <a
+                                                                    className={
+                                                                        "point" +
+                                                                        (isChosen
+                                                                            ? " active"
+                                                                            : "")
+                                                                    }
+                                                                    role="button"
+                                                                    tabIndex={0}
+                                                                    title={p.name}
+                                                                    data-point-id={
+                                                                        p.id
+                                                                    }
+                                                                    data-role-id={
+                                                                        role.id
+                                                                    }
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        setPointForRole(
+                                                                            role.id,
+                                                                            p.id,
+                                                                        );
+                                                                        setPointsPopoverRoleId(
+                                                                            null,
+                                                                        );
+                                                                    }}
+                                                                    onKeyDown={(
+                                                                        e,
+                                                                    ) => {
+                                                                        if (
+                                                                            e.key ===
+                                                                                "Enter" ||
+                                                                            e.key ===
+                                                                                " "
+                                                                        ) {
+                                                                            e.preventDefault();
+                                                                            e.stopPropagation();
+                                                                            setPointForRole(
+                                                                                role.id,
+                                                                                p.id,
+                                                                            );
+                                                                            setPointsPopoverRoleId(
+                                                                                null,
+                                                                            );
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    <span className="item-text">
+                                                                        {p.name}
+                                                                    </span>
+                                                                </a>
+                                                            </li>
+                                                        );
+                                                    })}
+                                                </ul>
+                                            ) : null}
+                                        </li>
+                                    ))}
+                                    <li className="ticket-role-points total">
+                                        <span className="role">
+                                            {t(
+                                                "US.TOTAL_POINTS",
+                                                LABEL_TOTAL_POINTS,
+                                            )}
+                                        </span>
+                                        <span className="points">
+                                            {totalPoints}
+                                        </span>
+                                    </li>
+                                </ul>
                             </div>
                         ) : null}
 
@@ -1123,43 +1920,128 @@ export function UserStoryEditLightbox(
                             `.ticket-detail-settings`: due date, team/client
                             requirement toggles, and the blocking toggle. */}
                         <div className="ticket-detail-settings">
-                            <div className="due-date-field">
-                                <span className="label">
-                                    {t("COMMON.FIELDS.DUE_DATE", LABEL_DUE_DATE)}
-                                </span>
-                                <span className="due-date">
-                                    {dueDate ? (
-                                        <Icon
-                                            name="icon-clock"
-                                            wrapperClass="due-date-icon"
-                                            fill={
-                                                dueDateColor(dueDate, dueDateConfig) ??
-                                                undefined
-                                            }
-                                            title={t(
-                                                "COMMON.CARD.DUE_DATE",
-                                                DUE_DATE_TOOLTIP,
-                                                {
-                                                    date: dueDateTitle(
-                                                        dueDate,
-                                                        dueDateConfig,
-                                                    ),
-                                                },
-                                            )}
-                                        />
-                                    ) : null}
-                                    <input
-                                        type="date"
-                                        className="due-date-input"
-                                        name="due_date"
-                                        value={dueDate}
-                                        aria-label={t(
-                                            "COMMON.FIELDS.DUE_DATE",
-                                            LABEL_DUE_DATE,
-                                        )}
-                                        onChange={(e) => setDueDate(e.target.value)}
-                                    />
-                                </span>
+                            {/* Due date — ports due-date-popover.jade: a
+                                `.btn-icon.due-date-button` clock trigger (colored
+                                by the due-date state, matching the board Card /
+                                rows) that opens a `.date-picker-popover` for
+                                picking / clearing the date. Replaces the always-
+                                visible native date input (KAN-02), so the resting
+                                form shows an icon button alongside the
+                                team/client/block toggles. */}
+                            <div className="due-date-button-wrapper">
+                                <button
+                                    type="button"
+                                    className={
+                                        "btn-icon due-date-button is-editable date-picker-popover-trigger" +
+                                        (dueDate ? " date-set active" : "")
+                                    }
+                                    style={
+                                        dueDate
+                                            ? {
+                                                  background:
+                                                      dueDateColor(
+                                                          dueDate,
+                                                          dueDateConfig,
+                                                      ) ?? undefined,
+                                              }
+                                            : undefined
+                                    }
+                                    aria-label={t(
+                                        "COMMON.FIELDS.DUE_DATE",
+                                        LABEL_DUE_DATE,
+                                    )}
+                                    aria-expanded={dueDatePopoverOpen}
+                                    title={
+                                        dueDate
+                                            ? t(
+                                                  "COMMON.CARD.DUE_DATE",
+                                                  DUE_DATE_TOOLTIP,
+                                                  {
+                                                      date: dueDateTitle(
+                                                          dueDate,
+                                                          dueDateConfig,
+                                                      ),
+                                                  },
+                                              )
+                                            : t(
+                                                  "COMMON.FIELDS.DUE_DATE",
+                                                  LABEL_DUE_DATE,
+                                              )
+                                    }
+                                    onClick={() =>
+                                        setDueDatePopoverOpen((v) => !v)
+                                    }
+                                >
+                                    <Icon name="icon-clock" />
+                                </button>
+                                {dueDatePopoverOpen ? (
+                                    <div
+                                        className="date-picker-popover"
+                                        style={{ display: "block" }}
+                                    >
+                                        <div className="date-picker-container">
+                                            <input
+                                                type="date"
+                                                className="due-date-input"
+                                                name="due_date"
+                                                value={dueDate}
+                                                aria-label={t(
+                                                    "COMMON.FIELDS.DUE_DATE",
+                                                    LABEL_DUE_DATE,
+                                                )}
+                                                onChange={(e) =>
+                                                    setDueDate(e.target.value)
+                                                }
+                                                onKeyDown={(e) => {
+                                                    if (e.key === "Escape") {
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        setDueDatePopoverOpen(
+                                                            false,
+                                                        );
+                                                    }
+                                                }}
+                                            />
+                                        </div>
+                                        {dueDate ? (
+                                            <div className="date-picker-popover-footer">
+                                                <a
+                                                    className="date-picker-clean"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    title={t(
+                                                        "LIGHTBOX.SET_DUE_DATE.TITLE_ACTION_DELETE_DUE_DATE",
+                                                        LABEL_CLEAR_DUE_DATE,
+                                                    )}
+                                                    aria-label={t(
+                                                        "LIGHTBOX.SET_DUE_DATE.TITLE_ACTION_DELETE_DUE_DATE",
+                                                        LABEL_CLEAR_DUE_DATE,
+                                                    )}
+                                                    onClick={() => {
+                                                        setDueDate("");
+                                                        setDueDatePopoverOpen(
+                                                            false,
+                                                        );
+                                                    }}
+                                                    onKeyDown={(e) => {
+                                                        if (
+                                                            e.key === "Enter" ||
+                                                            e.key === " "
+                                                        ) {
+                                                            e.preventDefault();
+                                                            setDueDate("");
+                                                            setDueDatePopoverOpen(
+                                                                false,
+                                                            );
+                                                        }
+                                                    }}
+                                                >
+                                                    <Icon name="icon-trash" />
+                                                </a>
+                                            </div>
+                                        ) : null}
+                                    </div>
+                                ) : null}
                             </div>
 
                             <button

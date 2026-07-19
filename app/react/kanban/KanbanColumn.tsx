@@ -7,6 +7,7 @@
  */
 
 import { createElement, Fragment, useCallback, useEffect, useRef } from "react";
+import type { ReactNode } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Card } from "./Card";
@@ -52,6 +53,28 @@ const UNFOLD_FALLBACK = "Unfold column";
 const WIP_LIMIT_KEY = "KANBAN.WIP_LIMIT";
 const WIP_LIMIT_FALLBACK = "WIP Limit";
 
+// -- Board placeholder catalog keys ----------------------------------------
+// Authoritative keys + English fallbacks from the legacy placeholder partial
+// (app/partials/common/components/kanban-placeholder.jade) and the frozen
+// catalog (app/locales/taiga/locale-en.json → KANBAN.*). Reproduced verbatim
+// so the English locale and jsdom render the exact legacy copy.
+const PLACEHOLDER_CARD_TITLE_KEY = "KANBAN.PLACEHOLDER_CARD_TITLE";
+const PLACEHOLDER_CARD_TITLE_FALLBACK = "This could be a user story";
+const PLACEHOLDER_CARD_TEXT_KEY = "KANBAN.PLACEHOLDER_CARD_TEXT";
+const PLACEHOLDER_CARD_TEXT_FALLBACK =
+    "Create user stories here and change their status to track their progress.";
+const US_NOT_FOUND_TITLE_KEY = "KANBAN.US_NOT_FOUND_TITLE";
+const US_NOT_FOUND_TITLE_FALLBACK = "No matching results found";
+const US_NOT_FOUND_TEXT_P1_KEY = "KANBAN.US_NOT_FOUND_TEXT_P1";
+const US_NOT_FOUND_TEXT_P1_FALLBACK =
+    "Try again using more general search terms or disabled some filters.";
+const US_NOT_FOUND_TEXT_P2_KEY = "KANBAN.US_NOT_FOUND_TEXT_P2";
+// The P2 catalog value embeds a leading `<strong>…</strong>` emphasis around
+// "Archived stories". Preserved verbatim; rendered via the split-on-<strong>
+// convention below (never dangerouslySetInnerHTML).
+const US_NOT_FOUND_TEXT_P2_FALLBACK =
+    "<strong>Archived stories</strong> are not loaded by default. Unfold the archived statuses to expand your search.";
+
 /**
  * Build the drag-and-drop container key for a (status, swimlane) cell.
  *
@@ -65,6 +88,31 @@ export function buildContainerKey(
 ): string {
     const swimlane = swimlaneId === null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneId;
     return `${statusId}::${swimlane}`;
+}
+
+/**
+ * Render a localized string that embeds a single `<strong>…</strong>` emphasis
+ * (the KANBAN.US_NOT_FOUND_TEXT_P2 catalog value wraps "Archived stories").
+ * Rather than risk `dangerouslySetInnerHTML`, we split on the single known
+ * `<strong>` boundary — mirroring `renderDeleteMessage` in `BacklogApp` — and
+ * render each segment as escaped React text, preserving both the bold emphasis
+ * (visual parity with the legacy Jade) and localization. When a locale's value
+ * carries no `<strong>`, the tag-stripped plain text is rendered.
+ */
+function renderStrongText(rendered: string): ReactNode {
+    const match = rendered.match(
+        /^([\s\S]*?)<strong>([\s\S]*?)<\/strong>([\s\S]*)$/,
+    );
+    if (!match) {
+        return rendered.replace(/<\/?strong>/g, "");
+    }
+    return (
+        <>
+            {match[1]}
+            <strong>{match[2]}</strong>
+            {match[3]}
+        </>
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +455,80 @@ export function KanbanColumn(props: KanbanColumnProps): JSX.Element {
             {showPlaceholder ? (
                 <div
                     className={"card-placeholder" + (notFound ? " not-found" : "")}
-                />
+                >
+                    {notFound ? (
+                        // -- Search / filter "no results" placeholder ---------
+                        // Ported from kanban-placeholder.jade (notFoundUserstories
+                        // branch): a title + two paragraphs, the second carrying a
+                        // <strong> emphasis rendered via renderStrongText.
+                        <>
+                            <p className="title">
+                                {t(
+                                    US_NOT_FOUND_TITLE_KEY,
+                                    US_NOT_FOUND_TITLE_FALLBACK,
+                                )}
+                            </p>
+                            <p>
+                                {t(
+                                    US_NOT_FOUND_TEXT_P1_KEY,
+                                    US_NOT_FOUND_TEXT_P1_FALLBACK,
+                                )}
+                            </p>
+                            <p>
+                                {renderStrongText(
+                                    t(
+                                        US_NOT_FOUND_TEXT_P2_KEY,
+                                        US_NOT_FOUND_TEXT_P2_FALLBACK,
+                                    ),
+                                )}
+                            </p>
+                        </>
+                    ) : (
+                        // -- Empty-board placeholder --------------------------
+                        // Ported from kanban-placeholder.jade (!notFoundUserstories
+                        // branch): a skeleton "board card" (styled by
+                        // card-placeholder.scss) followed by the title + helper
+                        // text. The .placeholder-titles / .placeholder-avatar
+                        // blocks carry no SCSS rules (invisible) but are
+                        // reproduced verbatim for exact DOM fidelity.
+                        <>
+                            <div className="placeholder-board-card">
+                                <div className="placeholder-board-row">
+                                    <div className="placeholder-board-text small" />
+                                    <div className="placeholder-board-text big" />
+                                </div>
+                                <div className="placeholder-board-row">
+                                    <div className="placeholder-board-text" />
+                                </div>
+                                <div className="placeholder-board-row avatar">
+                                    <div className="placeholder-board-avatar" />
+                                    <div className="placeholder-board-user" />
+                                </div>
+                            </div>
+                            <div className="placeholder-titles">
+                                <div className="text-small" />
+                                <div className="text-large" />
+                            </div>
+                            <div className="placeholder-avatar">
+                                <div className="image" />
+                                <div className="text" />
+                            </div>
+
+                            <p className="title">
+                                {t(
+                                    PLACEHOLDER_CARD_TITLE_KEY,
+                                    PLACEHOLDER_CARD_TITLE_FALLBACK,
+                                )}
+                            </p>
+                            <p>
+                                {t(
+                                    PLACEHOLDER_CARD_TEXT_KEY,
+                                    PLACEHOLDER_CARD_TEXT_FALLBACK,
+                                )}
+                            </p>
+                        </>
+                    )}
+                </div>
             ) : null}
 
             <SortableContext items={cardIds} strategy={verticalListSortingStrategy}>

@@ -6,10 +6,12 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-import { createElement, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { createElement, useCallback, useEffect, useId, useRef, useState } from "react";
+import type { CSSProperties, FormEvent, ReactNode } from "react";
 import sortBy from "lodash/sortBy";
 import debounce from "lodash/debounce";
+import * as userStorageApi from "../shared/api/userStorage";
+import type { StoredCustomFilters } from "../shared/api/userStorage";
 import {
     httpDelete,
     httpGet,
@@ -37,10 +39,15 @@ import type {
 } from "../shared/dnd/DndProvider";
 import { KanbanBoard } from "./KanbanBoard";
 import { Icon } from "../shared/ui/Icon";
+import { resolveUserAvatar } from "../shared/ui/avatar";
 import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
+import { useDialogA11y } from "../shared/dialog/useDialogA11y";
 import { t } from "../shared/i18n/translate";
+import { setAll as setAppMeta } from "../shared/meta/appMeta";
 import { buildContainerKey } from "./KanbanColumn";
 import { UserStoryEditLightbox } from "./UserStoryEditLightbox";
+import { SelectUserLightbox } from "./SelectUserLightbox";
+import type { SelectUserRole } from "./SelectUserLightbox";
 import type {
     AssignableUser,
     UserStoryCreateFields,
@@ -130,13 +137,14 @@ const SEARCH_DEBOUNCE_MS = 200;
 // `.projects` notifications does not trigger overlapping full-board refetches.
 // The AngularJS baseline wrapped BOTH subscription handlers in
 // `taiga.debounceLeading(randomInt(700, 1000), fn)` (kanban/main.coffee L246-255),
-// where `debounceLeading` is `_.debounce(fn, wait, {leading:false, trailing:true})`.
-// We reproduce the coalescing with a fixed wait at the upper bound of the legacy
-// random range (the randomness was only an anti-thundering-herd jitter across
-// clients, not user-visible behavior) and, per the review's "leading-edge"
-// directive, fire on the leading edge so the first event of a burst still
-// refreshes immediately while the remainder are coalesced into a single trailing
-// refresh. Latest-request protection is provided by the reload generation guard.
+// where `debounceLeading` is `_.debounce(fn, wait, {leading:false, trailing:true})`
+// (utils.coffee L121) — i.e. PURE TRAILING. We reproduce that exactly with a fixed
+// wait at the upper bound of the legacy random range (the randomness was only an
+// anti-thundering-herd jitter across clients, not user-visible behavior). A rapid
+// stream of events therefore collapses into EXACTLY ONE trailing full-board refresh
+// once the burst settles — never a per-event refetch (Issue 2: a 20-event burst must
+// not fan out into ~40 fetches). Latest-request protection is provided by the reload
+// generation guard.
 const EVENTS_DEBOUNCE_MS = 1000;
 
 // Non-visible input identifiers for the search affordance. All USER-VISIBLE
@@ -450,6 +458,37 @@ function buildUserstoriesParams(
     return params;
 }
 
+// F-KANBAN-ARCHIVED-NO-LOAD: parameters for the per-status fetch of an ARCHIVED
+// column's stories, performed lazily when the user unfolds that column. This
+// mirrors the legacy AngularJS `loadUserStoriesForStatus({status, ...})` call
+// (kanban/main.coffee), which fetched a single archived status's stories on the
+// `kanban:show-userstories-for-status` broadcast.
+//
+// The decisive difference from `buildUserstoriesParams` is the DELIBERATE
+// OMISSION of `status__is_archived: false`: the base board request keeps that
+// filter (so archived stories stay out of the normal columns), while this
+// request scopes to one specific `status` id and therefore returns that status's
+// stories regardless of their archived flag. The same zoom-driven include flags,
+// search query, and sidebar filter selection are applied so the archived column
+// honours the active search/filters exactly like the live columns.
+function buildArchivedStatusParams(
+    level: number,
+    query: string,
+    selected: KanbanSelectedFilter[],
+    statusId: number,
+): QueryParams {
+    const params: QueryParams = { status: statusId };
+    if (level >= 2) {
+        params.include_attachments = 1;
+        params.include_tasks = 1;
+    }
+    if (query) {
+        params.q = query;
+    }
+    Object.assign(params, pickSelectedFilterParams(selected));
+    return params;
+}
+
 function buildUsersById(project: KanbanProject): UsersById {
     const result: UsersById = {};
     const members = Array.isArray(project.members) ? project.members : [];
@@ -478,6 +517,14 @@ interface KanbanFilterOption {
     name: string;
     color?: string;
     count?: number;
+    /**
+     * Avatar fields, preserved from `filters_data` for the `assigned_users` /
+     * `owner` categories so the option row can render its member avatar
+     * (`filter.jade`'s `img.user-pic[tg-avatar]`, KAN-04). Absent for every
+     * non-user category.
+     */
+    gravatar_id?: string | null;
+    photo?: string | null;
 }
 
 /** A group of filter options (e.g. "Tags", "Assigned to"). */
@@ -492,10 +539,40 @@ interface KanbanSelectedFilter {
     id: string;
     name: string;
     dataType: string;
+    /**
+     * Include/exclude mode of this selection (KAN-04). `"exclude"` routes the id
+     * to the `exclude_<dataType>` query param; anything else (or absent) means
+     * an ordinary include. Mirrors the shared `tg-filter` `mode` field.
+     */
+    mode?: string;
     color?: string;
 }
 
+/**
+ * A saved ("custom") filter for the Kanban board (KAN-04). The saved-filter NAME
+ * doubles as its id — mirroring the AngularJS custom-filter store
+ * (`{id: key, name: key, filter: value}`, controllerMixins.coffee L362-L364) and
+ * the Backlog module's `CustomFilter`. Declared LOCALLY so the Kanban module
+ * stays self-contained (no value/type coupling to the Backlog module).
+ */
+interface KanbanCustomFilter {
+    id: string;
+    name: string;
+    /** The stored query-param map (filter key incl. `exclude_` prefix → ids). */
+    filter?: Record<string, string>;
+}
+
 type KanbanFilters = KanbanFilterCategory[];
+
+/**
+ * `storeCustomFiltersName` for the Kanban board (kanban/main.coffee L57), used as
+ * the `/user-storage` key suffix so the React screen reads/writes the SAME saved
+ * filters the AngularJS client used. Byte-identical to the AngularJS value.
+ */
+const KANBAN_CUSTOM_FILTERS_SUFFIX = "kanban-custom-filters";
+
+/** Angular `filterModeOptions` (filter.controller.coffee L20). */
+const KANBAN_FILTER_MODE_OPTIONS = ["include", "exclude"] as const;
 
 /**
  * URL query keys the Kanban controller whitelisted (`validQueryParams`,
@@ -566,6 +643,11 @@ export function buildKanbanFilterCategories(
             id: it.id != null ? String(it.id) : "null",
             name: readStringField(it.full_name) || "Unassigned",
             count: readNumber(it.count),
+            // KAN-04: carry the avatar identity so the option row can render
+            // its member picture (a null gravatar → the "unnamed" placeholder,
+            // matching the AngularJS "Unassigned" row).
+            gravatar_id: typeof it.gravatar_id === "string" ? it.gravatar_id : null,
+            photo: typeof it.photo === "string" ? it.photo : null,
         })),
     });
 
@@ -588,6 +670,10 @@ export function buildKanbanFilterCategories(
             id: String(it.id),
             name: readStringField(it.full_name),
             count: readNumber(it.count),
+            // KAN-04: owner options are also `single-filter-type-user` and carry
+            // an avatar (filter.jade renders `img.user-pic` for both categories).
+            gravatar_id: typeof it.gravatar_id === "string" ? it.gravatar_id : null,
+            photo: typeof it.photo === "string" ? it.photo : null,
         })),
     });
 
@@ -622,7 +708,10 @@ export function pickSelectedFilterParams(
 ): QueryParams {
     const groups: Record<string, string[]> = {};
     for (const filter of selected) {
-        const key = filter.dataType;
+        // KAN-04: excluded values route to the `exclude_<dataType>` param, so
+        // the include/exclude toggle round-trips to the same endpoint.
+        const key =
+            filter.mode === "exclude" ? `exclude_${filter.dataType}` : filter.dataType;
         if (!KANBAN_VALID_QUERY_PARAMS.has(key)) {
             continue;
         }
@@ -635,6 +724,116 @@ export function pickSelectedFilterParams(
     return params;
 }
 
+/**
+ * Reduce the current selection to the plain string→string map a custom filter
+ * persists (filter key incl. `exclude_` prefix → comma-joined ids). Mirrors the
+ * Backlog module's `selectedToStoredMap` and the AngularJS `saveCustomFilter`
+ * (controllerMixins.coffee L201-L214).
+ */
+function selectedToStoredMap(
+    selected: KanbanSelectedFilter[],
+): Record<string, string> {
+    const groups: Record<string, string[]> = {};
+    for (const filter of selected) {
+        const key =
+            filter.mode === "exclude" ? `exclude_${filter.dataType}` : filter.dataType;
+        if (!KANBAN_VALID_QUERY_PARAMS.has(key)) {
+            continue;
+        }
+        (groups[key] ??= []).push(String(filter.id));
+    }
+    const map: Record<string, string> = {};
+    for (const key of Object.keys(groups)) {
+        map[key] = groups[key].join(",");
+    }
+    return map;
+}
+
+/**
+ * Rebuild a {@link KanbanSelectedFilter} list from a saved custom-filter param
+ * map, matching each id against the freshly-loaded categories to recover its
+ * display name/color (falling back to the raw id when the value no longer
+ * exists). Keys carrying the `exclude_` prefix are restored with
+ * `mode: "exclude"`. Mirrors the Backlog `reconstructSelectedFromParamMap`.
+ */
+function reconstructSelectedFromParamMap(
+    paramMap: Record<string, string>,
+    categories: KanbanFilters,
+): KanbanSelectedFilter[] {
+    const byDataType = new Map<string, KanbanFilterCategory>();
+    for (const category of categories) {
+        byDataType.set(category.dataType, category);
+    }
+    const selected: KanbanSelectedFilter[] = [];
+    for (const rawKey of Object.keys(paramMap)) {
+        const value = paramMap[rawKey];
+        if (value == null || value === "") {
+            continue;
+        }
+        const isExclude = rawKey.startsWith("exclude_");
+        const dataType = isExclude ? rawKey.slice("exclude_".length) : rawKey;
+        const mode = isExclude ? "exclude" : "include";
+        const category = byDataType.get(dataType);
+        for (const id of String(value).split(",")) {
+            const trimmed = id.trim();
+            if (trimmed === "") {
+                continue;
+            }
+            const option = category?.content.find((o) => String(o.id) === trimmed);
+            selected.push({
+                id: trimmed,
+                name: option ? option.name : trimmed,
+                dataType,
+                mode,
+                ...(option?.color !== undefined ? { color: option.color } : {}),
+            });
+        }
+    }
+    return selected;
+}
+
+/**
+ * Convert the raw `/user-storage` value (name → param map) into the
+ * {@link KanbanCustomFilter} list the panel renders. Mirrors the Backlog
+ * `storedToCustomFilters` and the `_.forOwn` mapping in `generateFilters`
+ * (controllerMixins.coffee L362-L364).
+ */
+function storedToKanbanCustomFilters(raw: StoredCustomFilters): KanbanCustomFilter[] {
+    return Object.keys(raw).map((key) => ({ id: key, name: key, filter: raw[key] }));
+}
+
+/**
+ * Per-category `single-filter-type-*` class (filter.jade `ng-class`), mirroring
+ * the Backlog module. `assigned_users` / `owner` become `single-filter-type-user`
+ * (the class the compiled `filter.scss` themes with the member avatar), tags
+ * `single-filter-type-tag`, everything else `single-filter-type-general`.
+ */
+function kanbanOptionTypeClass(dataType: string): string {
+    if (dataType === "tags") {
+        return "single-filter-type-tag";
+    }
+    if (dataType === "assigned_users" || dataType === "owner") {
+        return "single-filter-type-user";
+    }
+    return "single-filter-type-general";
+}
+
+/**
+ * Per-option inline color, reproducing filter.jade's `ng-style`: tags color the
+ * background; every other category colors the left border; absent colors fall
+ * back to a transparent border so the SCSS `border-left` slot stays reserved.
+ * Mirrors the Backlog module's `optionStyle`.
+ */
+function kanbanOptionStyle(
+    dataType: string,
+    option: KanbanFilterOption,
+): CSSProperties {
+    if (dataType === "tags") {
+        return option.color ? { background: option.color } : {};
+    }
+    return { borderColor: option.color ? option.color : "transparent" };
+}
+
 // ---------------------------------------------------------------------------
 // KanbanFilterPanel — in-board reimplementation of the shared `tg-filter`
 // directive. The root carries `.kanban-filter` so the already-compiled SCSS
@@ -645,90 +844,363 @@ export function pickSelectedFilterParams(
 interface KanbanFilterPanelProps {
     filters: KanbanFilters;
     selectedFilters: KanbanSelectedFilter[];
+    /** Saved ("custom") filters for this project (KAN-04). */
+    customFilters: KanbanCustomFilter[];
+    /** Currently-applied saved filter id, for the `.active` highlight. */
+    activeCustomFilter: string | null;
+    /** Include/exclude mode of the NEXT option selection (KAN-04). */
+    filterMode: string;
+    onSetFilterMode: (mode: string) => void;
     onAddFilter: (category: KanbanFilterCategory, option: KanbanFilterOption) => void;
     onRemoveFilter: (filter: KanbanSelectedFilter) => void;
+    onSaveCustomFilter: (name: string) => void;
+    onSelectCustomFilter: (filter: KanbanCustomFilter) => void;
+    onRemoveCustomFilter: (filter: KanbanCustomFilter) => void;
 }
 
+/**
+ * In-board reimplementation of the shared AngularJS `tg-filter` widget
+ * (filter.jade + filter.controller.coffee), rendering the SAME class-driven DOM
+ * as the Backlog port so the compiled `filter.scss` themes it unchanged. KAN-04
+ * restored the capabilities the first Kanban port dropped, bringing it to parity
+ * with the Backlog panel:
+ *   - the saved ("custom") filters section (list + add-form + delete),
+ *   - the "Filtered by:" applied-filter chips with a visible × remove glyph,
+ *   - the include/exclude mode toggle and the included/excluded split, and
+ *   - collapsible filter categories (only one open at a time; all closed
+ *     initially, matching `FilterController.opened = null`).
+ * The root keeps the `.kanban-filter#kanban-filter` id/class so the board's
+ * toggle contract (panel present iff open) and any board-scoped layout survive.
+ */
 function KanbanFilterPanel(props: KanbanFilterPanelProps): JSX.Element {
-    const { filters, selectedFilters, onAddFilter, onRemoveFilter } = props;
-    const isSelected = (dataType: string, id: string): boolean =>
-        selectedFilters.some(
-            (f) => f.dataType === dataType && String(f.id) === String(id),
-        );
+    const {
+        filters,
+        selectedFilters,
+        customFilters,
+        activeCustomFilter,
+        filterMode,
+        onSetFilterMode,
+        onAddFilter,
+        onRemoveFilter,
+        onSaveCustomFilter,
+        onSelectCustomFilter,
+        onRemoveCustomFilter,
+    } = props;
+
+    // -- Collapse: a single open category dataType (null = all closed). --------
+    const [opened, setOpened] = useState<string | null>(null);
+    const isOpen = useCallback((dataType: string): boolean => opened === dataType, [opened]);
+    const toggleCategory = useCallback((dataType: string): void => {
+        setOpened((prev) => (prev === dataType ? null : dataType));
+    }, []);
+
+    // -- Custom-filter add-form state + validation (filter.controller). --------
+    const [customFilterForm, setCustomFilterForm] = useState<boolean>(false);
+    const [customFilterName, setCustomFilterName] = useState<string>("");
+    const [lengthZeroError, setLengthZeroError] = useState<boolean>(false);
+    const [repeatedFilterError, setRepeatedFilterError] = useState<boolean>(false);
+
+    const openCustomFilter = useCallback((): void => {
+        setCustomFilterForm(true);
+        setLengthZeroError(false);
+        setRepeatedFilterError(false);
+    }, []);
+
+    const submitCustomFilter = useCallback(
+        (event: FormEvent): void => {
+            event.preventDefault();
+            const name = customFilterName;
+            const isDuplicate = customFilters.some((f) => f.name === name);
+            if (name.length > 0 && !isDuplicate) {
+                setLengthZeroError(false);
+                setRepeatedFilterError(false);
+                onSaveCustomFilter(name);
+                setCustomFilterForm(false);
+                setCustomFilterName("");
+                return;
+            }
+            setLengthZeroError(name.length === 0);
+            setRepeatedFilterError(name.length > 0 && isDuplicate);
+        },
+        [customFilterName, customFilters, onSaveCustomFilter],
+    );
+
+    const isSelected = useCallback(
+        (dataType: string, id: string): boolean =>
+            selectedFilters.some(
+                (f) => f.dataType === dataType && String(f.id) === String(id),
+            ),
+        [selectedFilters],
+    );
+
+    // -- Applied filters split by mode. ----------------------------------------
+    const includedFilters = selectedFilters.filter((f) => f.mode !== "exclude");
+    const excludedFilters = selectedFilters.filter((f) => f.mode === "exclude");
+    const hasCustomForm = customFilterForm && selectedFilters.length > 0;
+
+    /** One applied-filter chip (shared by the included/excluded groups). */
+    const appliedChip = (filter: KanbanSelectedFilter): JSX.Element => (
+        <div
+            key={`${filter.dataType}:${filter.id}`}
+            className={`single-applied-filter ${filter.mode ?? "include"}`}
+        >
+            <span className="name">{filter.name}</span>
+            <button
+                type="button"
+                className="remove-filter e2e-remove-filter"
+                aria-label={t("COMMON.FILTERS.REMOVE", "Remove filter {{name}}", {
+                    name: filter.name,
+                })}
+                onClick={() => onRemoveFilter(filter)}
+            >
+                <Icon name="icon-close" />
+            </button>
+        </div>
+    );
 
     return (
         <div className="kanban-filter" id="kanban-filter">
-            {selectedFilters.length > 0 ? (
-                <div className="filters-applied">
-                    {selectedFilters.map((filter) => (
+            {/* Custom (saved) filters ---------------------------------------- */}
+            <div className="custom-filters">
+                <div className="custom-filters-header">
+                    <div className="custom-filters-title">
+                        <span className="name">
+                            {t("COMMON.FILTERS.TITLE", "Custom filters")}
+                        </span>
+                        <span className="number">({customFilters.length})</span>
+                    </div>
+                    {!customFilterForm && (
                         <button
                             type="button"
-                            key={`${filter.dataType}:${filter.id}`}
-                            className="filter-applied"
-                            onClick={() => onRemoveFilter(filter)}
-                            title={t("COMMON.FILTERS.ACTION_REMOVE", "Remove filter")}
+                            className="add-custom-filter"
+                            disabled={selectedFilters.length === 0}
+                            onClick={openCustomFilter}
                         >
-                            <span className="name">{filter.name}</span>
+                            {t("COMMON.FILTERS.ACTION_ADD", "Add")}
                         </button>
-                    ))}
+                    )}
                 </div>
-            ) : null}
 
-            <div className="filters-cats">
-                {filters.map((category) => (
-                    <div
-                        className="filter-category"
-                        key={category.dataType}
-                        data-type={category.dataType}
-                    >
-                        <h4 className="filters-title">{category.title}</h4>
-                        <ul className="filter-list">
-                            {category.content.map((option) => {
-                                const selected = isSelected(
-                                    category.dataType,
-                                    option.id,
-                                );
-                                return (
-                                    <li
-                                        key={String(option.id)}
-                                        className={
-                                            "single-filter" +
-                                            (selected ? " active" : "")
-                                        }
-                                    >
-                                        <button
-                                            type="button"
-                                            className="filter-name"
-                                            onClick={() =>
-                                                selected
-                                                    ? onRemoveFilter({
-                                                          id: option.id,
-                                                          name: option.name,
-                                                          dataType: category.dataType,
-                                                          color: option.color,
-                                                      })
-                                                    : onAddFilter(category, option)
-                                            }
-                                        >
-                                            {option.color ? (
-                                                <span
-                                                    className="color-bullet"
-                                                    style={{ background: option.color }}
-                                                />
-                                            ) : null}
-                                            <span className="name">{option.name}</span>
-                                            {typeof option.count === "number" ? (
-                                                <span className="number">
-                                                    {option.count}
-                                                </span>
-                                            ) : null}
-                                        </button>
-                                    </li>
-                                );
-                            })}
-                        </ul>
+                {hasCustomForm && (
+                    <form className="custom-filters-add-form" onSubmit={submitCustomFilter}>
+                        <input
+                            className={`add-filter-input e2e-filter-name-input${
+                                lengthZeroError || repeatedFilterError ? " checksley-error" : ""
+                            }`}
+                            type="text"
+                            placeholder={t(
+                                "COMMON.FILTERS.PLACEHOLDER_FILTER_NAME",
+                                "Write the filter name and press enter",
+                            )}
+                            aria-label={t(
+                                "COMMON.FILTERS.PLACEHOLDER_FILTER_NAME",
+                                "Write the filter name and press enter",
+                            )}
+                            value={customFilterName}
+                            onChange={(e) => setCustomFilterName(e.target.value)}
+                        />
+                        {lengthZeroError && (
+                            <span className="error-text">
+                                {t("COMMON.FILTERS.LENGTH_ZERO_ERROR", "Please add a filter name")}
+                            </span>
+                        )}
+                        {repeatedFilterError && !lengthZeroError && (
+                            <span className="error-text">
+                                {t(
+                                    "COMMON.FILTERS.REPEATED_FILTER_ERROR",
+                                    "This filter name is already in use",
+                                )}
+                            </span>
+                        )}
+                        <button className="btn-small e2e-open-custom-filter-form" type="submit">
+                            {t("COMMON.FILTERS.ACTION_SAVE_CUSTOM_FILTER", "save filter")}
+                        </button>
+                    </form>
+                )}
+
+                {customFilters.length > 0 && (
+                    <div className="custom-filter-list">
+                        {customFilters.map((filter) => (
+                            <div
+                                key={String(filter.id)}
+                                className={`single-filter single-filter-type-custom${
+                                    filter.id === activeCustomFilter ? " active" : ""
+                                }`}
+                            >
+                                <button
+                                    type="button"
+                                    className="name"
+                                    onClick={() => onSelectCustomFilter(filter)}
+                                >
+                                    {filter.name}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="remove-filter e2e-remove-custom-filter"
+                                    aria-label={t(
+                                        "COMMON.FILTERS.REMOVE_CUSTOM_FILTER",
+                                        "Remove saved filter {{name}}",
+                                        { name: filter.name },
+                                    )}
+                                    onClick={() => onRemoveCustomFilter(filter)}
+                                >
+                                    <Icon name="icon-trash" />
+                                </button>
+                            </div>
+                        ))}
                     </div>
-                ))}
+                )}
+            </div>
+
+            <div className="filters-step-cat">
+                {/* Applied filters, split into included / excluded ----------- */}
+                {(includedFilters.length > 0 || excludedFilters.length > 0) && (
+                    <div className="filters-applied">
+                        {includedFilters.length > 0 && (
+                            <div className="filters-included">
+                                <div className="filters-title">
+                                    {t("COMMON.FILTERS.ADVANCED_FILTERS.INCLUDED", "Filtered by:")}
+                                </div>
+                                <div className="filters-wrapper">
+                                    {includedFilters.map(appliedChip)}
+                                </div>
+                            </div>
+                        )}
+                        {excludedFilters.length > 0 && (
+                            <div className="filters-excluded">
+                                <div className="filters-title">
+                                    {t("COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDED", "Excluded:")}
+                                </div>
+                                <div className="filters-wrapper">
+                                    {excludedFilters.map(appliedChip)}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {/* Include / exclude mode toggle ----------------------------- */}
+                <div className="filters-advanced">
+                    <div className="filters-advanced-form">
+                        {KANBAN_FILTER_MODE_OPTIONS.map((option) => (
+                            <div className="custom-radio" key={option}>
+                                <input
+                                    type="radio"
+                                    name="kanban-filter-mode"
+                                    id={`kanban-filter-mode-${option}`}
+                                    value={option}
+                                    checked={filterMode === option}
+                                    onChange={() => onSetFilterMode(option)}
+                                />
+                                <label
+                                    className={`filter-mode ${option}${
+                                        filterMode === option ? " active" : ""
+                                    }`}
+                                    htmlFor={`kanban-filter-mode-${option}`}
+                                >
+                                    <span className="radio-mark">
+                                        <span className={`radio-mark-inner ${option}`} />
+                                    </span>
+                                    <span>
+                                        {option === "include"
+                                            ? t("COMMON.FILTERS.ADVANCED_FILTERS.INCLUDE", "Include")
+                                            : t("COMMON.FILTERS.ADVANCED_FILTERS.EXCLUDE", "Exclude")}
+                                    </span>
+                                </label>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                {/* Collapsible filter categories ----------------------------- */}
+                <div className="filters-cats">
+                    <ul>
+                        {filters.map((category) => {
+                            const open = isOpen(category.dataType);
+                            return (
+                                <li
+                                    key={category.dataType}
+                                    className={open ? "selected" : ""}
+                                    data-type={category.dataType}
+                                >
+                                    <button
+                                        type="button"
+                                        className={`filters-cat-single e2e-category${
+                                            open ? " selected" : ""
+                                        }`}
+                                        aria-expanded={open}
+                                        onClick={() => toggleCategory(category.dataType)}
+                                    >
+                                        <span className="title">{category.title}</span>
+                                        <Icon name={open ? "icon-arrow-down" : "icon-arrow-right"} />
+                                    </button>
+
+                                    {open && (
+                                        <div className="filter-list">
+                                            {category.content
+                                                .filter(
+                                                    (option) =>
+                                                        !isSelected(category.dataType, option.id),
+                                                )
+                                                .map((option) => {
+                                                    // KAN-04: the `assigned_users` / `owner`
+                                                    // categories render a member avatar
+                                                    // (`filter.jade`'s `img.user-pic[tg-avatar]`).
+                                                    // A null gravatar resolves to the "unnamed"
+                                                    // placeholder — matching the AngularJS
+                                                    // "Unassigned" / "Not assigned" rows.
+                                                    const isUserType =
+                                                        category.dataType ===
+                                                            "assigned_users" ||
+                                                        category.dataType === "owner";
+                                                    const avatar = isUserType
+                                                        ? resolveUserAvatar({
+                                                              id: 0,
+                                                              gravatar_id:
+                                                                  option.gravatar_id ?? null,
+                                                              photo: option.photo ?? null,
+                                                          })
+                                                        : null;
+                                                    return (
+                                                    <button
+                                                        type="button"
+                                                        key={String(option.id)}
+                                                        className={`single-filter ${kanbanOptionTypeClass(
+                                                            category.dataType,
+                                                        )}`}
+                                                        style={kanbanOptionStyle(
+                                                            category.dataType,
+                                                            option,
+                                                        )}
+                                                        onClick={() => onAddFilter(category, option)}
+                                                    >
+                                                        {avatar && (
+                                                            <img
+                                                                className="user-pic"
+                                                                style={{
+                                                                    background: avatar.bg,
+                                                                }}
+                                                                src={avatar.url}
+                                                                alt=""
+                                                            />
+                                                        )}
+                                                        <span className="name">{option.name}</span>
+                                                        {typeof option.count === "number" &&
+                                                            option.count > 0 && (
+                                                                <span className="number e2e-filter-count">
+                                                                    {option.count}
+                                                                </span>
+                                                            )}
+                                                    </button>
+                                                    );
+                                                })}
+                                        </div>
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>
+                </div>
             </div>
         </div>
     );
@@ -886,6 +1358,20 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
     // server-side failure error (QA-FUNC-06) in the shared `.bulk-error` slot.
     const [validationError, setValidationError] = useState<string | null>(null);
 
+    // F-KANBAN-BULK-MODAL: promote the bulk-insert lightbox to a proper modal
+    // dialog, matching the sibling `UserStoryEditLightbox` and the Backlog
+    // `BulkUserStoriesLightbox`. `useDialogA11y` supplies role="dialog" +
+    // aria-modal="true", moves focus into the dialog on open, traps Tab focus,
+    // makes the background inert, restores focus on close, and closes on Escape
+    // (stack-aware). The lightbox is only mounted while open (bulkStatusId !==
+    // null in the parent), so `open` is constant `true` for its lifetime.
+    const titleId = useId();
+    const { dialogRef, dialogProps } = useDialogA11y({
+        open: true,
+        onClose,
+        closeOnEscape: true,
+    });
+
     const currentStatus =
         statuses.find((status) => status.id === statusId) ?? statuses[0];
     const currentSwimlane =
@@ -899,7 +1385,11 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
     // note on why the translator is not invoked at module load). Keys + English
     // fallbacks are the authoritative catalog entries referenced by the legacy
     // `lightbox-us-bulk.jade`.
-    const NOTIFY_CLOSE_LABEL = t("NOTIFICATION.CLOSE", "Close notification");
+    // F-KANBAN-BULK-CLOSE-LABEL: this control dismisses a MODAL DIALOG, so its
+    // accessible name is the generic dialog "close" (COMMON.CLOSE) — matching
+    // the sibling lightbox close buttons — not the notification-toast dismiss
+    // string ("Close notification"), which belongs to `KanbanNotification`.
+    const BULK_CLOSE_LABEL = t("COMMON.CLOSE", "close");
     const BULK_TITLE = t("COMMON.NEW_BULK", "New bulk insert");
     const BULK_SELECT_STATUS = t("LIGHTBOX.CREATE_EDIT.SELECT_STATUS", "Select status");
     const BULK_LOCATION = t("LIGHTBOX.CREATE_EDIT.LOCATION", "Location");
@@ -925,13 +1415,18 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
     };
 
     return (
-        <div className="lightbox lightbox-generic-bulk open">
+        <div
+            className="lightbox lightbox-generic-bulk open"
+            ref={dialogRef}
+            {...dialogProps}
+            aria-labelledby={titleId}
+        >
             <div className="lightbox-us-bulk">
                 <button
                     type="button"
                     className="close lightbox-close e2e-bulk-close"
-                    aria-label={NOTIFY_CLOSE_LABEL}
-                    title={NOTIFY_CLOSE_LABEL}
+                    aria-label={BULK_CLOSE_LABEL}
+                    title={BULK_CLOSE_LABEL}
                     onClick={onClose}
                 >
                     <Icon name="icon-close" />
@@ -942,7 +1437,7 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
                         handleSubmit();
                     }}
                 >
-                    <h2 className="title">{BULK_TITLE}</h2>
+                    <h2 className="title" id={titleId}>{BULK_TITLE}</h2>
 
                     {statuses.length ? (
                         <fieldset>
@@ -1235,6 +1730,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const [selectedFilters, setSelectedFilters] = useState<KanbanSelectedFilter[]>(
         [],
     );
+    // KAN-04: include/exclude mode of the NEXT option selection, saved ("custom")
+    // filters, and the currently-applied saved filter id — the three tg-filter
+    // capabilities the first Kanban port dropped (parity with the Backlog panel).
+    const [filterMode, setFilterMode] = useState<string>("include");
+    const [customFilters, setCustomFilters] = useState<KanbanCustomFilter[]>([]);
+    const [activeCustomFilter, setActiveCustomFilter] = useState<string | null>(null);
 
     const projectRef = useRef<KanbanProject | null>(null);
     // Mirrors `resolvedId` so the memoised async loaders never read a stale
@@ -1244,6 +1745,9 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     const zoomLevelRef = useRef(zoomLevel);
     const filterQRef = useRef(filterQ);
     const selectedFiltersRef = useRef(selectedFilters);
+    // KAN-04: mirror the include/exclude mode so `addFilter` (which reads refs,
+    // not reactive closures) always sees the live value.
+    const filterModeRef = useRef<string>(filterMode);
     const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     // In-flight guard for the bulk-create submit — preserves the double-submit
     // prevention (QA verified PASS) now that the lightbox closes only on success
@@ -1270,9 +1774,45 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // is replaced (rapid successive moves) and on unmount, so overlapping timers
     // can neither fight over `movedUs` nor fire after the root is gone.
     const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // F-KANBAN-ARCHIVED-NO-LOAD: the board's raw story list is composed from the
+    // base (non-archived) list PLUS the stories of any ARCHIVED columns the user
+    // has unfolded. `reduceSetUserstories` rebuilds the whole board from the list
+    // it is handed, so every board publish must pass the COMPOSED list (base +
+    // shown archived); otherwise a reload would silently drop the archived
+    // stories the user asked to see. `baseUserstoriesRef` holds the latest base
+    // list; `shownArchivedRef` maps an unfolded archived status id -> its fetched
+    // stories.
+    const baseUserstoriesRef = useRef<UserStoryModel[]>([]);
+    const shownArchivedRef = useRef<Record<number, UserStoryModel[]>>({});
     zoomLevelRef.current = zoomLevel;
     filterQRef.current = filterQ;
     selectedFiltersRef.current = selectedFilters;
+    filterModeRef.current = filterMode;
+
+    // F-KANBAN-ARCHIVED-NO-LOAD: merge the base list with every shown archived
+    // column's stories, de-duplicated by id (a story belongs to exactly one
+    // status, so the archived set never legitimately overlaps the base set —
+    // the dedup simply keeps the compose idempotent). The composed list is what
+    // is handed to `kanban.setUserstories`, which groups stories into columns by
+    // `status`, so archived stories land in their archived column and — because
+    // `statusHide` is never populated — render once the column is unfolded.
+    const composeBoardUserstories = (): UserStoryModel[] => {
+        const composed: UserStoryModel[] = [];
+        const seen = new Set<number>();
+        const append = (list: UserStoryModel[]): void => {
+            for (const us of list) {
+                if (!seen.has(us.id)) {
+                    seen.add(us.id);
+                    composed.push(us);
+                }
+            }
+        };
+        append(baseUserstoriesRef.current);
+        for (const key of Object.keys(shownArchivedRef.current)) {
+            append(shownArchivedRef.current[Number(key)] ?? []);
+        }
+        return composed;
+    };
 
     // -----------------------------------------------------------------------
     // Data loading (deferred until projectId is finite)
@@ -1289,25 +1829,47 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         }
         const level = levelOverride ?? zoomLevelRef.current;
         const query = queryOverride ?? filterQRef.current;
+        const selected = selectedFiltersRef.current;
+        // F-KANBAN-ARCHIVED-NO-LOAD: any archived columns the user has already
+        // unfolded must survive a reload (filter/search change, WebSocket event,
+        // post-drag refresh). Re-fetch each in the SAME parallel batch — under the
+        // SAME generation guard — so their content also honours the active
+        // search/filters, then recompose. When no archived column is unfolded
+        // this list is empty and the request set is unchanged (base + swimlanes).
+        const shownArchivedIds = Object.keys(shownArchivedRef.current).map(Number);
         // M-03/M-04: claim the newest generation. Any load already in flight is
         // now stale and will drop its result below.
         const myGen = ++loadGenRef.current;
         try {
-            const [usResponse, swimlaneResponse] = await Promise.all([
-                listUserstories(
-                    id,
-                    buildUserstoriesParams(level, query, selectedFiltersRef.current),
-                ),
-                httpGet<Swimlane[]>("/swimlanes", { project: id }),
-            ]);
+            const [usResponse, swimlaneResponse, ...archivedResponses] =
+                await Promise.all([
+                    listUserstories(
+                        id,
+                        buildUserstoriesParams(level, query, selected),
+                    ),
+                    httpGet<Swimlane[]>("/swimlanes", { project: id }),
+                    ...shownArchivedIds.map((statusId) =>
+                        listUserstories(
+                            id,
+                            buildArchivedStatusParams(level, query, selected, statusId),
+                        ),
+                    ),
+                ]);
             // Drop the result if the root unmounted OR a newer load superseded us.
             if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
             }
             const userstories =
                 (usResponse.data as unknown as UserStoryModel[]) ?? [];
+            // Refresh the shown-archived cache from the parallel responses.
+            shownArchivedIds.forEach((statusId, index) => {
+                shownArchivedRef.current[statusId] =
+                    (archivedResponses[index]?.data as unknown as UserStoryModel[]) ??
+                    [];
+            });
+            baseUserstoriesRef.current = userstories;
             kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
-            kanban.setUserstories(userstories);
+            kanban.setUserstories(composeBoardUserstories());
             // Multi-select group drag (QA-FUNC-01): clear the card selection whenever
             // the board reloads, mirroring `cleanSelectedUss` (main.coffee L597) so a
             // stale selection cannot outlive the cards it referenced.
@@ -1319,6 +1881,50 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             // only if we are still the newest live load — surface the shared error
             // toast instead of silently leaving the board stale.
             if (!aliveRef.current || myGen !== loadGenRef.current) {
+                return;
+            }
+            setErrorNotice(NOTIFY_ERROR_MESSAGE);
+        }
+    };
+
+    /**
+     * F-KANBAN-ARCHIVED-NO-LOAD: fetch a single ARCHIVED status's stories and
+     * merge them into the board. Invoked lazily when the user UNFOLDS an archived
+     * column (see {@link foldStatus}), reproducing the legacy AngularJS
+     * `loadUserStoriesForStatus({status, ...})` call that ran on the
+     * `kanban:show-userstories-for-status` broadcast.
+     *
+     * The request uses {@link buildArchivedStatusParams} — scoped to the status
+     * id, WITHOUT `status__is_archived:false` — so it returns the archived
+     * stories the base board request deliberately excludes. On success the
+     * fetched stories are cached under the status id and the board is recomposed
+     * (base + all shown archived); a failure surfaces the shared error toast and
+     * leaves the base board intact. Guarded by `aliveRef` so a late resolve after
+     * unmount never calls `setState`.
+     */
+    const loadArchivedStatus = async (statusId: number): Promise<void> => {
+        const id = resolvedIdRef.current;
+        if (!isValidProjectId(id)) {
+            return;
+        }
+        try {
+            const response = await listUserstories(
+                id,
+                buildArchivedStatusParams(
+                    zoomLevelRef.current,
+                    filterQRef.current,
+                    selectedFiltersRef.current,
+                    statusId,
+                ),
+            );
+            if (!aliveRef.current) {
+                return;
+            }
+            shownArchivedRef.current[statusId] =
+                (response.data as unknown as UserStoryModel[]) ?? [];
+            kanban.setUserstories(composeBoardUserstories());
+        } catch {
+            if (!aliveRef.current) {
                 return;
             }
             setErrorNotice(NOTIFY_ERROR_MESSAGE);
@@ -1473,11 +2079,38 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             }
             const userstories =
                 (usResponse.data as unknown as UserStoryModel[]) ?? [];
+            // F-KANBAN-ARCHIVED-NO-LOAD: seed the base list and publish the
+            // composed board. Archived columns start folded on initial load
+            // (see the `is_archived` fold-forcing above), so `shownArchivedRef`
+            // is empty here and the composed list equals the base list; the
+            // archived stories arrive lazily on the first unfold.
+            baseUserstoriesRef.current = userstories;
             kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
-            kanban.setUserstories(userstories);
+            kanban.setUserstories(composeBoardUserstories());
 
             // Load the sidebar filter categories (auxiliary; never blocks the board).
             void loadFilters();
+
+            // KAN-04: load the saved ("custom") filters for this project from
+            // `/user-storage` (auxiliary; never blocks the board). Guarded by the
+            // same generation so a slow response from an older project can't leak.
+            void (async (): Promise<void> => {
+                try {
+                    const raw = await userStorageApi.getFilters(
+                        project.id,
+                        KANBAN_CUSTOM_FILTERS_SUFFIX,
+                    );
+                    if (!aliveRef.current || myGen !== loadGenRef.current) {
+                        return;
+                    }
+                    setCustomFilters(storedToKanbanCustomFilters(raw));
+                } catch (err) {
+                    if (typeof console !== "undefined") {
+                        // eslint-disable-next-line no-console
+                        console.error("[taiga-react] loadCustomFilters failed", err);
+                    }
+                }
+            })();
         } catch (err) {
             if (!aliveRef.current || myGen !== loadGenRef.current) {
                 return;
@@ -1506,18 +2139,19 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         void loadInitialData();
     };
 
-    // M-11: leading+trailing coalescing wrappers for the two WebSocket handlers,
+    // M-11: pure-trailing coalescing wrappers for the two WebSocket handlers,
     // created ONCE and reused for the socket's whole life. Each invokes the latest
     // reload/refresh closure via its ref, so a burst of events collapses into a
-    // single leading refresh plus (at most) one trailing refresh. `.cancel()` on
-    // teardown discards any pending trailing call (timer cleanup + latest-request
-    // protection across resolvedId transitions and unmount).
+    // SINGLE trailing refresh once the burst settles (matching the AngularJS
+    // `debounceLeading` = {leading:false, trailing:true}). `.cancel()` on teardown
+    // discards any pending trailing call (timer cleanup + latest-request protection
+    // across resolvedId transitions and unmount).
     const debouncedReloadRef = useRef<ReturnType<typeof debounce> | null>(null);
     if (debouncedReloadRef.current === null) {
         debouncedReloadRef.current = debounce(
             () => reloadRef.current(),
             EVENTS_DEBOUNCE_MS,
-            { leading: true, trailing: true },
+            { leading: false, trailing: true },
         );
     }
     const debouncedRefreshAllRef = useRef<ReturnType<typeof debounce> | null>(
@@ -1527,7 +2161,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         debouncedRefreshAllRef.current = debounce(
             () => refreshAllRef.current(),
             EVENTS_DEBOUNCE_MS,
-            { leading: true, trailing: true },
+            { leading: false, trailing: true },
         );
     }
 
@@ -1570,13 +2204,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const userstoriesKey = `changes.project.${resolvedId}.userstories`;
         const projectsKey = `changes.project.${resolvedId}.projects`;
         client.subscribe(userstoriesKey, () => {
-            // M-11: coalesce bursts (leading fire + single trailing refresh).
+            // M-11: coalesce bursts into a single trailing refresh.
             debouncedReloadRef.current?.();
         });
         client.subscribe(projectsKey, (data) => {
             // The matches filter runs SYNCHRONOUSLY per event (outside the
             // debounce) so a matching event within a burst is never missed just
-            // because the leading/trailing sampled event did not match; only the
+            // because the trailing-sampled event did not match; only the
             // resulting full refresh is coalesced.
             const matches = (data as { matches?: string }).matches;
             if (
@@ -1621,6 +2255,53 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             debouncedRefreshAllRef.current?.cancel();
         };
     }, []);
+
+    // F-001: restore document.title / meta parity with the AngularJS baseline.
+    //
+    // The original KanbanController set the page metadata once `loadInitialData`
+    // resolved (kanban/main.coffee L117-122):
+    //   title = translate.instant("KANBAN.PAGE_TITLE", {projectName})
+    //   description = translate.instant("KANBAN.PAGE_DESCRIPTION",
+    //                                   {projectName, projectDescription})
+    //   appMetaService.setAll(title, description)
+    // The React port dropped this, leaving the tab title on the static
+    // index.html default ("Taiga") and — after an AngularJS → React SPA
+    // transition — stale on the previous route's title.
+    //
+    // Keying on the RESOLVED project's `name`/`description` (stable primitives,
+    // not the object identity) fires this effect exactly when the project first
+    // resolves and whenever those fields genuinely change — never churning on
+    // unrelated data refreshes. Because it also runs on every fresh mount, it
+    // re-applies the title when the board is re-entered from another route,
+    // curing the stale-title-after-SPA-transition case. `t()` reads the live,
+    // shared angular-translate catalog at runtime (localized), falling back to
+    // the English literal when Angular is absent.
+    const kanbanProjectName = projectLoaded?.name ?? "";
+    const kanbanProjectDescription =
+        typeof projectLoaded?.description === "string"
+            ? projectLoaded.description
+            : "";
+    useEffect(() => {
+        if (projectLoaded === null) {
+            return;
+        }
+        const title = t("KANBAN.PAGE_TITLE", "Kanban - {{projectName}}", {
+            projectName: kanbanProjectName,
+        });
+        const description = t(
+            "KANBAN.PAGE_DESCRIPTION",
+            "The kanban panel, with user stories of the project {{projectName}}: {{projectDescription}}",
+            {
+                projectName: kanbanProjectName,
+                projectDescription: kanbanProjectDescription,
+            },
+        );
+        setAppMeta(title, description);
+        // `projectLoaded` is read only for the null-guard; the meaningful inputs
+        // are the name/description primitives, so the effect re-runs only when
+        // the page metadata would actually change.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [kanbanProjectName, kanbanProjectDescription]);
 
     // -----------------------------------------------------------------------
     // Controls
@@ -1679,6 +2360,20 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         us: null,
         statusId: null,
         focusAssignee: false,
+    });
+
+    // [KAN-03] Dedicated "Select assigned user" picker state. The card action
+    // "Assign to" must open the lightweight member picker (a search box + an
+    // avatar member list + role-group rows + an ADD button) — the React port of
+    // `changeUsAssignedUsers` (kanban/main.coffee L339) → `tg-lb-select-user` —
+    // NOT the full story-edit form. `us` is the assignment target (its raw
+    // `assigned_users`/`assigned_to` seed the picker's current selection).
+    const [assignLightbox, setAssignLightbox] = useState<{
+        open: boolean;
+        us: UserStoryModel | null;
+    }>({
+        open: false,
+        us: null,
     });
 
     /**
@@ -1805,24 +2500,76 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     };
 
     /**
-     * F3: the card's "Assign to" affordance. The AngularJS quick-assign picker
-     * was bound to the now-deleted controller (`changeUsAssignedUsers` via
-     * `lightboxFactory`) and has no surviving bridge, so — consistent with the
-     * Backlog root, which routes every story-field edit through the generic form
-     * — assignment opens the same React edit form, focused on the assignee field.
+     * [KAN-03] F3: the card's "Assign to" affordance. Ports
+     * `KanbanController.changeUsAssignedUsers` (kanban/main.coffee L339), which
+     * opened the `tg-lb-select-user` lightbox — a dedicated "Select assigned
+     * user" picker (search box + avatar member list + role-group rows + ADD),
+     * NOT the full story-edit form. The migration had temporarily routed this to
+     * the edit form focused on the assignee field; this restores the dedicated
+     * picker so the card action behaves and looks exactly like the AngularJS
+     * baseline. The chosen ids are persisted by {@link onConfirmAssignedUsers}.
      */
     const onAssignUs = (usId: number): void => {
         const view = kanban.state.usMap[usId];
         if (!view) {
             return;
         }
-        setUsLightbox({
-            open: true,
-            mode: "edit",
-            us: view.model,
-            statusId: null,
-            focusAssignee: true,
-        });
+        setAssignLightbox({ open: true, us: view.model });
+    };
+
+    /**
+     * [KAN-03] Persist the assignment chosen in {@link SelectUserLightbox}.
+     * Ports the `changeUsAssignedUsers` `onClose(assignedUsersIds)` contract
+     * (kanban/main.coffee L339-L349) exactly:
+     *   - `assigned_users` becomes the chosen id set;
+     *   - if the current `assigned_to` is not among them (and the set is
+     *     non-empty), `assigned_to` becomes the first chosen id;
+     *   - if the set is empty, `assigned_to` becomes `null`.
+     * The write targets the frozen `PATCH /userstories/{id}` endpoint (carrying
+     * the story `version` for optimistic-concurrency parity with every other
+     * board edit), then reloads. `onConfirm` is invoked fire-and-forget by the
+     * picker, so this handler never rethrows — a version conflict reconciles via
+     * a reload, mirroring the legacy `patch`/409 recovery.
+     */
+    const onConfirmAssignedUsers = async (
+        assignedUserIds: number[],
+    ): Promise<void> => {
+        const target = assignLightbox.us;
+        // Close optimistically (the directive closed the lightbox on ADD); a
+        // failed write is reconciled by the reload below.
+        setAssignLightbox({ open: false, us: null });
+        if (!target) {
+            return;
+        }
+        let assignedTo: number | null =
+            (target.assigned_to as number | null | undefined) ?? null;
+        if (assignedUserIds.length === 0) {
+            assignedTo = null;
+        } else if (assignedTo == null || !assignedUserIds.includes(assignedTo)) {
+            assignedTo = assignedUserIds[0];
+        }
+        try {
+            await httpPatch(`/userstories/${target.id}`, {
+                assigned_users: assignedUserIds,
+                assigned_to: assignedTo,
+                version: (target as { version?: number }).version,
+            });
+            if (!aliveRef.current) {
+                return;
+            }
+            await reloadUserstories();
+        } catch (err) {
+            // A 409 means the server advanced past our `version`; reload to
+            // reconcile (the only recovery the legacy save performed). Any other
+            // error leaves the board as-is.
+            if (
+                err instanceof HttpError &&
+                err.status === 409 &&
+                aliveRef.current
+            ) {
+                await reloadUserstories();
+            }
+        }
     };
 
     /**
@@ -2012,11 +2759,17 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             id: option.id,
             name: option.name,
             dataType: category.dataType,
+            // KAN-04: attach the current include/exclude mode so the selection
+            // round-trips to the correct `<dataType>` / `exclude_<dataType>` param.
+            mode: filterModeRef.current,
             ...(option.color !== undefined ? { color: option.color } : {}),
         };
         const next = [...current, added];
         selectedFiltersRef.current = next;
         setSelectedFilters(next);
+        // A manual selection clears the applied saved-filter highlight (parity
+        // with filter.controller.coffee `selectFilter` → activeCustomFilter = null).
+        setActiveCustomFilter(null);
         // QA-FUNC-09: persist the updated filter selection (with the current
         // search query) so it survives a reload (port of `storeFilters`).
         saveKanbanFilters(resolvedId, { q: filterQRef.current, selected: next });
@@ -2032,11 +2785,107 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         );
         selectedFiltersRef.current = next;
         setSelectedFilters(next);
+        setActiveCustomFilter(null);
         // QA-FUNC-09: persist the reduced filter selection (port of
         // `storeFilters`).
         saveKanbanFilters(resolvedId, { q: filterQRef.current, selected: next });
         void reloadUserstories();
         void loadFilters(next);
+    };
+
+    /* -- Custom (saved) filters — KAN-04 ----------------------------------- */
+
+    /**
+     * Port of `saveCustomFilter` (controllerMixins.coffee L201-L214): snapshot
+     * the current selection into a param map, merge it under `name`, and persist
+     * the whole map back to `/user-storage` under the kanban suffix.
+     */
+    const saveCustomFilter = (name: string): void => {
+        const id = resolvedIdRef.current;
+        if (!Number.isInteger(id) || id <= 0) {
+            return;
+        }
+        const paramMap = selectedToStoredMap(selectedFiltersRef.current);
+        void (async (): Promise<void> => {
+            try {
+                const existing = await userStorageApi.getFilters(
+                    id,
+                    KANBAN_CUSTOM_FILTERS_SUFFIX,
+                );
+                const nextStore: StoredCustomFilters = { ...existing, [name]: paramMap };
+                await userStorageApi.storeFilters(
+                    id,
+                    nextStore,
+                    KANBAN_CUSTOM_FILTERS_SUFFIX,
+                );
+                if (!aliveRef.current) {
+                    return;
+                }
+                setCustomFilters(storedToKanbanCustomFilters(nextStore));
+            } catch (err) {
+                if (typeof console !== "undefined") {
+                    // eslint-disable-next-line no-console
+                    console.error("[taiga-react] saveCustomFilter failed", err);
+                }
+            }
+        })();
+    };
+
+    /**
+     * Port of `selectCustomFilter` (controllerMixins.coffee L197-L200): replace
+     * the whole selection with the saved filter's stored params, then reload.
+     */
+    const selectCustomFilter = (filter: KanbanCustomFilter): void => {
+        const nextSelected = reconstructSelectedFromParamMap(
+            filter.filter ?? {},
+            filters,
+        );
+        selectedFiltersRef.current = nextSelected;
+        setSelectedFilters(nextSelected);
+        setActiveCustomFilter(filter.id);
+        saveKanbanFilters(resolvedId, {
+            q: filterQRef.current,
+            selected: nextSelected,
+        });
+        void reloadUserstories();
+        void loadFilters(nextSelected);
+    };
+
+    /**
+     * Port of `removeCustomFilter` (controllerMixins.coffee L216-L221): drop the
+     * saved filter from the stored map and persist (DELETE when it becomes
+     * empty). The current selection is left untouched.
+     */
+    const removeCustomFilter = (filter: KanbanCustomFilter): void => {
+        const id = resolvedIdRef.current;
+        if (!Number.isInteger(id) || id <= 0) {
+            return;
+        }
+        void (async (): Promise<void> => {
+            try {
+                const existing = await userStorageApi.getFilters(
+                    id,
+                    KANBAN_CUSTOM_FILTERS_SUFFIX,
+                );
+                const nextStore: StoredCustomFilters = { ...existing };
+                delete nextStore[String(filter.id)];
+                await userStorageApi.storeFilters(
+                    id,
+                    nextStore,
+                    KANBAN_CUSTOM_FILTERS_SUFFIX,
+                );
+                if (!aliveRef.current) {
+                    return;
+                }
+                setActiveCustomFilter((prev) => (prev === filter.id ? null : prev));
+                setCustomFilters(storedToKanbanCustomFilters(nextStore));
+            } catch (err) {
+                if (typeof console !== "undefined") {
+                    // eslint-disable-next-line no-console
+                    console.error("[taiga-react] removeCustomFilter failed", err);
+                }
+            }
+        })();
     };
 
     const foldStatus = (status: Status): void => {
@@ -2047,6 +2896,26 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         // survives a reload (port of `storeStatusColumnModes`).
         saveColumnFolds(resolvedId, next);
         setUnfold(nextFolded ? null : status.id);
+
+        // F-KANBAN-ARCHIVED-NO-LOAD: an ARCHIVED column loads its stories lazily
+        // on unfold and drops them on fold. The base board request keeps
+        // `status__is_archived:false`, so without this the archived column would
+        // stay permanently empty. Live (non-archived) columns are unaffected —
+        // their stories are always present from the base load, so folding/
+        // unfolding them is a pure view toggle.
+        if (status.is_archived) {
+            if (nextFolded) {
+                // Folding: forget this archived status's stories and recompose
+                // the board so its cards disappear (mirrors the legacy re-hide).
+                if (shownArchivedRef.current[status.id] !== undefined) {
+                    delete shownArchivedRef.current[status.id];
+                    kanban.setUserstories(composeBoardUserstories());
+                }
+            } else {
+                // Unfolding: fetch this archived status's stories and merge them.
+                void loadArchivedStatus(status.id);
+            }
+        }
     };
 
     const toggleSwimlane = (swimlaneId: number): void => {
@@ -2355,12 +3224,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         // A DISTINCT class (not `.kanban-load-error`) keeps the permission-denied
         // state cleanly separable from the generic 500 load-error state.
         return (
-            <section className="main kanban permission-denied">
+            <main className="main kanban permission-denied">
                 <div className="kanban-permission-denied-message" role="alert">
                     <h1>{PERMISSION_DENIED_TITLE}</h1>
                     <p>{PERMISSION_DENIED_TEXT}</p>
                 </div>
-            </section>
+            </main>
         );
     }
 
@@ -2394,8 +3263,24 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             .filter((user) => Number.isInteger(user.id));
     })();
 
+    // [KAN-03] The "Select assigned user" picker needs the FULL member records
+    // (avatar seed + role) that the filter-derived `assignableUsers` above lacks.
+    // Port `fillUsersAndRoles` (controllerMixins.coffee L22-L24): the active
+    // members sorted by display name. Roles are all `project.roles` (id + name);
+    // the picker itself hides any role that contributes no member, matching the
+    // Jade `ng-if="item.type != 'role' || item.userIds.length"`.
+    const assignActiveUsers: BaseUser[] = ((project?.members ?? []) as BaseUser[])
+        .filter((member) => member.is_active)
+        .slice()
+        .sort((a, b) =>
+            (a.full_name_display || "").localeCompare(b.full_name_display || ""),
+        );
+    const assignRoles: SelectUserRole[] = (
+        (project?.roles ?? []) as Array<{ id: number; name: string }>
+    ).map((role) => ({ id: role.id, name: role.name }));
+
     return (
-        <section className={"main kanban" + (swimlaneMode ? " swimlane" : "")}>
+        <main className={"main kanban" + (swimlaneMode ? " swimlane" : "")}>
             <div className="kanban-header">
                 <header>
                     <h1>
@@ -2416,6 +3301,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                             <span className="text">
                                 {openFilter ? "Hide filters" : "Filters"}
                             </span>
+                            {/* KAN-04: active-filter count badge (parity with the
+                              * Backlog toggle's `.selected-filters`). */}
+                            {selectedFilters.length > 0 ? (
+                                <span className="selected-filters">
+                                    {selectedFilters.length}
+                                </span>
+                            ) : null}
                         </button>
                         {/*
                           * tg-input-search: a real custom element (styled by tag
@@ -2474,8 +3366,15 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                     <KanbanFilterPanel
                         filters={filters}
                         selectedFilters={selectedFilters}
+                        customFilters={customFilters}
+                        activeCustomFilter={activeCustomFilter}
+                        filterMode={filterMode}
+                        onSetFilterMode={setFilterMode}
                         onAddFilter={addFilter}
                         onRemoveFilter={removeFilter}
+                        onSaveCustomFilter={saveCustomFilter}
+                        onSelectCustomFilter={selectCustomFilter}
+                        onRemoveCustomFilter={removeCustomFilter}
                     />
                 ) : null}
 
@@ -2568,6 +3467,45 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 />
             ) : null}
 
+            {/* [KAN-03] The dedicated "Select assigned user" picker opened by the
+                card "Assign to" action. `currentUsers` seeds the selection from
+                the target story's `assigned_users` ∪ `assigned_to` (the
+                CoffeeScript `_.compact(_.union(item.assigned_users,
+                [item.assigned_to]))`, kanban/main.coffee L341). Mounted only
+                while open AND a project is loaded (so member/role props are
+                populated), mirroring the edit-lightbox guard above. */}
+            {assignLightbox.open && project ? (
+                <SelectUserLightbox
+                    open={assignLightbox.open}
+                    activeUsers={assignActiveUsers}
+                    roles={assignRoles}
+                    currentUsers={
+                        assignLightbox.us
+                            ? Array.from(
+                                  new Set([
+                                      ...(((
+                                          assignLightbox.us
+                                              .assigned_users as
+                                              | number[]
+                                              | undefined
+                                      ) ?? []) as number[]),
+                                      ...(assignLightbox.us.assigned_to != null
+                                          ? [
+                                                assignLightbox.us
+                                                    .assigned_to as number,
+                                            ]
+                                          : []),
+                                  ]),
+                              )
+                            : []
+                    }
+                    onConfirm={onConfirmAssignedUsers}
+                    onCancel={() =>
+                        setAssignLightbox({ open: false, us: null })
+                    }
+                />
+            ) : null}
+
             {/* [N-03] Themed delete-confirmation dialog, replacing the native
                 window.confirm. Ports `$tgConfirm.askOnDelete(...)`:
                 title US.TITLE_DELETE_ACTION, message US.TITLE_DELETE_MESSAGE. */}
@@ -2588,6 +3526,6 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 }}
                 onCancel={handleCancelDelete}
             />
-        </section>
+        </main>
     );
 }

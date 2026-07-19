@@ -69,6 +69,58 @@ export const getToken = (): string | null => readStorageString("token");
  */
 export const getRefreshToken = (): string | null => readStorageString("refresh");
 
+/**
+ * The current authenticated user, as AngularJS cached it under
+ * localStorage["userInfo"] (`authService` `setUserdata` ->
+ * `$tgStorage.set("userInfo", userModel._attrs)`, app/coffee/modules/auth.coffee
+ * L96-L100). Unlike the token, this value is a JSON OBJECT (not a string), so it
+ * is JSON-decoded and returned as-is. Returns null when no session exists or the
+ * stored value is malformed / not an object.
+ *
+ * The React screens read this ONLY to resolve "self" affordances that AngularJS
+ * also derives from the same cache — e.g. the create/edit lightbox's
+ * "Assign to me" control (ports `$currentUserService.getUser().get('id')`,
+ * app/modules/components/assigned-inline/assigned-users-inline.directive.coffee
+ * L79-L80). It never writes, so it establishes no parallel session identity.
+ */
+export interface CurrentUser {
+    /** The user's numeric id (the only field the React screens strictly need). */
+    id: number;
+    /** Display name, when present. */
+    full_name_display?: string;
+    /** Login handle, when present. */
+    username?: string;
+    /** Avatar photo URL, when present (may be null for the default avatar). */
+    photo?: string | null;
+    /** Gravatar seed used by the default-avatar hash, when present. */
+    gravatar_id?: string;
+    /** Any other cached fields are preserved but untyped. */
+    [key: string]: unknown;
+}
+
+export const getCurrentUser = (): CurrentUser | null => {
+    try {
+        if (typeof window === "undefined" || window.localStorage == null) {
+            return null;
+        }
+        const serializedValue = window.localStorage.getItem("userInfo");
+        if (serializedValue === null) {
+            return null;
+        }
+        const parsed: unknown = JSON.parse(serializedValue);
+        if (
+            parsed !== null &&
+            typeof parsed === "object" &&
+            typeof (parsed as { id?: unknown }).id === "number"
+        ) {
+            return parsed as CurrentUser;
+        }
+        return null;
+    } catch {
+        return null;
+    }
+};
+
 /*
  * ---------------------------------------------------------------------------
  * SESSION WRITES — narrowly scoped to the React-side 401 token-refresh flow.

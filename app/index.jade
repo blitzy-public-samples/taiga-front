@@ -32,7 +32,59 @@ html(lang="en", ng-attr-dir="{{ isRTL ? 'rtl' : 'ltr' }}")
             window.TAIGA_USER_PILOT_TOKEN = '#{userpilotToken}'
             window._taigaAvailableThemes = !{availableThemes};
 
+        //- INITIAL PRE-BOOT LOADER (QA Issue 4 — perceived performance).
+        //- A static, inline-styled spinner that paints on FIRST PAINT, before any
+        //- JavaScript executes. The application's existing `.loader` (tg-loader)
+        //- stays `display:none` until AngularJS has bootstrapped and its directive
+        //- adds `.active`, so during the (long, on slow links) bundle-download +
+        //- bootstrap window the user previously saw a blank white screen. This
+        //- overlay gives immediate visual feedback with ZERO JavaScript and NO
+        //- dependency on any external stylesheet (all styles are inlined here), so
+        //- it renders as soon as the document is parsed. app-loader.coffee removes
+        //- it (removeInitialLoader) the instant angular.bootstrap completes, handing
+        //- off seamlessly to the AngularJS-driven UI.
+        style.
+            #tg-initial-loader {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                z-index: 100000;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                background-color: #ffffff;
+            }
+            #tg-initial-loader .tg-initial-loader-spinner {
+                box-sizing: border-box;
+                width: 44px;
+                height: 44px;
+                border: 4px solid rgba(112, 114, 143, 0.2);
+                border-top-color: #83eede;
+                border-radius: 50%;
+                animation: tg-initial-loader-spin 0.8s linear infinite;
+            }
+            #tg-initial-loader .tg-initial-loader-text {
+                margin-top: 18px;
+                color: #70728f;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                font-size: 14px;
+                letter-spacing: 0.02em;
+            }
+            @keyframes tg-initial-loader-spin {
+                to { transform: rotate(360deg); }
+            }
+
     body(tg-main, ng-class="{'rtl': isRTL}")
+        //- Pre-boot loader element (styles live in the <style> block in <head>).
+        //- Static markup so it paints without waiting for AngularJS/React to boot;
+        //- removed by app-loader.coffee right after angular.bootstrap.
+        #tg-initial-loader(role="status", aria-label="Loading Taiga")
+            .tg-initial-loader-spinner
+            .tg-initial-loader-text Loading…
+
         tg-legacy
 
         div(tg-navigation-bar, ng-if="!errorHandling.showingError")

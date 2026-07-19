@@ -57,6 +57,7 @@
 import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 import moment from "moment";
+import debounce from "lodash/debounce";
 
 import type {
     CustomFilter,
@@ -68,6 +69,7 @@ import type {
     ProjectStats,
     SelectedFilter,
     Sprint,
+    Swimlane,
     UserStory,
     UserStoryActions,
 } from "./types";
@@ -108,6 +110,7 @@ import { notifyError } from "../shared/notifications/notificationCenter";
 import { NotificationHost } from "../shared/notifications/NotificationHost";
 import { resetInterceptorHooks, setInterceptorHooks } from "../shared/api/httpInterceptor";
 import { t } from "../shared/i18n/translate";
+import { setAll as setAppMeta } from "../shared/meta/appMeta";
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -230,6 +233,17 @@ const VALID_QUERY_PARAMS: ReadonlySet<string> = new Set<string>([
  * responsiveness of the AngularJS `tg-input-search` debounce.
  */
 const SEARCH_DEBOUNCE_MS = 250;
+
+/**
+ * Debounce (ms) applied to WebSocket-triggered board refreshes (Issue 2). A
+ * burst of `changes.project.{id}.*` events (e.g. a bulk edit) previously fired
+ * one full board refetch PER event. Coalescing them with a pure-trailing
+ * debounce collapses the burst into a single refresh once the events settle,
+ * matching the original AngularJS `debounceLeading` coalescer
+ * (`_.debounce(fn, wait, { leading: false, trailing: true })`, utils.coffee
+ * L121). Kept identical to the Kanban root's `EVENTS_DEBOUNCE_MS`.
+ */
+const EVENTS_DEBOUNCE_MS = 1000;
 
 /**
  * Legacy localStorage key for the burndown-collapsed flag (N-01). Reproduced
@@ -1232,6 +1246,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
     // Local component state NOT owned by the board-state hook.
     const [project, setProject] = useState<Project | null>(null);
+    // BL-01: swimlanes for the create / bulk-create user-story lightboxes'
+    // SELECT SWIMLANE control. Fetched from `GET /swimlanes?project={id}` inside
+    // `loadProject` when the kanban module is active (parity with the Kanban
+    // forms); empty on a no-swimlane board, which hides the control.
+    const [swimlanes, setSwimlanes] = useState<Swimlane[]>([]);
     const [permissionDenied, setPermissionDenied] = useState<boolean>(false);
     const [loadError, setLoadError] = useState<string | null>(null);
     // [ERR-2] offline surface: set when a React `fetch` fails with no HTTP
@@ -1417,6 +1436,25 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 // Port `errorHandlingService.permissionDenied()`.
                 setPermissionDenied(true);
                 return false;
+            }
+            // BL-01: when the kanban module is active the project may define
+            // swimlanes; fetch them so the create / bulk-create lightboxes can
+            // offer the SELECT SWIMLANE control (parity with the Kanban forms,
+            // `lb-create-edit-us.jade` gate `is_kanban_activated && swimlanesList`).
+            // Non-fatal — on failure the selector simply does not render.
+            if (res.data.is_kanban_activated) {
+                try {
+                    const swRes = await httpGet<Swimlane[]>("swimlanes", {
+                        project: res.data.id,
+                    });
+                    if (aliveRef.current && myGen === loadGenRef.current) {
+                        setSwimlanes(Array.isArray(swRes.data) ? swRes.data : []);
+                    }
+                } catch (err) {
+                    reportError("loadSwimlanes failed", err);
+                }
+            } else if (aliveRef.current && myGen === loadGenRef.current) {
+                setSwimlanes([]);
             }
             return true;
         } catch (err) {
@@ -1684,11 +1722,72 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     /* Phase C — WebSocket subscription (port initializeSubscription)          */
     /* ---------------------------------------------------------------------- */
 
+    // Issue 2 — WebSocket burst coalescing.
+    //
+    // Each `.userstories` / `.milestones` / `.projects` event used to run its
+    // full refetch SYNCHRONOUSLY, so a burst (e.g. a bulk edit emitting dozens
+    // of events) fired dozens of overlapping refetches (~2 requests × N events).
+    // We wrap each handler's work in a PURE-TRAILING debounce so a burst on a
+    // given key collapses into exactly ONE refresh once the events settle —
+    // matching the original AngularJS `debounceLeading`
+    // (`{ leading: false, trailing: true }`). The debounced instances are
+    // created ONCE (useRef) and invoke the LATEST loader closures through refs,
+    // so they survive re-renders; they are cancelled on re-init and on unmount
+    // (below) to drop any pending trailing call against a stale project/socket.
+    const wsUserstoriesActionRef = useRef<() => void>(() => undefined);
+    const wsMilestonesActionRef = useRef<() => void>(() => undefined);
+    const wsProjectsActionRef = useRef<() => void>(() => undefined);
+    wsUserstoriesActionRef.current = () => {
+        void loadUserstories({ reset: true });
+        void loadSprints();
+    };
+    wsMilestonesActionRef.current = () => {
+        void loadSprints();
+        void loadClosedSprints();
+        void loadProjectStats();
+    };
+    wsProjectsActionRef.current = () => {
+        void refreshProjectState();
+    };
+
+    const debouncedUserstoriesRef = useRef<ReturnType<typeof debounce> | null>(
+        null,
+    );
+    if (debouncedUserstoriesRef.current === null) {
+        debouncedUserstoriesRef.current = debounce(
+            () => wsUserstoriesActionRef.current(),
+            EVENTS_DEBOUNCE_MS,
+            { leading: false, trailing: true },
+        );
+    }
+    const debouncedMilestonesRef = useRef<ReturnType<typeof debounce> | null>(
+        null,
+    );
+    if (debouncedMilestonesRef.current === null) {
+        debouncedMilestonesRef.current = debounce(
+            () => wsMilestonesActionRef.current(),
+            EVENTS_DEBOUNCE_MS,
+            { leading: false, trailing: true },
+        );
+    }
+    const debouncedProjectsRef = useRef<ReturnType<typeof debounce> | null>(
+        null,
+    );
+    if (debouncedProjectsRef.current === null) {
+        debouncedProjectsRef.current = debounce(
+            () => wsProjectsActionRef.current(),
+            EVENTS_DEBOUNCE_MS,
+            { leading: false, trailing: true },
+        );
+    }
+
     /**
      * Port of `initializeSubscription` (main.coffee L223). Uses the SHARED
      * events client (never a parallel connection). The `.milestones`
      * subscription passes `{ selfNotification: true }` verbatim so the backlog
-     * refreshes even for changes this client originated.
+     * refreshes even for changes this client originated. Each handler now fans
+     * its work through the pure-trailing debounced refs above (Issue 2), so a
+     * burst of events collapses into a single trailing refresh per key.
      */
     const initializeSubscription = useCallback((): void => {
         const id = resolvedIdRef.current;
@@ -1703,22 +1802,25 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (eventsRef.current) {
             eventsRef.current.disconnect();
             eventsRef.current = null;
+            // Drop any trailing refresh still pending for the previous socket so
+            // it cannot fire against the newly established (different) project.
+            debouncedUserstoriesRef.current?.cancel();
+            debouncedMilestonesRef.current?.cancel();
+            debouncedProjectsRef.current?.cancel();
         }
         const client = createEventsClient();
         eventsRef.current = client;
         client.connect();
 
         client.subscribe(`changes.project.${id}.userstories`, () => {
-            void loadUserstories({ reset: true });
-            void loadSprints();
+            // Issue 2: coalesce a burst into one trailing refresh.
+            debouncedUserstoriesRef.current?.();
         });
 
         client.subscribe(
             `changes.project.${id}.milestones`,
             () => {
-                void loadSprints();
-                void loadClosedSprints();
-                void loadProjectStats();
+                debouncedMilestonesRef.current?.();
             },
             { selfNotification: true },
         );
@@ -1735,15 +1837,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         // to swimlane/status match strings; any project-attribute change is
         // relevant to at least one Backlog gate or list.
         client.subscribe(`changes.project.${id}.projects`, () => {
-            void refreshProjectState();
+            debouncedProjectsRef.current?.();
         });
-    }, [
-        loadUserstories,
-        loadSprints,
-        loadClosedSprints,
-        loadProjectStats,
-        refreshProjectState,
-    ]);
+        // NOTE: the debounced refs (stable useRef instances) invoke the latest
+        // loader closures via `ws*ActionRef`, so this callback has no reactive
+        // loader dependencies — it only needs to be created once.
+    }, []);
 
     /**
      * Port of `loadInitialData` (main.coffee L488): project → subscription →
@@ -2390,7 +2489,9 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 resolvedId,
                 fields.statusId,
                 fields.subject,
-                null,
+                // BL-01: create the story into the chosen swimlane (parity with
+                // the Kanban create flow); `null` = unclassified / no-swimlane.
+                fields.swimlane,
             );
             // The bulk_create endpoint returns full story objects; the API
             // adapter types them with the minimal `{ id }` shape, so narrow to the
@@ -2464,6 +2565,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     blocked_note: changes.blocked_note,
                     team_requirement: changes.team_requirement,
                     client_requirement: changes.client_requirement,
+                    // BL-01: persist a swimlane reassignment made from the edit form.
+                    swimlane: changes.swimlane,
                     version: target.version,
                 });
                 // Reproduce the CoffeeScript submit order: save →
@@ -2911,8 +3014,58 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             }
             eventsRef.current?.disconnect();
             eventsRef.current = null;
+            // Issue 2: cancel any pending trailing WebSocket refresh so it cannot
+            // fire after unmount / project change.
+            debouncedUserstoriesRef.current?.cancel();
+            debouncedMilestonesRef.current?.cancel();
+            debouncedProjectsRef.current?.cancel();
         };
     }, [projectId, loadInitialData]);
+
+    // F-001: restore document.title / meta parity with the AngularJS baseline.
+    //
+    // The original BacklogController set the page metadata once `loadInitialData`
+    // resolved (backlog/main.coffee L105-110):
+    //   title = translate.instant("BACKLOG.PAGE_TITLE", {projectName})
+    //   description = translate.instant("BACKLOG.PAGE_DESCRIPTION",
+    //                                   {projectName, projectDescription})
+    //   appMetaService.setAll(title, description)
+    // The React port dropped this, leaving the tab title on the static
+    // index.html default ("Taiga") and — after an AngularJS → React SPA
+    // transition — stale on the previous route's title.
+    //
+    // Keying on the RESOLVED project's `name`/`description` (stable primitives,
+    // not the object identity) fires this effect exactly when the project first
+    // resolves and whenever those fields genuinely change — never churning on
+    // unrelated data refreshes. Because it also runs on every fresh mount, it
+    // re-applies the title when the backlog is re-entered from another route,
+    // curing the stale-title-after-SPA-transition case. `t()` reads the live,
+    // shared angular-translate catalog at runtime (localized), falling back to
+    // the English literal when Angular is absent.
+    const backlogProjectName = project?.name ?? "";
+    const backlogProjectDescription =
+        typeof project?.description === "string" ? project.description : "";
+    useEffect(() => {
+        if (project === null) {
+            return;
+        }
+        const title = t("BACKLOG.PAGE_TITLE", "Backlog - {{projectName}}", {
+            projectName: backlogProjectName,
+        });
+        const description = t(
+            "BACKLOG.PAGE_DESCRIPTION",
+            "The backlog panel, with user stories and sprints of the project {{projectName}}: {{projectDescription}}",
+            {
+                projectName: backlogProjectName,
+                projectDescription: backlogProjectDescription,
+            },
+        );
+        setAppMeta(title, description);
+        // `project` is read only for the null-guard; the meaningful inputs are
+        // the name/description primitives, so the effect re-runs only when the
+        // page metadata would actually change.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [backlogProjectName, backlogProjectDescription]);
 
     /* ---------------------------------------------------------------------- */
     /* Phase I — render (port backlog.jade; EXACT class names)                 */
@@ -3412,6 +3565,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 open={bulkLightbox.open}
                 project={project}
                 defaultStatusId={project.default_us_status}
+                swimlanes={swimlanes}
+                defaultSwimlaneId={project.default_swimlane ?? null}
                 onCreated={onBulkCreated}
                 onClose={() => setBulkLightbox({ open: false })}
             />
@@ -3421,6 +3576,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 project={project}
                 us={usLightbox.us}
                 assignableUsers={assignableUsers}
+                swimlanes={swimlanes}
+                defaultSwimlaneId={project.default_swimlane ?? null}
                 onCreate={onCreateUserStory}
                 onEdit={onSaveUserStoryEdit}
                 fetchAttachments={fetchUsAttachments}

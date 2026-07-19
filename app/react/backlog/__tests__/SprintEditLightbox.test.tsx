@@ -283,6 +283,11 @@ describe("SprintEditLightbox — validation gates the API", () => {
 
         // The required message is rendered (in the name field's error span)...
         expect(screen.getByText(REQUIRED_MESSAGE)).toBeInTheDocument();
+        // [BL-02] ...the invalid-field red border comes from `input.checksley-error`,
+        // so the class must land on the <input> itself (the port put it on the
+        // border:0 <fieldset>, so no border ever showed)...
+        const nameInput = container.querySelector(".sprint-name") as HTMLInputElement;
+        expect(nameInput).toHaveClass("checksley-error");
         // ...and neither persistence endpoint was reached.
         expect(createMock).not.toHaveBeenCalled();
         expect(saveMock).not.toHaveBeenCalled();
@@ -556,6 +561,20 @@ describe("SprintEditLightbox — delete flow", () => {
         expect(dialog).not.toBeNull();
         expect(removeMock).not.toHaveBeenCalled();
 
+        // [BL-04] The confirm shows the "Are you sure you want to delete?" question
+        // line (span.subtitle, ported from askOnDelete's NOTIFICATION.ASK_DELETE
+        // default) above the sprint name.
+        expect(dialog!.querySelector(".subtitle")?.textContent).toBe(
+            "Are you sure you want to delete?",
+        );
+        // [BL-05] The DELETE button is styled red by the theme's
+        // `.btn-small[variant=destructive]` selector, so it must carry the
+        // `variant="destructive"` attribute (the port omitted it → mint fallback).
+        expect(dialog!.querySelector(".js-confirm")).toHaveAttribute(
+            "variant",
+            "destructive",
+        );
+
         // Confirm the deletion.
         fireEvent.click(dialog!.querySelector(".js-confirm") as HTMLElement);
 
@@ -632,23 +651,40 @@ describe("SprintEditLightbox — DOM fidelity & controlled inputs", () => {
         expect(screen.getByText("New sprint")).toBeInTheDocument();
     });
 
-    it("updates the three editable inputs on change", () => {
+    it("updates the name via typing and the dates via the Pikaday calendar picker", () => {
+        // [BL-03] The name is still a free-text input; the two date fields are
+        // now the themed DatePicker (read-only text formatted "DD MMM YYYY" that
+        // opens a Pikaday-classed calendar popover). Seed dates are 2021-01-01 /
+        // 2021-01-15 (makeValues default), so the fields DISPLAY the formatted
+        // value — never the raw ISO — and the picker emits the ISO on selection.
         const { container } = renderLightbox({
             mode: "create",
             initialValues: makeValues({ name: "" }),
         });
 
+        // Name — unchanged free-text behavior.
         const nameInput = container.querySelector(".sprint-name") as HTMLInputElement;
         fireEvent.change(nameInput, { target: { value: "Typed sprint" } });
         expect(nameInput.value).toBe("Typed sprint");
 
+        // Dates render the formatted display (NOT the raw YYYY-MM-DD), and are
+        // read-only (no native date UI), so a raw `change` cannot mutate them.
         const startInput = container.querySelector(".date-start") as HTMLInputElement;
-        fireEvent.change(startInput, { target: { value: "2022-05-01" } });
-        expect(startInput.value).toBe("2022-05-01");
-
         const finishInput = container.querySelector(".date-end") as HTMLInputElement;
-        fireEvent.change(finishInput, { target: { value: "2022-05-20" } });
-        expect(finishInput.value).toBe("2022-05-20");
+        expect(startInput.value).toBe("01 Jan 2021");
+        expect(finishInput.value).toBe("15 Jan 2021");
+        expect(startInput).toHaveAttribute("readonly");
+        expect(startInput).not.toHaveAttribute("type", "date");
+
+        // Open the start field's calendar and pick a day; the field updates to the
+        // newly-picked formatted date. Day buttons expose the full formatted date
+        // as their accessible name (aria-label).
+        fireEvent.click(startInput);
+        expect(container.querySelector(".pika-single")).not.toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: "10 Jan 2021" }));
+        expect(startInput.value).toBe("10 Jan 2021");
+        // Selecting a day closes the popover.
+        expect(container.querySelector(".pika-single")).toBeNull();
     });
 
     it("shows the last-sprint hint only on create when a name is provided", () => {

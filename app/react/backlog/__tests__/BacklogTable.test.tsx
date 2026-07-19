@@ -27,16 +27,17 @@
  *  - the row-options menu (edit / delete gated by `delete_us` /
  *    move-to-top gated by "first in backlog").
  *  - the IntersectionObserver infinite-scroll sentinel (fires `onLoadMore`
- *    ONLY when `canLoadMore && !loadingUserstories`, and NEVER on mount).
+ *    whenever the sentinel intersects while `canLoadMore && !loadingUserstories`).
  *  - checkbox selection reporting `(ref, checked, shiftKey)`.
  *
  * jsdom ships no `IntersectionObserver`, so a controllable mock is installed on
  * `global` in `beforeEach`. Its `observe()` fires an initial `isIntersecting:
- * true` callback — mirroring a real browser's first synchronous notification —
- * which the component's "skip the first callback" guard
- * (`infinite-scroll-immediate-check='false'`) must swallow. That proves
- * `onLoadMore` is not fired on mount even when the sentinel is already visible;
- * a subsequent explicit `trigger(true)` then exercises the load path.
+ * true` callback — mirroring a real browser reporting the sentinel already in
+ * view. Per the Issue 1 fix the component HONORS that intersection: a first
+ * page that does not overflow the viewport must chain-load subsequent pages
+ * (the old "skip the first callback" guard suppressed this and left the list
+ * capped at page 1). Each intersection therefore drives one guarded
+ * `onLoadMore`; a subsequent explicit `trigger(true)` exercises further loads.
  */
 
 import { render, fireEvent, act, waitFor } from "@testing-library/react";
@@ -57,8 +58,9 @@ import type { Project, UserStory, UserStoryActions } from "../types";
  * component created and drive it via {@link trigger}.
  *
  * `observe` deliberately fires an initial `isIntersecting: true` callback to
- * emulate the browser's first synchronous notification; the component skips
- * that first callback, so `onLoadMore` must NOT fire until a later
+ * emulate the browser reporting the sentinel already in view; per the Issue 1
+ * fix the component honors it (chain-loading a short first page), so a guarded
+ * `onLoadMore` fires on that first callback and again on each later
  * `trigger(true)`.
  */
 class MockIntersectionObserver {
@@ -70,14 +72,25 @@ class MockIntersectionObserver {
     readonly rootMargin: string = "";
     readonly thresholds: ReadonlyArray<number> = [];
 
-    constructor(callback: IntersectionObserverCallback) {
+    constructor(
+        callback: IntersectionObserverCallback,
+        options?: IntersectionObserverInit,
+    ) {
         this.callback = callback;
+        // Capture the rootMargin the component passes so a test can assert the
+        // observer is configured to pre-fetch before the exact viewport edge
+        // ([F-BACKLOG-INFINITE-SCROLL]). Defaults to "" when no options are
+        // supplied, preserving the behavior the other tests rely on.
+        if (options?.rootMargin != null) {
+            this.rootMargin = options.rootMargin;
+        }
         MockIntersectionObserver.instances.push(this);
     }
 
     observe = jest.fn((_target: Element): void => {
-        // Mirror the browser's initial synchronous notification. The component's
-        // skip-first-callback guard must consume this so nothing loads on mount.
+        // Mirror the browser's initial synchronous notification. The component
+        // honors it (chain-loading a short first page), so a guarded onLoadMore
+        // fires on this first callback when canLoadMore && !loading.
         this.emit(true);
     });
 
@@ -395,12 +408,15 @@ describe("BacklogTable", () => {
 
         fireEvent.click(container.querySelector(".us-points") as Element);
 
-        const pop = container.querySelector("ul.popover.pop-points");
+        // [BL-07] The fixture has a SINGLE computable role ("Back", id 1), so the
+        // popover preselects it and opens directly on the compact point grid
+        // (`.pop-points-open`) — NOT the old all-roles-expanded `.pop-points` list
+        // that overflowed the viewport.
+        const pop = container.querySelector("ul.popover.pop-points-open");
         expect(pop).not.toBeNull();
 
-        // Only the single computable role ("Back", id 1) is listed; its point
-        // anchors are [?, 1, 2] → index 2 is point id 12.
-        const pointLinks = container.querySelectorAll(".pop-points a");
+        // The single role's point anchors are [?, 1, 2] → index 2 is point id 12.
+        const pointLinks = container.querySelectorAll(".pop-points-open a.point");
         expect(pointLinks).toHaveLength(3);
         fireEvent.click(pointLinks[2] as Element);
 
@@ -630,18 +646,22 @@ describe("BacklogTable", () => {
         expect(props.onLoadMore).not.toHaveBeenCalled();
     });
 
-    it("calls onLoadMore when the sentinel intersects (canLoadMore && !loading) but never on mount", () => {
+    it("calls onLoadMore on every sentinel intersection while canLoadMore && !loading (chain-loads to fill the viewport)", () => {
         const { props } = renderTable({ canLoadMore: true, loadingUserstories: false });
 
-        // The observer exists and observed the sentinel, but its initial
-        // (mount-time) intersecting callback was skipped: no load yet.
+        // The observer exists and observed the sentinel. Because the mock
+        // reports the sentinel already intersecting (a first page that does not
+        // overflow the viewport), the Issue 1 fix chain-loads immediately: the
+        // guarded onLoadMore fires once. (The old code suppressed this initial
+        // callback and left the backlog capped at the first page.)
         const io = lastIntersectionObserver();
         expect(io).not.toBeUndefined();
-        expect(props.onLoadMore).not.toHaveBeenCalled();
-
-        // A subsequent intersection loads the next page.
-        act(() => io?.trigger(true));
         expect(props.onLoadMore).toHaveBeenCalledTimes(1);
+
+        // A subsequent intersection (e.g. after the user scrolls) loads another
+        // page.
+        act(() => io?.trigger(true));
+        expect(props.onLoadMore).toHaveBeenCalledTimes(2);
     });
 
     it("does not call onLoadMore while loadingUserstories is true", () => {
@@ -680,6 +700,27 @@ describe("BacklogTable", () => {
         expect(io!.disconnect).toHaveBeenCalled();
     });
 
+    it("observes the sentinel with a rootMargin so page 2 pre-loads before the exact viewport edge [F-BACKLOG-INFINITE-SCROLL]", () => {
+        // Regression guard: the original defect paired a zero-height sentinel
+        // with an option-less observer (rootMargin ""), so intersection only
+        // occurred at the exact bottom edge and page 2 never loaded on scroll.
+        // The fix passes a 200px bottom/top rootMargin.
+        renderTable({ canLoadMore: true });
+        const io = lastIntersectionObserver();
+        expect(io).not.toBeUndefined();
+        expect(io!.rootMargin).toBe("200px 0px");
+    });
+
+    it("gives the infinite-scroll sentinel a non-zero inline height so the observer can intersect it [F-BACKLOG-INFINITE-SCROLL]", () => {
+        const { container } = renderTable({ canLoadMore: true });
+        const sentinel = container.querySelector<HTMLElement>(".infinite-scroll-sentinel");
+        expect(sentinel).not.toBeNull();
+        // The compiled stylesheet declares NO rule for `.infinite-scroll-sentinel`,
+        // so without an inline height it collapses to 0px (the reported defect).
+        // The fix sets height:1px so the element has a real layout box.
+        expect(sentinel!.style.height).toBe("1px");
+    });
+
     /* ---------------------------------------------------------------------- */
     /* [S] Popover reveal contract                                            */
     /* ---------------------------------------------------------------------- */
@@ -708,7 +749,8 @@ describe("BacklogTable", () => {
             const { container } = renderTable({ userstories: [us], visibleRefs: [5] });
 
             fireEvent.click(container.querySelector(".us-points") as Element);
-            expect(container.querySelector("ul.popover.pop-points")).toHaveStyle({
+            // [BL-07] Single computable role → opens directly on `.pop-points-open`.
+            expect(container.querySelector("ul.popover.pop-points-open")).toHaveStyle({
                 display: "block",
             });
         });
@@ -859,29 +901,72 @@ describe("BacklogTable", () => {
 
         /* ---- POINTS popover (grouped menu) ------------------------------- */
 
-        it("points: exposes a grouped role=menu whose roving focus traverses every point across role groups", async () => {
+        it("points: single computable role opens a flat point menu whose roving focus traverses every option", async () => {
+            // [BL-07] With one computable role the popover preselects it and opens
+            // directly on the compact point grid (`.pop-points-open`) — a FLAT
+            // `role="menu"` of point `menuitem`s (no per-role groups, which is what
+            // the old all-expanded structure used and what overflowed the viewport).
             const us = makeUs({ id: 50, ref: 5 });
             const { container } = renderTable({ userstories: [us], visibleRefs: [5] });
             const trigger = container.querySelector(".us-points") as HTMLElement;
             fireEvent.click(trigger);
 
-            const menu = container.querySelector("ul.pop-points") as HTMLElement;
+            const menu = container.querySelector("ul.pop-points-open") as HTMLElement;
             expect(menu).toHaveAttribute("role", "menu");
             expect(trigger).toHaveAttribute("aria-controls", menu.id);
-            // Each computable role is a labelled group inside the menu.
-            const group = menu.querySelector('[role="group"]') as HTMLElement;
-            expect(group).not.toBeNull();
-            expect(group).toHaveAttribute("aria-labelledby");
-            // All point choices are menuitems (?, 1, 2 for the single computable role).
+            // All point choices are flat menuitems (?, 1, 2 for the single role).
             const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
             expect(items).toHaveLength(3);
 
             await waitFor(() => expect(document.activeElement).toBe(items[0]));
             fireEvent.keyDown(menu, { key: "End" });
             expect(document.activeElement).toBe(items[2]);
-            // Roving focus crosses the group boundary and wraps to the first item.
+            // Roving focus wraps to the first item.
             fireEvent.keyDown(menu, { key: "ArrowDown" });
             expect(document.activeElement).toBe(items[0]);
+        });
+
+        it("points: multiple computable roles open the compact role list, then reveal that role's points", () => {
+            // [BL-07] The core fix: with >1 computable role the popover opens on the
+            // COMPACT role list (`.pop-role`), each entry "<Role> (<current>)". Picking
+            // a role reveals ONLY that role's point options (`.pop-points-open`) — it
+            // never renders every role expanded at once.
+            const project = makeProject({
+                roles: [
+                    { id: 1, name: "Back", computable: true, order: 1 },
+                    { id: 3, name: "Front", computable: true, order: 2 },
+                ],
+            });
+            const us = makeUs({ id: 50, ref: 5, points: { "1": 11, "3": 12 } });
+            const { container, props } = renderTable({
+                project,
+                userstories: [us],
+                visibleRefs: [5],
+            });
+
+            fireEvent.click(container.querySelector(".us-points") as Element);
+
+            // Stage 1: compact role list, NOT the point grid.
+            const roleList = container.querySelector("ul.popover.pop-role");
+            expect(roleList).not.toBeNull();
+            expect(container.querySelector("ul.popover.pop-points-open")).toBeNull();
+            const roleItems = roleList!.querySelectorAll("a.role");
+            expect(roleItems).toHaveLength(2);
+            // Each role shows its current point NAME: Back→"1" (id 11), Front→"2" (id 12).
+            expect(roleItems[0].textContent).toContain("Back (1)");
+            expect(roleItems[1].textContent).toContain("Front (2)");
+
+            // Stage 2: pick "Front" → its point options appear (role list is gone).
+            fireEvent.click(roleItems[1] as Element);
+            expect(container.querySelector("ul.popover.pop-role")).toBeNull();
+            const pointGrid = container.querySelector("ul.popover.pop-points-open");
+            expect(pointGrid).not.toBeNull();
+            const pointLinks = pointGrid!.querySelectorAll("a.point");
+            expect(pointLinks).toHaveLength(3);
+
+            // Selecting a point fires onChangePoints for the CHOSEN role (Front, id 3).
+            fireEvent.click(pointLinks[0] as Element);
+            expect(props.actions.onChangePoints).toHaveBeenCalledWith(us, 3, 10);
         });
 
         /* ---- OPTIONS popover --------------------------------------------- */

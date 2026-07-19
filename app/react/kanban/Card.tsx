@@ -7,6 +7,7 @@
  */
 
 import { useState, useRef, useEffect, useId } from "react";
+import { createPortal } from "react-dom";
 import type { MouseEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -145,6 +146,19 @@ export function Card(props: CardProps): JSX.Element {
     const actionsMenuRef = useRef<HTMLDivElement>(null);
     const actionsMenuId = useId();
 
+    // Screen-space anchor for the floating actions popover. The legacy
+    // `taiga.globalPopover` (app/coffee/libs/popovers.coffee) appends the menu to
+    // `document.body` and positions it at `top = rect.bottom`, `left = rect.right
+    // - width` (right-aligned under the trigger). We reproduce that verbatim via
+    // a portal so the menu is never clipped by the scrolling column
+    // (`overflow: auto`), matching the baseline where the popover overflows the
+    // card. Width is the `.global-popover` mixin width (170px).
+    const GLOBAL_POPOVER_WIDTH = 170;
+    const [actionsPos, setActionsPos] = useState<{ top: number; left: number }>({
+        top: 0,
+        left: 0,
+    });
+
     // Move focus onto the first menu item once the popup is rendered (post-paint).
     useEffect(() => {
         if (!actionsOpen) {
@@ -157,6 +171,46 @@ export function Card(props: CardProps): JSX.Element {
             items?.[0]?.focus();
         }, 0);
         return () => window.clearTimeout(timer);
+    }, [actionsOpen]);
+
+    // Compute the portal position from the trigger's rect each time the menu
+    // opens (mirrors globalPopover's rect math). Recomputed on open so a scrolled
+    // board still anchors the menu under the kebab.
+    useEffect(() => {
+        if (!actionsOpen) {
+            return;
+        }
+        const rect = actionsButtonRef.current?.getBoundingClientRect();
+        if (rect) {
+            setActionsPos({
+                top: rect.bottom,
+                left: Math.max(0, rect.right - GLOBAL_POPOVER_WIDTH),
+            });
+        }
+    }, [actionsOpen]);
+
+    // Dismiss the menu on an outside click (pointer). The legacy popover closes
+    // on any click outside itself (popovers.coffee binds a body click handler);
+    // we mirror that, ignoring clicks on the trigger (which toggles) and inside
+    // the menu itself.
+    useEffect(() => {
+        if (!actionsOpen) {
+            return undefined;
+        }
+        const onPointerDown = (event: globalThis.MouseEvent): void => {
+            const target = event.target as Node | null;
+            if (
+                target &&
+                (actionsButtonRef.current?.contains(target) ||
+                    actionsMenuRef.current?.contains(target))
+            ) {
+                return;
+            }
+            setActionsOpen(false);
+        };
+        document.addEventListener("mousedown", onPointerDown, true);
+        return () =>
+            document.removeEventListener("mousedown", onPointerDown, true);
     }, [actionsOpen]);
 
     /** Close the menu; optionally return focus to the trigger (keyboard dismiss). */
@@ -407,84 +461,130 @@ export function Card(props: CardProps): JSX.Element {
                         >
                             <Icon name="icon-more-vertical" />
                         </button>
-                        {actionsOpen && (
-                            <div
-                                className="card-actions-menu"
-                                id={actionsMenuId}
-                                ref={actionsMenuRef}
-                                role="menu"
-                                aria-label={t("COMMON.CARD.ACTIONS", "Actions")}
-                                onKeyDown={handleActionsMenuKeyDown}
-                            >
-                                {canModify && (
-                                    <button
-                                        type="button"
-                                        role="menuitem"
-                                        tabIndex={-1}
-                                        className="card-action-edit"
-                                        onClick={(event) => {
-                                            event.stopPropagation();
-                                            setActionsOpen(false);
-                                            onClickEdit?.(item.id);
-                                        }}
-                                    >
-                                        {t("COMMON.CARD.EDIT", "Edit card")}
-                                    </button>
-                                )}
-                                {canModify && (
-                                    <button
-                                        type="button"
-                                        role="menuitem"
-                                        tabIndex={-1}
-                                        className="card-action-assigned-to"
-                                        onClick={(event) => {
-                                            event.stopPropagation();
-                                            setActionsOpen(false);
-                                            onClickAssignedTo?.(item.id);
-                                        }}
-                                    >
-                                        {t("COMMON.CARD.ASSIGN_TO", "Assign To")}
-                                    </button>
-                                )}
-                                {canDelete && (
-                                    <button
-                                        type="button"
-                                        role="menuitem"
-                                        tabIndex={-1}
-                                        className="card-action-delete"
-                                        onClick={(event) => {
-                                            event.stopPropagation();
-                                            setActionsOpen(false);
-                                            onClickDelete?.(item.id);
-                                        }}
-                                    >
-                                        {t("COMMON.CARD.DELETE", "Delete card")}
-                                    </button>
-                                )}
-                                {/* [M-13] "Move to top" — ports the legacy card
-                                    action gated on `canEdit(...) && !isFirst`
-                                    (kanban/main.coffee L1090-L1097). Localized
-                                    label (COMMON.CARD.MOVE_TO_TOP) + the
-                                    `icon-move-to-top` glyph, hidden for the card
-                                    already at the top of its column. */}
-                                {canModify && !isFirst && (
-                                    <button
-                                        type="button"
-                                        role="menuitem"
-                                        tabIndex={-1}
-                                        className="card-action-move-to-top"
-                                        onClick={(event) => {
-                                            event.stopPropagation();
-                                            setActionsOpen(false);
-                                            onClickMoveToTop?.(item.id);
-                                        }}
-                                    >
-                                        <Icon name="icon-move-to-top" />
-                                        {t("COMMON.CARD.MOVE_TO_TOP", "Move to top")}
-                                    </button>
-                                )}
-                            </div>
-                        )}
+                        {actionsOpen &&
+                            createPortal(
+                                // [KAN-05] The card actions menu reproduces the
+                                // legacy `taiga.globalPopover` output verbatim: a
+                                // floating `div.popover.global-popover > ul > li >
+                                // button` (each button = svg glyph + text label),
+                                // appended to `document.body` and positioned under
+                                // the trigger. The `.popover`/`.global-popover`
+                                // SCSS (styles/modules/common/popover.scss) themes
+                                // it — white card, 1px gray400 border, 4px radius,
+                                // 4px/4px/8px shadow, teal (link-primary) text and
+                                // svg fill, hover gray200 — so it is a floating
+                                // vertical dropdown, not inline text. The mixin's
+                                // default `display:none` is overridden with the
+                                // inline `display:block` the jQuery plugin also set
+                                // when fading the popover in. Roving-focus/ARIA and
+                                // the menuitem semantics are preserved.
+                                <div
+                                    className="popover global-popover"
+                                    id={actionsMenuId}
+                                    ref={actionsMenuRef}
+                                    role="menu"
+                                    aria-label={t("COMMON.CARD.ACTIONS", "Actions")}
+                                    onKeyDown={handleActionsMenuKeyDown}
+                                    style={{
+                                        display: "block",
+                                        top: actionsPos.top,
+                                        left: actionsPos.left,
+                                        width: GLOBAL_POPOVER_WIDTH,
+                                    }}
+                                >
+                                    <ul>
+                                        {canModify && (
+                                            <li>
+                                                <button
+                                                    type="button"
+                                                    role="menuitem"
+                                                    tabIndex={-1}
+                                                    className="card-action-edit"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setActionsOpen(false);
+                                                        onClickEdit?.(item.id);
+                                                    }}
+                                                >
+                                                    <Icon name="icon-edit" />
+                                                    {t("COMMON.CARD.EDIT", "Edit card")}
+                                                </button>
+                                            </li>
+                                        )}
+                                        {canModify && (
+                                            <li>
+                                                <button
+                                                    type="button"
+                                                    role="menuitem"
+                                                    tabIndex={-1}
+                                                    className="card-action-assigned-to"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setActionsOpen(false);
+                                                        onClickAssignedTo?.(item.id);
+                                                    }}
+                                                >
+                                                    <Icon name="icon-assign-to" />
+                                                    {t(
+                                                        "COMMON.CARD.ASSIGN_TO",
+                                                        "Assign To",
+                                                    )}
+                                                </button>
+                                            </li>
+                                        )}
+                                        {canDelete && (
+                                            <li>
+                                                <button
+                                                    type="button"
+                                                    role="menuitem"
+                                                    tabIndex={-1}
+                                                    className="card-action-delete"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setActionsOpen(false);
+                                                        onClickDelete?.(item.id);
+                                                    }}
+                                                >
+                                                    <Icon name="icon-trash" />
+                                                    {t(
+                                                        "COMMON.CARD.DELETE",
+                                                        "Delete card",
+                                                    )}
+                                                </button>
+                                            </li>
+                                        )}
+                                        {/* [M-13] "Move to top" — ports the legacy
+                                            card action gated on `canEdit(...) &&
+                                            !isFirst` (kanban/main.coffee
+                                            L1090-L1097). Localized label
+                                            (COMMON.CARD.MOVE_TO_TOP) + the
+                                            `icon-move-to-top` glyph, hidden for the
+                                            card already at the top of its column. */}
+                                        {canModify && !isFirst && (
+                                            <li>
+                                                <button
+                                                    type="button"
+                                                    role="menuitem"
+                                                    tabIndex={-1}
+                                                    className="card-action-move-to-top"
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        setActionsOpen(false);
+                                                        onClickMoveToTop?.(item.id);
+                                                    }}
+                                                >
+                                                    <Icon name="icon-move-to-top" />
+                                                    {t(
+                                                        "COMMON.CARD.MOVE_TO_TOP",
+                                                        "Move to top",
+                                                    )}
+                                                </button>
+                                            </li>
+                                        )}
+                                    </ul>
+                                </div>,
+                                document.body,
+                            )}
                     </div>
                 )}
 
@@ -601,7 +701,13 @@ export function Card(props: CardProps): JSX.Element {
                         >
                             <div className="card-statistics-init">
                                 <span>
-                                    {model.total_points ? (
+                                    {/*
+                                      Show the point estimation whenever a value is present,
+                                      including a legitimate 0 estimation. A plain truthy check
+                                      treats 0 as "no estimate" and renders "N/E"; a null-aware
+                                      check (matching the Backlog point rendering) preserves 0.
+                                    */}
+                                    {model.total_points != null ? (
                                         <span
                                             className="card-estimation"
                                             title={t("COMMON.CARD.ESTIMATION", "Estimation")}

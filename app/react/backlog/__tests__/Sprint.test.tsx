@@ -140,22 +140,25 @@ describe("Sprint", () => {
   it("initialises expanded when sprint is open and toggles collapse via the compact button", () => {
     const sprint = makeSprint({ id: 1, closed: false, user_stories: [makeUs({ id: 1, ref: 1 })] });
     const { container } = renderSprint({ sprint });
-    // An OPEN sprint starts EXPANDED: the table carries `.open` and the compact
-    // button carries `.active` (mirrors tgBacklogSprint.toggleSprint, which turns
-    // both classes ON for a non-closed sprint on init).
+    // [BL-11] An OPEN sprint starts EXPANDED: the table carries `.open`, and the
+    // compact button is NOT `.active`. Per the corrected contract `.active` marks
+    // the COLLAPSED state (the CSS rotates the single `icon-arrow-right` glyph to
+    // rotate(0) → points right ▷ when collapsed; the default un-`active` state is
+    // rotate(90deg) → points down ▽ when expanded).
     expect(container.querySelector(".sprint-table.open")).not.toBeNull();
-    expect(container.querySelector(".compact-sprint.active")).not.toBeNull();
-    fireEvent.click(container.querySelector(".compact-sprint") as HTMLElement);
-    // Clicking the compact button COLLAPSES it: `.open` and `.active` drop together.
-    expect(container.querySelector(".sprint-table.open")).toBeNull();
     expect(container.querySelector(".compact-sprint.active")).toBeNull();
+    fireEvent.click(container.querySelector(".compact-sprint") as HTMLElement);
+    // Clicking the compact button COLLAPSES it: `.open` drops and `.active` turns ON.
+    expect(container.querySelector(".sprint-table.open")).toBeNull();
+    expect(container.querySelector(".compact-sprint.active")).not.toBeNull();
   });
 
   it("initialises collapsed when sprint is closed", () => {
     const sprint = makeSprint({ id: 2, closed: true, user_stories: [makeUs({ id: 1, ref: 1 })] });
     const { container } = renderSprint({ sprint });
-    // A CLOSED sprint starts COLLAPSED: neither `.active` nor `.open` is present.
-    expect(container.querySelector(".compact-sprint.active")).toBeNull();
+    // [BL-11] A CLOSED sprint starts COLLAPSED: `.compact-sprint` carries `.active`
+    // (arrow rotated to point right ▷) and the table has NO `.open`.
+    expect(container.querySelector(".compact-sprint.active")).not.toBeNull();
     expect(container.querySelector(".sprint-table.open")).toBeNull();
   });
 

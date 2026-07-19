@@ -765,7 +765,14 @@ export function Burndown(props: BurndownProps): JSX.Element {
                     <span className="number">{completedPercentage}%</span>
                 </div>
 
-                {stats?.total_points != null ? (
+                {/* [BL-12] The project-points stat renders only when the project has
+                    a truthy total. The authoritative summary.jade gates this block on
+                    `ng-if="stats.total_points"` — an AngularJS truthiness test that
+                    omits the stat when `total_points` is `0`, `null`, or `undefined`.
+                    A previous `!= null` check rendered a spurious "0 project points"
+                    stat on projects with no defined total (e.g. empty project-5), so we
+                    restore the exact truthiness semantics here. */}
+                {stats?.total_points ? (
                     <div className="summary-stats">
                         <span className="number">{formatNumber(stats.total_points)}</span>
                         <span className="description">

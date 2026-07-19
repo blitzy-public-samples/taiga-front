@@ -290,3 +290,45 @@ test("marks background siblings inert + aria-hidden while open and restores them
     expect(background).not.toHaveAttribute("aria-hidden");
     expect(opener).not.toHaveAttribute("inert");
 });
+
+/* -------------------------------------------------------------------------- */
+/* aria-hidden focus safety (F-KANBAN-BULK-MODAL hardening)                   */
+/* -------------------------------------------------------------------------- */
+
+test("clears focus off the opener before inerting so no focused node sits under aria-hidden", () => {
+    render(<Harness />);
+    const opener = screen.getByTestId("opener");
+
+    // Focus the opener, then open the dialog from it. This mirrors a real
+    // trigger (e.g. a Kanban column's "Add new bulk" button) that lives inside
+    // a background region the hook is about to neutralize.
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    act(() => {
+        fireEvent.click(opener);
+    });
+
+    // Synchronously after the open effect — and crucially BEFORE the deferred
+    // focus timer runs — the backdrop is already inert/aria-hidden. The opener
+    // must NOT still be the focused element, otherwise it would sit focused
+    // beneath an aria-hidden ancestor: the exact condition browsers refuse and
+    // report as "Blocked aria-hidden ... descendant retained focus".
+    expect(opener).toHaveAttribute("aria-hidden", "true");
+    expect(document.activeElement).not.toBe(opener);
+    const active = document.activeElement as HTMLElement | null;
+    const hiddenAncestor = active ? active.closest('[aria-hidden="true"]') : null;
+    expect(hiddenAncestor).toBeNull();
+
+    // The deferred focus entry still lands inside the dialog…
+    flushFocus();
+    expect(document.activeElement).toBe(screen.getByTestId("first"));
+
+    // …and focus is still returned to the original opener on close, proving the
+    // pre-inert blur did not lose the captured restore target.
+    act(() => {
+        fireEvent.keyDown(document, { key: "Escape" });
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+});

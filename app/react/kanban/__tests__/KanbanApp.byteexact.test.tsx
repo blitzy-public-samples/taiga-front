@@ -9,6 +9,13 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import type { DropNeighbors, NormalizedDragEnd, ResolvedDrop } from "../../shared/dnd/DndProvider";
 import type { KanbanState } from "../useKanbanState";
 
+// WebSocket-driven board refreshes are coalesced through a PURE-TRAILING lodash
+// debounce (EVENTS_DEBOUNCE_MS = 1000ms in KanbanApp, matching the AngularJS
+// `debounceLeading`). A `.userstories`/`.projects` event therefore triggers its
+// board fetch only on the trailing edge; assertions on that fetch must poll past
+// the debounce window.
+const WS_REFRESH_TIMEOUT = 3000;
+
 interface CapturedProps {
     state: KanbanState;
     canAddUs: boolean;
@@ -347,7 +354,10 @@ describe("KanbanApp — WebSocket subscription (frozen routing keys)", () => {
             mockEvents.subs["changes.project.7.userstories"]({});
             await Promise.resolve();
         });
-        expect(findCall("/userstories")).toBeTruthy();
+        // Pure-trailing debounce: the reload fetch fires on the trailing edge.
+        await waitFor(() => expect(findCall("/userstories")).toBeTruthy(), {
+            timeout: WS_REFRESH_TIMEOUT,
+        });
     });
 
     it("refreshes the whole board only for matching projects events", async () => {
@@ -357,13 +367,21 @@ describe("KanbanApp — WebSocket subscription (frozen routing keys)", () => {
             mockEvents.subs["changes.project.7.projects"]({ matches: "projects.swimlane" });
             await Promise.resolve();
         });
-        expect(findCall("/projects/7")).toBeTruthy();
+        // Pure-trailing debounce: the full-board refresh fires on the trailing edge.
+        await waitFor(() => expect(findCall("/projects/7")).toBeTruthy(), {
+            timeout: WS_REFRESH_TIMEOUT,
+        });
 
+        // A non-matching event is filtered out SYNCHRONOUSLY (before the debounce),
+        // so it never schedules a refresh. The previous matching refresh has
+        // already fired (awaited above), leaving the debounce idle — so no
+        // /projects/7 fetch occurs even after the debounce window elapses.
         fetchMock.mockClear();
         await act(async () => {
             mockEvents.subs["changes.project.7.projects"]({ matches: "something.unrelated" });
             await Promise.resolve();
         });
+        await new Promise((r) => setTimeout(r, WS_REFRESH_TIMEOUT));
         expect(findCall("/projects/7")).toBeFalsy();
     });
 

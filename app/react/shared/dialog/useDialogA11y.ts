@@ -230,8 +230,29 @@ export function useDialogA11y({
         restoreFocusRef.current =
             active instanceof HTMLElement ? active : null;
 
+        // Blur the outgoing focus BEFORE neutralizing the backdrop, but ONLY
+        // when it lives OUTSIDE the dialog (i.e. the trigger in the
+        // soon-to-be-inert background). The element to restore on close is
+        // already captured above, and focus is moved into the dialog on the
+        // next tick below. Without this step the still-focused trigger can
+        // momentarily sit beneath a freshly `aria-hidden` ancestor (e.g. a
+        // Kanban column trigger inside its `.kanban-manager` wrapper), which
+        // browsers refuse and report as "Blocked aria-hidden on an element
+        // because its descendant retained focus". The in-dialog guard is
+        // essential: a caller effect may have already moved focus into the
+        // dialog (e.g. onto an assignee field) before this effect runs, and
+        // that focus must be preserved. [F-KANBAN-BULK-MODAL]
+        const dialogRoot = dialogRef.current;
+        if (
+            active instanceof HTMLElement &&
+            typeof active.blur === "function" &&
+            (!dialogRoot || !dialogRoot.contains(active))
+        ) {
+            active.blur();
+        }
+
         // Physically neutralize the backdrop.
-        const cleanupInert = applyBackgroundInert(dialogRef.current);
+        const cleanupInert = applyBackgroundInert(dialogRoot);
 
         // Move focus into the dialog after paint (elements exist + are focusable).
         const focusTimer = window.setTimeout(() => {

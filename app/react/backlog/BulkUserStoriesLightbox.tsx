@@ -36,17 +36,21 @@
  *    when position === "top", runs its move-to-top-of-backlog reorder.
  *  - anti-double-submit guard replacing the CoffeeScript `debounce 2000` (L353).
  *
- * The swimlane fieldset (jade L57-66) is intentionally NOT rendered: it is gated
- * on `project.is_kanban_activated`, which is never the active context for the
- * backlog, so `swimlane_id` is ALWAYS sent as `null`.
+ * The swimlane fieldset (jade L57-66) IS rendered when the project has swimlanes
+ * (BL-01): the shared bulk template gates it on `project.is_kanban_activated`,
+ * and a kanban-activated project reachable from the Backlog can define
+ * swimlanes, so the SELECT SWIMLANE control is reproduced here (matching the
+ * Kanban bulk lightbox) and the chosen `swimlane_id` is sent on create. On a
+ * no-swimlane project the control is hidden and `swimlane_id` is `null`.
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef, useId } from "react";
 import type { FormEvent } from "react";
 
-import type { Project, UsStatus, Id, UserStory } from "./types";
+import type { Project, UsStatus, Id, UserStory, Swimlane } from "./types";
 import { bulkCreate } from "../shared/api/userstories";
 import { t } from "../shared/i18n/translate";
+import { Icon } from "../shared/ui/Icon";
 import { useDialogA11y } from "../shared/dialog/useDialogA11y";
 
 /* -------------------------------------------------------------------------- */
@@ -61,6 +65,10 @@ import { useDialogA11y } from "../shared/dialog/useDialogA11y";
 const TITLE_NEW_BULK = "New bulk insert";
 /** LIGHTBOX.CREATE_EDIT.SELECT_STATUS */
 const LABEL_SELECT_STATUS = "Select status";
+/** LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE — the bulk swimlane control label (BL-01). */
+const LABEL_SELECT_SWIMLANE = "Select swimlane";
+/** ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT — suffix on the default swimlane (BL-01). */
+const LABEL_SWIMLANE_DEFAULT = "Default";
 /** LIGHTBOX.CREATE_EDIT.LOCATION */
 const LABEL_LOCATION = "Location";
 /** LIGHTBOX.CREATE_EDIT.CREATE_BOTTOM */
@@ -117,6 +125,16 @@ export interface BulkUserStoriesLightboxProps {
      */
     defaultStatusId: Id;
     /**
+     * Project swimlanes for the SELECT SWIMLANE control (BL-01). Empty on a
+     * no-swimlane project, which hides the control. Fetched by `BacklogApp`.
+     */
+    swimlanes: Swimlane[];
+    /**
+     * Project default swimlane id — the swimlane pre-selected on open (BL-01).
+     * `null` on a no-swimlane project.
+     */
+    defaultSwimlaneId: Id | null;
+    /**
      * Invoked with the created stories and the chosen position after a successful
      * `bulkCreate`. Mirrors the `usform:bulk:success` broadcast (L375); `BacklogApp`
      * reloads the backlog and, when `position === "top"`, runs its
@@ -134,7 +152,15 @@ export interface BulkUserStoriesLightboxProps {
 export function BulkUserStoriesLightbox(
     props: BulkUserStoriesLightboxProps,
 ): JSX.Element | null {
-    const { open, project, defaultStatusId, onCreated, onClose } = props;
+    const {
+        open,
+        project,
+        defaultStatusId,
+        swimlanes,
+        defaultSwimlaneId,
+        onCreated,
+        onClose,
+    } = props;
 
     // Ports `$scope.new = { statusId, bulk, us_position }` plus the transient
     // `displayStatusSelector` / submit / error UI flags from the directive scope.
@@ -142,6 +168,10 @@ export function BulkUserStoriesLightbox(
     const [bulk, setBulk] = useState<string>("");
     const [usPosition, setUsPosition] = useState<"top" | "bottom">("bottom");
     const [displayStatusSelector, setDisplayStatusSelector] = useState<boolean>(false);
+    // BL-01: chosen swimlane (`swimlane_id`) + the styled selector open flag.
+    const [swimlaneId, setSwimlaneId] = useState<Id | null>(defaultSwimlaneId);
+    const [displaySwimlaneSelector, setDisplaySwimlaneSelector] =
+        useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState<boolean>(false);
 
@@ -156,10 +186,15 @@ export function BulkUserStoriesLightbox(
             setBulk("");
             setUsPosition("bottom");
             setDisplayStatusSelector(false);
+            // BL-01: pre-select the project default swimlane on (re)open
+            // (baseline shows "voluptate (Default)"); fall back to the first
+            // swimlane when a swimlane project defines no explicit default.
+            setSwimlaneId(defaultSwimlaneId ?? swimlanes[0]?.id ?? null);
+            setDisplaySwimlaneSelector(false);
             setError(null);
             setSubmitting(false);
         }
-    }, [open, defaultStatusId]);
+    }, [open, defaultStatusId, defaultSwimlaneId, swimlanes]);
 
     // [M-09] Complete modal-dialog accessibility (role/aria-modal, focus
     // entry+trap+return, background inert, nested-Escape policy) via the shared
@@ -184,6 +219,21 @@ export function BulkUserStoriesLightbox(
     const currentStatus = useMemo<UsStatus | undefined>(
         () => project.us_statuses.find((status) => status.id === statusId),
         [project.us_statuses, statusId],
+    );
+
+    // BL-01: whether to render the SELECT SWIMLANE control (jade gate
+    // `project.is_kanban_activated`, only meaningful when swimlanes exist) and
+    // the currently-selected swimlane object for the button label.
+    const showSwimlaneSelector = useMemo<boolean>(
+        () => project.is_kanban_activated === true && swimlanes.length > 0,
+        [project.is_kanban_activated, swimlanes.length],
+    );
+    const currentSwimlane = useMemo<Swimlane | null>(
+        () =>
+            swimlaneId === null
+                ? null
+                : swimlanes.find((swimlane) => swimlane.id === swimlaneId) ?? null,
+        [swimlanes, swimlaneId],
     );
 
     // Ports toggleStatus() — flip the dropdown open/closed.
@@ -227,9 +277,10 @@ export function BulkUserStoriesLightbox(
             setError(null);
             setSubmitting(true);
             try {
-                // Backlog context: the kanban swimlane selector is never active, so
-                // `swimlane_id` is ALWAYS null (jade swimlane fieldset not rendered).
-                const res = await bulkCreate(project.id, statusId, bulk, null);
+                // BL-01: create the stories into the chosen swimlane when the
+                // project has swimlanes; `null` (no-swimlane project) is sent as
+                // the unclassified swimlane, exactly as before.
+                const res = await bulkCreate(project.id, statusId, bulk, swimlaneId);
                 // The bulk_create endpoint returns full user-story objects; the API
                 // adapter types them with the minimal `{ id }` shape, so narrow to the
                 // richer domain `UserStory` for the consumer (mirrors the CoffeeScript
@@ -245,7 +296,7 @@ export function BulkUserStoriesLightbox(
                 setSubmitting(false);
             }
         },
-        [submitting, bulk, project.id, statusId, usPosition, onCreated, onClose],
+        [submitting, bulk, project.id, statusId, swimlaneId, usPosition, onCreated, onClose],
     );
 
     return (
@@ -363,11 +414,88 @@ export function BulkUserStoriesLightbox(
                     </div>
                 </fieldset>
 
-                {/*
-                  Swimlane-select fieldset (jade L57-66) is intentionally NOT rendered:
-                  it is gated on `project.is_kanban_activated`, which is false in the
-                  backlog context, so `swimlane_id` is always sent as `null`.
-                */}
+                {/* Swimlane selector — ports lightbox-us-bulk.jade `fieldset.swimlane-select`
+                    (tg-swimlane-selector), rendered when the project has swimlanes
+                    (BL-01). Reproduces the Kanban bulk `.swimlane-selector`
+                    structure — a styled dropdown of the project swimlanes with the
+                    default marked "(Default)" — so the compiled SCSS themes it
+                    identically. The baseline order is STATUS → LOCATION → SWIMLANE
+                    → textarea. */}
+                {showSwimlaneSelector ? (
+                    <fieldset className="swimlane-select">
+                        <span className="label">
+                            {t("LIGHTBOX.CREATE_EDIT.SELECT_SWIMLANE", LABEL_SELECT_SWIMLANE)}
+                        </span>
+                        <div className="swimlane-selector">
+                            <button
+                                type="button"
+                                className="select"
+                                aria-haspopup="listbox"
+                                aria-expanded={displaySwimlaneSelector}
+                                onClick={() =>
+                                    setDisplaySwimlaneSelector((o) => !o)
+                                }
+                            >
+                                {currentSwimlane ? (
+                                    <span className="swimlane-select-text">
+                                        <span>{currentSwimlane.name}</span>
+                                        {currentSwimlane.id === defaultSwimlaneId &&
+                                        swimlanes.length > 1 ? (
+                                            <span className="swimlane-default">
+                                                {" (" +
+                                                    t(
+                                                        "ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT",
+                                                        LABEL_SWIMLANE_DEFAULT,
+                                                    ) +
+                                                    ")"}
+                                            </span>
+                                        ) : null}
+                                    </span>
+                                ) : (
+                                    <span className="swimlane-select-text unclassified">
+                                        {swimlanes[0]?.name}
+                                    </span>
+                                )}
+                                <Icon name="icon-arrow-down" />
+                            </button>
+                            {displaySwimlaneSelector ? (
+                                <div className="options" role="listbox">
+                                    {swimlanes.map((swimlane) => (
+                                        <button
+                                            key={swimlane.id}
+                                            type="button"
+                                            role="option"
+                                            aria-selected={swimlane.id === swimlaneId}
+                                            className={
+                                                "option" +
+                                                (swimlane.id === swimlaneId
+                                                    ? " selected"
+                                                    : "")
+                                            }
+                                            onClick={() => {
+                                                setSwimlaneId(swimlane.id);
+                                                setDisplaySwimlaneSelector(false);
+                                            }}
+                                        >
+                                            <span>{swimlane.name}</span>
+                                            {defaultSwimlaneId === swimlane.id &&
+                                            swimlanes.length > 1 ? (
+                                                <span className="swimlane-default">
+                                                    {" (" +
+                                                        t(
+                                                            "ADMIN.PROJECT_KANBAN_OPTIONS.DEFAULT",
+                                                            LABEL_SWIMLANE_DEFAULT,
+                                                        ) +
+                                                        ")"}
+                                                </span>
+                                            ) : null}
+                                        </button>
+                                    ))}
+                                </div>
+                            ) : null}
+                        </div>
+                    </fieldset>
+                ) : null}
 
                 <fieldset>
                     <textarea

@@ -319,7 +319,15 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
                     <div className="sprint-name-container">
                         <div className="sprint-name">
                             <button
-                                className={`compact-sprint${!collapsed ? " active" : ""}`}
+                                // [BL-11] Chevron orientation. The compiled SCSS gives
+                                // `.compact-sprint` a default `transform: rotate(90deg)`
+                                // (the `icon-arrow-right` glyph rotated to point DOWN ▽)
+                                // and `.compact-sprint.active { transform: rotate(0) }`
+                                // (the glyph un-rotated, pointing RIGHT ▷). The authoritative
+                                // AngularJS baseline shows EXPANDED sprints with a DOWN ▽
+                                // chevron and COMPACTED sprints with a RIGHT ▷ chevron, so
+                                // `active` must be applied when COLLAPSED — not when expanded.
+                                className={`compact-sprint${collapsed ? " active" : ""}`}
                                 title={t("BACKLOG.COMPACT_SPRINT", "Compact Sprint")}
                                 // [Q] Icon-only chevron toggle: give it an accessible
                                 // name and expose its expanded/collapsed state.
@@ -397,7 +405,22 @@ export function Sprint({ sprint, project, dragEnabled, onEditSprint }: SprintPro
             </div>
 
             {/* === sprint table (droppable target; id = `sprint:${sprint.id}`) === */}
-            <div ref={setDroppableRef} className={sprintTableClassName}>
+            {/*
+              [BL-11] Compact-collapse actually HIDES the story list. The legacy
+              `tgBacklogSprint` directive used jQuery `.slideToggle()`, which leaves
+              an inline `display:none` on `.sprint-table` when compacted. We reproduce
+              that end state with an inline `display` toggle rather than flipping the
+              wrapper to `.sprint-closed` — the wrapper class also grays out the points
+              (`.sprint-closed .number/.description`) and buttons, which is NOT wanted
+              for a merely-compacted OPEN sprint. The explicit `block` when expanded also
+              overrides the `.sprint-closed .sprint-table { display:none }` rule so a
+              genuinely-closed sprint can still be expanded on demand.
+            */}
+            <div
+                ref={setDroppableRef}
+                className={sprintTableClassName}
+                style={{ display: collapsed ? "none" : "block" }}
+            >
                 {!hasStories ? (
                     <div className="sprint-empty">
                         {view.canModifyUs ? (

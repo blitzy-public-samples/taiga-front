@@ -73,6 +73,14 @@ import { httpGet, httpPost, httpDelete, httpPatch, HttpError } from "../../share
 import { listUserstories, bulkCreate } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
 
+// WebSocket-driven board refreshes are coalesced through a PURE-TRAILING lodash
+// debounce (EVENTS_DEBOUNCE_MS = 1000ms in KanbanApp, matching the AngularJS
+// `debounceLeading` = {leading:false, trailing:true}). A burst of events therefore
+// produces exactly ONE reload, on the trailing edge after the burst settles — no
+// leading (immediate) reload. Assertions on the post-event reload must poll past
+// that window, so give them a timeout comfortably larger than the debounce.
+const WS_REFRESH_TIMEOUT = 3000;
+
 /* -------------------------------------------------------------------------- */
 /* Module mocks. Variables referenced inside a jest.mock factory MUST be       */
 /* `mock`-prefixed (ts-jest hoists the factory above the imports).             */
@@ -582,7 +590,9 @@ describe("KanbanApp — transient NaN tolerance", () => {
         expect(mockListUserstories).not.toHaveBeenCalled();
         expect(mockCreateEventsClient).not.toHaveBeenCalled();
         expect(mockCaptured.boardProps).toBeNull();
-        expect(document.querySelector("section.main.kanban")).not.toBeNull();
+        // F-KANBAN-NO-MAIN: the Kanban screen root is a <main> landmark
+        // (mirroring the Backlog `<main className="main scrum">`), not a <section>.
+        expect(document.querySelector("main.main.kanban")).not.toBeNull();
         expect(document.querySelector(".board-zoom")).not.toBeNull();
     });
 });
@@ -744,7 +754,8 @@ describe("KanbanApp — happy load", () => {
         currentUserstories = [makeUs({ id: 1, status: 100, swimlane: 50, kanban_order: 0 })];
         await renderLoaded();
         await waitFor(() =>
-            expect(document.querySelector("section.main.kanban.swimlane")).not.toBeNull(),
+            // F-KANBAN-NO-MAIN: <main> landmark carries the swimlane modifier class.
+            expect(document.querySelector("main.main.kanban.swimlane")).not.toBeNull(),
         );
     });
 });
@@ -868,12 +879,18 @@ describe("KanbanApp — WebSocket", () => {
         await act(async () => {
             usCb({});
         });
-        await waitFor(() =>
-            expect(mockListUserstories.mock.calls.length).toBeGreaterThan(before),
+        // Pure-trailing debounce: the reload fires on the trailing edge, so poll
+        // past the debounce window.
+        await waitFor(
+            () =>
+                expect(mockListUserstories.mock.calls.length).toBeGreaterThan(
+                    before,
+                ),
+            { timeout: WS_REFRESH_TIMEOUT },
         );
     });
 
-    it("[M-11] coalesces a burst of userstories events into a single leading reload", async () => {
+    it("[M-11] coalesces a burst of userstories events into a single trailing reload", async () => {
         const { usCb } = await loadAndGetCallbacks();
         const before = mockListUserstories.mock.calls.length;
         // Fire five events back-to-back within one tick, as an event storm would.
@@ -884,10 +901,18 @@ describe("KanbanApp — WebSocket", () => {
             usCb({});
             usCb({});
         });
-        // The leading edge issues exactly ONE reload; the remaining four are
-        // coalesced (the trailing refresh is deferred by EVENTS_DEBOUNCE_MS and
-        // does not fire within this synchronous window). Pre-fix, all five would
-        // have triggered overlapping full-board refetches.
+        // Pure-trailing debounce: NOTHING fires synchronously on the leading edge
+        // (Issue 2 — the pre-fix leading:true form issued an immediate reload per
+        // burst, and the un-debounced form issued one PER event). The five events
+        // coalesce into exactly ONE reload on the trailing edge once the burst
+        // settles.
+        expect(mockListUserstories.mock.calls.length).toBe(before);
+        await waitFor(
+            () =>
+                expect(mockListUserstories.mock.calls.length).toBe(before + 1),
+            { timeout: WS_REFRESH_TIMEOUT },
+        );
+        // And it stays at exactly one coalesced reload (no per-event fan-out).
         expect(mockListUserstories.mock.calls.length).toBe(before + 1);
     });
 
@@ -898,10 +923,13 @@ describe("KanbanApp — WebSocket", () => {
         await act(async () => {
             usCb({});
         });
-        await waitFor(() =>
-            expect(
-                document.querySelector(".kanban-notification-error"),
-            ).not.toBeNull(),
+        // Pure-trailing debounce defers the (failing) reload to the trailing edge.
+        await waitFor(
+            () =>
+                expect(
+                    document.querySelector(".kanban-notification-error"),
+                ).not.toBeNull(),
+            { timeout: WS_REFRESH_TIMEOUT },
         );
     });
 
@@ -913,12 +941,15 @@ describe("KanbanApp — WebSocket", () => {
         await act(async () => {
             projCb({ matches: "projects.swimlane" });
         });
-        await waitFor(() =>
-            expect(
-                mockHttpGet.mock.calls.filter((c) =>
-                    String(c[0]).startsWith("/projects/"),
-                ).length,
-            ).toBeGreaterThan(before),
+        // Pure-trailing debounce: the full refresh fires on the trailing edge.
+        await waitFor(
+            () =>
+                expect(
+                    mockHttpGet.mock.calls.filter((c) =>
+                        String(c[0]).startsWith("/projects/"),
+                    ).length,
+                ).toBeGreaterThan(before),
+            { timeout: WS_REFRESH_TIMEOUT },
         );
     });
 
@@ -971,12 +1002,15 @@ describe("KanbanApp — WebSocket", () => {
         await act(async () => {
             projCb({ matches: "projects.swimlane" });
         });
-        await waitFor(() =>
-            expect(
-                mockHttpGet.mock.calls.filter((c) =>
-                    String(c[0]).startsWith("/projects/"),
-                ).length,
-            ).toBeGreaterThan(projectGetsBefore),
+        // Pure-trailing debounce: the full refresh fires on the trailing edge.
+        await waitFor(
+            () =>
+                expect(
+                    mockHttpGet.mock.calls.filter((c) =>
+                        String(c[0]).startsWith("/projects/"),
+                    ).length,
+                ).toBeGreaterThan(projectGetsBefore),
+            { timeout: WS_REFRESH_TIMEOUT },
         );
 
         // The refresh must NOT churn the WebSocket effect: the subscription
@@ -998,6 +1032,52 @@ describe("KanbanApp — WebSocket", () => {
             `changes.project.${PROJECT_ID}.projects`,
         );
         expect(mockEventsClient.disconnect).toHaveBeenCalledTimes(1);
+    });
+});
+
+/* ========================================================================== */
+/* Component — document.title / meta parity (F-001)                           */
+/* ========================================================================== */
+
+describe("KanbanApp — document.title / meta parity (F-001)", () => {
+    afterEach(() => {
+        // Do not leak a page title/description into unrelated specs.
+        document.title = "";
+        document.head
+            .querySelectorAll('meta[name="description"]')
+            .forEach((el) => el.remove());
+    });
+
+    it("sets the tab title to 'Kanban - <projectName>' once the project resolves", async () => {
+        await renderLoaded();
+
+        // No Angular injector in jsdom → t() uses the English fallback,
+        // interpolating the fixture project name ("My Project").
+        expect(document.title).toBe("Kanban - My Project");
+    });
+
+    it("sets a meta description that interpolates the project name", async () => {
+        await renderLoaded();
+
+        const description = document.head
+            .querySelector('meta[name="description"]')
+            ?.getAttribute("content");
+        expect(description).toBeTruthy();
+        expect(description).toContain("My Project");
+        expect(description).toContain("kanban panel");
+    });
+
+    it("overrides a stale SPA-transition title when the board mounts (F-001 cure)", async () => {
+        // Simulate an AngularJS route (e.g. the Sprint Taskboard) having set its
+        // own title BEFORE the React Kanban root mounts — the exact state after
+        // a browser Back into the board. The board's mount-time metadata effect
+        // must reset the tab title to the Kanban title rather than leaving the
+        // previous route's title stale.
+        document.title = "Sprint 2026 - Sprint taskboard - Other Project";
+
+        await renderLoaded();
+
+        expect(document.title).toBe("Kanban - My Project");
     });
 });
 
@@ -1056,6 +1136,48 @@ describe("KanbanApp — bulk create", () => {
         const close = document.querySelector(".e2e-bulk-close") as HTMLButtonElement;
         await act(async () => {
             fireEvent.click(close);
+        });
+        expect(document.querySelector(".bulk-subjects")).toBeNull();
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+    });
+
+    // F-KANBAN-BULK-MODAL + F-KANBAN-BULK-CLOSE-LABEL: the bulk-insert lightbox
+    // must be an accessible modal dialog (role=dialog, aria-modal, an accessible
+    // name wired to its title, focus moved inside on open, and Escape-to-close),
+    // and its close control must carry the generic dialog "close" label — not
+    // the notification-toast "Close notification" string.
+    it("exposes the bulk lightbox as an accessible modal dialog with a correct close label", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("bulk", 100);
+        });
+        const dialog = document.querySelector(
+            ".lightbox-generic-bulk",
+        ) as HTMLElement;
+        expect(dialog).not.toBeNull();
+        // Modal dialog semantics.
+        expect(dialog.getAttribute("role")).toBe("dialog");
+        expect(dialog.getAttribute("aria-modal")).toBe("true");
+        // Accessible name is wired from the dialog title via aria-labelledby.
+        const labelledBy = dialog.getAttribute("aria-labelledby");
+        expect(labelledBy).toBeTruthy();
+        const title = document.querySelector("h2.title") as HTMLElement;
+        expect(title).not.toBeNull();
+        expect(title.id).toBe(labelledBy);
+        expect(title.textContent).toBe("New bulk insert");
+        // Focus is moved into the dialog on open (never left on <body>). The hook
+        // moves focus on a post-paint setTimeout(0), so poll for it.
+        await waitFor(() => {
+            expect(dialog.contains(document.activeElement)).toBe(true);
+            expect(document.activeElement).not.toBe(document.body);
+        });
+        // F-KANBAN-BULK-CLOSE-LABEL: the close control is named "close".
+        const close = document.querySelector(".e2e-bulk-close") as HTMLButtonElement;
+        expect(close.getAttribute("aria-label")).toBe("close");
+        expect(close.getAttribute("title")).toBe("close");
+        // Escape dismisses the (topmost) dialog.
+        await act(async () => {
+            fireEvent.keyDown(dialog, { key: "Escape" });
         });
         expect(document.querySelector(".bulk-subjects")).toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
@@ -1773,16 +1895,25 @@ describe("KanbanApp — edit & assignee callbacks (F3)", () => {
         );
     });
 
-    it("onClickAssignedTo opens the edit form focused on the assignee field", async () => {
+    it("onClickAssignedTo opens the dedicated select-user picker for the clicked story (KAN-03)", async () => {
         await renderLoaded();
         await act(async () => {
             mockCaptured.boardProps?.onClickAssignedTo?.(1);
         });
-        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
-        expect(lb).not.toBeNull();
-        expect(lb.querySelector(".title")?.textContent).toContain("Edit user story");
-        // The assignee control receives focus (ports the quick-assign focus).
-        expect(document.activeElement).toBe(lb.querySelector(".assigned-to-select"));
+        // [KAN-03] The card's "Assign to" affordance opens the dedicated
+        // Select-assigned-user picker (ports `tg-lb-select-user`) — a search +
+        // avatar member list — NOT the full story-edit form.
+        const picker = document.querySelector(
+            ".lightbox-select-user.open",
+        ) as HTMLElement;
+        expect(picker).not.toBeNull();
+        expect(picker.querySelector(".title")?.textContent).toContain(
+            "Select assigned user",
+        );
+        // The full edit form is NOT opened by the quick-assign action.
+        expect(
+            document.querySelector(".lightbox-create-edit.open"),
+        ).toBeNull();
     });
 
     it("does not open the form for an unknown story id", async () => {
@@ -1791,7 +1922,10 @@ describe("KanbanApp — edit & assignee callbacks (F3)", () => {
             mockCaptured.boardProps?.onClickEdit?.(999999);
             mockCaptured.boardProps?.onClickAssignedTo?.(999999);
         });
+        // Neither the edit form nor the [KAN-03] select-user picker opens for an
+        // unknown id (both handlers return early).
         expect(document.querySelector(".lightbox-create-edit.open")).toBeNull();
+        expect(document.querySelector(".lightbox-select-user.open")).toBeNull();
     });
 
     it("edit persists via PATCH userstories/{id} with the story version when submitted", async () => {
@@ -2041,9 +2175,33 @@ describe("KanbanApp — sidebar filters (F2)", () => {
         await act(async () => {
             fireEvent.click(filterBtn);
         });
+        // KAN-04: categories are now the collapsible tg-filter accordion —
+        // one `<li data-type>` per category under `.filters-cats`.
         await waitFor(() =>
-            expect(document.querySelectorAll(".filter-category").length).toBe(5),
+            expect(
+                document.querySelectorAll(".filters-cats li[data-type]").length,
+            ).toBe(5),
         );
+    }
+
+    /**
+     * KAN-04: the tg-filter accordion is collapsed by default, so an option is
+     * reached by first expanding its category (`.filters-cat-single`) and then
+     * clicking the revealed `.single-filter`.
+     */
+    async function expandAndClickOption(dataType: string): Promise<void> {
+        const catHeader = document.querySelector(
+            `li[data-type="${dataType}"] .filters-cat-single`,
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(catHeader);
+        });
+        const option = document.querySelector(
+            `li[data-type="${dataType}"] .filter-list .single-filter`,
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(option);
+        });
     }
 
     it("renders the five whitelisted categories and OMITS status", async () => {
@@ -2053,7 +2211,7 @@ describe("KanbanApp — sidebar filters (F2)", () => {
 
         expect(document.querySelector(".kanban-filter")).not.toBeNull();
         const dataTypes = Array.from(
-            document.querySelectorAll(".filter-category"),
+            document.querySelectorAll(".filters-cats li[data-type]"),
         ).map((el) => el.getAttribute("data-type"));
         expect(dataTypes).toEqual([
             "tags",
@@ -2072,12 +2230,7 @@ describe("KanbanApp — sidebar filters (F2)", () => {
         await openFilterPanel();
 
         const before = mockListUserstories.mock.calls.length;
-        const tagOption = document.querySelector(
-            '[data-type="tags"] .filter-name',
-        ) as HTMLButtonElement;
-        await act(async () => {
-            fireEvent.click(tagOption);
-        });
+        await expandAndClickOption("tags");
 
         await waitFor(() =>
             expect(mockListUserstories.mock.calls.length).toBeGreaterThan(before),
@@ -2086,8 +2239,10 @@ describe("KanbanApp — sidebar filters (F2)", () => {
             PROJECT_ID,
             expect.objectContaining({ tags: "urgent" }),
         );
-        // The applied-filter chip is shown.
-        expect(document.querySelector(".filters-applied .filter-applied")).not.toBeNull();
+        // The applied-filter chip is shown (KAN-04 tg-filter `single-applied-filter`).
+        expect(
+            document.querySelector(".filters-applied .single-applied-filter"),
+        ).not.toBeNull();
     });
 
     it("removing an applied tag reloads WITHOUT the query param", async () => {
@@ -2095,24 +2250,22 @@ describe("KanbanApp — sidebar filters (F2)", () => {
         await renderLoaded();
         await openFilterPanel();
 
-        const tagOption = document.querySelector(
-            '[data-type="tags"] .filter-name',
-        ) as HTMLButtonElement;
-        await act(async () => {
-            fireEvent.click(tagOption);
-        });
+        await expandAndClickOption("tags");
         await waitFor(() =>
-            expect(document.querySelector(".filter-applied")).not.toBeNull(),
+            expect(document.querySelector(".single-applied-filter")).not.toBeNull(),
         );
 
-        const chip = document.querySelector(".filter-applied") as HTMLButtonElement;
+        // KAN-04: removal is via the chip's × glyph (`.remove-filter` button).
+        const removeBtn = document.querySelector(
+            ".single-applied-filter .remove-filter",
+        ) as HTMLButtonElement;
         const beforeRemove = mockListUserstories.mock.calls.length;
         await act(async () => {
-            fireEvent.click(chip);
+            fireEvent.click(removeBtn);
         });
 
         await waitFor(() =>
-            expect(document.querySelector(".filter-applied")).toBeNull(),
+            expect(document.querySelector(".single-applied-filter")).toBeNull(),
         );
         // A reload was issued and it carried NO `tags` param.
         expect(mockListUserstories.mock.calls.length).toBeGreaterThan(beforeRemove);
@@ -2252,12 +2405,19 @@ describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () 
         });
         await waitFor(() =>
             expect(
-                document.querySelectorAll(".filter-category").length,
+                document.querySelectorAll(".filters-cats li[data-type]").length,
             ).toBeGreaterThan(0),
         );
 
+        // KAN-04: expand the tags accordion category, then click the option.
+        const catHeader = document.querySelector(
+            'li[data-type="tags"] .filters-cat-single',
+        ) as HTMLButtonElement;
+        await act(async () => {
+            fireEvent.click(catHeader);
+        });
         const tagOption = document.querySelector(
-            '[data-type="tags"] .filter-name',
+            'li[data-type="tags"] .filter-list .single-filter',
         ) as HTMLButtonElement;
         await act(async () => {
             fireEvent.click(tagOption);
@@ -2271,6 +2431,145 @@ describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () 
         expect(persisted?.selected).toEqual([
             expect.objectContaining({ dataType: "tags", name: "urgent" }),
         ]);
+    });
+});
+
+/* ========================================================================== */
+/* F-KANBAN-ARCHIVED-NO-LOAD — archived column lazy-loads its stories on unfold */
+/* ========================================================================== */
+
+describe("KanbanApp — archived column lazy load (F-KANBAN-ARCHIVED-NO-LOAD)", () => {
+    const ARCHIVED_ID = 300;
+
+    // A project with one live column (100) and one ARCHIVED column (300).
+    function installArchivedProject(): void {
+        currentProject = makeProject({
+            us_statuses: [
+                makeStatus(100, 1),
+                { ...makeStatus(ARCHIVED_ID, 3), is_archived: true },
+            ],
+        });
+    }
+
+    // Route `listUserstories`: the per-status ARCHIVED fetch (params.status ===
+    // ARCHIVED_ID) returns the archived story; every other (base) fetch returns
+    // the live story. This distinguishes the two request kinds the fix issues.
+    function installArchivedRouting(
+        base: UserStoryModel[],
+        archived: UserStoryModel[],
+    ): void {
+        mockListUserstories.mockImplementation((...args: readonly unknown[]) => {
+            const params = (args[1] ?? {}) as Record<string, unknown>;
+            if (params.status === ARCHIVED_ID) {
+                return Promise.resolve(mkRes(archived));
+            }
+            return Promise.resolve(mkRes(base));
+        });
+    }
+
+    function archivedStatus(): Status {
+        return { ...makeStatus(ARCHIVED_ID, 3), is_archived: true };
+    }
+
+    it("does not fetch archived stories on initial load; the archived column starts empty and folded", async () => {
+        installArchivedProject();
+        installArchivedRouting(
+            [makeUs({ id: 1, status: 100 })],
+            [makeUs({ id: 99, status: ARCHIVED_ID })],
+        );
+        await renderLoaded();
+        // The archived column is forced folded and its stories are NOT loaded.
+        expect(mockCaptured.boardProps?.folds[ARCHIVED_ID]).toBe(true);
+        expect(
+            mockCaptured.boardProps?.state.usByStatus[String(ARCHIVED_ID)] ?? [],
+        ).toEqual([]);
+        const archivedCalls = mockListUserstories.mock.calls.filter(
+            (call) => (call[1] as Record<string, unknown>).status === ARCHIVED_ID,
+        );
+        expect(archivedCalls.length).toBe(0);
+    });
+
+    it("keeps the base board request's status__is_archived:false filter unchanged", async () => {
+        installArchivedProject();
+        installArchivedRouting(
+            [makeUs({ id: 1, status: 100 })],
+            [makeUs({ id: 99, status: ARCHIVED_ID })],
+        );
+        await renderLoaded();
+        const baseCall = mockListUserstories.mock.calls.find(
+            (call) => (call[1] as Record<string, unknown>).status === undefined,
+        );
+        expect(baseCall).toBeTruthy();
+        expect(
+            (baseCall![1] as Record<string, unknown>).status__is_archived,
+        ).toBe(false);
+    });
+
+    it("fetches (without the archived filter) and merges archived stories when the column is unfolded", async () => {
+        installArchivedProject();
+        installArchivedRouting(
+            [makeUs({ id: 1, status: 100 })],
+            [makeUs({ id: 99, status: ARCHIVED_ID, subject: "Archived story" })],
+        );
+        await renderLoaded();
+
+        await act(async () => {
+            mockCaptured.boardProps?.onFoldStatus?.(archivedStatus());
+        });
+
+        // A per-status archived request was issued, scoped to the status id and
+        // WITHOUT the base `status__is_archived:false` filter.
+        await waitFor(() => {
+            const archivedCalls = mockListUserstories.mock.calls.filter(
+                (call) =>
+                    (call[1] as Record<string, unknown>).status === ARCHIVED_ID,
+            );
+            expect(archivedCalls.length).toBe(1);
+        });
+        const archivedCall = mockListUserstories.mock.calls.find(
+            (call) => (call[1] as Record<string, unknown>).status === ARCHIVED_ID,
+        );
+        expect(
+            (archivedCall![1] as Record<string, unknown>).status__is_archived,
+        ).toBeUndefined();
+
+        // The archived story now populates the archived column; the live column
+        // is preserved (base + archived merge).
+        await waitFor(() =>
+            expect(
+                mockCaptured.boardProps?.state.usByStatus[String(ARCHIVED_ID)],
+            ).toEqual([99]),
+        );
+        expect(mockCaptured.boardProps?.state.usByStatus["100"]).toEqual([1]);
+    });
+
+    it("drops the archived stories from the board when the column is re-folded", async () => {
+        installArchivedProject();
+        installArchivedRouting(
+            [makeUs({ id: 1, status: 100 })],
+            [makeUs({ id: 99, status: ARCHIVED_ID })],
+        );
+        await renderLoaded();
+
+        // Unfold -> archived stories load.
+        await act(async () => {
+            mockCaptured.boardProps?.onFoldStatus?.(archivedStatus());
+        });
+        await waitFor(() =>
+            expect(
+                mockCaptured.boardProps?.state.usByStatus[String(ARCHIVED_ID)],
+            ).toEqual([99]),
+        );
+
+        // Fold again -> archived stories are removed from the board.
+        await act(async () => {
+            mockCaptured.boardProps?.onFoldStatus?.(archivedStatus());
+        });
+        await waitFor(() =>
+            expect(
+                mockCaptured.boardProps?.state.usByStatus[String(ARCHIVED_ID)] ?? [],
+            ).toEqual([]),
+        );
     });
 });
 

@@ -62,6 +62,7 @@ import { t } from "../shared/i18n/translate";
 import { HttpError } from "../shared/api/httpClient";
 import { ConfirmDialog } from "../shared/dialog/ConfirmDialog";
 import { useDialogA11y } from "../shared/dialog/useDialogA11y";
+import { DatePicker } from "../shared/ui/DatePicker";
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -398,13 +399,16 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
         setValues((prev) => ({ ...prev, name: next }));
     }, []);
 
-    const handleStartChange = useCallback((event: ChangeEvent<HTMLInputElement>): void => {
-        const next = event.target.value;
+    // [BL-03] The date fields are now the themed {@link DatePicker} (Pikaday-
+    // classed), which emits the picked date directly in the `YYYY-MM-DD` wire
+    // format — so these handlers take a string, not a change event. The value
+    // shape is UNCHANGED (still `YYYY-MM-DD`), leaving validate()/normalize()/
+    // payload untouched.
+    const handleStartChange = useCallback((next: string): void => {
         setValues((prev) => ({ ...prev, estimated_start: next }));
     }, []);
 
-    const handleFinishChange = useCallback((event: ChangeEvent<HTMLInputElement>): void => {
-        const next = event.target.value;
+    const handleFinishChange = useCallback((next: string): void => {
         setValues((prev) => ({ ...prev, estimated_finish: next }));
     }, []);
 
@@ -448,10 +452,18 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                         : t("BACKLOG.EDIT_SPRINT", "Edit Sprint")}
                 </h2>
 
-                <fieldset className={errors.name ? "checksley-error" : undefined}>
+                <fieldset>
+                    {/* [BL-02] The red invalid-field border comes from the compiled
+                        rule `input.checksley-error { border: 2px solid $color-solid-red }`
+                        (and `:focus` → `$color-link-red` #E44057) — it targets the
+                        INPUT, not the fieldset (which is `border:0`). The port put the
+                        class on the <fieldset>, so no border ever showed and a focused
+                        field fell back to the teal focus border. The class now lives on
+                        the <input>, matching how checksley/parsley flags the failing
+                        field, so the border renders red as in the baseline. */}
                     <input
                         ref={nameRef}
-                        className="sprint-name e2e-sprint-name"
+                        className={`sprint-name e2e-sprint-name${errors.name ? " checksley-error" : ""}`}
                         type="text"
                         name="name"
                         maxLength={NAME_MAX_LENGTH}
@@ -466,30 +478,41 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
                     {errors.name && <span className="checksley-required">{errors.name}</span>}
                 </fieldset>
 
+                {/* [BL-03] The two date fields are the themed {@link DatePicker}
+                    reproducing the legacy `tg-date-selector` (Pikaday) control: a
+                    read-only text input formatted "DD MMM YYYY" (no native
+                    `type=date` mask, no native calendar icon) that opens a
+                    Pikaday-classed calendar popover. The value stays `YYYY-MM-DD`.
+                    [BL-02] The `checksley-error` class is appended to the field's
+                    className on error so the invalid date gets the same red border
+                    as the name field. The DatePicker renders as a Fragment (input +
+                    popover), so the `.date-start`/`.date-end` input still sits
+                    directly inside this `.dates > div` (SCSS anchor + error-span
+                    parent relationship preserved). */}
                 <fieldset className="dates">
                     <div>
-                        <input
+                        <DatePicker
                             ref={startRef}
-                            className="date-start"
-                            type="date"
+                            className={`date-start${errors.estimated_start ? " checksley-error" : ""}`}
                             name="estimated_start"
                             value={values.estimated_start}
                             onChange={handleStartChange}
-                            aria-label={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START", "Estimated Start")}
+                            disabled={submitting}
+                            ariaLabel={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_START", "Estimated Start")}
                         />
                         {errors.estimated_start && (
                             <span className="checksley-required">{errors.estimated_start}</span>
                         )}
                     </div>
                     <div>
-                        <input
+                        <DatePicker
                             ref={finishRef}
-                            className="date-end"
-                            type="date"
+                            className={`date-end${errors.estimated_finish ? " checksley-error" : ""}`}
                             name="estimated_finish"
                             value={values.estimated_finish}
                             onChange={handleFinishChange}
-                            aria-label={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END", "Estimated End")}
+                            disabled={submitting}
+                            ariaLabel={t("LIGHTBOX.ADD_EDIT_SPRINT.PLACEHOLDER_SPRINT_END", "Estimated End")}
                         />
                         {errors.estimated_finish && (
                             <span className="checksley-required">{errors.estimated_finish}</span>
@@ -538,11 +561,17 @@ export function SprintEditLightbox(props: SprintEditLightboxProps): JSX.Element 
 
         {/* [H] Themed delete-confirm dialog (replaces the native window.confirm).
             Ports `$confirm.askOnDelete(LIGHTBOX.DELETE_SPRINT.TITLE, sprint.name)`
-            — title + sprint name in the `.lightbox-generic-delete` shell. */}
+            — title + sprint name in the `.lightbox-generic-delete` shell.
+            [BL-04] `askOnDelete` (confirm.coffee L122-125) defaults the subtitle to
+            `NOTIFICATION.ASK_DELETE` ("Are you sure you want to delete?") when the
+            caller passes none; the React port dropped that line, so the confirm
+            showed only the sprint name. The subtitle is restored here, rendered in
+            the dialog's `span.subtitle` above the `span.message` sprint name. */}
         <ConfirmDialog
             open={deleteConfirmOpen}
             variant="delete"
             title={t("LIGHTBOX.DELETE_SPRINT.TITLE", DELETE_CONFIRM_TITLE)}
+            subtitle={t("NOTIFICATION.ASK_DELETE", "Are you sure you want to delete?")}
             message={sprint ? <strong>{sprint.name}</strong> : null}
             confirmLabel={t("COMMON.DELETE", "Delete")}
             cancelLabel={t("COMMON.CANCEL", "Cancel")}

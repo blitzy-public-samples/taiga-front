@@ -197,6 +197,19 @@ export function ConfirmDialog({
                                 ? "btn-small btn-confirm js-confirm"
                                 : "btn-small js-confirm"
                         }
+                        /* [BL-05] The confirm button's fill is driven ENTIRELY by
+                           the `variant` attribute in the compiled theme
+                           (`.btn-small[variant=destructive]{background:#e44057}`
+                           vs the default `.btn-small` mint `#83EEDE`). The legacy
+                           lightbox-generic-delete.jade declares the delete button
+                           `variant="destructive"`; the React port omitted it, so
+                           the destructive confirm fell back to the mint default.
+                           Restoring the attribute makes the DELETE button red and
+                           the neutral (ask) confirm primary — SCSS-driven, no
+                           hardcoded color. Supplied via a JSX spread because
+                           `variant` is a non-standard DOM attribute with no slot
+                           in React's `<button>` typing; React forwards it verbatim. */
+                        {...{ variant: isDelete ? "destructive" : "primary" }}
                         type="button"
                         onClick={handleConfirm}
                         disabled={busy}

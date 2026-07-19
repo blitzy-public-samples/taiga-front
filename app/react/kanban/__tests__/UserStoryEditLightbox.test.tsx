@@ -31,7 +31,7 @@
  *                         assigned_to}); onClose fires on success
  *  - status dropdown   -> toggles the `.pop-status` popover; selecting updates it
  *  - points per role   -> only computable roles get a selector; selection flows
- *  - assignee          -> options come from assignableUsers + "Not assigned"
+ *  - assignee          -> the ported `.pop-users` picker lists project members
  *  - focusAssignee     -> the assignee control receives focus on open
  *  - Escape-to-close   -> pressing Escape (when not submitting) calls onClose
  *  - failure           -> a rejected onCreate keeps the lightbox open + shows the
@@ -58,7 +58,6 @@ const TITLE_NEW = "New user story";
 const TITLE_EDIT = "Edit user story";
 const LABEL_CREATE = "Create";
 const LABEL_SAVE = "Save";
-const LABEL_NOT_ASSIGNED = "Not assigned";
 const REQUIRED_MESSAGE = "This value is required.";
 const SUBJECT_TOO_LONG_MESSAGE =
     "This value is too long. It should have 500 characters or less.";
@@ -92,6 +91,13 @@ function makeProject(overrides: Partial<KanbanProject> = {}): KanbanProject {
             { id: 100, name: "New", color: "#aaa", order: 1, is_archived: false, wip_limit: null },
             { id: 101, name: "Done", color: "#0b0", order: 2, is_archived: false, wip_limit: null },
         ],
+        // Active project members drive the assignee PICKER candidate list
+        // (`.pop-users` ports lb-select-user). The ids/names mirror ASSIGNABLE so
+        // the assigned-name fallback and the picker agree.
+        members: [
+            { id: 42, username: "ada", full_name_display: "Ada Lovelace", is_active: true },
+            { id: 43, username: "alan", full_name_display: "Alan Turing", is_active: true },
+        ] as unknown[],
         default_swimlane: null,
         ...overrides,
     } as KanbanProject;
@@ -157,6 +163,67 @@ function renderLightbox(
 /** Query the root `.lightbox` element. */
 function root(container: HTMLElement): HTMLElement {
     return container.querySelector(".lightbox") as HTMLElement;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom-widget interaction helpers (KAN-02): the create/edit form replaced   */
+/* the native <select>/<input> controls with the ported tg widgets. These      */
+/* drive the same interactions the AngularJS DOM offered.                      */
+/* -------------------------------------------------------------------------- */
+
+/** Set a point for a computable role via the `ul.pop-points-open` selector:
+ *  click the role row (`li.ticket-role-points[data-role-id]`) then the point. */
+function setRolePoint(
+    container: HTMLElement,
+    roleId: number,
+    pointId: number,
+): void {
+    fireEvent.click(
+        container.querySelector(
+            `.ticket-role-points[data-role-id="${roleId}"]`,
+        ) as HTMLElement,
+    );
+    fireEvent.click(
+        container.querySelector(
+            `.pop-points-open .point[data-point-id="${pointId}"]`,
+        ) as HTMLElement,
+    );
+}
+
+/** Assign a member via the `.pop-users` picker (ports lb-select-user): open the
+ *  picker from the assignee trigger, then click the member row by id. */
+function chooseAssignee(container: HTMLElement, userId: number): void {
+    fireEvent.click(
+        container.querySelector(
+            ".ticket-assigned-to .users-dropdown.user-assigned",
+        ) as HTMLElement,
+    );
+    fireEvent.click(
+        container.querySelector(
+            `.pop-users .user-list-single[data-user-id="${userId}"]`,
+        ) as HTMLElement,
+    );
+}
+
+/** Open the due-date picker popover and return its `input[name="due_date"]`. */
+function openDueDateInput(container: HTMLElement): HTMLInputElement {
+    fireEvent.click(container.querySelector(".due-date-button") as HTMLElement);
+    return container.querySelector(
+        '.date-picker-popover input[name="due_date"]',
+    ) as HTMLInputElement;
+}
+
+/** Reveal the tag input (`.add-tag-button` is a teal reveal button) and return
+ *  the now-visible `.add-tag-input .tag-input`. */
+function revealTagInput(container: HTMLElement): HTMLInputElement {
+    fireEvent.click(
+        container.querySelector(
+            ".add-tag-button.e2e-show-tag-input",
+        ) as HTMLElement,
+    );
+    return container.querySelector(
+        ".add-tag-input .tag-input",
+    ) as HTMLInputElement;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -240,9 +307,19 @@ test("edit mode seeds subject/status/points/assignee from the row and hides the 
     expect(container.querySelector(".status-text")?.textContent).toBe("Done");
     // No creation-position section in edit mode.
     expect(container.querySelector("section.creation-position")).toBeNull();
-    // Assignee seeded to user 42.
-    const assignee = container.querySelector(".assigned-to-select") as HTMLSelectElement;
-    expect(assignee.value).toBe("42");
+    // Assignee seeded to user 42 — the ported picker shows the assigned member's
+    // display name in the `.user-assigned` trigger (KAN-02: native <select> gone).
+    expect(
+        container
+            .querySelector(".ticket-assigned-to .user-assigned")
+            ?.textContent?.trim(),
+    ).toBe("Ada Lovelace");
+    // Points seeded from the row: Back (role 11) shows point 102 -> "1".
+    expect(
+        container
+            .querySelector('.ticket-role-points[data-role-id="11"] .points')
+            ?.textContent?.trim(),
+    ).toBe("1");
 });
 
 /* -------------------------------------------------------------------------- */
@@ -277,13 +354,12 @@ test("create submit passes {subject, statusId, points, assignedTo, position} and
     const subject = container.querySelector('input[name="subject"]') as HTMLInputElement;
     fireEvent.change(subject, { target: { value: "New thing" } });
 
-    // Set a point for the first computable role (Back = 11 -> point 102).
-    const pointSelect = container.querySelector(".points-select") as HTMLSelectElement;
-    fireEvent.change(pointSelect, { target: { value: "102" } });
+    // Set a point for the first computable role (Back = 11 -> point 102) via the
+    // ported `.pop-points-open` role selector (KAN-02: native <select> gone).
+    setRolePoint(container, 11, 102);
 
-    // Choose an assignee.
-    const assignee = container.querySelector(".assigned-to-select") as HTMLSelectElement;
-    fireEvent.change(assignee, { target: { value: "43" } });
+    // Choose an assignee (43 = Alan) via the ported `.pop-users` picker.
+    chooseAssignee(container, 43);
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement);
 
@@ -381,7 +457,10 @@ test("the status dropdown toggles the popover and selecting a status updates the
 
 test("only computable roles get a point selector", () => {
     const { container } = renderLightbox({ mode: "create" });
-    const roleRows = container.querySelectorAll(".points-per-role");
+    // The ported `ul.points-per-role` renders one CLICKABLE `li.ticket-role-points`
+    // per computable role plus a non-clickable "total points" summary row, so the
+    // computable count is the clickable rows (KAN-02: native <select> gone).
+    const roleRows = container.querySelectorAll(".ticket-role-points.clickable");
     // Two computable roles (Back, Front); the non-computable Design is excluded.
     expect(roleRows.length).toBe(2);
     expect(container.textContent).toContain("Back");
@@ -393,14 +472,22 @@ test("only computable roles get a point selector", () => {
 /* Assignee options                                                            */
 /* -------------------------------------------------------------------------- */
 
-test("the assignee control lists the assignable users plus a 'Not assigned' option", () => {
+test("the assignee picker lists the project members", () => {
     const { container } = renderLightbox({ mode: "create" });
-    const options = Array.from(
-        (container.querySelector(".assigned-to-select") as HTMLSelectElement).options,
-    ).map((o) => o.textContent);
-    expect(options[0]).toBe(LABEL_NOT_ASSIGNED);
-    expect(options).toContain("Ada Lovelace");
-    expect(options).toContain("Alan Turing");
+    // Open the picker from the assignee trigger (ports the lb-select-user popover;
+    // KAN-02 replaced the native <select> with the `.pop-users` member list).
+    fireEvent.click(
+        container.querySelector(
+            ".ticket-assigned-to .users-dropdown.user-assigned",
+        ) as HTMLElement,
+    );
+    const picker = container.querySelector(".pop-users.popover") as HTMLElement;
+    expect(picker).not.toBeNull();
+    const names = Array.from(
+        picker.querySelectorAll(".user-list-single .user-list-name"),
+    ).map((n) => n.textContent?.trim());
+    expect(names).toContain("Ada Lovelace");
+    expect(names).toContain("Alan Turing");
 });
 
 /* -------------------------------------------------------------------------- */
@@ -413,8 +500,9 @@ test("focusAssignee lands focus on the assignee control on open", () => {
         us: makeUs(),
         focusAssignee: true,
     });
+    // KAN-02/KAN-03: focus lands on the ported assignee trigger anchor.
     expect(document.activeElement).toBe(
-        container.querySelector(".assigned-to-select"),
+        container.querySelector(".ticket-assigned-to .users-dropdown.user-assigned"),
     );
 });
 
@@ -500,10 +588,10 @@ test("[M-10] edit seeds all secondary fields from the story", () => {
     expect(chips.length).toBe(2);
     expect(chips[0].querySelector("span")?.textContent).toBe("backend");
     expect((chips[0] as HTMLElement).style.backgroundColor).toBe("rgb(255, 0, 0)");
-    // Due date.
-    expect(
-        (container.querySelector('input[name="due_date"]') as HTMLInputElement).value,
-    ).toBe("2025-01-15");
+    // Due date — the value lives in the ported date-picker popover, revealed by
+    // clicking the `.due-date-button` (KAN-02: the always-present native input
+    // was replaced by the popover control).
+    expect(openDueDateInput(container).value).toBe("2025-01-15");
     // Blocking — blocked-note visible (no `hidden`) and seeded.
     const blockedNote = container.querySelector(".blocked-note") as HTMLElement;
     expect(blockedNote).not.toHaveClass("hidden");
@@ -533,7 +621,8 @@ test("[M-10] blocked-note is hidden until is-blocked is toggled on", () => {
 
 test("[M-10] adding a tag via Enter and deleting a chip", () => {
     const { container } = renderLightbox({ mode: "create" });
-    const input = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    // The tag input is revealed by the teal `.add-tag-button` (KAN-02).
+    const input = revealTagInput(container);
     fireEvent.change(input, { target: { value: "NewTag" } });
     fireEvent.keyDown(input, { key: "Enter" });
     // Normalized to lower-case; chip rendered; input cleared.
@@ -549,7 +638,7 @@ test("[M-10] adding a tag via Enter and deleting a chip", () => {
 
 test("[M-10] a duplicate tag is not added twice", () => {
     const { container } = renderLightbox({ mode: "create" });
-    const input = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    const input = revealTagInput(container);
     fireEvent.change(input, { target: { value: "dup" } });
     fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.change(input, { target: { value: "DUP" } });
@@ -557,11 +646,13 @@ test("[M-10] a duplicate tag is not added twice", () => {
     expect(container.querySelectorAll(".tags-container .tag").length).toBe(1);
 });
 
-test("[M-10] the add-tag input is absent without the add_us permission", () => {
+test("[M-10] the add-tag control is absent without the add_us permission", () => {
     const { container } = renderLightbox({
         mode: "create",
         project: makeProject({ my_permissions: ["view_us", "modify_us"] }),
     });
+    // Both the reveal button and the (hidden-by-default) input are add_us-gated.
+    expect(container.querySelector(".add-tag-button")).toBeNull();
     expect(container.querySelector(".add-tag-input")).toBeNull();
 });
 
@@ -573,7 +664,8 @@ test("[M-10] create payload carries edited secondary fields", async () => {
     fireEvent.change(container.querySelector("textarea.description") as HTMLTextAreaElement, {
         target: { value: "desc text" },
     });
-    fireEvent.change(container.querySelector('input[name="due_date"]') as HTMLInputElement, {
+    // Due date via the ported picker popover (KAN-02).
+    fireEvent.change(openDueDateInput(container), {
         target: { value: "2025-03-01" },
     });
     fireEvent.click(container.querySelector(".btn-icon.team-requirement") as HTMLElement);
@@ -581,7 +673,8 @@ test("[M-10] create payload carries edited secondary fields", async () => {
     fireEvent.change(container.querySelector('input[name="blocked_note"]') as HTMLInputElement, {
         target: { value: "blocked reason" },
     });
-    const tagInput = container.querySelector(".add-tag-input .tag-input") as HTMLInputElement;
+    // Tag via the revealed input (KAN-02).
+    const tagInput = revealTagInput(container);
     fireEvent.change(tagInput, { target: { value: "alpha" } });
     fireEvent.keyDown(tagInput, { key: "Enter" });
 

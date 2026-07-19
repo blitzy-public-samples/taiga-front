@@ -148,12 +148,27 @@ loadReactApp = ->
             console.error("Taiga: #{message}", err)
             return
 
+# Remove the static pre-boot loader (#tg-initial-loader in index.jade) the moment
+# AngularJS has bootstrapped and taken over rendering. This turns the always-on
+# first-paint spinner OFF exactly when the real app is ready, eliminating the
+# blank-screen gap (QA Issue 4) without leaving a lingering overlay. Guarded so a
+# missing element is a harmless no-op (e.g. if the markup was ever absent).
+removeInitialLoader = ->
+    loader = document.getElementById("tg-initial-loader")
+    if loader and loader.parentNode
+        loader.parentNode.removeChild(loader)
+
 loadApp = (emojisPromise) ->
     loadJS("#{window._version}/js/elements.js").then () ->
         loadReactApp().then () ->
             loadJS("#{window._version}/js/app.js").then () ->
                 emojisPromise.then ->
+                    # Preserve the AAP-mandated serial load order
+                    # (elements.js -> react-app.js -> app.js -> bootstrap); only
+                    # ADD the loader teardown immediately after bootstrap so the
+                    # pre-boot spinner is dismissed the instant the app is live.
                     angular.bootstrap(document, ['taiga'])
+                    removeInitialLoader()
 
 promise = fetch "conf.json"
 promise

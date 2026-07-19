@@ -75,6 +75,15 @@ import {
     subscribeNotifications,
 } from "../../shared/notifications/notificationCenter";
 
+// WebSocket-driven board refreshes are coalesced through a pure-trailing
+// lodash debounce (EVENTS_DEBOUNCE_MS = 1000ms in BacklogApp, mirroring the
+// AngularJS `debounceLeading` = {leading:false, trailing:true}). A single
+// `.userstories`/`.milestones`/`.projects` event therefore reloads the board
+// only after the debounce settles (Issue 2: collapse a burst of events into
+// one trailing refetch). Assertions on the post-event reload must poll past
+// that window, so give them a timeout comfortably larger than the debounce.
+const WS_REFRESH_TIMEOUT = 3000;
+
 /* -------------------------------------------------------------------------- */
 /* Module mocks — ALL of ../shared/** plus the presentational children.        */
 /* Variables referenced inside a jest.mock factory MUST be `mock`-prefixed     */
@@ -517,6 +526,52 @@ test("renders the neutral loading shell (no crash) while projectId is NaN", () =
 });
 
 /* ========================================================================== */
+/* (a1) document.title / meta parity (F-001)                                   */
+/* ========================================================================== */
+
+describe("BacklogApp — document.title / meta parity (F-001)", () => {
+    afterEach(() => {
+        // Do not leak a page title/description into unrelated specs.
+        document.title = "";
+        document.head
+            .querySelectorAll('meta[name="description"]')
+            .forEach((el) => el.remove());
+    });
+
+    test("sets the tab title to 'Backlog - <projectName>' once the project resolves", async () => {
+        await renderApp();
+
+        // No Angular injector in jsdom → t() uses the English fallback,
+        // interpolating the fixture project name ("My Project").
+        expect(document.title).toBe("Backlog - My Project");
+    });
+
+    test("sets a meta description that interpolates the project name", async () => {
+        await renderApp();
+
+        const description = document.head
+            .querySelector('meta[name="description"]')
+            ?.getAttribute("content");
+        expect(description).toBeTruthy();
+        expect(description).toContain("My Project");
+        expect(description).toContain("backlog panel");
+    });
+
+    test("re-applies the title on remount, curing a stale SPA-transition title", async () => {
+        const first = await renderApp();
+        expect(document.title).toBe("Backlog - My Project");
+        first.unmount();
+
+        // Simulate an AngularJS route (e.g. the Sprint Taskboard) having set its
+        // own title while the React root was unmounted.
+        document.title = "Sprint 2026 - Sprint taskboard - Other Project";
+
+        await renderApp();
+        expect(document.title).toBe("Backlog - My Project");
+    });
+});
+
+/* ========================================================================== */
 /* (a2) Project-id validity, URL-slug fallback, error-state reset (QA #1)      */
 /* ========================================================================== */
 
@@ -749,12 +804,18 @@ test("C-05: a .projects event refreshes the project record and reconciles depend
     });
 
     // The authoritative project record is re-fetched (re-evaluating every gate),
-    // and dependent data (sprints/stories/stats) is reconciled.
-    expect(countGet((p) => p === `projects/${PROJECT_ID}`)).toBeGreaterThan(
-        projectGetsBefore,
-    );
-    expect(mockListMilestones.mock.calls.length).toBeGreaterThan(
-        milestoneCallsBefore,
+    // and dependent data (sprints/stories/stats) is reconciled. The refresh is
+    // debounced (pure-trailing, EVENTS_DEBOUNCE_MS), so poll past that window.
+    await waitFor(
+        () => {
+            expect(
+                countGet((p) => p === `projects/${PROJECT_ID}`),
+            ).toBeGreaterThan(projectGetsBefore);
+            expect(mockListMilestones.mock.calls.length).toBeGreaterThan(
+                milestoneCallsBefore,
+            );
+        },
+        { timeout: WS_REFRESH_TIMEOUT },
     );
 });
 
@@ -778,9 +839,11 @@ test("C-05: a .projects event that revokes module activation gates the screen", 
     });
 
     // The permission-denied gate now renders live (module activation went stale
-    // before C-05; the `.projects` subscription refreshes it in place).
-    await waitFor(() =>
-        expect(container.querySelector(".permission-denied")).not.toBeNull(),
+    // before C-05; the `.projects` subscription refreshes it in place). The
+    // refresh is debounced (pure-trailing, EVENTS_DEBOUNCE_MS), so poll past it.
+    await waitFor(
+        () => expect(container.querySelector(".permission-denied")).not.toBeNull(),
+        { timeout: WS_REFRESH_TIMEOUT },
     );
 });
 
@@ -1181,6 +1244,7 @@ test("onCreate (no points/assignee) POSTs bulk_create with subject+status and re
             blocked_note: "",
             team_requirement: false,
             client_requirement: false,
+            swimlane: null,
             attachmentsToAdd: [],
         });
     });
@@ -1215,6 +1279,7 @@ test("onCreate with points/assignee issues a follow-up PATCH on the new story", 
             blocked_note: "",
             team_requirement: false,
             client_requirement: false,
+            swimlane: null,
             attachmentsToAdd: [],
         });
     });
@@ -1259,6 +1324,7 @@ test("onCreate with position 'top' reorders the new story to the top", async () 
             blocked_note: "",
             team_requirement: false,
             client_requirement: false,
+            swimlane: null,
             attachmentsToAdd: [],
         });
     });
@@ -1293,6 +1359,7 @@ test("onEdit PATCHes userstories/{id} with the changed fields + version and relo
             team_requirement: false,
             client_requirement: false,
             attachmentsToDelete: [],
+            swimlane: null,
             attachmentsToAdd: [],
         });
     });
@@ -1302,6 +1369,9 @@ test("onEdit PATCHes userstories/{id} with the changed fields + version and relo
         status: 101,
         points: { "1": 11 },
         assigned_to: 42,
+        // BL-01: the edit PATCH now carries the swimlane (null here — the edited
+        // story has no swimlane and the fixture defines none).
+        swimlane: null,
         description: "",
         tags: [],
         due_date: null,
@@ -1346,6 +1416,7 @@ test("onEdit reloads the backlog and rethrows on a 409 version conflict", async 
                 team_requirement: false,
                 client_requirement: false,
                 attachmentsToDelete: [],
+                swimlane: null,
                 attachmentsToAdd: [],
             })
             .then(() => undefined)
@@ -1390,6 +1461,7 @@ describe("BacklogApp — user-story form persistence (M-10)", () => {
                 blocked_note: "",
                 team_requirement: true,
                 client_requirement: false,
+                swimlane: null,
                 attachmentsToAdd: [file],
             });
         });
@@ -1439,6 +1511,7 @@ describe("BacklogApp — user-story form persistence (M-10)", () => {
                 blocked_note: "",
                 team_requirement: false,
                 client_requirement: false,
+                swimlane: null,
                 attachmentsToAdd: [],
             });
         });
@@ -1471,6 +1544,7 @@ describe("BacklogApp — user-story form persistence (M-10)", () => {
                     team_requirement: false,
                     client_requirement: false,
                     attachmentsToDelete: [55],
+                    swimlane: null,
                     attachmentsToAdd: [file],
                 },
             );
@@ -2635,10 +2709,18 @@ test("the userstories subscription callback reloads stories and sprints", async 
         await Promise.resolve();
     });
 
-    await waitFor(() =>
-        expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore),
+    // The reload is debounced (pure-trailing, EVENTS_DEBOUNCE_MS): both the
+    // userstories refetch and the sprint reload fire together on the trailing
+    // edge, so poll past the debounce window for both.
+    await waitFor(
+        () => {
+            expect(countGet((p) => p === "userstories")).toBeGreaterThan(usBefore);
+            expect(mockListMilestones.mock.calls.length).toBeGreaterThan(
+                sprintsBefore,
+            );
+        },
+        { timeout: WS_REFRESH_TIMEOUT },
     );
-    expect(mockListMilestones.mock.calls.length).toBeGreaterThan(sprintsBefore);
 });
 
 test("the milestones subscription callback reloads open + closed sprints and stats", async () => {
@@ -2656,10 +2738,20 @@ test("the milestones subscription callback reloads open + closed sprints and sta
         await Promise.resolve();
     });
 
-    await waitFor(() =>
-        expect(mockListMilestones).toHaveBeenCalledWith(PROJECT_ID, { closed: true }),
+    // The reload is debounced (pure-trailing, EVENTS_DEBOUNCE_MS): the closed-
+    // sprint reload and the project-stats refetch fire together on the trailing
+    // edge, so poll past the debounce window for both.
+    await waitFor(
+        () => {
+            expect(mockListMilestones).toHaveBeenCalledWith(PROJECT_ID, {
+                closed: true,
+            });
+            expect(countGet((p) => p.includes("/stats"))).toBeGreaterThan(
+                statsBefore,
+            );
+        },
+        { timeout: WS_REFRESH_TIMEOUT },
     );
-    expect(countGet((p) => p.includes("/stats"))).toBeGreaterThan(statsBefore);
 });
 
 test("disconnects the shared events client on unmount", async () => {

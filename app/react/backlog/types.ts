@@ -253,8 +253,30 @@ export interface Project {
   /** Non-null when the project is archived; disables drag-and-drop. */
   archived_code?: string | null;
   default_us_status: Id;
+  /**
+   * Project-level default swimlane id (`null` on a no-swimlane board). Ports
+   * the Kanban `project.default_swimlane`; it pre-selects the SWIMLANE control
+   * in the create / bulk-create user-story lightboxes (BL-01).
+   */
+  default_swimlane?: Id | null;
   total_milestones: number | null;
   i_am_admin: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * A kanban swimlane. Although swimlanes are a Kanban-board concept, the shared
+ * create / bulk-create user-story lightboxes offer a SWIMLANE selector whenever
+ * the project has swimlanes (`lb-create-edit-us.jade` gate
+ * `project.is_kanban_activated && swimlanesList.size`), so the Backlog fetches
+ * them to reproduce that control (BL-01). Mirrors the Kanban `Swimlane` shape
+ * (`useKanbanState.ts`) but is declared locally to keep the two React roots
+ * decoupled.
+ */
+export interface Swimlane {
+  id: Id;
+  name: string;
+  order?: number;
   [key: string]: unknown;
 }
 
