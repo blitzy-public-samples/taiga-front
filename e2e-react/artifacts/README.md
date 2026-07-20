@@ -1,9 +1,9 @@
 # e2e-react visual evidence (before / after)
 
-This directory stores the committed before/after **screenshots** and data
-**fingerprints** that prove the visual fidelity of the two migrated screens
-(Kanban, Backlog) as AngularJS is replaced by React in-place. The evidence is
-curated and secret-free (see the security policy below).
+This directory stores the committed before/after **screenshots**, curated screen
+**recordings**, and data **fingerprints** that prove the visual fidelity of the
+two migrated screens (Kanban, Backlog) as AngularJS is replaced by React
+in-place. The evidence is curated and secret-free (see the security policy below).
 
 ## What is committed here
 
@@ -20,9 +20,15 @@ curated and secret-free (see the security policy below).
     (filename, screen, route, project, viewport, md5, bytes, and a short visual
     description per shot).
 - `react/` — the React captures, taken AFTER the migration on the same,
-  unchanged database. This set is produced by the downstream live-stack pass
-  documented under "Two-phase capture workflow" and is committed under
-  `react/` once generated. Until then `react/` holds only its `.gitkeep`.
+  unchanged database, produced by the downstream live-stack pass documented under
+  "Two-phase capture workflow". This set is **committed and tracked**:
+  - `react/kanban/*.png` and `react/backlog/*.png` — the per-section React stills
+    that mirror the baseline parity branches (swimlanes, WIP, filters, drag
+    mirrors, lightbox triggers, multi-select, …).
+  - `react/*_1280.png` — the five top-level before/after pair captures that match
+    the `baseline/*_1280.png` pairs by filename (see `MANIFEST.md`).
+  - `react/recordings/*.webm` — the curated Kanban and Backlog screen recordings
+    (see "Screen recordings" below).
 
 ## Git-tracked — do NOT gitignore the evidence
 
@@ -31,11 +37,14 @@ curated and secret-free (see the security policy below).
   NOT list `e2e-react/`; do not add it.
 - The ONLY exclusion is the scoped `artifacts/.gitignore`, which ignores just the
   Playwright **runtime** output that `npm run e2e` regenerates and that is NOT
-  evidence: each phase's `*/output/` folder (videos/traces/last-run) and the
-  generated `report/`. This is the deliberate opposite of the legacy
-  "ignore the whole directory" trick — it keeps the curated stills/fingerprints
-  tracked while keeping regenerated, potentially credential-bearing runtime files
-  out of version control.
+  curated evidence: each phase's `output/` folder (raw last-run videos, any
+  trace, last-run screenshots) and the generated `report/`. The curated
+  Kanban/Backlog screen recordings are promoted OUT of `output/` into the tracked
+  `<phase>/recordings/` folder by the global teardown, so they are committed while
+  the raw `output/` tree stays ignored. This is the deliberate opposite of the
+  legacy "ignore the whole directory" trick — it keeps the curated
+  stills/recordings/fingerprints tracked while keeping regenerated,
+  potentially trace-bearing runtime files out of version control.
 
 ## Security policy — no credentials in committed evidence (F-SEC-01)
 
@@ -46,9 +55,14 @@ header, or response body (CWE-532 / CWE-200). This is enforced by construction:
   Playwright trace bundles the full authenticated request/response record — the
   login form fill, the `Authorization: Bearer` token, the `X-Session-Id` header,
   cookies, and API bodies — so no trace is ever produced or committed.
-- **No videos or traces are committed.** Only curated `*.png` stills and
-  text fingerprints/manifests are tracked; the runtime `output/`/`report/`
-  folders (which hold any video/trace/report) are git-ignored (above).
+- **No traces are committed; only curated, secret-free recordings are.** A
+  Playwright trace is never produced (`trace: 'off'`), so none is ever committed.
+  The always-on video is secret-free — the login password field renders masked
+  and the specs never draw a token/password into the DOM — so the curated
+  Kanban/Backlog screen recordings are promoted into the tracked
+  `<phase>/recordings/` folder as committed motion evidence. The raw per-run
+  `output/`/`report/` folders (which hold the unpromoted last-run video and the
+  HTML report) stay git-ignored (above).
 - **Screenshots are credential-free.** The login page renders its password field
   masked, and the specs never print a token or password into the DOM.
 - **No secret literals in this tree.** Credentials are resolved at runtime from
@@ -93,6 +107,26 @@ pass is a build-and-run step, not a code change.
   `baseline/` (the default). This is used identically by the `../fixtures/`
   screenshot helper (`artifacts/<phase>/<section>/<name>.png`), and the specs
   read the same phase to select DOM-accurate, phase-aware selectors.
+
+## Screen recordings (`<phase>/recordings/`)
+
+The Playwright config records an always-on `video.webm` for every test, but it
+writes them under the git-ignored per-test `output/` tree. The global teardown
+`../global-teardown.ts` runs after the suite and **promotes** the two canonical
+screen-flow recordings — the Kanban flow (`kanban.spec.ts`) and the Backlog flow
+(`backlog.spec.ts`) — out of `output/` into the git-tracked
+`<phase>/recordings/` folder:
+
+- `react/recordings/kanban-kanban-firefox.webm` — the full Kanban evidence flow.
+- `react/recordings/backlog-backlog-firefox.webm` — the full Backlog evidence flow.
+
+Only those two flow recordings are promoted; the ancillary
+`comparability.spec.ts` (navigation-only recaptures) and `persistence.spec.ts`
+(API round-trip) clips are intentionally NOT promoted, because they are already
+covered by the committed screenshots and by server-side assertions respectively —
+keeping the tracked `recordings/` folder curated rather than cluttered. The
+recordings are secret-free for the same reasons the screenshots are (masked
+password field, no token drawn into the DOM, tracing disabled).
 
 ## Data comparability — non-mutating captures (F-AAP-06)
 

@@ -501,7 +501,19 @@ export function BulkCreateUsLightbox({
             aria-label={translate('COMMON.ONE_ITEM_LINE', undefined, 'One item per line...')}
             aria-invalid={bulkError ? true : undefined}
             value={bulk}
-            onChange={(event) => setBulk(event.target.value)}
+            onChange={(event) => {
+              const value = event.target.value;
+              setBulk(value);
+              // N-08: the "This value is required." message is surfaced on a
+              // failed submit (see handleSubmit). Previously it persisted even
+              // after the user started typing, because this handler only updated
+              // the value. Clear it as soon as the textarea holds a non-blank
+              // value so a corrected field stops showing a stale message. Only
+              // ever clears an existing error — never adds one on keystroke.
+              if (bulkError && value.trim().length > 0) {
+                setBulkError(null);
+              }
+            }}
           />
           {bulkError && (
             <ul className="checksley-error-list" role="alert">

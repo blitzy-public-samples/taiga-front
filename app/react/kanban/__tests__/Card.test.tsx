@@ -401,6 +401,9 @@ describe('epics', () => {
         const epic = container.querySelector('a.card-epic') as HTMLAnchorElement;
         expect(epic).toBeInTheDocument();
         expect(epic.getAttribute('href')).toBe('/project/proj/epic/7');
+        // N-11 (a11y name): every epic link carries an accessible name = the
+        // epic subject, so it is never an unnamed control.
+        expect(epic.getAttribute('aria-label')).toBe('Epic A');
         const color = container.querySelector('.epic-color') as HTMLElement;
         expect(color.style.backgroundColor).toBe('rgb(0, 255, 0)');
         // epic-name shows only for the first epic when zoomLevel !== 0.
@@ -416,9 +419,15 @@ describe('epics', () => {
         // The zoomLevel>0 wrapper is absent; the compact epics container holds them.
         const compact = container.querySelector('.card-compact-epics') as HTMLElement;
         expect(compact).toBeInTheDocument();
-        expect(compact.querySelector('.card-epic')).toBeInTheDocument();
+        const epic = compact.querySelector('a.card-epic') as HTMLAnchorElement;
+        expect(epic).toBeInTheDocument();
         // epic-name is suppressed at zoom level 0.
         expect(container.querySelector('.epic-name')).toBeNull();
+        // N-11 (a11y name): at zoom 0 the link has NO visible text (only the
+        // colour swatch), so the aria-label is its ONLY accessible name — this
+        // is precisely the previously-unnamed case the fix resolves.
+        expect(epic.getAttribute('aria-label')).toBe('Epic A');
+        expect((epic.textContent || '').trim()).toBe('');
     });
 });
 

@@ -286,6 +286,33 @@ describe('BulkCreateUsLightbox', () => {
       expect(screen.getByText('This value is required.')).toBeInTheDocument();
       expect(mockBulk).not.toHaveBeenCalled();
     });
+
+    it('N-08: clears the required error as soon as the user types a non-blank value', () => {
+      const { container } = renderLightbox();
+
+      // Failed submit surfaces the required error and flags the textarea.
+      submitForm(container);
+      expect(screen.getByText('This value is required.')).toBeInTheDocument();
+      expect(getTextarea(container)).toHaveClass('checksley-error');
+
+      // Typing a non-blank value must clear the error immediately — no resubmit.
+      typeBulk(container, 'A user story');
+      expect(screen.queryByText('This value is required.')).not.toBeInTheDocument();
+      expect(getTextarea(container)).not.toHaveClass('checksley-error');
+    });
+
+    it('N-08: keeps the required error while the value is still blank (whitespace does not clear it)', () => {
+      const { container } = renderLightbox();
+
+      submitForm(container);
+      expect(screen.getByText('This value is required.')).toBeInTheDocument();
+
+      // A whitespace-only "correction" is still blank, so the error must persist
+      // (the clear guard only fires for a genuinely non-blank value).
+      typeBulk(container, '    ');
+      expect(screen.getByText('This value is required.')).toBeInTheDocument();
+      expect(getTextarea(container)).toHaveClass('checksley-error');
+    });
   });
 
   describe('valid submit → bulkCreate', () => {

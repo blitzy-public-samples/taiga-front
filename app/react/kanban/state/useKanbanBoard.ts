@@ -78,6 +78,32 @@ import type {
 } from '../../shared/types';
 
 /* ========================================================================== *
+ * Request options
+ * ========================================================================== */
+
+/**
+ * QA M-10: the `/userstories` board listing MUST disable pagination, exactly as
+ * the AngularJS board did. The legacy `KanbanController.loadUserstories`
+ * (main.coffee 464-509) lists through `userstories.listAll` ->
+ * `$repo.queryMany("userstories", …)`, and `queryMany`
+ * (base/repository.coffee 135-140) sends `x-disable-pagination: "1"` by default
+ * (whenever `options.enablePagination` is falsy). Without this header the DRF
+ * backend caps the response at the default page size (30), so a board with more
+ * than 30 stories rendered only its first page. Passing this header on EVERY
+ * board list (initial load, live WebSocket reload, and archived-column reopen)
+ * restores the full-board fetch and is a prerequisite for the M-24 live-delete
+ * reconciliation (which can only prune ids correctly against a COMPLETE list).
+ *
+ * The value is the string `"1"` to match the legacy header byte-for-byte, and
+ * `client.buildHeaders` merges caller `headers` LAST so this override is honored
+ * (client.ts:101-104, 258-259). A single frozen constant is shared by all three
+ * call sites to keep the contract identical and allocation-free.
+ */
+const DISABLE_PAGINATION: Readonly<{ headers: Record<string, string> }> = Object.freeze({
+    headers: { 'x-disable-pagination': '1' },
+});
+
+/* ========================================================================== *
  * Public hook API
  * ========================================================================== */
 
@@ -365,8 +391,10 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
             const thisSearch = filterQ;
 
             // SOURCE 471-474: stories + swimlanes in parallel.
+            // QA M-10: disable pagination so the ENTIRE board loads (see
+            // DISABLE_PAGINATION) — not just the backend's first 30-story page.
             const [userstories, swimlanes] = await Promise.all([
-                api.get<UserStory[]>('/userstories', p),
+                api.get<UserStory[]>('/userstories', p, DISABLE_PAGINATION),
                 loadSwimlanes(proj),
             ]);
 
@@ -447,7 +475,12 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     const handleUserstoriesEvent = useCallback(async (): Promise<void> => {
         try {
             const p = buildParamsRef.current();
-            const userstories = await api.get<UserStory[]>('/userstories', p);
+            // QA M-10 + M-24: the live reload MUST fetch the full, unpaginated
+            // board so the EVENTS_LOAD reconciliation can both merge changed
+            // stories AND prune deleted ones against a COMPLETE id set. A
+            // paginated (first-30) response would make the reducer wrongly
+            // "remove" every non-archived story past page 1 on each frame.
+            const userstories = await api.get<UserStory[]>('/userstories', p, DISABLE_PAGINATION);
             dispatch({ type: 'EVENTS_LOAD', userstories });
         } catch {
             /* live refresh is best-effort; ignore transient failures */
@@ -649,7 +682,10 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                 if (filterQ) {
                     p.q = filterQ;
                 }
-                const stories = await api.get<UserStory[]>('/userstories', p);
+                // QA M-10: an archived status column can also hold more than a
+                // page of stories; disable pagination for parity with the legacy
+                // `loadUserStoriesForStatus` (main.coffee 511-535 -> queryMany).
+                const stories = await api.get<UserStory[]>('/userstories', p, DISABLE_PAGINATION);
                 dispatch({ type: 'ADD', usList: stories });
             } catch {
                 /* reopening an archived column is best-effort */

@@ -62,6 +62,7 @@ import {
     getAuthToken,
     getSessionId,
     getLanguage,
+    navigateToUserStoryDetail,
 } from '../session';
 
 /*
@@ -255,4 +256,62 @@ describe('session bridge — getLanguage (Accept-Language source, resolution ord
         expect(getLanguage()).toBe('ja');
     });
 });
+
+/*
+ * navigateToUserStoryDetail (M-11 / M-12 / M-13) — the shell-owned US-detail
+ * navigation the Kanban card actions ("Edit card" / "Assign To") and the
+ * backlog "Edit" option route to (the common-module edit/assignee lightboxes
+ * are OOS — AAP §0.2.2 / §0.4.1). The target URL mirrors `Card.tsx`'s `usHref`
+ * byte-for-byte (`/project/:slug/us/:ref`). jsdom does not implement navigation,
+ * so `window.location` is swapped for a writable stub we assert against.
+ */
+describe('session bridge — navigateToUserStoryDetail (US-detail routing)', () => {
+    let savedLocationDescriptor: PropertyDescriptor | undefined;
+    const INITIAL_HREF = 'http://localhost/kanban';
+
+    beforeEach(() => {
+        savedLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+        Object.defineProperty(window, 'location', {
+            configurable: true,
+            writable: true,
+            value: {
+                href: INITIAL_HREF,
+                origin: 'http://localhost',
+                pathname: '/kanban',
+                search: '',
+                hash: '',
+                assign() {},
+                replace() {},
+            },
+        });
+    });
+
+    afterEach(() => {
+        if (savedLocationDescriptor) {
+            Object.defineProperty(window, 'location', savedLocationDescriptor);
+        }
+    });
+
+    it('navigates to /project/:slug/us/:ref (byte-for-byte the Card.tsx usHref)', () => {
+        navigateToUserStoryDetail('my-project', 42);
+        expect(window.location.href).toBe('/project/my-project/us/42');
+    });
+
+    it('does NOT navigate when the slug is missing (defensive guard)', () => {
+        navigateToUserStoryDetail(null, 42);
+        expect(window.location.href).toBe(INITIAL_HREF);
+        navigateToUserStoryDetail(undefined, 42);
+        expect(window.location.href).toBe(INITIAL_HREF);
+        navigateToUserStoryDetail('', 42);
+        expect(window.location.href).toBe(INITIAL_HREF);
+    });
+
+    it('does NOT navigate when the ref is missing (defensive guard)', () => {
+        navigateToUserStoryDetail('my-project', null);
+        expect(window.location.href).toBe(INITIAL_HREF);
+        navigateToUserStoryDetail('my-project', undefined);
+        expect(window.location.href).toBe(INITIAL_HREF);
+    });
+});
+
 

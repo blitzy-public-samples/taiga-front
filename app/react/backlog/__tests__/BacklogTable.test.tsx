@@ -385,6 +385,106 @@ describe('BacklogTable', () => {
       const checkbox = within(getRow(container, 1)).getByRole('checkbox');
       expect(checkbox).toBeChecked();
     });
+
+    // ---- M-14: keyboard operability + accessible name + non-focusable label ----
+
+    it('exposes the selection control as a named checkbox (M-14 accessible name)', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1 })],
+        project: makeModifyProject(),
+      });
+
+      // The native input (no longer `display:none`) is queryable BY ITS ROLE AND
+      // NAME — proving assistive tech can both find it and announce what it does.
+      const named = within(getRow(container, 1)).getByRole('checkbox', {
+        name: 'Select user story #1',
+      });
+      expect(named).toBeInTheDocument();
+      expect(named).toHaveAttribute('type', 'checkbox');
+    });
+
+    it('the decorative <label> is NOT in the tab order (M-14 — the input is the focus target)', () => {
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1 })],
+        project: makeModifyProject(),
+      });
+
+      // The visual box is drawn by the <label>, but it must no longer be
+      // separately focusable (the prior `tabIndex={0}` on the label was the bug).
+      const label = getRow(container, 1).querySelector('label[for="us-check-1"]');
+      expect(label).not.toBeNull();
+      expect(label).not.toHaveAttribute('tabindex');
+      // The input itself is a natively-focusable control (no negative tabindex).
+      const checkbox = within(getRow(container, 1)).getByRole('checkbox');
+      expect(checkbox).not.toHaveAttribute('tabindex', '-1');
+    });
+
+    it('toggles selection on Enter, forwarding (us, toggledValue, false) (M-14 keyboard)', () => {
+      const onToggleCheck = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeModifyProject(),
+        handlers: { onToggleCheck },
+      });
+
+      // Native checkboxes do not toggle on Enter; the component adds it for
+      // parity. The row is unchecked, so Enter lifts the TOGGLED value `true`.
+      const checkbox = within(getRow(container, 1)).getByRole('checkbox');
+      fireEvent.keyDown(checkbox, { key: 'Enter' });
+
+      expect(onToggleCheck).toHaveBeenCalledTimes(1);
+      expect(onToggleCheck).toHaveBeenCalledWith(us, true, false);
+    });
+
+    it('forwards shiftKey on Shift+Enter so keyboard range-select works (M-14)', () => {
+      const onToggleCheck = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        project: makeModifyProject(),
+        handlers: { onToggleCheck },
+      });
+
+      const checkbox = within(getRow(container, 1)).getByRole('checkbox');
+      fireEvent.keyDown(checkbox, { key: 'Enter', shiftKey: true });
+
+      expect(onToggleCheck).toHaveBeenCalledTimes(1);
+      // The real `shiftKey` reaches the container's range logic (third arg true).
+      expect(onToggleCheck).toHaveBeenCalledWith(us, true, true);
+      expect(onToggleCheck.mock.calls[0][2]).toBe(true);
+    });
+
+    it('Enter on an already-checked row lifts the toggled-off value (M-14)', () => {
+      const onToggleCheck = jest.fn();
+      const us = makeUserStory({ id: 1, ref: 1 });
+      const { container } = renderTable({
+        userstories: [us],
+        checkedIds: [1],
+        project: makeModifyProject(),
+        handlers: { onToggleCheck },
+      });
+
+      const checkbox = within(getRow(container, 1)).getByRole('checkbox');
+      fireEvent.keyDown(checkbox, { key: 'Enter' });
+
+      // Currently checked ⇒ Enter toggles it OFF (false), no shift.
+      expect(onToggleCheck).toHaveBeenCalledWith(us, false, false);
+    });
+
+    it('ignores non-activation keys (no toggle on ArrowDown/Tab) (M-14)', () => {
+      const onToggleCheck = jest.fn();
+      const { container } = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1 })],
+        project: makeModifyProject(),
+        handlers: { onToggleCheck },
+      });
+
+      const checkbox = within(getRow(container, 1)).getByRole('checkbox');
+      fireEvent.keyDown(checkbox, { key: 'ArrowDown' });
+      fireEvent.keyDown(checkbox, { key: 'Tab' });
+      expect(onToggleCheck).not.toHaveBeenCalled();
+    });
   });
 
   describe('status popover -> onUpdateStatus', () => {
@@ -504,7 +604,12 @@ describe('BacklogTable', () => {
       // Checkbox, drag handle and options trigger are all present…
       const checkbox = within(row).getByRole('checkbox');
       expect(checkbox).toBeInTheDocument();
-      expect(row.querySelector(DRAG_HANDLE)).toBeInTheDocument();
+      const dragHandle = row.querySelector(DRAG_HANDLE) as HTMLElement;
+      expect(dragHandle).toBeInTheDocument();
+      // N-11 (a11y name): the drag handle carries role="button" (via @dnd-kit)
+      // and the drag INSTRUCTIONS, but previously had NO accessible name. It is
+      // now named after the story it reorders, mirroring the checkbox pattern.
+      expect(dragHandle).toHaveAttribute('aria-label', 'Reorder user story #1');
       expect(row.querySelector(OPTIONS_TRIGGER)).toBeInTheDocument();
       // …the status anchor is clickable (no `not-clickable` modifier)…
       expect(mustQuery(row, US_STATUS)).not.toHaveClass('not-clickable');

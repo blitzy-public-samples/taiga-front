@@ -157,6 +157,40 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
   const [submitting, setSubmitting] = useState(false);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
 
+  /*
+   * N-08: live revalidation. Validation errors are surfaced on a failed submit
+   * (see `handleSubmit`), exactly as the legacy checksley form did. Previously
+   * those messages then persisted verbatim even after the user corrected the
+   * offending field, because the input `onChange` handlers only updated the
+   * value and never touched `errors`. `clearError` is invoked from each field's
+   * `onChange` so that, once a field carries a validation message, giving it a
+   * valid (non-blank — the only rule the sprint validator enforces) value clears
+   * that field's message immediately. It ONLY ever removes an existing error; it
+   * never adds a new one on keystroke, so untouched fields are not prematurely
+   * flagged and the submit-time validation contract is unchanged.
+   */
+  function clearError(
+    field: 'name' | 'estimated_start' | 'estimated_finish',
+    value: string,
+  ): void {
+    if (value.trim().length === 0) {
+      return;
+    }
+    setErrors((prev) => {
+      if (!prev[field]) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[field];
+      // When the last field error clears, drop the aggregate `hasErrors` flag so
+      // create-mode UI gated on it (e.g. the ".last-sprint-name" hint) returns.
+      if (Object.keys(next).length === 0) {
+        setHasErrors(false);
+      }
+      return next;
+    });
+  }
+
   // F-UI-05: turn the lightbox into a real accessible modal dialog. The
   // returned ref is spread onto the `.lightbox` shell (which also carries
   // `role="dialog"` + `aria-modal="true"`), giving it a focus trap,
@@ -505,7 +539,10 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
               )}
               value={name}
               ref={nameInputRef}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value);
+                clearError('name', e.target.value);
+              }}
             />
             {errors.name && (
               <ul className="checksley-error-list" role="alert">
@@ -550,7 +587,10 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
                   'Estimated Start',
                 )}
                 value={estimatedStart}
-                onChange={(e) => setEstimatedStart(e.target.value)}
+                onChange={(e) => {
+                  setEstimatedStart(e.target.value);
+                  clearError('estimated_start', e.target.value);
+                }}
               />
               {errors.estimated_start && (
                 <ul className="checksley-error-list" role="alert">
@@ -569,7 +609,10 @@ export function CreateEditSprintLightbox(props: CreateEditSprintLightboxProps): 
                   'Estimated End',
                 )}
                 value={estimatedFinish}
-                onChange={(e) => setEstimatedFinish(e.target.value)}
+                onChange={(e) => {
+                  setEstimatedFinish(e.target.value);
+                  clearError('estimated_finish', e.target.value);
+                }}
               />
               {errors.estimated_finish && (
                 <ul className="checksley-error-list" role="alert">

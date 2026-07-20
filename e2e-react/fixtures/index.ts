@@ -13,3 +13,4 @@
 export * from './common';
 export * from './capture';
 export * from './auth';
+export * from './api';

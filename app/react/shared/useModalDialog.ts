@@ -25,7 +25,10 @@
  *   1. FOCUS TRAP — Tab / Shift+Tab cycle only through the focusable descendants
  *      of the dialog; focus can never leave it while it is open.
  *   2. ESCAPE — pressing Escape invokes `onClose` (matching the legacy
- *      lightbox-service Escape binding).
+ *      lightbox-service Escape binding). The keydown listener is installed on
+ *      `document` (not on the dialog element) so Escape still dismisses the
+ *      dialog after focus has left it — e.g. after a backdrop click returns
+ *      focus to <body>. See the N-10 FIX comment at the listener registration.
  *   3. INITIAL FOCUS — when the dialog opens, if focus is not already inside it,
  *      the first focusable descendant is focused (a component may instead focus
  *      a specific field first; this only acts as a fallback).
@@ -142,10 +145,20 @@ export function useModalDialog<T extends HTMLElement = HTMLElement>(
       }
     };
 
-    dialog.addEventListener('keydown', onKeyDown);
+    // N-10 FIX: bind the keydown listener on `document`, NOT on the dialog
+    // element. When the listener was scoped to `dialog`, Escape only worked
+    // while focus was physically inside the dialog; a backdrop click (or any
+    // interaction that moved focus back to <body>) left the dialog with focus
+    // trapping still visually active but Escape silently dead, because the
+    // keydown never reached the dialog node. Listening on `document` mirrors the
+    // legacy AngularJS lightbox-service (which bound Escape globally) so Escape
+    // dismisses the dialog regardless of where focus currently sits. The Tab
+    // branch below already guards every focus decision with
+    // `dialog.contains(active)`, so it remains correct at document scope.
+    document.addEventListener('keydown', onKeyDown);
 
     return () => {
-      dialog.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keydown', onKeyDown);
       // Restore focus to the opener (if it is still focusable/attached).
       const prev = previouslyFocused.current;
       if (prev && typeof prev.focus === 'function' && document.contains(prev)) {

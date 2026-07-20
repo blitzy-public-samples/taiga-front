@@ -56,8 +56,13 @@ loadJS = (path) ->
         script.type = 'text/javascript'
         script.src = path
         script.onload = resolve
+        # QA M-02: the original `reject(err, s)` referenced an undefined `s`,
+        # which threw a ReferenceError INSIDE the error handler and destroyed the
+        # diagnostic (the real load failure was masked by the bogus reference).
+        # Reject with a single, descriptive Error naming the failed asset so the
+        # loadApp() chain can log a diagnosable message and degrade gracefully.
         script.onerror = (err) ->
-            reject(err, s)
+            reject(new Error("Failed to load script: #{path}"))
         document.body.appendChild(script)
 
 loadPlugin = (pluginPath) ->
@@ -108,29 +113,66 @@ mainLoad = ->
             .then(() => loadApp(emojisPromise))
 
 loadApp = (emojisPromise) ->
-    loadJS("#{window._version}/js/elements.js").then () ->
-        loadJS("#{window._version}/js/react.js").then () ->
-            loadJS("#{window._version}/js/app.js").then () ->
-                emojisPromise.then ->
-                    angular.bootstrap(document, ['taiga'])
+    # QA M-02: bootstrap resilience. The AAP requires the Web-Components bundle
+    # (elements.js) and the React bundle (react.js) to be loaded BEFORE
+    # angular.bootstrap, in that order (see §0.6.1). Both are OPTIONAL enhancement
+    # bundles, though — only app.js is required for the AngularJS shell and every
+    # legacy (non-migrated) screen. The original chain had NO error handling, so a
+    # failure to load react.js (or elements.js) rejected the whole chain and
+    # angular.bootstrap never ran, blanking the ENTIRE application. Here the two
+    # optional bundles are loaded best-effort (log + continue on error) while the
+    # load ORDER is preserved, so a missing/broken React bundle degrades to
+    # "Kanban/Backlog unavailable" instead of a dead app. app.js remains mandatory;
+    # if it (or the bootstrap itself) fails, a single diagnosable fatal error is
+    # logged rather than failing silently.
+    loadOptional = (path, label) ->
+        loadJS(path).catch (err) ->
+            msg = "[app-loader] Failed to load #{label} (#{path}). " +
+                "The AngularJS application will still start; " +
+                "features provided by #{label} will be unavailable."
+            console.error(msg, err)
+            return
 
-promise = fetch "conf.json"
-promise
-.then((response) => response.json())
-.then (data) ->
-    window.taigaConfig = Object.assign({}, window.taigaConfig, data)
+    # Emoji data is cosmetic; guard it so a transient failure cannot block the
+    # bootstrap (the original `emojisPromise.then` would have swallowed bootstrap
+    # on an emoji-fetch rejection — the same class of blank-app bug as M-02).
+    safeEmojis = emojisPromise.catch (err) ->
+        console.error("[app-loader] Emoji data failed to load; continuing without it.", err)
+        return
 
-    base = document.querySelector('base')
+    loadOptional("#{window._version}/js/elements.js", "elements.js (Web Components)")
+        .then(-> loadOptional("#{window._version}/js/react.js", "react.js (React Kanban/Backlog screens)"))
+        .then(-> loadJS("#{window._version}/js/app.js"))
+        .then(-> safeEmojis)
+        .then(-> angular.bootstrap(document, ['taiga']))
+        .catch (err) ->
+            msg = "[app-loader] Failed to load the core application bundle " +
+                "(app.js) or to bootstrap AngularJS; the application cannot start."
+            console.error(msg, err)
 
-    if base && window.taigaConfig.baseHref
-        base.setAttribute("href", window.taigaConfig.baseHref)
-    else if !base && window.taigaConfig.baseHref
-        base = document.createElement('base')
-        base.setAttribute("href", window.taigaConfig.baseHref)
-        document.head.appendChild(base)
+# QA M-03: attach the fallback `.catch` to the END of the promise chain rather
+# than to the raw `fetch` promise. The original `promise.catch(...)` was bound to
+# the un-chained `fetch` result, so it only caught network/fetch rejections — a
+# malformed conf.json that made `response.json()` throw produced an UNHANDLED
+# rejection in the `.then(...).then(...)` branch and `mainLoad()` never ran,
+# blanking the app. Chaining the catch here makes BOTH a failed fetch AND a
+# JSON-parse error fall back to `mainLoad()`, which boots the application with the
+# built-in default `window.taigaConfig`.
+fetch("conf.json")
+    .then((response) => response.json())
+    .then (data) ->
+        window.taigaConfig = Object.assign({}, window.taigaConfig, data)
 
-    mainLoad()
+        base = document.querySelector('base')
 
-promise.catch () ->
-    console.error "Your conf.json file is not a valid json file, please review it."
-    mainLoad()
+        if base && window.taigaConfig.baseHref
+            base.setAttribute("href", window.taigaConfig.baseHref)
+        else if !base && window.taigaConfig.baseHref
+            base = document.createElement('base')
+            base.setAttribute("href", window.taigaConfig.baseHref)
+            document.head.appendChild(base)
+
+        mainLoad()
+    .catch (err) ->
+        console.error("Your conf.json file is not a valid json file, please review it.", err)
+        mainLoad()

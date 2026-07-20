@@ -708,6 +708,20 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
                 const index = draft.userstories.findIndex((u) => u.id === action.usId);
                 if (index > -1) {
                     draft.userstories.splice(index, 1);
+                    // N-03 (stale "N stories" header after delete): SYMMETRIC with
+                    // `addUsOptimistic`'s `totalUserStories += clones.length` above.
+                    // The backlog header renders `totalUserStories` (the pagination
+                    // total established at load), NOT `userstories.length`. A
+                    // successful optimistic delete removes exactly one backlog story,
+                    // so the total must shrink by one IN STEP with the list splice —
+                    // otherwise the header count stays stale (e.g. "14 stories") until
+                    // a full reload, because the delete success path reloads only
+                    // sprints + stats and never refetches the paginated userstories
+                    // list (useBacklog.deleteUs). On a delete FAILURE the hook
+                    // reconciles via `reloadUserstories({ reset: true })`, which
+                    // re-establishes both the list and `totalUserStories` from the
+                    // authoritative `x-pagination-count` header. Clamp at 0.
+                    draft.totalUserStories = Math.max(0, draft.totalUserStories - 1);
                 }
                 recomputeBacklogDerived(draft);
                 break;

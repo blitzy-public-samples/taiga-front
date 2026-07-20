@@ -329,7 +329,21 @@ export const Card = forwardRef<HTMLElement, CardProps>(function Card(
         return (
             <div className="card-epics">
                 {epics.map((epic, index) => (
-                    <a className="card-epic" key={epic.id} href={epicHref(epic.ref)}>
+                    // N-11 (a11y name): give EVERY epic link an accessible name.
+                    // Only the first epic at zoomLevel > 0 renders the visible
+                    // `.epic-name` text below; all other epic links (index > 0,
+                    // or any epic at zoomLevel === 0) rendered just the colour
+                    // swatch, leaving the anchor with an EMPTY accessible name
+                    // (a runtime audit found 5 such unnamed links on a sample
+                    // board). `aria-label={epic.subject}` names them all — the
+                    // same subject already used for the swatch `title` and the
+                    // visible text — without changing any layout or styling.
+                    <a
+                        className="card-epic"
+                        key={epic.id}
+                        href={epicHref(epic.ref)}
+                        aria-label={epic.subject}
+                    >
                         <span
                             className="epic-color"
                             style={{ backgroundColor: epic.color }}

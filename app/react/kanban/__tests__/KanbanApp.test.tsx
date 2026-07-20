@@ -80,6 +80,9 @@ import { useKanbanBoard } from '../state/useKanbanBoard';
 import { useResolvedProjectId } from '../../shared/useResolvedProjectId';
 import { filtersData, createUserStory } from '../../shared/api/userstories';
 import { makeProject, makeStatus, makeSwimlane, makeUserStory, makeBoardCard, makeUsMap } from './factories';
+// N-01: assert the move-to-top reorder maps a null swimlane to the synthetic
+// unclassified id, so the test references the SAME constant the container does.
+import { UNCLASSIFIED_SWIMLANE_ID } from '../state/boardReducer';
 
 import type { UseKanbanBoardResult } from '../state/useKanbanBoard';
 
@@ -544,6 +547,10 @@ describe('KanbanApp', () => {
       const section = container.querySelector('section.main.kanban');
       expect(section).not.toBeNull();
       expect(section?.classList.contains('swimlane')).toBe(false);
+      // N-11 (a11y landmark): the board section is the page's `main` landmark.
+      // "main" was previously only a SCSS class; `role="main"` now exposes it as
+      // the single main landmark so screen readers can jump to the board.
+      expect(section?.getAttribute('role')).toBe('main');
 
       // Header + actions + option groups + filter button.
       expect(container.querySelector('.kanban-header')).not.toBeNull();
@@ -1134,6 +1141,87 @@ describe('KanbanApp', () => {
       expect(board.reload).not.toHaveBeenCalled();
     });
 
+    /*
+     * N-02 — a BLOCKED / OFFLINE single-"+" create surfaces a SANITIZED,
+     * user-facing error toast instead of a silent unhandled rejection.
+     *
+     * `createUserStory` (POST /userstories) rejects with a raw
+     * `TypeError: Failed to fetch` when the network is offline or the request
+     * is blocked (the api client only wraps `!response.ok` responses, never
+     * network-layer failures). Previously the container's fire-and-forget create
+     * had NO `catch`, so the rejection became an unhandled promise rejection with
+     * zero user feedback. The fix routes it into the shared `NotificationError`
+     * banner (the SAME red toast used for a failed drag reorder), echoing the
+     * subject (React-escaped, XSS-safe) so the user knows what failed and can
+     * retry. The `finally` reload still reconciles the board with server truth
+     * (no partial write occurred).
+     */
+    it('"+" surfaces a sanitized, dismissible error toast when the create is blocked/offline, and still reloads', async () => {
+      const board = primeAddBoard();
+      const SUBJECT = 'BLITZY offline story';
+      promptSpy = jest.spyOn(window, 'prompt').mockReturnValue(SUBJECT);
+      // Model a network-layer failure: fetch rejects (not an ApiError).
+      mockCreateUserStory.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+      const { container } = await renderApp();
+      const header = container.querySelector('.task-colum-name') as HTMLElement;
+      const addBtn = within(header).getByTitle('Add new user story');
+
+      // No error toast before the attempt.
+      expect(container.querySelector('.notification-message-error')).toBeNull();
+
+      await act(async () => {
+        fireEvent.click(addBtn);
+        // Settle: await createUserStory() rejects -> catch(setState) -> finally(reload).
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // The create was attempted with the frozen contract...
+      expect(mockCreateUserStory).toHaveBeenCalledTimes(1);
+      // ...and the failure produced a SANITIZED, dismissible alert echoing the
+      // subject (announced via role="alert"), not a raw "Failed to fetch".
+      const toast = container.querySelector('.notification-message-error');
+      expect(toast).not.toBeNull();
+      expect(toast).toHaveAttribute('role', 'alert');
+      const alertText = screen.getByRole('alert').textContent ?? '';
+      expect(alertText).toContain('Could not create the user story');
+      expect(alertText).toContain(SUBJECT);
+      expect(alertText).toContain('Please try again.');
+      expect(alertText).not.toContain('Failed to fetch');
+      // The board still reconciles with server truth (parity with other error paths).
+      expect(board.reload).toHaveBeenCalledTimes(1);
+
+      // The toast is user-dismissible (clears the create-error state).
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }));
+      });
+      expect(container.querySelector('.notification-message-error')).toBeNull();
+    });
+
+    it('"+" shows NO error toast on a successful create (only the reload runs)', async () => {
+      const board = primeAddBoard();
+      promptSpy = jest.spyOn(window, 'prompt').mockReturnValue('BLITZY happy story');
+      mockCreateUserStory.mockResolvedValueOnce({} as never);
+
+      const { container } = await renderApp();
+      const header = container.querySelector('.task-colum-name') as HTMLElement;
+      const addBtn = within(header).getByTitle('Add new user story');
+
+      await act(async () => {
+        fireEvent.click(addBtn);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockCreateUserStory).toHaveBeenCalledTimes(1);
+      // Success surfaces no error banner; the board reloads to show the new card.
+      expect(container.querySelector('.notification-message-error')).toBeNull();
+      expect(board.reload).toHaveBeenCalledTimes(1);
+    });
+
     it('"+=" opens the hosted bulk-create lightbox pre-selecting the clicked status, and closes on success/cancel', async () => {
       primeAddBoard();
 
@@ -1177,6 +1265,163 @@ describe('KanbanApp', () => {
   });
 
   /*
+   * N-01 — bulk-create POSITION is honored (top vs bottom).
+   *
+   * The hosted `BulkCreateUsLightbox` resolves `onSuccess(result, position)`
+   * with the created stories AND the user's chosen placement ('top' | 'bottom').
+   * The backend `bulk_create` ALWAYS appends at the BOTTOM (it accepts no
+   * position), so honoring "top" requires a follow-up reorder — exactly what the
+   * AngularJS `usform:bulk:success` handler did: on `position == 'top'` it called
+   * `moveUsToTop(uss)` which PERSISTED a reorder via `bulk_update_kanban_order`
+   * (kanban/main.coffee:197-206, moveUsToTop 160-184). The React container's
+   * `handleBulkSuccess` reproduces this: for 'top' with a non-empty column it
+   * finds the column's current first card as the anchor and calls
+   * `board.move(createdIds, status, swimlaneArg, 0, null, anchor)` (the same
+   * primitive + column-read as the sibling `handleMoveToTop`), then reloads; for
+   * 'bottom', or an empty column, it just reloads (the stories are already where
+   * the reload will render them). The QA finding was that the container DISCARDED
+   * both `result` and `position` and only reloaded, silently dropping "top".
+   */
+  describe('bulk-create position honored (N-01)', () => {
+    // Prime a loaded, NO-swimlane board with a single status (100 "New") that
+    // already holds one card (id 1) — so "top" has an anchor to insert before.
+    function primeBulkBoard(): UseKanbanBoardResult {
+      const s100 = makeStatus({ id: 100, name: 'New', order: 1, is_archived: false });
+      const card = makeBoardCard({ model: makeUserStory({ id: 1, status: 100, swimlane: null }) });
+      return primeBoard({
+        project: makeProject({ my_permissions: ['view_us', 'add_us', 'modify_us'] }),
+        initialLoad: true,
+        usStatusList: [s100],
+        usByStatus: { '100': [1] },
+        swimlanesList: [],
+        usMap: makeUsMap([card]),
+      });
+    }
+
+    it("position 'top' with an existing card PERSISTS a move-to-top before the anchor, then reloads", async () => {
+      const board = primeBulkBoard();
+      await renderApp();
+
+      // Two stories bulk-created into status 100 (unclassified swimlane).
+      const result = [
+        makeUserStory({ id: 900, status: 100, swimlane: null }),
+        makeUserStory({ id: 901, status: 100, swimlane: null }),
+      ];
+
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess(result, 'top');
+        // Settle move() -> .then(reload).
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // Reorder persisted with BOTH created ids, above the column's current
+      // first card (anchor id 1), at index 0, with the null swimlane mapped to
+      // the synthetic unclassified id (-1) — byte-for-byte the move-to-top shape.
+      expect(board.move).toHaveBeenCalledTimes(1);
+      expect(board.move).toHaveBeenCalledWith(
+        [900, 901],
+        100,
+        UNCLASSIFIED_SWIMLANE_ID,
+        0,
+        null,
+        1,
+      );
+      // Board reconciled with server truth after the move resolves.
+      expect(board.reload).toHaveBeenCalledTimes(1);
+      // The bulk lightbox is closed (bulkStatusId reset to null).
+      expect(mockCaptured.bulkLightbox.open).toBe(false);
+    });
+
+    it("position 'top' into an EMPTY column skips the reorder and just reloads (parity: moveUsToTop no-ops with no anchor)", async () => {
+      const s100 = makeStatus({ id: 100, name: 'New', order: 1, is_archived: false });
+      const board = primeBoard({
+        project: makeProject({ my_permissions: ['view_us', 'add_us', 'modify_us'] }),
+        initialLoad: true,
+        usStatusList: [s100],
+        usByStatus: { '100': [] }, // empty column -> no anchor
+        swimlanesList: [],
+        usMap: {},
+      });
+      await renderApp();
+
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess(
+          [makeUserStory({ id: 900, status: 100, swimlane: null })],
+          'top',
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("position 'bottom' never reorders — it only reloads (backend already appended at bottom)", async () => {
+      const board = primeBulkBoard();
+      await renderApp();
+
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess(
+          [makeUserStory({ id: 900, status: 100, swimlane: null })],
+          'bottom',
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("position 'top' on a SWIMLANE board reads the swimlane grouping for the anchor and targets that lane", async () => {
+      const s100 = makeStatus({ id: 100, name: 'New', order: 1, is_archived: false });
+      const sw10 = makeSwimlane({ id: 10, name: 'Swimlane A', order: 1 });
+      const card = makeBoardCard({ model: makeUserStory({ id: 1, status: 100, swimlane: 10 }) });
+      const board = primeBoard({
+        project: makeProject({ my_permissions: ['view_us', 'add_us', 'modify_us'] }),
+        initialLoad: true,
+        usStatusList: [s100],
+        swimlanesList: [sw10],
+        swimlanesStatuses: { '10': [s100] },
+        usByStatus: { '100': [1] },
+        usByStatusSwimlanes: { '10': { '100': [1] } },
+        usMap: makeUsMap([card]),
+      });
+      await renderApp();
+
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess(
+          [makeUserStory({ id: 900, status: 100, swimlane: 10 })],
+          'top',
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // Anchor resolved from usByStatusSwimlanes['10']['100'][0] === 1, and the
+      // classified swimlane (10) is passed through unchanged.
+      expect(board.move).toHaveBeenCalledTimes(1);
+      expect(board.move).toHaveBeenCalledWith([900], 100, 10, 0, null, 1);
+      expect(board.reload).toHaveBeenCalledTimes(1);
+    });
+
+    it("an EMPTY result array is a safe no-op reload regardless of position", async () => {
+      const board = primeBulkBoard();
+      await renderApp();
+
+      await act(async () => {
+        mockCaptured.bulkLightbox.onSuccess([], 'top');
+        await Promise.resolve();
+      });
+
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /*
    * F-CQ-02 — the five card/board controls split into TWO groups by what the
    * legacy `KanbanController` OWNED:
    *   - DELETE is OWNED: the controller called `@repo.remove(model)` directly
@@ -1190,34 +1435,61 @@ describe('KanbanApp', () => {
    *     the file manifest (§0.4.1), so these stay permission-gated no-ops and the
    *     board reflects their outcome only through the events bridge.
    */
-  describe('card action callbacks — DELETE owned; EDIT / ASSIGN delegated', () => {
+  describe('card action callbacks — DELETE owned; EDIT / ASSIGN route to US detail (M-11/M-12)', () => {
     let confirmSpy: jest.SpyInstance;
-    afterEach(() => {
-      confirmSpy?.mockRestore();
+    // M-11 / M-12: "Edit card" and "Assign To" navigate to the shell-owned US
+    // detail screen via `navigateToUserStoryDetail` -> `window.location.href`.
+    // jsdom does not implement navigation, so replace `location` with a writable
+    // stub we can ASSERT against, restored after each test so it never leaks into
+    // later specs in this file. (Same pattern as `client.test.ts`.)
+    let savedLocationDescriptor: PropertyDescriptor | undefined;
+    const INITIAL_HREF = 'http://localhost/kanban';
+
+    beforeEach(() => {
+      savedLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        writable: true,
+        value: {
+          href: INITIAL_HREF,
+          origin: 'http://localhost',
+          pathname: '/kanban',
+          search: '',
+          hash: '',
+          assign() {},
+          replace() {},
+        },
+      });
     });
 
-    it('EDIT / ASSIGNED-TO delegate as no-ops when GRANTED (board reflects only via events bridge)', async () => {
-      // GRANT modify_us + delete_us so each handler PASSES its gate and reaches
-      // its delegation branch — the strongest path to exercise.
+    afterEach(() => {
+      confirmSpy?.mockRestore();
+      if (savedLocationDescriptor) {
+        Object.defineProperty(window, 'location', savedLocationDescriptor);
+      }
+    });
+
+    it('EDIT (M-11): GRANTED routes to the shell-owned US detail /project/:slug/us/:ref', async () => {
+      // GRANT modify_us so the handler PASSES its `canModifyUs` gate and reaches
+      // the navigation branch. `primeLoadedNoSwimlane` seeds one card (id 1,
+      // ref 1) on a project with slug "proj", so the target is
+      // `/project/proj/us/1` — byte-for-byte the card title link (`Card.tsx`
+      // usHref), i.e. the shell-owned detail screen that OWNS editing.
       const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us', 'delete_us'] });
       await renderApp();
 
       const col = mockCaptured.column[0];
       expect(typeof col.onClickEdit).toBe('function');
-      expect(typeof col.onClickAssignedTo).toBe('function');
       expect(typeof col.onToggleFold).toBe('function');
 
-      // EDIT / ASSIGN open the COMMON module's `genericform:edit` /
-      // `tg-lb-select-user` dialogs (AAP §0.2.2 OOS; §0.4.1 defines no Kanban
-      // edit/assignee component). Even with permissions GRANTED they SAFELY
-      // DELEGATE — they neither throw NOR mutate the board themselves; the board
-      // changes only when a lightbox SUCCESS event arrives through the bridge.
-      expect(() => {
-        act(() => {
-          col.onClickEdit(1);
-          col.onClickAssignedTo(1);
-        });
-      }).not.toThrow();
+      act(() => {
+        col.onClickEdit(1);
+      });
+
+      // Navigated to the detail screen (resolving the human `ref` from usMap),
+      // and did NOT mutate the board itself (persistence + reflection are owned
+      // by the detail screen + events bridge).
+      expect(window.location.href).toBe('/project/proj/us/1');
       expect(board.deleteUserStory).not.toHaveBeenCalled();
       expect(board.move).not.toHaveBeenCalled();
       expect(board.reload).not.toHaveBeenCalled();
@@ -1226,12 +1498,33 @@ describe('KanbanApp', () => {
       expect(board.hideArchivedStatus).not.toHaveBeenCalled();
     });
 
-    it('EDIT / ASSIGNED-TO stay side-effect-free when DENIED (permission gate holds)', async () => {
+    it('ASSIGN-TO (M-12): GRANTED routes to the same shell-owned US detail screen', async () => {
+      // DEVIATION (documented): "Assign To" consolidates onto the US detail
+      // screen because the `tg-lb-select-user` inline picker is common-module
+      // OOS (AAP §0.2.2 / §0.4.1) — so it navigates to the same
+      // `/project/:slug/us/:ref` as Edit.
+      const board = primeLoadedNoSwimlane({ my_permissions: ['view_us', 'modify_us', 'delete_us'] });
+      await renderApp();
+
+      const col = mockCaptured.column[0];
+      expect(typeof col.onClickAssignedTo).toBe('function');
+
+      act(() => {
+        col.onClickAssignedTo(1);
+      });
+
+      expect(window.location.href).toBe('/project/proj/us/1');
+      expect(board.deleteUserStory).not.toHaveBeenCalled();
+      expect(board.move).not.toHaveBeenCalled();
+      expect(board.reload).not.toHaveBeenCalled();
+    });
+
+    it('EDIT / ASSIGNED-TO do NOT navigate and stay side-effect-free when DENIED (permission gate holds)', async () => {
       // DENY: the default project grants only `view_us` (no modify_us), so both
-      // handlers short-circuit at their gate. The columns still RECEIVE the
-      // handlers (the gate lives INSIDE the container handler, reproducing the
-      // SOURCE `canModifyUs` check), so this asserts the gate holds AND denial is
-      // side-effect-free.
+      // handlers short-circuit at their `canModifyUs` gate BEFORE navigating.
+      // The columns still RECEIVE the handlers (the gate lives INSIDE the
+      // container handler, reproducing the SOURCE `canModifyUs` check), so this
+      // asserts the gate holds AND denial neither navigates NOR mutates.
       const board = primeLoadedNoSwimlane(); // my_permissions === ['view_us']
       await renderApp();
 
@@ -1245,6 +1538,8 @@ describe('KanbanApp', () => {
           col.onClickAssignedTo(1);
         });
       }).not.toThrow();
+      // href UNCHANGED — the gate short-circuited before navigation.
+      expect(window.location.href).toBe(INITIAL_HREF);
       expect(board.deleteUserStory).not.toHaveBeenCalled();
       expect(board.move).not.toHaveBeenCalled();
       expect(board.reload).not.toHaveBeenCalled();

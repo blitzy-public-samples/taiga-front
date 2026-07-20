@@ -142,14 +142,20 @@ The migrated Kanban and Backlog screens are React 18; every other screen is stil
 
     **Visual evidence** (before/after) is committed under
     `e2e-react/artifacts/{baseline,react}/` — curated screenshots, seed-data
-    fingerprints, and manifests. Captures are **non-mutating** (lightboxes are
-    opened then cancelled, drags are released at their origin, deletes are
-    dismissed) so the seed-once database is preserved byte-for-byte identical
-    across both passes; see `e2e-react/artifacts/README.md` for the two-phase
-    workflow, the fingerprint proof, and the secret-free artifact policy
-    (tracing is disabled, no traces/videos are committed). The specs use
-    phase-aware selectors so the baseline pass targets the AngularJS DOM and the
-    React pass targets the migrated React DOM.
+    fingerprints, manifests, and the curated Kanban/Backlog screen **recordings**
+    (`artifacts/<phase>/recordings/*.webm`, promoted from the run by the
+    Playwright global teardown `e2e-react/global-teardown.ts`). Captures are
+    **non-mutating** (lightboxes are opened then cancelled, drags are released at
+    their origin, deletes are dismissed) so the seed-once database is preserved
+    byte-for-byte identical across both passes; see
+    `e2e-react/artifacts/README.md` for the two-phase workflow, the fingerprint
+    proof, and the secret-free artifact policy. That policy keeps **tracing
+    disabled**, so no request/response trace (which would bundle the JWT and the
+    `X-Session-Id` header) is ever committed; the committed evidence is the
+    screenshots (the password field renders masked) plus the secret-free curated
+    `recordings/` videos — the raw per-run `output/` tree stays git-ignored. The
+    specs use phase-aware selectors so the baseline pass targets the AngularJS
+    DOM and the React pass targets the migrated React DOM.
 
     **Live-stack runtime validation** (post-migration): after the Docker image is
     rebuilt from source and the stack is up on port 9000, validate the migrated
@@ -172,7 +178,7 @@ The migrated Kanban and Backlog screens are React 18; every other screen is stil
 
     ```
     protractor conf.e2e.js --suite=auth     # To tests authentication
-    protractor conf.e2e.js --suite=auth,public,wiki,admin,issues,epics,tasks,userProfile,userStories,home,projectHome,search,team,discover     # To test all the platform authenticated
+    protractor conf.e2e.js --suite=auth,public,wiki,admin,issues,epics,tasks,userProfile,userStories,home,projectHome,search,team,discover,createProject,transferProject     # To test all the platform authenticated
     ```
 
     The Protractor harness (`conf.e2e.js`, `run-e2e.js`) and the 16 remaining
@@ -182,3 +188,13 @@ The migrated Kanban and Backlog screens are React 18; every other screen is stil
     from `e2e/helpers/index.js` and the target mappings retired from
     `conf.e2e.js` / `run-e2e.js`. Those two screens are now covered by the React
     Playwright layer above.
+
+    > **Note on suite coverage.** `conf.e2e.js` also defines the `createProject`
+    > and `transferProject` suites (both the suite mappings and their spec files
+    > are retained unchanged), so they are runnable directly — e.g.
+    > `protractor conf.e2e.js --suite=createProject`. The convenience
+    > `node run-e2e.js` wrapper iterates a hardcoded subset that does **not**
+    > include `createProject` / `transferProject`; run those two through
+    > `conf.e2e.js` directly. `run-e2e.js` is left unchanged deliberately, per the
+    > migration's minimal-change scope (only the Kanban/Backlog mappings were
+    > retired from the harness).

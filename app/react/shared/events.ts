@@ -65,9 +65,16 @@
  *   2. Subscriptions are ref-counted per routing key via a
  *      `Map<routingKey, Set<callback>>` so the Kanban and Backlog screens can
  *      both listen to the same key. The `subscribe` frame is emitted once (first
- *      listener) and the `unsubscribe` frame once (last listener leaves), so the
- *      backend still sees exactly one subscription per key — the wire protocol
- *      is unchanged.
+ *      listener). An `unsubscribe` frame is emitted (deferred to a microtask,
+ *      re-gated on the socket still being OPEN) when a key's last listener
+ *      leaves WHILE other keys remain; when the last listener across ALL keys
+ *      leaves the socket is closed instead, which the backend treats as an
+ *      implicit unsubscribe of every key on the connection (identical to a
+ *      browser-tab close). Either way the backend sees exactly one subscription
+ *      per key and the wire frames are unchanged — see M-09 in
+ *      {@link EventsBridge.removeSubscription} for why a multi-key teardown that
+ *      ends by closing the socket must NOT precede that close with `unsubscribe`
+ *      frames (it otherwise crashes `taiga-events`).
  *   3. `subscribe`/`unsubscribe` are NOT gated on the transient `error` flag (as
  *      `events.coffee:196,220` are). React registers the local handler and
  *      queues the frame regardless, so a board that subscribes during a
@@ -710,21 +717,53 @@ class EventsBridge {
     }
 
     /**
-     * Remove one listener for a key and, when the last listener for that key is
-     * gone, emit the `unsubscribe` frame (`events.coffee:225-230`) and drop the
-     * key locally.
+     * Remove one listener for a key. When that key loses its last listener the
+     * key is dropped locally; the `unsubscribe` wire frame
+     * (`events.coffee:225-230`) is emitted only in the case described below.
      *
-     * F-AAP-04: additionally, once the last listener across ALL keys is gone,
-     * fully tear the connection down via {@link disconnect}. Without this the
-     * socket, the heartbeat interval, any pending reconnect timer and the
-     * outbound message queue would all survive with zero subscribers — the
-     * resource leak flagged in the review. The `unsubscribe` frame is enqueued
-     * (and flushed synchronously if the socket is OPEN) BEFORE the teardown
-     * closes the socket, so it still reaches the wire in the normal case; if the
-     * socket was never open the server has no subscription for us anyway and the
-     * subsequent `close` cleans up server-side. The next {@link subscribe} then
-     * opens a fresh socket because {@link disconnect} resets the `started`
-     * latch.
+     * F-AAP-04: once the last listener across ALL keys is gone, fully tear the
+     * connection down via {@link disconnect}. Without this the socket, the
+     * heartbeat interval, any pending reconnect timer and the outbound message
+     * queue would all survive with zero subscribers — the resource leak flagged
+     * in the review. The next {@link subscribe} then opens a fresh socket
+     * because {@link disconnect} resets the `started` latch.
+     *
+     * M-09 (Integration / Availability — a last-listener `unsubscribe` frame
+     * terminates the external `taigaio/taiga-events` service). `taiga-events`
+     * services each `unsubscribe` with an ASYNCHRONOUS RabbitMQ queue-unbind;
+     * closing the socket while any such unbind reply is still in flight orphans
+     * it, raising an unhandled `Channel ended, no reply will be forthcoming`
+     * rejection that crashes the events process (RestartPolicy `no` → it does
+     * not come back). Reproduced 4× in QA and again during this fix (exit 1).
+     *
+     * The screens this migration ships ALWAYS unsubscribe a project's three keys
+     * (userstories / milestones / projects) together on unmount, so a naive
+     * "send `unsubscribe` whenever another key still remains" is NOT enough: the
+     * first two removals would each fire a frame synchronously and the third
+     * would close the socket, reproducing the very `unsubscribe…unsubscribe…close`
+     * sequence that crashes the service. The fix therefore has two parts:
+     *
+     *   1. LAST listener across ALL keys → skip the frame entirely and let
+     *      {@link disconnect}'s socket close drop every binding server-side.
+     *      Closing the WebSocket is the canonical, backend-supported teardown —
+     *      exactly what a browser-tab close does, which the service handles
+     *      gracefully.
+     *   2. A key that empties while OTHER keys remain → the `unsubscribe` frame
+     *      is still the correct wire action (stop this key while the others keep
+     *      streaming), but it is DEFERRED to a microtask and re-gated on the
+     *      socket still being OPEN. In the real multi-key teardown the third
+     *      removal closes the socket synchronously BEFORE any deferred frame
+     *      runs, so every deferred frame is suppressed and the wire shows only a
+     *      clean close — no `unsubscribe`-then-close race. In a genuine PARTIAL
+     *      unsubscribe (some keys stay subscribed, socket stays open) the frame
+     *      is sent, and because the socket remains open the backend's unbind
+     *      reply is delivered normally. The deferred send is also suppressed if
+     *      the key was re-subscribed before the microtask ran (unsub→resub race).
+     *
+     * No frame SHAPE changes; React simply stops emitting the one temporal
+     * pattern (unsubscribe-immediately-then-close) that AngularJS never
+     * produces, making React traffic MORE indistinguishable from AngularJS, not
+     * less (AAP §0.1.1 / §0.6.1 WebSocket contract preserved).
      */
     private removeSubscription(routingKey: string, callback: EventCallback): void {
         const handlers = this.subscriptions.get(routingKey);
@@ -734,20 +773,55 @@ class EventsBridge {
 
         handlers.delete(callback);
 
-        if (handlers.size === 0) {
-            this.subscriptions.delete(routingKey);
-            // Drop the retained options in lock-step so a later reconnect never
-            // resurrects a subscription whose last listener has left.
-            this.subscriptionOptions.delete(routingKey);
-            this.sendMessage({
-                cmd: 'unsubscribe',
-                routing_key: routingKey,
-            });
+        // Other listeners for this key remain — nothing to unsubscribe yet.
+        if (handlers.size !== 0) {
+            return;
         }
 
+        // This key just lost its last listener: drop it (and its retained
+        // options in lock-step so a reconnect never resurrects a subscription
+        // whose last listener has left).
+        this.subscriptions.delete(routingKey);
+        this.subscriptionOptions.delete(routingKey);
+
         if (!this.hasSubscriptions()) {
+            // M-09 part 1 — LAST listener across ALL keys: close the socket
+            // WITHOUT emitting a per-key `unsubscribe` frame. The close itself
+            // drops every binding on the connection server-side; emitting a
+            // frame first and then closing crashes `taiga-events` (see doc).
             this.disconnect();
+            return;
         }
+
+        // M-09 part 2 — other keys still have listeners, so the socket will stay
+        // open. Emit `unsubscribe` for this one key, but DEFER it to a microtask
+        // and re-gate on the socket still being OPEN (and the key not having been
+        // re-subscribed) so a synchronous multi-key teardown that ends by closing
+        // the socket suppresses the frame instead of racing a close against its
+        // async unbind reply.
+        queueMicrotask((): void => {
+            if (this.isSocketOpen() && !this.subscriptions.has(routingKey)) {
+                this.sendMessage({
+                    cmd: 'unsubscribe',
+                    routing_key: routingKey,
+                });
+            }
+        });
+    }
+
+    /**
+     * @returns `true` only while the underlying socket exists and is genuinely
+     *          OPEN (the exact precondition {@link flush} uses before writing).
+     *          Used by {@link removeSubscription} to suppress a deferred
+     *          `unsubscribe` frame once a concurrent teardown has closed the
+     *          socket (M-09).
+     */
+    private isSocketOpen(): boolean {
+        return (
+            this.ws !== undefined &&
+            this.connected &&
+            this.ws.readyState === WebSocket.OPEN
+        );
     }
 
     /* -------------------------------------------------------------------- *

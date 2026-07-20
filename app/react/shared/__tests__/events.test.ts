@@ -12,7 +12,11 @@
  *   - the socket opens lazily on the first subscribe and the `subscribe` frame
  *     is emitted after `open` (behind the auth frame);
  *   - the socket is CLOSED and the heartbeat STOPPED once the last subscriber
- *     across all keys leaves, with the `unsubscribe` frame flushed first;
+ *     across all keys leaves, WITHOUT emitting an `unsubscribe` frame first —
+ *     the close is the server-side teardown and preceding it with `unsubscribe`
+ *     crashes `taiga-events` ("Channel ended, no reply will be forthcoming",
+ *     M-09); a per-key `unsubscribe` is only emitted (deferred, socket-open
+ *     gated) when a key empties while OTHER keys keep the socket open;
  *   - a reconnect scheduled by a socket error is CANCELLED by the final
  *     unsubscribe, so no zombie socket is reopened later (the core leak);
  *   - a `close` event can no longer resurrect the socket after teardown;
@@ -275,17 +279,22 @@ describe('events bridge — connect / subscribe', () => {
 
 // ===========================================================================
 describe('events bridge — teardown at zero subscribers (F-AAP-04)', () => {
-    it('closes the socket, stops the heartbeat and flushes unsubscribe when the last subscriber leaves', () => {
+    it('closes the socket and stops the heartbeat when the last subscriber leaves, WITHOUT sending an unsubscribe frame first (M-09)', () => {
         const unsubscribe = subscribe('changes.project.42.userstories', jest.fn());
         const ws = latestSocket();
         ws.emitOpen(); // starts the heartbeat
 
         unsubscribe();
 
-        // The unsubscribe frame went out on the still-open socket BEFORE close.
-        expect(sentCmds(ws)).toContain('unsubscribe');
-        const unsubFrame = sentFrames(ws).find((f) => f.cmd === 'unsubscribe');
-        expect(unsubFrame).toEqual({ cmd: 'unsubscribe', routing_key: 'changes.project.42.userstories' });
+        // M-09: on the last-listener path NO `unsubscribe` frame is emitted — the
+        // socket close itself drops the binding server-side. Emitting
+        // `unsubscribe` and then closing immediately orphans the backend's async
+        // RabbitMQ unbind reply and crashes taiga-events ("Channel ended, no
+        // reply will be forthcoming"). Flushing any deferred microtask must STILL
+        // produce no unsubscribe (the socket is already closed → suppressed).
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
+        jest.runAllTicks();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
 
         // Socket closed, and no timers survive (heartbeat cleared).
         expect(ws.closeCalls).toBe(1);
@@ -348,31 +357,44 @@ describe('events bridge — reference counting across keys/listeners (F-AAP-04)'
         // Dropping one key must not close the socket.
         unUs();
         expect(ws.closeCalls).toBe(0);
-        expect(jest.getTimerCount()).toBeGreaterThan(0); // heartbeat still running
+        // The heartbeat interval is still running (plus a deferred unsubscribe
+        // microtask now sits in the fake-timer queue), so the count is > 0.
+        expect(jest.getTimerCount()).toBeGreaterThan(0);
 
         // Dropping the last key tears everything down.
         unMs();
         expect(ws.closeCalls).toBe(1);
+
+        // Flush the deferred microtasks: the userstories unsubscribe scheduled by
+        // the first drop is suppressed (the socket is now closed), and no timers
+        // survive the teardown (M-09 + F-AAP-04).
+        jest.runAllTicks();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
         expect(jest.getTimerCount()).toBe(0);
     });
 
-    it('keeps the socket open until BOTH listeners on the same key unsubscribe', () => {
+    it('keeps the socket open until BOTH listeners on the same key unsubscribe, then closes WITHOUT an unsubscribe frame (M-09)', () => {
         const un1 = subscribe('changes.project.3.userstories', jest.fn());
         const un2 = subscribe('changes.project.3.userstories', jest.fn());
         const ws = latestSocket();
         ws.emitOpen();
 
+        // First listener leaving does not empty the key → no teardown, no frame.
         un1();
+        jest.runAllTicks();
         expect(ws.closeCalls).toBe(0);
         expect(sentCmds(ws)).not.toContain('unsubscribe');
 
+        // Second (last) listener leaving empties the only key → the socket is
+        // closed directly. M-09: NO `unsubscribe` frame precedes the close.
         un2();
-        expect(sentCmds(ws)).toContain('unsubscribe');
+        jest.runAllTicks();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
         expect(ws.closeCalls).toBe(1);
         expect(jest.getTimerCount()).toBe(0);
     });
 
-    it('subscribeProjectChanges tears down all of its subscriptions and closes the socket', () => {
+    it('subscribeProjectChanges tears down all three subscriptions by closing the socket, emitting NO unsubscribe frames (M-09 multi-key teardown)', () => {
         const unsubscribe = subscribeProjectChanges(42, {
             onUserstories: jest.fn(),
             onMilestones: jest.fn(),
@@ -388,8 +410,101 @@ describe('events bridge — reference counting across keys/listeners (F-AAP-04)'
         expect(subscribeCount).toBe(3);
 
         unsubscribe();
+        // This is the exact real-world teardown that crashed taiga-events: all
+        // three keys (userstories / milestones / projects) leave together. The
+        // third removal closes the socket synchronously BEFORE any deferred
+        // per-key frame runs, so every `unsubscribe` is suppressed — the wire
+        // shows a clean close, never `unsubscribe…unsubscribe…close` (M-09).
+        // Flush microtasks to prove the suppression is real, not merely pending.
+        jest.runAllTicks();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
         expect(ws.closeCalls).toBe(1);
         expect(jest.getTimerCount()).toBe(0);
+    });
+});
+
+// ===========================================================================
+// M-09 (Integration / Availability): the unsubscribe-frame-then-close temporal
+// pattern crashes the external taiga-events service ("Channel ended, no reply
+// will be forthcoming"). These tests lock in the two-part client-side fix:
+//   (a) a key that empties while OTHER keys keep the socket open still emits an
+//       `unsubscribe` frame — DEFERRED to a microtask, socket-open gated;
+//   (b) a multi-key teardown that ends by closing the socket suppresses every
+//       deferred frame, so the wire never shows unsubscribe-then-close;
+//   (c) an unsub→resub race on the same key suppresses the stale frame.
+describe('events bridge — M-09 unsubscribe-frame safety on teardown', () => {
+    it('emits a deferred unsubscribe frame for a key that empties while OTHER keys keep the socket open', () => {
+        const unUs = subscribe('changes.project.9.userstories', jest.fn());
+        subscribe('changes.project.9.milestones', jest.fn()); // keeps the socket open
+        const ws = latestSocket();
+        ws.emitOpen();
+
+        // Dropping ONE key while another remains: the frame is DEFERRED, so it is
+        // NOT on the wire synchronously.
+        unUs();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
+
+        // Once the microtask runs — and because the socket is still OPEN (the
+        // milestones listener remains) — the frame goes out exactly once.
+        jest.runAllTicks();
+        const unsub = sentFrames(ws).filter((f) => f.cmd === 'unsubscribe');
+        expect(unsub).toHaveLength(1);
+        expect(unsub[0]).toEqual({ cmd: 'unsubscribe', routing_key: 'changes.project.9.userstories' });
+
+        // The socket must NOT close (milestones is still subscribed).
+        expect(ws.closeCalls).toBe(0);
+    });
+
+    it('suppresses a deferred unsubscribe frame when a synchronous multi-key teardown closes the socket first', () => {
+        // Two keys dropped back-to-back: the second drop is the last listener and
+        // closes the socket synchronously, so the first key's deferred frame must
+        // be suppressed (this is the exact crash sequence the fix prevents).
+        const unUs = subscribe('changes.project.9.userstories', jest.fn());
+        const unMs = subscribe('changes.project.9.milestones', jest.fn());
+        const ws = latestSocket();
+        ws.emitOpen();
+
+        unUs(); // schedules a deferred unsubscribe (socket still open at this point)
+        unMs(); // last listener overall → closes the socket synchronously
+        expect(ws.closeCalls).toBe(1);
+
+        // Flushing the deferred microtask must produce NO unsubscribe (socket
+        // already closed → isSocketOpen() false → suppressed).
+        jest.runAllTicks();
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
+    });
+
+    it('suppresses a deferred unsubscribe frame when the key is re-subscribed before the microtask runs (unsub→resub race)', () => {
+        const unUs = subscribe('changes.project.9.userstories', jest.fn());
+        subscribe('changes.project.9.milestones', jest.fn()); // keeps the socket open
+        const ws = latestSocket();
+        ws.emitOpen();
+
+        unUs(); // schedules a deferred unsubscribe for userstories
+        // Re-subscribe the SAME key before the microtask runs.
+        subscribe('changes.project.9.userstories', jest.fn());
+        jest.runAllTicks();
+
+        // The stale deferred unsubscribe must be suppressed — the key is live
+        // again, so unsubscribing it would wrongly cancel the new subscription.
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
+        expect(ws.closeCalls).toBe(0);
+    });
+
+    it('unsubscribe remains idempotent and safe to call repeatedly after teardown', () => {
+        const unsubscribe = subscribe('changes.project.42.userstories', jest.fn());
+        const ws = latestSocket();
+        ws.emitOpen();
+
+        unsubscribe();
+        expect(ws.closeCalls).toBe(1);
+
+        // Calling the same unsubscribe again is a no-op: no throw, no second
+        // close, no stray frame.
+        expect(() => unsubscribe()).not.toThrow();
+        jest.runAllTicks();
+        expect(ws.closeCalls).toBe(1);
+        expect(sentCmds(ws)).not.toContain('unsubscribe');
     });
 });
 

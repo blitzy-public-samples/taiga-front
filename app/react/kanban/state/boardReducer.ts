@@ -707,6 +707,41 @@ export function reducer(state: State, action: Action): State {
                     addInternal(draft, newUss);
                 }
 
+                // QA M-24: reconcile REMOVALS. The original `eventsLoadUserstories`
+                // port only merged modified + new stories, so a user story deleted
+                // (or filtered out of the board) on the backend LINGERED on the
+                // board until a manual reload — the reported live-delete defect.
+                // The fresh list is now the COMPLETE non-archived board (M-10
+                // disabled pagination), so any raw story ABSENT from it has been
+                // removed and must be pruned. The ONE exception is a story in a
+                // reopened archived status (`archivedStatus`): those are fetched
+                // separately by `showArchivedStatus` and are intentionally NOT part
+                // of this `status__is_archived:false` list, so they must be
+                // preserved rather than pruned. This restores live-delete parity
+                // with the AngularJS board (whose sibling Backlog reconciles via a
+                // full replace) without disturbing expanded archived columns. The
+                // final `refresh(draft,false)` rebuilds `usByStatus`/swimlanes from
+                // the pruned raw list, so removing from raw/order/usMap suffices.
+                const freshIds = new Set(userstories.map((us) => us.id));
+                const removedIds = draft.userstoriesRaw
+                    .filter(
+                        (raw) =>
+                            !freshIds.has(raw.id) &&
+                            !draft.archivedStatus.includes(raw.status),
+                    )
+                    .map((raw) => raw.id);
+
+                if (removedIds.length) {
+                    const removedSet = new Set(removedIds);
+                    draft.userstoriesRaw = draft.userstoriesRaw.filter(
+                        (u) => !removedSet.has(u.id),
+                    );
+                    for (const id of removedIds) {
+                        delete draft.order[id];
+                        delete draft.usMap[id];
+                    }
+                }
+
                 refresh(draft, false);
                 break;
             }

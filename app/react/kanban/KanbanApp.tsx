@@ -51,13 +51,17 @@ import { UNCLASSIFIED_SWIMLANE_ID } from './state/boardReducer';
 // action here (it is purely presentational — "props down, events up").
 import { BulkCreateUsLightbox } from '../backlog/components/BulkCreateUsLightbox';
 import { canModifyUs, canAddUs, canMutate } from '../shared/permissions';
+// M-11 / M-12 parity fix: "Edit card" and "Assign To" route to the shell-owned
+// US detail screen (the common-module edit/assignee lightboxes are OOS — AAP
+// §0.2.2 / §0.4.1). `navigateToUserStoryDetail` centralises that navigation.
+import { navigateToUserStoryDetail } from '../shared/session';
 import { NotificationError } from '../shared/NotificationError';
 // C1 fix (dest#4): `createUserStory` powers the single "+" add; `filtersData`
 // is the pre-existing filter loader.
 import { filtersData, createUserStory } from '../shared/api/userstories';
 import { useResolvedProjectId } from '../shared/useResolvedProjectId';
 import { translate } from '../shared/i18n';
-import type { Project, Status, FiltersData, FilterOption } from '../shared/types';
+import type { Project, Status, FiltersData, FilterOption, UserStory } from '../shared/types';
 
 /*
  * The board toolbar hosts two AngularJS custom elements the retained SCSS
@@ -724,6 +728,15 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
     // lightbox pre-selects the clicked column's status; cleared on close/success.
     const [bulkStatusId, setBulkStatusId] = useState<number | null>(null);
 
+    // QA N-02 (offline/blocked single-"+" create): user-facing, SANITIZED error
+    // for a failed single-story create. Previously `handleAddNewUs` had no
+    // `catch`, so a blocked/offline `POST /userstories` surfaced only as an
+    // unhandled promise rejection ("Failed to fetch") with NO user feedback and
+    // no retry cue. This state feeds the shared `NotificationError` toast (the
+    // same red banner used for `moveError`) so a rejected create is no longer
+    // silent. Cleared at the start of each new create attempt and on dismiss.
+    const [createError, setCreateError] = useState<string | null>(null);
+
     /* ---- Multi-select + moved-card highlight ----------------------------- */
 
     const [selectedUss, setSelectedUss] = useState<Record<number, boolean>>({});
@@ -997,14 +1010,19 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canModifyUs(board.project)) {
                 return;
             }
-            // DELEGATED (deferred): the edit lightbox is the common module's
-            // `genericform:edit` directive (AAP §0.2.2 OOS; §0.4.1 defines no
-            // Kanban edit component). The controller only reacted to
-            // `usform:edit:success`; the events bridge reflects the persisted
-            // change back onto the board.
-            void usId;
+            // M-11 parity fix: the AngularJS controller opened the COMMON-module
+            // `genericform:edit` lightbox here (AAP §0.2.2 OOS; §0.4.1 defines no
+            // React Kanban edit component), then reacted to `usform:edit:success`.
+            // Rather than reproduce an out-of-scope lightbox, route to the
+            // shell-owned US DETAIL screen — the SAME destination as the card
+            // title link (`Card.tsx` `usHref`) — which owns viewing/editing; the
+            // events bridge still reflects any persisted change back onto the
+            // board. Resolve the human `ref` from the derived card (the callback
+            // receives the numeric `id`).
+            const ref = board.usMap[usId]?.model?.ref;
+            navigateToUserStoryDetail(board.project?.slug, ref);
         },
-        [board.project],
+        [board.project, board.usMap],
     );
 
     const handleClickDelete = useCallback(
@@ -1035,13 +1053,19 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             if (!canModifyUs(board.project)) {
                 return;
             }
-            // DELEGATED (deferred): the assignee picker is the common module's
-            // `tg-lb-select-user` lightbox (AAP §0.2.2 OOS; §0.4.1 defines no
-            // Kanban assignee component). The events bridge reflects the
-            // persisted assignment back onto the board.
-            void usId;
+            // M-12 parity fix: the AngularJS controller opened the COMMON-module
+            // `tg-lb-select-user` assignee lightbox here (AAP §0.2.2 OOS; §0.4.1
+            // defines no React assignee component). That lightbox is itself
+            // out-of-scope, so reproducing an inline assignee picker (the
+            // finding's literal suggestion) would pull common-module UI into
+            // scope. DEVIATION (documented): consolidate "Assign To" onto the
+            // shell-owned US DETAIL screen — the same destination as "Edit card"
+            // and the card title link — which owns assignment; the events bridge
+            // reflects the persisted assignment back onto the board.
+            const ref = board.usMap[usId]?.model?.ref;
+            navigateToUserStoryDetail(board.project?.slug, ref);
         },
-        [board.project],
+        [board.project, board.usMap],
     );
 
     const handleAddNewUs = useCallback(
@@ -1077,6 +1101,9 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
             const swimlane = Boolean(project.is_kanban_activated)
                 ? project.default_swimlane ?? null
                 : null;
+            // QA N-02: clear any stale create error so the toast reflects only
+            // the outcome of THIS attempt.
+            setCreateError(null);
             void (async () => {
                 try {
                     await createUserStory({
@@ -1085,6 +1112,17 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                         status: statusId,
                         swimlane,
                     });
+                } catch {
+                    // QA N-02 (offline/blocked create): surface a SANITIZED,
+                    // actionable, user-facing error instead of a silent unhandled
+                    // rejection ("Failed to fetch"). No internal/error details are
+                    // leaked; the subject is echoed (React-escaped) so the user
+                    // knows what failed and can retry safely. The `finally` reload
+                    // still reconciles the board with server truth (no partial
+                    // write occurred).
+                    setCreateError(
+                        `Could not create the user story “${subject}”. Please try again.`,
+                    );
                 } finally {
                     // Reload on both success and failure: on success the new card
                     // appears; on failure the board reconciles with server truth
@@ -1110,15 +1148,83 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
         [board.project],
     );
 
-    // C1 fix (dest#4): after a successful bulk create, reload the board so the
-    // new cards appear (parity with the AngularJS `usform:bulk:success` refresh)
-    // and close the lightbox. The created stories + insert position are provided
-    // by the lightbox but the Kanban board reloads wholesale (the board reducer
-    // is keyed by status/swimlane, not an append position).
-    const handleBulkSuccess = useCallback(() => {
-        setBulkStatusId(null);
-        board.reload();
-    }, [board]);
+    // C1 fix (dest#4) + QA N-01 (honor top/bottom): after a successful bulk
+    // create, close the lightbox and reload the board so the new cards appear
+    // (parity with the AngularJS `usform:bulk:success` refresh,
+    // kanban/main.coffee:197-206).
+    //
+    // N-01 parity fix: the backend `bulk_create` ALWAYS appends the new stories
+    // at the BOTTOM of the column (highest `kanban_order`). The AngularJS handler
+    // therefore honored the chosen position by calling `moveUsToTop(uss)` when
+    // `position === 'top'` (main.coffee:204-205), which PERSISTED a reorder via
+    // `bulk_update_kanban_order` (moveUsToTop 160-184 -> moveUs 596-632). The
+    // previous React handler discarded `position` entirely and only reloaded, so
+    // a "top" request silently landed the stories at the bottom.
+    //
+    // We reproduce `moveUsToTop` exactly using the documented `move()` primitive
+    // (the hook explicitly delegates move-to-top to the container — see
+    // `useKanbanBoard` KanbanBoardApi doc, "moveUsToTop -> delegated to the
+    // container; move() is the primitive"). The created stories are not yet in
+    // local board state (only a reload adds them), so we compute the anchor —
+    // the column's CURRENT first card — from the pre-reload index and move the
+    // created block before it. `move()` optimistically skips the not-yet-present
+    // created ids (`MOVE` reducer guards `if (!usModel) return`), but STILL posts
+    // `bulk_update_kanban_order` with those ids + `beforeUserstoryId = anchor`, so
+    // the reorder is PERSISTED authoritatively; the subsequent reload then renders
+    // the created cards at the top. "bottom" needs no reorder — the wholesale
+    // reload shows them exactly where `bulk_create` placed them.
+    const handleBulkSuccess = useCallback(
+        (result: UserStory[], position: 'top' | 'bottom') => {
+            setBulkStatusId(null);
+
+            if (position === 'top' && result.length > 0) {
+                // All stories in a single bulk create share the lightbox's chosen
+                // status and swimlane, so the first result is representative.
+                const first = result[0];
+                const statusId = first.status;
+                const swimlaneRaw = first.swimlane; // number | null
+
+                // Find the column's current first card — the anchor to insert
+                // BEFORE. Mirror the sibling `handleMoveToTop` column-read EXACTLY
+                // (the direct port of AngularJS `moveUsToTop`, SOURCE 172-176): a
+                // swimlane-classified story looks up its swimlane grouping, an
+                // unclassified story (swimlane null) reads the flat grouping. The
+                // reducer derives `usByStatusSwimlanes` FROM `usByStatus`
+                // (boardReducer:333), so the flat grouping is always populated.
+                const list = swimlaneRaw
+                    ? board.usByStatusSwimlanes[String(swimlaneRaw)]?.[String(statusId)]
+                    : board.usByStatus[String(statusId)];
+                const anchor = list && list.length ? list[0] : null;
+
+                // Only reorder when there is an existing card to sit above; an
+                // empty column means the created stories are already at the top
+                // after the reload (parity: moveUsToTop no-ops when `nextUsId` is
+                // null, main.coffee:183-184).
+                if (anchor != null) {
+                    const createdIds = result.map((us) => us.id);
+                    // Map a null swimlane to the synthetic unclassified id (-1) so
+                    // `move()` round-trips it back to `null` on the wire, exactly
+                    // as `handleMoveToTop` does (SOURCE 183).
+                    const swimlaneArg =
+                        swimlaneRaw == null ? UNCLASSIFIED_SWIMLANE_ID : swimlaneRaw;
+                    // Persist the move-to-top, then reload to render server truth.
+                    // `move()` never rejects (it handles its own errors + surfaces
+                    // `moveError`), but guard both settlement paths so the board is
+                    // always reconciled.
+                    void board
+                        .move(createdIds, statusId, swimlaneArg, 0, null, anchor)
+                        .then(
+                            () => board.reload(),
+                            () => board.reload(),
+                        );
+                    return;
+                }
+            }
+
+            board.reload();
+        },
+        [board],
+    );
 
     // C1 fix (dest#4): dismiss the bulk-create lightbox without creating.
     const handleCloseBulk = useCallback(() => {
@@ -1293,7 +1399,18 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
 
     return (
         <div className="wrapper">
-            <section className={sectionClass}>
+            {/*
+              N-11 (a11y landmark): the Kanban screen previously exposed NO
+              `main` landmark — its primary region was a `<section class="main
+              kanban">` whose "main" is only a SCSS class, not the `main` ARIA
+              role. (The Backlog screen already had one.) Adding `role="main"`
+              here makes the board the page's single main landmark so screen
+              readers can jump straight to it; it is behaviour-only and changes
+              no layout or styling. A document-wide audit confirmed there is no
+              other `main`/`role="main"` on the page, so this introduces no
+              duplicate-landmark violation.
+            */}
+            <section className={sectionClass} role="main">
                 {/*
                   F-AAP-03 (dest#8): dismissible error toast for a REJECTED drag
                   reorder (`bulk_update_kanban_order`). Previously `move()`
@@ -1305,6 +1422,16 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                   truth via reload-on-error).
                 */}
                 <NotificationError message={board.moveError} onClose={board.clearMoveError} />
+                {/*
+                  QA N-02: dismissible error toast for a REJECTED single-"+"
+                  create (`POST /userstories`). Previously a blocked/offline
+                  create produced only an unhandled promise rejection with NO
+                  user feedback. Reuses the identical shared error banner as the
+                  drag-reorder error above; renders nothing while `createError`
+                  is null. Dismiss clears the state (the board was already
+                  reconciled to server truth via the create flow's reload).
+                */}
+                <NotificationError message={createError} onClose={() => setCreateError(null)} />
                 <div className="kanban-header">
                     <header>
                         <h1>{SECTION_NAME}</h1>

@@ -86,3 +86,67 @@
         width: 185px;
     }
 }
+
+// -----------------------------------------------------------------------------
+// N-14 (focus fidelity): restore the board-search focus cue.
+//
+// The AngularJS shell rendered a visible teal focus cue on the board search
+// input; the migrated React `#kanban-board-search` lost it — a runtime audit
+// confirmed that focusing it left outline, box-shadow AND border-color all
+// unchanged (no focus indicator at all). This rule restores a brand-teal focus
+// ring using the existing `$color-link-primary` token. It is scoped to the id
+// `#kanban-board-search`, which exists ONLY on the React Kanban screen, so no
+// other screen is affected. Layout-neutral (border-colour change + box-shadow;
+// no size change).
+// -----------------------------------------------------------------------------
+#kanban-board-search {
+    &:focus,
+    &:focus-visible {
+        border-color: $color-link-primary;
+        box-shadow: 0 0 0 1px $color-link-primary;
+        outline: none;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// N-09 (keyboard operability): make the Kanban zoom radios keyboard-operable.
+//
+// The zoom control markup comes from the SHARED board-zoom component
+// (app/modules/components/board-zoom/board-zoom.{jade,scss}), whose
+// `.zoom-radio input { display: none }` rule removes the native radios from the
+// accessibility tree — so they can never receive focus and the arrow keys do
+// nothing. That shared SCSS is ALSO consumed by the out-of-scope Taskboard, so
+// it must not be edited. Instead we override ONLY inside the React Kanban:
+// `.kanban .zoom-radio input` (specificity 0,2,1) beats the shared
+// `.zoom-radio input` (0,1,1), and `.kanban` never matches the Taskboard's
+// `.taskboard` root — so the Taskboard is untouched.
+//
+// The radios become VISUALLY HIDDEN BUT FOCUSABLE (the standard accessible
+// pattern, mirroring the M-14 checkbox fix): they stay in the a11y tree, form a
+// real keyboard radiogroup (Tab in, Arrow keys move focus + selection, firing
+// each radio's onChange -> setZoom), while the visible `.checkmark` pill is
+// unchanged, preserving 100% visual fidelity. A brand-teal focus ring is drawn
+// on the `.checkmark` of the currently focused radio for a visible focus cue.
+// -----------------------------------------------------------------------------
+.kanban .zoom-radio {
+    position: relative;
+
+    input {
+        clip: rect(0 0 0 0);
+        display: inline-block;
+        height: 1px;
+        margin: 0;
+        opacity: 0;
+        overflow: hidden;
+        padding: 0;
+        pointer-events: none;
+        position: absolute;
+        white-space: nowrap;
+        width: 1px;
+
+        &:focus-visible ~ .checkmark {
+            outline: 2px solid $color-link-primary;
+            outline-offset: 2px;
+        }
+    }
+}

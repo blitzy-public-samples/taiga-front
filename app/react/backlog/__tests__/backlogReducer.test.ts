@@ -619,6 +619,48 @@ describe('addUsOptimistic / removeUsOptimistic', () => {
         expect(ids(state.userstories)).toEqual([10, 30]);
         expect(state.visibleUserStories).toEqual([10, 30]);
     });
+
+    it('removeUsOptimistic decrements totalUserStories by 1 so the "N stories" header updates without a reload (N-03)', () => {
+        let state = seedBacklog([
+            [10, 1],
+            [20, 2],
+            [30, 3],
+        ]);
+        // Establish the loaded pagination total exactly as the hook does from the
+        // response header — the backlog header renders THIS value, not
+        // `userstories.length`.
+        state = dispatch(state, { type: 'setPagination', totalUserStories: 3 });
+        expect(state.totalUserStories).toBe(3);
+
+        // A successful optimistic delete removes exactly one backlog story, so the
+        // header total must shrink by one immediately (3 -> 2) — symmetric with
+        // addUsOptimistic's bump — WITHOUT waiting for a full reload.
+        state = dispatch(state, { type: 'removeUsOptimistic', usId: 20 });
+        expect(state.totalUserStories).toBe(2);
+        expect(ids(state.userstories)).toEqual([10, 30]);
+    });
+
+    it('removeUsOptimistic clamps totalUserStories at 0 and never goes negative (N-03)', () => {
+        let state = seedBacklog([[10, 1]]);
+        // Total left at its initial 0 (no pagination header seen yet).
+        expect(state.totalUserStories).toBe(0);
+        state = dispatch(state, { type: 'removeUsOptimistic', usId: 10 });
+        // The story is removed, but the clamped total stays at 0 (never -1).
+        expect(ids(state.userstories)).toEqual([]);
+        expect(state.totalUserStories).toBe(0);
+    });
+
+    it('removeUsOptimistic for an unknown id leaves totalUserStories unchanged (N-03)', () => {
+        let state = seedBacklog([
+            [10, 1],
+            [20, 2],
+        ]);
+        state = dispatch(state, { type: 'setPagination', totalUserStories: 2 });
+        // No story with id 999 — nothing is removed, so the total must NOT change.
+        state = dispatch(state, { type: 'removeUsOptimistic', usId: 999 });
+        expect(ids(state.userstories)).toEqual([10, 20]);
+        expect(state.totalUserStories).toBe(2);
+    });
 });
 
 /* ========================================================================== *

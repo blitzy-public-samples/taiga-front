@@ -124,6 +124,14 @@ export default defineConfig({
   // passes never overwrite each other.
   outputDir: `artifacts/${CAPTURE_PHASE}/output`,
 
+  // M-07 (P7-EVID-01): after the run, promote the always-on `video.webm` files
+  // from the git-ignored per-test `output/` into the git-TRACKED
+  // `artifacts/<phase>/recordings/` directory, so the required committed
+  // Kanban/Backlog screen recordings actually exist in the artifact tree. Only
+  // the (secret-safe) rendered video is promoted; the raw `output/` tree and any
+  // trace bundle stay ignored. Path is relative to this config file.
+  globalTeardown: './global-teardown.ts',
+
   // Deterministic, serial execution: a single worker with a single browser instance
   // and no retries keeps the before/after captures stable and comparable.
   workers: 1,

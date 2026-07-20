@@ -585,6 +585,147 @@ describe('BacklogApp', () => {
       expect(() => renderApp()).not.toThrow();
       expect(screen.getAllByTestId('sprint')).toHaveLength(2);
     });
+
+    it('N-11: exposes a correct heading hierarchy — "Backlog" semantically level 1, "Sprints" level 2', () => {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(1),
+        sprints: [makeMilestone()],
+        totalMilestones: 1,
+      });
+
+      const { container } = renderApp();
+
+      // The primary "Backlog" heading keeps its visual <h2> tag (baseline
+      // fidelity — the SCSS + global typography style it via the tag) but is
+      // marked aria-level=1 so assistive tech sees it as the top-level heading.
+      const backlog = container.querySelector('.backlog-header-title h2') as HTMLElement;
+      expect(backlog).not.toBeNull();
+      expect(backlog.textContent).toContain('Backlog');
+      expect(backlog).toHaveAttribute('aria-level', '1');
+
+      // The "Sprints" sidebar heading keeps its visual <h1> tag but is marked
+      // aria-level=2 so it is semantically subordinate — fixing the previous
+      // out-of-order H2(Backlog) -> H1(Sprints) heading sequence with NO visual
+      // change.
+      const sprints = container.querySelector('.sprint-header h1') as HTMLElement;
+      expect(sprints).not.toBeNull();
+      expect(sprints.textContent).toContain('Sprints');
+      expect(sprints).toHaveAttribute('aria-level', '2');
+    });
+  });
+
+  /* ------------------------------------------------------------------ *
+   * Shift-range multiselect — REAL handleToggleCheck (M-14)
+   *
+   * These specs drive the container's genuine `handleToggleCheck`
+   * (captured off the mocked `BacklogTable` as `onToggleCheck`) with real
+   * `useState`/`useRef` machinery and assert the resulting `checkedIds`
+   * prop the container feeds back to the table.
+   *
+   * Runtime re-verification of M-14 surfaced a latent React-18 ordering
+   * bug: `handleToggleCheck` read the previous anchor
+   * (`lastCheckedIdRef.current`) INSIDE the `setCheckedIds` functional
+   * updater, but overwrote that same ref to the CURRENT row id in the
+   * synchronous handler body immediately after calling `setCheckedIds`.
+   * Because React runs the updater during the render phase (AFTER the
+   * handler body), the updater observed the just-overwritten value, so
+   * `from === to` and a shift-range collapsed to just the two endpoints.
+   * The mocked-table isolation lets us call the real handler directly; to
+   * make the regression DETERMINISTIC we batch the anchor toggle and the
+   * shift toggle inside a SINGLE `act(...)`. The first `setCheckedIds`
+   * marks the fiber's lanes, so the second dispatch cannot take React's
+   * eager-state fast-path and MUST defer its updater to the render phase —
+   * exactly the ordering that manifested at runtime. On the pre-fix code
+   * this yields `{first, last}`; the fix (snapshotting the anchor before
+   * `setCheckedIds`) yields the full contiguous range.
+   * ------------------------------------------------------------------ */
+  describe('shift-range multiselect via the real handleToggleCheck (M-14)', () => {
+    it('selects the FULL contiguous range on a batched anchor+shift toggle, not just the endpoints', () => {
+      const stories = makeUserStories(5); // ids/refs 1..5, in backlog order
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: stories,
+      });
+
+      renderApp();
+
+      // The mocked table received the real handler + the initial (empty) selection.
+      expect(mockCaptured.backlogTable.checkedIds).toEqual([]);
+      const onToggleCheck = mockCaptured.backlogTable.onToggleCheck as (
+        us: (typeof stories)[number],
+        checked: boolean,
+        shiftKey: boolean,
+      ) => void;
+
+      // Batch BOTH interactions in one act(): (1) plain toggle of id 1 sets the
+      // anchor, (2) shift-toggle of id 4 extends the range. Batching guarantees
+      // the second updater DEFERS (no eager fast-path), reproducing the runtime
+      // ordering the fix addresses.
+      act(() => {
+        onToggleCheck(stories[0], true, false); // anchor -> id 1
+        onToggleCheck(stories[3], true, true); // shift  -> id 4
+      });
+
+      const finalChecked = [...mockCaptured.backlogTable.checkedIds].sort(
+        (a: number, b: number) => a - b,
+      );
+      // Pre-fix bug -> [1, 4] (endpoints only). Fixed -> full range [1,2,3,4].
+      expect(finalChecked).toEqual([1, 2, 3, 4]);
+    });
+
+    it('a plain (no-shift) toggle selects exactly the one clicked row and sets the anchor', () => {
+      const stories = makeUserStories(5);
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: stories,
+      });
+
+      renderApp();
+
+      const onToggleCheck = mockCaptured.backlogTable.onToggleCheck as (
+        us: (typeof stories)[number],
+        checked: boolean,
+        shiftKey: boolean,
+      ) => void;
+
+      act(() => {
+        onToggleCheck(stories[2], true, false); // id 3
+      });
+
+      expect(mockCaptured.backlogTable.checkedIds).toEqual([3]);
+    });
+
+    it('range selection is order-independent (shift UP from a lower anchor to a higher row)', () => {
+      const stories = makeUserStories(5);
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: stories,
+      });
+
+      renderApp();
+
+      const onToggleCheck = mockCaptured.backlogTable.onToggleCheck as (
+        us: (typeof stories)[number],
+        checked: boolean,
+        shiftKey: boolean,
+      ) => void;
+
+      // Anchor on id 5 (last), then shift-toggle id 2 -> range 2..5.
+      act(() => {
+        onToggleCheck(stories[4], true, false); // anchor -> id 5
+        onToggleCheck(stories[1], true, true); // shift  -> id 2
+      });
+
+      const finalChecked = [...mockCaptured.backlogTable.checkedIds].sort(
+        (a: number, b: number) => a - b,
+      );
+      expect(finalChecked).toEqual([2, 3, 4, 5]);
+    });
   });
 
   describe('drag/mutation error toast (F-AAP-03, dest#8)', () => {
@@ -795,15 +936,62 @@ describe('BacklogApp', () => {
       expect(stubActions.deleteUs).not.toHaveBeenCalled();
     });
 
-    it('onEditUs: is a DEFERRED no-op (common genericform, AAP §0.2.2 OOS)', () => {
-      renderEditable();
-      // No throw and no mutation action fired — the still-AngularJS US detail
-      // screen owns editing.
-      expect(() =>
-        mockCaptured.backlogTable.onEditUs(makeUserStory({ id: 9 })),
-      ).not.toThrow();
-      expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
-      expect(stubActions.deleteUs).not.toHaveBeenCalled();
+    describe('onEditUs — routes to the shell-owned US detail screen (M-13)', () => {
+      // M-13 parity fix: the backlog "Edit" option navigates to the shell-owned
+      // US detail screen via `navigateToUserStoryDetail` -> `window.location.href`.
+      // jsdom has no navigation, so swap `location` for a writable stub we can
+      // ASSERT against, restored after each test. (Same pattern as `client.test.ts`.)
+      let savedLocationDescriptor: PropertyDescriptor | undefined;
+      const INITIAL_HREF = 'http://localhost/backlog';
+
+      beforeEach(() => {
+        savedLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+        Object.defineProperty(window, 'location', {
+          configurable: true,
+          writable: true,
+          value: {
+            href: INITIAL_HREF,
+            origin: 'http://localhost',
+            pathname: '/backlog',
+            search: '',
+            hash: '',
+            assign() {},
+            replace() {},
+          },
+        });
+      });
+
+      afterEach(() => {
+        if (savedLocationDescriptor) {
+          Object.defineProperty(window, 'location', savedLocationDescriptor);
+        }
+      });
+
+      it('GRANTED (modify_us): navigates to /project/:slug/us/:ref (same detail screen as the row link)', () => {
+        // `renderEditable` primes a modify_us project with slug "project-1", so
+        // editing story ref 42 targets `/project/project-1/us/42` — the SAME
+        // shell-owned detail screen the row subject link opens.
+        renderEditable();
+        mockCaptured.backlogTable.onEditUs(makeUserStory({ id: 9, ref: 42 }));
+        expect(window.location.href).toBe('/project/project-1/us/42');
+        // Navigation only — no board mutation fires here (the detail screen +
+        // hook refresh own persistence/reflection).
+        expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
+        expect(stubActions.deleteUs).not.toHaveBeenCalled();
+      });
+
+      it('DENIED (view-only): gated — does NOT navigate and does not mutate', () => {
+        // The container handler gates on `canModifyUs` (mirroring the affordance,
+        // which BacklogTable renders only under `modify_us`), so a view-only
+        // project short-circuits BEFORE navigating.
+        renderEditable({ my_permissions: ['view_project', 'view_us'] });
+        expect(() =>
+          mockCaptured.backlogTable.onEditUs(makeUserStory({ id: 9, ref: 42 })),
+        ).not.toThrow();
+        expect(window.location.href).toBe(INITIAL_HREF);
+        expect(stubActions.updateUsStatus).not.toHaveBeenCalled();
+        expect(stubActions.deleteUs).not.toHaveBeenCalled();
+      });
     });
 
     it('the bulk "Add" button opens the BulkCreateUsLightbox', () => {

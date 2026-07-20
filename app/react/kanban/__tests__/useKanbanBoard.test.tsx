@@ -112,6 +112,17 @@ const PID = 7;
 /** The single user-story status/column id used across the suites. */
 const STATUS_ID = 100;
 
+/**
+ * QA M-10: every `/userstories` BOARD list (initial load, live reload, filter
+ * reload, and archived-column reopen) must disable pagination so the WHOLE
+ * board loads — parity with the AngularJS `queryMany` default
+ * (`x-disable-pagination: "1"`). The hook passes this as the third `api.get`
+ * argument, so the board-list assertions match it explicitly here.
+ */
+const DISABLE_PAGINATION_ARG = expect.objectContaining({
+    headers: expect.objectContaining({ 'x-disable-pagination': '1' }),
+});
+
 /* ========================================================================== *
  * Mutable fixtures (reset in beforeEach) that the api.get routing closure reads
  * by reference, so a test may reassign one BEFORE rendering to reshape a load.
@@ -207,6 +218,7 @@ describe('initial load', () => {
         expect(getMock).toHaveBeenCalledWith(
             '/userstories',
             expect.objectContaining({ project: PID, status__is_archived: false }),
+            DISABLE_PAGINATION_ARG,
         );
         expect(getMock).toHaveBeenCalledWith(
             '/swimlanes',
@@ -341,6 +353,7 @@ describe('kanban not activated / not found', () => {
         expect(getMock).toHaveBeenCalledWith(
             '/userstories',
             expect.objectContaining({ q: 'zzz' }),
+            DISABLE_PAGINATION_ARG,
         );
     });
 
@@ -387,6 +400,7 @@ describe('reload', () => {
             expect(getMock).toHaveBeenCalledWith(
                 '/userstories',
                 expect.objectContaining({ project: PID }),
+                DISABLE_PAGINATION_ARG,
             ),
         );
     });
@@ -409,6 +423,7 @@ describe('showArchivedStatus / hideArchivedStatus', () => {
                 include_attachments: true,
                 include_tasks: true,
             }),
+            DISABLE_PAGINATION_ARG,
         );
     });
 
@@ -442,6 +457,7 @@ describe('websocket handlers', () => {
             expect(getMock).toHaveBeenCalledWith(
                 '/userstories',
                 expect.objectContaining({ project: PID }),
+                DISABLE_PAGINATION_ARG,
             ),
         );
     });
@@ -510,6 +526,7 @@ describe('filter / zoom reload', () => {
             expect(getMock).toHaveBeenCalledWith(
                 '/userstories',
                 expect.objectContaining({ q: 'abc' }),
+                DISABLE_PAGINATION_ARG,
             ),
         );
     });
@@ -531,6 +548,7 @@ describe('load variants', () => {
                 include_attachments: 1,
                 include_tasks: 1,
             }),
+            DISABLE_PAGINATION_ARG,
         );
     });
 
@@ -595,6 +613,7 @@ describe('move — reconcile on persistence failure', () => {
             expect(getMock).toHaveBeenCalledWith(
                 '/userstories',
                 expect.objectContaining({ project: PID }),
+                DISABLE_PAGINATION_ARG,
             ),
         );
         expect(result.current.usMap[1]).toBeDefined();
@@ -732,6 +751,7 @@ describe('showArchivedStatus with an active filter', () => {
                 include_tasks: true,
                 q: 'needle',
             }),
+            DISABLE_PAGINATION_ARG,
         );
     });
 });
@@ -828,6 +848,7 @@ describe('deleteUserStory', () => {
             expect(getMock).toHaveBeenCalledWith(
                 '/userstories',
                 expect.objectContaining({ project: PID }),
+                DISABLE_PAGINATION_ARG,
             ),
         );
     });

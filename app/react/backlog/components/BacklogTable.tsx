@@ -409,6 +409,18 @@ const BacklogRow = ({
             ref={setActivatorNodeRef}
             {...attributes}
             {...(listeners ?? {})}
+            // N-11 (a11y name): @dnd-kit's spread `attributes` give this handle
+            // role="button" + the drag INSTRUCTIONS (via aria-describedby) but NO
+            // accessible NAME, so a runtime audit found all 13 backlog drag
+            // handles unnamed. Name each one after the story it reorders, using
+            // the same translate key pattern as the sibling selection checkbox
+            // ("Select user story #NN"). Declared AFTER the spreads so it is not
+            // clobbered by them. Behaviour-only: no layout/visual change.
+            aria-label={translate(
+              'BACKLOG.REORDER_US',
+              { ref: us.ref },
+              `Reorder user story #${us.ref}`,
+            )}
           >
             <TgSvg icon="icon-draggable" />
           </div>
@@ -416,14 +428,35 @@ const BacklogRow = ({
         {/* Selection checkbox — only rendered with `modify_us`. */}
         {canModify && (
           <div className="input">
-            <div className="custom-checkbox">
-              {/*
-                Controlled checkbox. `onClick` captures the browser's post-toggle
-                `checked` value AND the native `shiftKey` (for shift-range
-                selection) and lifts them up; the no-op `onChange` keeps React's
-                controlled-input contract satisfied. `id`/`for` are kept verbatim
-                (`us-check-{ref}`) because the SCSS + e2e selectors depend on them.
-              */}
+            {/*
+              M-14 — keyboard-accessible, Shift-range-capable selection.
+
+              The reference SCSS hides the native checkbox with
+              `.custom-checkbox input { display: none }` and drew the visible
+              14×14 box from the sibling `<label>` (`input:checked + label::after`
+              renders the fill). The prior React cut made that bare `<label>` the
+              focus target via `tabIndex={0}`. That was broken four ways: a
+              `<label>` exposes NO checkbox role, has NO accessible name, does NOT
+              toggle on Space/Enter, and — crucially — the browser-synthesised
+              click a label forwards to its input DROPS `shiftKey`, so Shift-range
+              selection collapsed to a single anchor row.
+
+              Fix (no SCSS rewrite, 100% visual parity): keep the native
+              controlled checkbox as the SINGLE semantic control and let the
+              existing `.custom-checkbox` / `label` SCSS keep drawing it. Override
+              only the `display:none` inline so the input stays in the a11y tree
+              AND the tab order, and layer it (fully transparent) over the whole
+              custom-checkbox box as the real pointer target. Real pointer and
+              keyboard events now hit the input directly, so `onClick` receives the
+              true post-toggle `checked` AND the true `shiftKey` for BOTH mouse
+              (Shift-click) and keyboard (Shift+Space). `position: relative` on the
+              wrapper (no offsets ⇒ no layout shift) anchors the transparent
+              overlay; the `<label>` is now purely decorative (no `tabIndex`).
+              `id`/`for` stay verbatim (`us-check-{ref}`) because the SCSS
+              `input:checked + label::after` fill selector and the e2e selectors
+              depend on them.
+            */}
+            <div className="custom-checkbox" style={{ position: 'relative' }}>
               <input
                 type="checkbox"
                 name="filter-mode"
@@ -433,21 +466,52 @@ const BacklogRow = ({
                   F-UI-04: the legacy `<label for>` carried NO text, so the
                   bulk-select checkbox had no accessible name. Give it one via a
                   localised `aria-label` (forward-compatible key + descriptive
-                  English fallback) referencing the story it selects.
+                  English fallback) referencing the story it selects. Now that the
+                  input is no longer `display:none`, this name is actually exposed
+                  to assistive tech (M-14).
                 */
                 aria-label={translate(
                   'BACKLOG.SELECT_US',
                   { ref: us.ref },
                   `Select user story #${us.ref}`,
                 )}
+                style={{
+                  // Transparent overlay covering the whole visible box so the
+                  // native input is the real pointer target (real clicks keep
+                  // their `shiftKey`, unlike a label-forwarded click).
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  height: '100%',
+                  margin: 0,
+                  opacity: 0,
+                  cursor: 'pointer',
+                  // Override the reference SCSS `display: none`: `opacity:0`
+                  // (unlike `display:none`) keeps the control focusable, named
+                  // and in the accessibility tree, and preserves native Space
+                  // toggling.
+                  display: 'block',
+                }}
                 onClick={(e) =>
                   onToggleCheck(us, e.currentTarget.checked, e.nativeEvent.shiftKey)
                 }
+                onKeyDown={(e) => {
+                  // Native checkboxes toggle on Space, which fires a `click` —
+                  // so `onClick` already covers Space and Shift+Space with the
+                  // correct `shiftKey`. They do NOT toggle on Enter; add it for
+                  // parity with the finding's "Space/Enter" expectation, forwarding
+                  // the real `shiftKey` and the toggled value.
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    onToggleCheck(us, !isChecked, e.shiftKey);
+                  }
+                }}
                 onChange={() => {
-                  /* controlled input: state is lifted via onClick */
+                  /* controlled input: selection is lifted via onClick / onKeyDown */
                 }}
               />
-              <label htmlFor={`us-check-${us.ref}`} tabIndex={0} />
+              <label htmlFor={`us-check-${us.ref}`} aria-hidden="true" />
             </div>
           </div>
         )}

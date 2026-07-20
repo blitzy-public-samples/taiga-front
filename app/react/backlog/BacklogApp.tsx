@@ -78,6 +78,9 @@ import {
 } from '../shared/filters';
 import type { FilterCategory, SelectedFilter } from '../shared/filters';
 import { canModifyUs, canAddUs, canAddMilestone, canMutate } from '../shared/permissions';
+// M-13 parity fix: the backlog "Edit" option routes to the shell-owned US detail
+// screen (the common-module edit lightbox is OOS — AAP §0.2.2 / §0.4.1).
+import { navigateToUserStoryDetail } from '../shared/session';
 // C2 fix (dest#5): the standard single-story create action. The deleted Backlog
 // controller delegated `genericform:new` to the common-module lightbox (OOS,
 // AAP §0.2.2); we call the same `/api/v1/userstories` endpoint directly.
@@ -638,9 +641,18 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
     // single row. `lastChecked` is updated on every interaction.
     const handleToggleCheck = useCallback(
         (us: UserStory, checked: boolean, shiftKey: boolean) => {
+            // M-14 shift-range fix: snapshot the previous anchor HERE, in the
+            // handler body, BEFORE calling `setCheckedIds`. React 18 runs the
+            // functional state updater during the render phase — i.e. AFTER this
+            // synchronous handler body has already executed, including the
+            // `lastCheckedIdRef.current = us.id` assignment at the end. Reading the
+            // ref *inside* the updater therefore observed the just-overwritten value
+            // (the current row's own id), collapsing every shift-range to a single
+            // row (`from === to`) and selecting only the two endpoints. Capturing it
+            // up-front preserves the genuine anchor set by the previous interaction.
+            const lastId = lastCheckedIdRef.current;
             setCheckedIds((prev) => {
                 const next = new Set(prev);
-                const lastId = lastCheckedIdRef.current;
 
                 if (shiftKey && lastId != null) {
                     const ids = userstories.map((u) => u.id);
@@ -701,15 +713,24 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
         [actions, project],
     );
 
-    // Edit a story. F-CQ-03 DEFERRED: the generic US edit form was the COMMON
-    // module's `genericform:edit` dialog (AAP §0.2.2 common OOS; §0.4.1 defines no
-    // React US-edit component). The row's subject link opens the still-AngularJS
-    // US detail screen, which owns viewing/editing — so this inline affordance is
-    // an AAP-scoped no-op, not a gap.
-    const handleEditUs = useCallback((_us: UserStory) => {
-        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no React edit component):
-         * generic US edit is owned by the still-AngularJS US detail screen. */
-    }, []);
+    // Edit a story. M-13 parity fix: the AngularJS backlog "Edit" option
+    // (`ctrl.editUserStory`) opened the COMMON-module `genericform:edit` dialog
+    // (AAP §0.2.2 common OOS; §0.4.1 defines no React US-edit component). Rather
+    // than a no-op, route to the shell-owned US DETAIL screen — the SAME
+    // destination as the row's subject link and the Kanban card actions — which
+    // owns viewing/editing. Gated on `modify_us` to mirror the affordance itself
+    // (`BacklogTable` renders `UsEditSelector` only under `canModify`,
+    // `tg-check-permission="modify_us"`); the hook's live refresh reflects any
+    // persisted change back into the backlog.
+    const handleEditUs = useCallback(
+        (us: UserStory) => {
+            if (!canModifyUs(project)) {
+                return;
+            }
+            navigateToUserStoryDetail(project?.slug, us.ref);
+        },
+        [project],
+    );
 
     // Inline status change (tgUsStatus popover). F-CQ-03 — the status popover UI
     // is reproduced in-scope by `BacklogTable`; the persistence was missing. Now
@@ -1047,7 +1068,24 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             <div className="backlog-menu">
                                 <div className="backlog-header">
                                     <div className="backlog-header-title">
-                                        <h2>Backlog</h2>
+                                        {/*
+                                          N-11 (heading order): the Backlog is the
+                                          page's PRIMARY content, but its heading was
+                                          an <h2> while the secondary Sprints sidebar
+                                          used <h1>, so assistive tech saw an
+                                          out-of-order H2→H1. The visual sizes are
+                                          driven by the global h1/h2 typography plus
+                                          the tag-scoped rules `.backlog-header h2`
+                                          and `.sprints h1`, so SWAPPING the tags
+                                          would change the rendered sizes and break
+                                          baseline fidelity. Instead we keep the tags
+                                          (visual byte-identical) and override only
+                                          the SEMANTIC level via `aria-level`: Backlog
+                                          becomes level 1, Sprints level 2 (below),
+                                          giving a correct 1→2 heading hierarchy with
+                                          zero visual change.
+                                        */}
+                                        <h2 aria-level={1}>Backlog</h2>
                                         {selectedFilterCount > 0 ? (
                                             <>
                                                 <span className="backlog-stories-number squared">
@@ -1374,7 +1412,16 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                 <div className="sidebar">
                     <section className="sprints">
                         <header className="sprint-header">
-                            <h1>
+                            {/*
+                              N-11 (heading order): keep the <h1> tag so the
+                              `.sprints h1` rule + global h1 typography render this
+                              sidebar heading exactly as the baseline did, but mark
+                              it `aria-level={2}` so it is semantically SUBORDINATE
+                              to the primary "Backlog" heading (level 1 above). This
+                              corrects the previous H2→H1 order for assistive tech
+                              without any visual change.
+                            */}
+                            <h1 aria-level={2}>
                                 {totalMilestones > 0 && (
                                     <span className="number">{totalMilestones}</span>
                                 )}

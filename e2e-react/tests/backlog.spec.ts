@@ -188,22 +188,51 @@ async function closePopover(page: Page): Promise<void> {
 }
 
 /**
- * Toggle a backlog row's selection checkbox by clicking its VISIBLE `<label>`.
+ * Toggle a backlog row's selection checkbox.
  *
- * The row's native `<input type="checkbox">` is rendered inside a
- * `.custom-checkbox` wrapper and is `display:none` (the styled `<label>` is the
- * visible 14×14 box the user actually clicks). Playwright's `.check()` requires
- * the target to be visible, so it cannot operate on the hidden input directly —
- * it must click the associated `<label>`, which toggles the controlled React
- * input through its `for`/`id` association exactly as a real click does. The
- * baseline (AngularJS) backlog uses the same `.custom-checkbox > input + label`
- * markup, so this is phase-agnostic. A `force`-check of the hidden input is the
- * fallback for any build that renders a directly-visible input.
+ * The DOM differs by phase (both reuse the `.custom-checkbox > input + label`
+ * markup and its `input:checked + label::after` fill selector):
+ *
+ *   • React (M-14): the native `<input type="checkbox">` is now the REAL,
+ *     focusable, accessibly-named control. It is rendered as a full-size,
+ *     transparent (`opacity:0`) overlay positioned ON TOP of a now-decorative,
+ *     `aria-hidden` `<label>` (the label only draws the visible 14×14 box via
+ *     SCSS). Two consequences follow: (a) a click aimed at the label is obscured
+ *     by the overlay input that paints above it, and (b) Playwright's default
+ *     minimal auto-scroll can leave a bottom row directly beneath the sticky
+ *     `.backlog-table-title` header, which then intercepts the click. So this
+ *     helper centers the input in the viewport (so the sticky header can never
+ *     cover it) and clicks the INPUT itself — `opacity:0` is still actionable in
+ *     Playwright, and a real click on the input preserves native toggle
+ *     semantics (M-14).
+ *   • Baseline (AngularJS): the input is `display:none` (not actionable) and the
+ *     visible `<label>` is the control, so the label is clicked instead.
+ *
+ * The correct target is chosen by input VISIBILITY: an `opacity:0` overlay input
+ * is visible to Playwright (React path) whereas a `display:none` input is not
+ * (baseline path). A `force`-check of the input is the last-resort fallback.
  */
 async function toggleRowCheckbox(row: Locator): Promise<void> {
+  const input = row.locator('.custom-checkbox input[type="checkbox"]').first();
+  // React (M-14): the input is the real control, but the decorative sibling
+  // `<label>` paints ON TOP of it (SCSS positions the visible box) and a bottom
+  // row can be scrolled directly beneath the sticky `.backlog-table-title`
+  // header — so a hit-tested `.click()` is intercepted by either the label or the
+  // header. `dispatchEvent('click')` fires the click DIRECTLY on the input with
+  // no hit-test and no auto-scroll, so neither the overlay label nor the sticky
+  // header can intercept it. The native checkbox pre-click toggle makes
+  // `e.currentTarget.checked` reflect the NEW value for the React `onClick`,
+  // exactly like a real click (a plain click carries `shiftKey:false`, which is
+  // the intended single-row toggle for this multi-select step).
+  if ((await input.count()) > 0 && (await input.isVisible().catch(() => false))) {
+    await input.dispatchEvent('click');
+    return;
+  }
+  // Baseline (AngularJS): the input is `display:none`; dispatch on the visible
+  // `<label>`, whose activation toggles the associated (ng-model-bound) input.
   const label = row.locator('.custom-checkbox label').first();
   if ((await label.count()) > 0) {
-    await label.click();
+    await label.dispatchEvent('click');
     return;
   }
   await row.locator('input[type="checkbox"]').first().check({ force: true });

@@ -371,3 +371,46 @@ export function redirectToLogin(): void {
         // tests. Real browsers navigate before this line can throw.
     }
 }
+
+/**
+ * Navigate the whole client to the shell-owned user-story DETAIL screen
+ * (`/project/:slug/us/:ref`) — the SAME route the Kanban card title link and the
+ * backlog row subject link already target (see `Card.tsx` `usHref`).
+ *
+ * This is the migration's parity replacement for the deleted COMMON-module
+ * dialogs that the AngularJS controllers opened on "Edit card" / "Assign To"
+ * (`genericform:edit`) and on the backlog "Edit" option: the AAP lists the
+ * common module OUT OF SCOPE (§0.2.2) and defines NO React edit/assignee
+ * component (§0.4.1), so rather than reproducing an out-of-scope lightbox the
+ * card/row actions route to the still-AngularJS US detail screen, which OWNS
+ * viewing, editing, and assignment. Consolidating "Assign To" onto the same
+ * detail screen (instead of an inline assignee picker) is a deliberate,
+ * AAP-scoped deviation from that finding's literal suggestion — the
+ * `tg-lb-select-user` lightbox it named is itself common-module OOS.
+ *
+ * The URL format mirrors `Card.tsx`'s `usHref` byte-for-byte
+ * (`project-userstories-detail = /project/:project/us/:ref`, `base.coffee:71-73`)
+ * so the destination is identical to clicking the card title. The assignment is
+ * wrapped in a `try/catch` for the same jsdom reason as `redirectToLogin`.
+ *
+ * @param projectSlug the owning project's slug (`project.slug`)
+ * @param usRef       the user story's human `ref` (NOT its numeric `id`)
+ */
+export function navigateToUserStoryDetail(
+    projectSlug: string | null | undefined,
+    usRef: number | null | undefined,
+): void {
+    // Defensive: never navigate to a malformed `/project//us/undefined` URL when
+    // the slug or ref cannot be resolved (the callers already guard, but a bad
+    // navigation must never be attempted).
+    if (!projectSlug || usRef == null) {
+        return;
+    }
+    const target = `/project/${projectSlug}/us/${usRef}`;
+    try {
+        window.location.href = target;
+    } catch {
+        // jsdom has no navigation; swallowing keeps unit tests total. Real
+        // browsers navigate before this line can throw.
+    }
+}

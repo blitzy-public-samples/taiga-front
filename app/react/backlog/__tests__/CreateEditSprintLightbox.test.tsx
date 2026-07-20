@@ -279,6 +279,44 @@ describe('CreateEditSprintLightbox', () => {
 
       expect(mockCreate).not.toHaveBeenCalled();
     });
+
+    it('N-08: clears a field error as soon as the user corrects that field (revalidate on change)', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+
+      // Failed submit surfaces the name error (dates are prefilled/valid).
+      submitForm(container);
+      expect(get(container, NAME)).toHaveClass('checksley-error');
+      expect(container.querySelector(ERROR_LIST)).toBeInTheDocument();
+
+      // Correcting the name must clear ITS error immediately — no resubmit.
+      typeInto(container, NAME, 'My Sprint');
+      expect(get(container, NAME)).not.toHaveClass('checksley-error');
+      // With the only error cleared, no error list remains.
+      expect(container.querySelector(ERROR_LIST)).not.toBeInTheDocument();
+    });
+
+    it('N-08: clears each date error independently when corrected, without flagging untouched fields', () => {
+      const { container } = renderLightbox({ mode: 'create', projectId: 7 });
+
+      // Force both date errors (valid name), leaving name un-flagged.
+      typeInto(container, NAME, 'Sprint X');
+      typeInto(container, DATE_START, '');
+      typeInto(container, DATE_END, '');
+      submitForm(container);
+      expect(get(container, DATE_START)).toHaveClass('checksley-error');
+      expect(get(container, DATE_END)).toHaveClass('checksley-error');
+
+      // Correcting ONLY the start date clears its error; the finish date error
+      // remains (correction is per-field, never re-flagging untouched fields).
+      typeInto(container, DATE_START, '01 Jan 2027');
+      expect(get(container, DATE_START)).not.toHaveClass('checksley-error');
+      expect(get(container, DATE_END)).toHaveClass('checksley-error');
+      expect(get(container, NAME)).not.toHaveClass('checksley-error');
+
+      // Correcting the finish date clears the last error.
+      typeInto(container, DATE_END, '15 Jan 2027');
+      expect(get(container, DATE_END)).not.toHaveClass('checksley-error');
+    });
   });
 
   describe('create mode — valid submit', () => {

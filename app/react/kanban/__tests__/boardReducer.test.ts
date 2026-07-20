@@ -684,6 +684,110 @@ describe('EVENTS_LOAD (modified + new merge)', () => {
 
 
 /* ========================================================================== *
+ * EVENTS_LOAD — removal reconciliation (QA M-24 live-delete parity)
+ * ========================================================================== */
+
+describe('EVENTS_LOAD (removal reconciliation — QA M-24)', () => {
+    it('prunes a story that is ABSENT from the fresh (complete) list — live delete', () => {
+        // Two stories on the board.
+        const base = reducer(initialState(), {
+            type: 'SET',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A', kanban_order: 1 }),
+                makeUserStory({ id: 2, status: 100, subject: 'B', kanban_order: 2 }),
+            ],
+        });
+        expect(ids(base, '100')).toEqual([1, 2]);
+
+        // A live frame arrives after story 2 was deleted on the backend: the
+        // fresh full list contains only story 1.
+        const state = reducer(base, {
+            type: 'EVENTS_LOAD',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A', kanban_order: 1 }),
+            ],
+        });
+
+        // Story 2's card must disappear from EVERY collection, not just linger.
+        expect(ids(state, '100')).toEqual([1]);
+        expect(state.usMap[2]).toBeUndefined();
+        expect(state.order[2]).toBeUndefined();
+        expect(state.userstoriesRaw.some((u) => u.id === 2)).toBe(false);
+        // Surviving story is untouched.
+        expect(state.userstoriesRaw.some((u) => u.id === 1)).toBe(true);
+    });
+
+    it('PRESERVES a story in a reopened archived status even though it is absent from the non-archived list', () => {
+        // Board with one active story (status 100).
+        let state = reducer(initialState(), {
+            type: 'SET',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A', kanban_order: 1 }),
+            ],
+        });
+
+        // Reopen an archived status column (status 200) and add its story —
+        // exactly what `showArchivedStatus` does (ADD_ARCHIVED_STATUS + ADD).
+        state = reducer(state, { type: 'ADD_ARCHIVED_STATUS', statusId: 200 });
+        state = reducer(state, {
+            type: 'ADD',
+            usList: [makeUserStory({ id: 9, status: 200, subject: 'ARCH', kanban_order: 1 })],
+        });
+        expect(state.usMap[9]).toBeDefined();
+
+        // A live `changes.project.*.userstories` frame carries the fresh
+        // NON-archived list (status__is_archived:false) — which never contains
+        // the archived story 9.
+        state = reducer(state, {
+            type: 'EVENTS_LOAD',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A', kanban_order: 1 }),
+            ],
+        });
+
+        // The archived story 9 must be preserved (not wrongly pruned).
+        expect(state.usMap[9]).toBeDefined();
+        expect(state.userstoriesRaw.some((u) => u.id === 9)).toBe(true);
+        expect(ids(state, '200')).toContain(9);
+        // The active story 1 remains too.
+        expect(ids(state, '100')).toEqual([1]);
+    });
+
+    it('merges modified + new AND prunes deleted in a single frame', () => {
+        const base = reducer(initialState(), {
+            type: 'SET',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A', kanban_order: 1 }),
+                makeUserStory({ id: 2, status: 100, subject: 'B', kanban_order: 2 }),
+                makeUserStory({ id: 3, status: 100, subject: 'C', kanban_order: 3 }),
+            ],
+        });
+
+        // Fresh list: 1 modified (A -> A2), 2 deleted (absent), 3 kept, 4 new.
+        const state = reducer(base, {
+            type: 'EVENTS_LOAD',
+            userstories: [
+                makeUserStory({ id: 1, status: 100, subject: 'A2', kanban_order: 1 }),
+                makeUserStory({ id: 3, status: 100, subject: 'C', kanban_order: 3 }),
+                makeUserStory({ id: 4, status: 100, subject: 'D', kanban_order: 4 }),
+            ],
+        });
+
+        // Modified applied.
+        expect(state.userstoriesRaw.find((u) => u.id === 1)?.subject).toBe('A2');
+        // Deleted pruned everywhere.
+        expect(state.usMap[2]).toBeUndefined();
+        expect(state.order[2]).toBeUndefined();
+        expect(state.userstoriesRaw.some((u) => u.id === 2)).toBe(false);
+        // New added, kept retained.
+        expect(ids(state, '100')).toContain(4);
+        expect(ids(state, '100')).toContain(3);
+        expect(ids(state, '100')).not.toContain(2);
+    });
+});
+
+
+/* ========================================================================== *
  * MOVE — insert at front (previousCard === null) (SOURCE 157-159)
  * ========================================================================== */
 

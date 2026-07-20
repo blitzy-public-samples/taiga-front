@@ -88,6 +88,32 @@ describe('useModalDialog (F-UI-05)', () => {
       fireEvent.keyDown(screen.getByTestId('dialog'), { key: 'Escape' });
       expect(onClose).not.toHaveBeenCalled();
     });
+
+    it('N-10: invokes onClose on Escape even when the event originates OUTSIDE the dialog', () => {
+      // Regression for N-10. Previously the keydown listener was attached to the
+      // dialog element, so once focus left the dialog (e.g. a backdrop click
+      // moved focus to <body>) an Escape keydown dispatched outside the dialog
+      // never reached the handler and the modal could not be dismissed. A
+      // keydown on `document.body` bubbles UP to `document` but does NOT travel
+      // DOWN into the dialog — so this fires the handler ONLY with the fixed
+      // document-level listener; it would not have with the old dialog-scoped one.
+      const onClose = jest.fn();
+      render(<Harness open onClose={onClose} />);
+
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('N-10: removes the document-level listener on close (no leak)', () => {
+      // After the dialog closes, an Escape dispatched outside it must NOT call
+      // onClose — proving the document listener is torn down in the cleanup.
+      const onClose = jest.fn();
+      const { rerender } = render(<Harness open onClose={onClose} />);
+
+      rerender(<Harness open={false} onClose={onClose} />);
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(onClose).not.toHaveBeenCalled();
+    });
   });
 
   describe('initial focus', () => {

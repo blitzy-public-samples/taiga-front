@@ -33,6 +33,7 @@
  * render/commit work is flushed and no "not wrapped in act" warnings escape.
  */
 
+import { useEffect } from 'react';
 import { act } from '@testing-library/react';
 
 import { mountElement } from '../mount';
@@ -350,5 +351,59 @@ describe('mountElement — disconnect / F-MILESTONE-04 reconnect race', () => {
         await disconnect(el);
         await flushMicrotasks();
         expect(probe(el)).toBeNull();
+    });
+
+    it('releases every root across repeated mount/unmount cycles — no host is left Fiber-rooted (M-23)', async () => {
+        // M-23 (P8-RES-01): repeated route cycling was observed to leave detached
+        // `tg-react-*` hosts Fiber-rooted with growing listener counts. This
+        // mirrors the AngularJS router creating a FRESH host element on each route
+        // entry and removing it on exit: every cycle MUST fully unmount its root,
+        // so the count of React unmounts equals the count of mounts (no root — and
+        // therefore no detached host — leaks).
+        const CYCLES = 8;
+        let mounts = 0;
+        let unmounts = 0;
+
+        // A probe that records its React mount/unmount via an effect cleanup.
+        // Matches the ProbeProps signature so it can drive `mountElement`.
+        function LifecycleProbe(props: ProbeProps): JSX.Element {
+            useEffect(() => {
+                mounts += 1;
+                return () => {
+                    unmounts += 1;
+                };
+            }, []);
+            return <span data-testid="probe">{props.projectId ?? ''}</span>;
+        }
+
+        // ONE custom-element definition; many instances (one per cycle).
+        const tag = defineElement(LifecycleProbe, ['project-id']);
+        const detachedHosts: HTMLElement[] = [];
+
+        for (let i = 0; i < CYCLES; i += 1) {
+            const el = document.createElement(tag);
+            el.setAttribute('project-id', String(i));
+
+            await connect(el);
+            expect(probe(el)).not.toBeNull(); // mounted this cycle
+
+            await disconnect(el);
+            await flushMicrotasks(); // run the deferred root.unmount()
+
+            // The React tree for THIS host is fully released each cycle.
+            expect(probe(el)).toBeNull();
+            detachedHosts.push(el);
+        }
+
+        // Every mount was matched by exactly one unmount: no root survived a
+        // teardown, so no detached host remained Fiber-rooted.
+        expect(mounts).toBe(CYCLES);
+        expect(unmounts).toBe(CYCLES);
+
+        // Belt-and-suspenders: none of the detached hosts retained rendered
+        // content after the run.
+        for (const host of detachedHosts) {
+            expect(probe(host)).toBeNull();
+        }
     });
 });
