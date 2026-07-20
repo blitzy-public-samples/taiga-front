@@ -236,7 +236,16 @@ function refreshRawOrder(draft: State): void {
  */
 function refresh(draft: State, refreshUsMap = true, refreshSwimlanesFlag = true): void {
     // SOURCE 255: stable numeric sort by the order snapshot (matches `_.sortBy`).
-    draft.userstoriesRaw.sort((a, b) => draft.order[a.id] - draft.order[b.id]);
+    // Assign a sorted COPY rather than sorting `userstoriesRaw` in place. The
+    // DnD-failure revert (Issue 3) dispatches `SET` with the immer-FROZEN
+    // `userstoriesRaw` snapshot captured before the optimistic move (see
+    // useKanbanBoard `move()` catch); an in-place `.sort()` on a frozen array
+    // throws "Cannot assign to read only property '0'", which escapes React
+    // rendering and blanks the board. `slice()` yields a fresh mutable array and
+    // preserves the exact ordering for every caller (SET / MOVE / status toggles).
+    draft.userstoriesRaw = draft.userstoriesRaw
+        .slice()
+        .sort((a, b) => draft.order[a.id] - draft.order[b.id]);
 
     // SOURCE 257-267: bucket us ids by status, de-duplicating before pushing.
     const collection: Record<string, number[]> = {};
