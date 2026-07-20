@@ -219,6 +219,44 @@ describe('reconcileAppliedFilterNames', () => {
     ];
     expect(reconcileAppliedFilterNames(selected, categories)).toBe(selected);
   });
+
+  // Regression for the QA security-gate finding "kanban filter-reconcile reload
+  // loop": a TAG filter's id equals its name (e.g. `?tags=foo`), so the
+  // "unresolved" guard (name !== id) can NEVER short-circuit it. Before the
+  // value-equality fix, reconcile returned a brand-new array on EVERY pass even
+  // when nothing had changed, defeating the consuming effect's `reconciled ===
+  // prev` guard and driving the reconcile -> filtersQuery -> reload -> reconcile
+  // loop (~76 reload cycles on a `?tags=` load). It must now resolve the color
+  // exactly once, then return the SAME reference so the loop cannot start.
+  it('resolves a tag filter (id === name) color once, then is stable across passes', () => {
+    const first: RestoredAppliedFilter[] = [
+      { id: 'foo', name: 'foo', dataType: 'tags', mode: 'include', color: null },
+    ];
+    // Pass 1: the color is filled in (null -> '#123') -> a genuine change -> new ref.
+    const pass1 = reconcileAppliedFilterNames(first, categories);
+    expect(pass1).not.toBe(first);
+    expect(pass1[0]).toEqual({
+      id: 'foo',
+      name: 'foo',
+      dataType: 'tags',
+      mode: 'include',
+      color: '#123',
+    });
+    // Pass 2: feeding the resolved output back yields NO change -> SAME reference,
+    // so the effect guard short-circuits and the reload loop never begins.
+    const pass2 = reconcileAppliedFilterNames(pass1, categories);
+    expect(pass2).toBe(pass1);
+  });
+
+  it('returns the SAME reference for an already-resolved tag filter (id === name)', () => {
+    // This is the exact shape that previously looped: id === name AND the color is
+    // already resolved. The pre-fix code flipped `changed` to true unconditionally
+    // and returned a fresh array here; the fix must return the input reference.
+    const selected: RestoredAppliedFilter[] = [
+      { id: 'foo', name: 'foo', dataType: 'tags', mode: 'include', color: '#123' },
+    ];
+    expect(reconcileAppliedFilterNames(selected, categories)).toBe(selected);
+  });
 });
 
 describe('buildFilterSearchString (serialization parity)', () => {

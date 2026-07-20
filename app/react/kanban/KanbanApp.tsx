@@ -379,6 +379,26 @@ function buildFiltersQuery(selected: AppliedFilter[], q: string): Record<string,
   return query;
 }
 
+/**
+ * Produce a STABLE, value-based key for a filters query object so the reload
+ * effect can compare successive queries by VALUE rather than by object identity.
+ *
+ * `buildFiltersQuery` returns a fresh object on every render (and after every
+ * filter reconciliation), so a bare reference comparison in the reload effect's
+ * dependency array fires even when the *effective* query is unchanged -- e.g.
+ * after a color-only tag reconciliation that never touches the query keys. That
+ * reference churn was the second half of the reconcile -> filtersQuery -> reload
+ * feedback loop the QA gate flagged. Sorting the keys makes the serialization
+ * insensitive to insertion order, so two value-identical queries always serialize
+ * to the same string and the effect can short-circuit a redundant reload.
+ */
+function serializeFiltersQuery(query: Record<string, unknown>): string {
+  return Object.keys(query)
+    .sort()
+    .map((key) => `${key}=${String(query[key])}`)
+    .join('&');
+}
+
 /* ------------------------------------------------------------------------- *
  * Public API
  * ------------------------------------------------------------------------- */
@@ -605,11 +625,27 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
   const didFilterMountRef = useRef(false);
+  // Defense-in-depth against the reconcile -> filtersQuery -> reload loop: track
+  // the last *serialized* query we acted on so a new-but-value-identical
+  // `filtersQuery` object (produced by a color-only tag reconciliation) does NOT
+  // schedule a redundant reload -- even in the hypothetical case where the
+  // upstream reference guard (`reconcileAppliedFilterNames`, Fix 1) were bypassed.
+  const lastQueryKeyRef = useRef<string>('');
   useEffect(() => {
+    const queryKey = serializeFiltersQuery(filtersQuery);
     if (!didFilterMountRef.current) {
+      // Skip the initial render (the hook already performed the first load) but
+      // record the mount query as the baseline so a later value-identical query
+      // is recognised as a no-op rather than a spurious change.
       didFilterMountRef.current = true;
+      lastQueryKeyRef.current = queryKey;
       return;
     }
+    // Value-equal to the query we last dispatched -> there is nothing to reload.
+    if (queryKey === lastQueryKeyRef.current) {
+      return;
+    }
+    lastQueryKeyRef.current = queryKey;
     const handle = setTimeout(() => {
       void reloadRef.current();
     }, 100);

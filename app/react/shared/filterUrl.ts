@@ -272,8 +272,24 @@ export function reconcileAppliedFilterNames<T extends RestoredAppliedFilter>(
     if (!resolved) {
       return filter;
     }
+    // Only treat this filter as *changed* when the resolved name/color ACTUALLY
+    // differ from the current values. This value-equality check is critical for
+    // tag filters, whose id equals their name (e.g. `?tags=ab` -> { id: 'ab',
+    // name: 'ab' }): the "unresolved" guard above can NEVER short-circuit them,
+    // so without this check every reconcile pass would return a brand-new object
+    // with identical fields, flip `changed` to true, and hand the caller a fresh
+    // array reference. That defeats the `reconciled === prev` guard in the
+    // consuming effect and drives the reconcile -> selectedFilters -> filtersQuery
+    // -> reload -> reconcile render loop the QA gate flagged (~76 reload cycles on
+    // a `?tags=` load). Resolving a color exactly once (null -> '#rrggbb') is a
+    // genuine change and still propagates; once the color is stable we return the
+    // SAME reference so the effect guard short-circuits and the loop cannot start.
+    const resolvedColor = resolved.color ?? filter.color ?? null;
+    if (filter.name === resolved.name && (filter.color ?? null) === resolvedColor) {
+      return filter;
+    }
     changed = true;
-    return { ...filter, name: resolved.name, color: resolved.color ?? filter.color ?? null };
+    return { ...filter, name: resolved.name, color: resolvedColor };
   });
   return changed ? next : (selected as T[]);
 }
