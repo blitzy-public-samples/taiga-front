@@ -537,10 +537,18 @@ const BacklogRow = ({
           {canModify && <TgSvg icon="icon-arrow-down" />}
         </a>
         {canModify && statusOpen && (
+          // dest#CRITICAL popover-visibility fix: the shared `popover` SCSS mixin
+          // declares `display:none` and no stylesheet rule ever unhides it;
+          // AngularJS revealed the popover via the jQuery `.popover().open()`
+          // plugin's `fadeIn()` (an inline `display:block`). Each <ul> renders
+          // only while its `*Open` flag is true, so the inline `display:'block'`
+          // is the faithful React equivalent of that reveal. (Same fix applies to
+          // all three BacklogTable popovers: pop-status, pop-role, pop-points.)
           <ul
             className="popover pop-status"
             role="menu"
             aria-label={translate('COMMON.FIELDS.STATUS', undefined, 'Status')}
+            style={{ display: 'block' }}
           >
             {statuses.map((status) => (
               <li className="popover-status" key={status.id} role="none">
@@ -618,6 +626,7 @@ const BacklogRow = ({
               undefined,
               'Select view per Role',
             )}
+            style={{ display: 'block' }}
           >
             {computableRoles.map((role) => (
               <li key={role.id} role="none">
@@ -645,6 +654,7 @@ const BacklogRow = ({
             className="popover pop-points"
             role="menu"
             aria-label={translate('COMMON.FIELDS.POINTS', undefined, 'Points')}
+            style={{ display: 'block' }}
           >
             {projectPoints.map((point) => (
               <li key={point.id} role="none">

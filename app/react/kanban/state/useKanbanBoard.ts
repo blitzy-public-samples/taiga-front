@@ -421,6 +421,9 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
     // F-CQ-02: latest board index so the stable `deleteUserStory` action can
     // resolve a story's model (id + status) without a stale closure.
     const usMapRef = useRef<UsMap>({});
+    // Issue 3 (offline in-place revert): latest raw board so the stable `move`
+    // action can capture an immutable pre-move snapshot without a stale closure.
+    const userstoriesRawRef = useRef<UserStory[]>([]);
 
     useEffect(() => {
         projectRef.current = project;
@@ -428,6 +431,7 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
         loadUserstoriesRef.current = loadUserstories;
         buildParamsRef.current = buildUserstoriesParams;
         usMapRef.current = state.usMap;
+        userstoriesRawRef.current = state.userstoriesRaw;
     });
 
     /* ---------------------------------------------------------------------- *
@@ -545,6 +549,14 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                     ? null
                     : swimlaneId;
 
+            // Issue 3 (offline in-place revert): capture the pre-move board
+            // snapshot BEFORE the optimistic dispatch. The reducer runs under
+            // immer, which froze these `userstoriesRaw` objects and produces NEW
+            // objects for the moved stories — so this array reference stays the
+            // untouched, immutable pre-move arrangement even after MOVE mutates
+            // the draft. It is a safe snapshot to revert to on failure.
+            const preMove = userstoriesRawRef.current;
+
             // (2) Optimistic local update; the reducer receives the API swimlane.
             dispatch({
                 type: 'MOVE',
@@ -580,12 +592,26 @@ export function useKanbanBoard(params: UseKanbanBoardParams): UseKanbanBoardResu
                 // F-AAP-03 (dest#8): surface an ACTIONABLE, user-facing error
                 // (no internal details) so a rejected move is no longer silent.
                 setMoveError(describeReorderError(err));
-                // On persistence failure, reconcile the board with the server so
-                // the optimistic update cannot leave the UI out of sync (the
-                // toast tells the user WHY the card visibly snapped back).
+                // Issue 3 (offline in-place revert): FIRST undo the optimistic
+                // move LOCALLY by restoring the captured pre-move snapshot. `SET`
+                // rebuilds every derived structure (order + swimlanes + usMap)
+                // from the snapshot, so the card visibly snaps back to its exact
+                // prior position IMMEDIATELY — even when the client is offline and
+                // the server reconciliation below cannot run. This removes the
+                // sole dependency on a successful re-fetch to undo a failed move.
+                dispatch({ type: 'SET', userstories: preMove });
+                // Then STILL reconcile with the server: when the network is
+                // available a successful re-fetch simply overwrites the reverted
+                // snapshot with authoritative server state; when it also fails
+                // (offline), the correct in-place revert above is left intact.
+                // This reconciliation is BEST-EFFORT — its rejection is swallowed
+                // so an offline re-fetch cannot surface as an unhandled promise
+                // rejection (the board is already correctly reverted above).
                 const proj = projectRef.current;
                 if (proj) {
-                    void loadUserstoriesRef.current(proj);
+                    void loadUserstoriesRef.current(proj).catch(() => {
+                        /* offline / transient — in-place revert already applied */
+                    });
                 }
             }
         },

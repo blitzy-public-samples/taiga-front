@@ -248,7 +248,17 @@ export const UsRolePointsSelector = ({
         // F-UI-04: expose the popover as an ARIA menu so assistive tech
         // announces it as a role chooser (matching the CardActions popover
         // pattern); the visible `.popover.pop-role` classes are unchanged.
-        <ul className="popover pop-role" role="menu" aria-label={selectViewPerRoleLabel}>
+        //
+        // dest#CRITICAL popover-visibility fix: inline `display:'block'` restores
+        // the jQuery `.popover().open()`->fadeIn() reveal that the shared
+        // `popover` SCSS mixin (display:none) otherwise hides. Rendered only while
+        // open, so the reveal is unconditional on the element.
+        <ul
+          className="popover pop-role"
+          role="menu"
+          aria-label={selectViewPerRoleLabel}
+          style={{ display: 'block' }}
+        >
           <li role="none">
             {/*
               F-UI-06: "clear selection" entry reads `COMMON.ROLES.ALL`

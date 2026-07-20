@@ -404,6 +404,11 @@ describe('BacklogTable', () => {
 
       fireEvent.click(mustQuery(row, US_STATUS));
       const popover = mustQuery(row, STATUS_POPOVER);
+      // dest#CRITICAL popover-visibility fix: assert the inline `display:block`
+      // reveal — the shared `popover` SCSS mixin declares `display:none` and
+      // AngularJS revealed the popover via the jQuery `.popover().open()`
+      // plugin's `fadeIn()` (inline display). jsdom reflects inline styles only.
+      expect(popover.style.display).toBe('block');
 
       // Pick status id 2 (different from the current id 1) → the update fires.
       fireEvent.click(mustQuery(popover, 'a.status[data-status-id="2"]'));
@@ -577,6 +582,8 @@ describe('BacklogTable', () => {
       // Step 1 — the role picker (`pop-role`), NOT the point list, is shown.
       const rolePicker = mustQuery(row, '.pop-role');
       expect(rolePicker).toBeInTheDocument();
+      // dest#CRITICAL popover-visibility fix: inline `display:block` reveal.
+      expect(rolePicker.style.display).toBe('block');
       expect(row.querySelector('.pop-points')).toBeNull();
       // One entry per COMPUTABLE role (2 of the 3 fixture roles).
       expect(rolePicker.querySelectorAll('a.role')).toHaveLength(2);
@@ -600,6 +607,8 @@ describe('BacklogTable', () => {
       // Step 2 — the point-value list is now shown, ordered by `order`.
       const pointList = mustQuery(row, '.pop-points');
       expect(pointList).toBeInTheDocument();
+      // dest#CRITICAL popover-visibility fix: inline `display:block` reveal.
+      expect(pointList.style.display).toBe('block');
       const options = pointList.querySelectorAll('a.point');
       expect(options).toHaveLength(2);
 

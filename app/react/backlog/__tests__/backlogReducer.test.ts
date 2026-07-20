@@ -568,6 +568,47 @@ describe('addUsOptimistic / removeUsOptimistic', () => {
         expect(state.userstories[state.userstories.length - 1].id).toBe(88);
     });
 
+    it('addUsOptimistic bumps totalUserStories by the number of created stories so the "N stories" header stays consistent (Issue 4)', () => {
+        let state = seedBacklog([
+            [1, 1],
+            [2, 2],
+        ]);
+        // Establish the loaded pagination total, exactly as the hook does from
+        // the response header — the backlog header renders THIS value.
+        state = dispatch(state, { type: 'setPagination', totalUserStories: 5 });
+        expect(state.totalUserStories).toBe(5);
+
+        // Bulk-create THREE new stories.
+        const created = [
+            makeUserStory({ id: 101, ref: 101, backlog_order: 0, milestone: null }),
+            makeUserStory({ id: 102, ref: 102, backlog_order: 0, milestone: null }),
+            makeUserStory({ id: 103, ref: 103, backlog_order: 0, milestone: null }),
+        ];
+        state = dispatch(state, {
+            type: 'addUsOptimistic',
+            userstories: created,
+            position: 'top',
+        });
+
+        // The total grows by exactly the number created (5 -> 8), keeping the
+        // header count consistent WITHOUT waiting for a full reload.
+        expect(state.totalUserStories).toBe(8);
+        // The three stories were actually inserted alongside the original two.
+        expect(state.userstories).toHaveLength(5);
+    });
+
+    it('addUsOptimistic bumps totalUserStories by 1 for a single created story (Issue 4)', () => {
+        let state = seedBacklog([[1, 1]]);
+        state = dispatch(state, { type: 'setPagination', totalUserStories: 1 });
+        const created = makeUserStory({ id: 77, ref: 77, backlog_order: 0, milestone: null });
+        state = dispatch(state, {
+            type: 'addUsOptimistic',
+            userstories: [created],
+            position: 'bottom',
+        });
+        expect(state.totalUserStories).toBe(2);
+    });
+
     it('removeUsOptimistic removes the story by id from the backlog and recomputes refs', () => {
         let state = seedBacklog([
             [10, 1],

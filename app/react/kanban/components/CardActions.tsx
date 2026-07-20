@@ -333,6 +333,18 @@ export function CardActions({
                           className="popover global-popover"
                           ref={menuRef}
                           style={{
+                              // dest#CRITICAL popover-visibility fix: the shared
+                              // `popover` SCSS mixin declares `display:none` and no
+                              // stylesheet rule ever unhides it. In AngularJS the
+                              // jQuery `.popover().open()` plugin revealed the menu
+                              // with `fadeIn()` (an inline `display:block`). Without
+                              // an equivalent inline reveal the menu stays hidden
+                              // even though it is in the DOM and correctly
+                              // positioned. The element is only rendered while
+                              // `open`, so an unconditional inline `display:'block'`
+                              // here is the faithful React equivalent of
+                              // open()->fadeIn().
+                              display: 'block',
                               top: `${position ? position.top : 0}px`,
                               left: `${position ? position.left : 0}px`,
                               width: `${position ? position.width : POPOVER_WIDTH}px`,

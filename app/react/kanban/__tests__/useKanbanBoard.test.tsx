@@ -605,6 +605,61 @@ describe('move — reconcile on persistence failure', () => {
         );
     });
 
+    it('reverts the board IN-PLACE to the pre-move arrangement when BOTH the persist call AND the server re-fetch fail (offline) — Issue 3', async () => {
+        const STATUS_A = 100;
+        const STATUS_B = 200;
+        projectFixture = makeProject({
+            id: PID,
+            is_kanban_activated: true,
+            us_statuses: [makeStatus({ id: STATUS_A }), makeStatus({ id: STATUS_B })],
+            my_permissions: ['view_us', 'modify_us'],
+        });
+        // A single story that starts in column A.
+        userstoriesFixture = [makeUserStory({ id: 1, status: STATUS_A, kanban_order: 1 })];
+
+        const { result } = await renderLoaded();
+
+        // Sanity: the story starts in column A, not column B.
+        expect(result.current.usByStatus[String(STATUS_A)]).toContain(1);
+        expect(result.current.usByStatus[String(STATUS_B)] ?? []).not.toContain(1);
+
+        // Simulate the client going OFFLINE: the persist call rejects AND every
+        // subsequent server re-fetch of the board also rejects — so the failure
+        // path CANNOT lean on the server to undo the optimistic move. The only
+        // thing that can restore the board is the local in-place snapshot revert.
+        bulkUpdateKanbanOrderMock.mockRejectedValueOnce(new Error('offline'));
+        getMock.mockImplementation((path: string) => {
+            if (path === `/projects/${PID}`) {
+                return Promise.resolve(projectFixture);
+            }
+            if (path === '/swimlanes') {
+                return Promise.resolve(swimlanesFixture);
+            }
+            if (path === '/userstories') {
+                return Promise.reject(new Error('offline'));
+            }
+            return Promise.reject(new Error(`unexpected api.get path: ${path}`));
+        });
+
+        // Move the story from column A to column B (optimistic), then both the
+        // persist and the reconciliation re-fetch fail.
+        await act(async () => {
+            await result.current.move([1], STATUS_B, -1, 0, null, null);
+        });
+
+        // The optimistic move is undone IN-PLACE by the captured snapshot — NOT
+        // by a server re-fetch (which failed). The story is back in column A and
+        // absent from column B, proving the revert does not depend on the server.
+        await waitFor(() =>
+            expect(result.current.usByStatus[String(STATUS_A)]).toContain(1),
+        );
+        expect(result.current.usByStatus[String(STATUS_B)] ?? []).not.toContain(1);
+        // The card itself is preserved (not lost by the revert).
+        expect(result.current.usMap[1]).toBeDefined();
+        // The failure is still surfaced to the user (toast), exactly as before.
+        await waitFor(() => expect(result.current.moveError).toBe('offline'));
+    });
+
     it('surfaces the server envelope message and clears moveError on the next successful move (F-AAP-03, dest#8)', async () => {
         projectFixture = makeProject({
             id: PID,

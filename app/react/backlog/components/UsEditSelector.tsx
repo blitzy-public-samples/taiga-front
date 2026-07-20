@@ -195,10 +195,18 @@ export const UsEditSelector = ({
         // F-UI-04: expose the option popover as an ARIA menu (matching the
         // kanban `CardActions` popover pattern); the visible
         // `.popover.us-option-popup` classes are unchanged.
+        //
+        // dest#CRITICAL popover-visibility fix: the shared `popover` SCSS mixin
+        // declares `display:none` and no stylesheet rule unhides it; AngularJS
+        // revealed the popover via the jQuery `.popover().open()` plugin's
+        // `fadeIn()` (an inline `display:block`). The <ul> is only rendered while
+        // `open`, so the inline `display:'block'` below is the faithful React
+        // equivalent of that reveal — without it the menu is invisible.
         <ul
           className={`popover us-option-popup${isFirst ? ' first' : ''}`}
           role="menu"
           aria-label={translate('BACKLOG.US_OPTIONS', undefined, 'User story options')}
+          style={{ display: 'block' }}
         >
           {canMutate(project, 'modify_us') && (
             <li role="none">

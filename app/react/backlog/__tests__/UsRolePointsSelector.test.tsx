@@ -131,6 +131,12 @@ describe('UsRolePointsSelector', () => {
       openPopover(container);
       const popover = getPopover(container);
 
+      // dest#CRITICAL popover-visibility fix: the shared `popover` SCSS mixin
+      // declares `display:none`; the legacy jQuery `.popover().open()` revealed
+      // it via `fadeIn()` (an inline `display:block`). Assert the component now
+      // sets that inline reveal itself (jsdom reflects inline styles only).
+      expect(popover.style.display).toBe('block');
+
       // The two computable roles are present…
       expect(within(popover).getByText('Back')).toBeInTheDocument();
       expect(within(popover).getByText('Front')).toBeInTheDocument();

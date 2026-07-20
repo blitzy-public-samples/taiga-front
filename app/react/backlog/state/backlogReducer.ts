@@ -688,6 +688,14 @@ export function backlogReducer(state: BacklogState, action: BacklogAction): Back
                     draft.userstories.push(...clones);
                 }
 
+                // Issue 4 (stale "N stories" header): the backlog header renders
+                // `totalUserStories` (the pagination total established at load).
+                // A bulk-create adds `clones.length` NEW stories to the backlog,
+                // so the total must grow by exactly that many — otherwise the
+                // header count stays stale until a full reload. Bump it in step
+                // with the optimistic insert so the header stays consistent.
+                draft.totalUserStories += clones.length;
+
                 draft.newUs = draft.newUs.concat(ids);
                 recomputeBacklogDerived(draft);
                 break;

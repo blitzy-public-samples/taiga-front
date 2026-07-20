@@ -177,7 +177,14 @@ describe('UsEditSelector', () => {
 
       openPopover(container);
 
-      expect(queryPopover(container)).toBeInTheDocument();
+      const popover = queryPopover(container);
+      expect(popover).toBeInTheDocument();
+      // dest#CRITICAL popover-visibility fix: the shared `popover` SCSS mixin
+      // declares `display:none`; the legacy jQuery `.popover().open()` revealed
+      // it via `fadeIn()` (an inline `display:block`). Assert the component now
+      // sets that inline reveal itself (jsdom reflects inline styles only, so a
+      // missing reveal would leave the popover `display:none` and invisible).
+      expect(popover?.style.display).toBe('block');
       // The trigger carries the legacy `popover-open` class while open…
       expect(getTrigger(container)).toHaveClass('popover-open');
       // …and advertises the disclosure state for assistive technology.

@@ -221,6 +221,24 @@ describe('popover open/close', () => {
         expect(trigger).toHaveClass('popover-open');
     });
 
+    it('reveals the open menu with an inline display:block (dest#CRITICAL fadeIn parity)', () => {
+        // Root cause of the CRITICAL "⋮ menu invisible" finding: the shared
+        // `popover` SCSS mixin declares `display:none` and no stylesheet rule
+        // unhides it. In AngularJS the jQuery `.popover().open()` plugin revealed
+        // the menu with `fadeIn()` (an inline `display:block`). The React port
+        // must set that inline reveal itself or the portaled menu is in the DOM
+        // but invisible. jsdom does NOT apply the SCSS mixin, so we assert the
+        // INLINE style the component is now responsible for setting.
+        const item = makeBoardCard();
+        const project = makeProject({ my_permissions: ['modify_us'] });
+        const { container } = render(
+            <CardActions item={item} project={project} zoomLevel={1} />,
+        );
+
+        const popover = openPopover(container);
+        expect(popover.style.display).toBe('block');
+    });
+
     it('exposes accessible menu-button semantics on the trigger and menu (F-UI-04)', () => {
         const item = makeBoardCard();
         const project = makeProject({ my_permissions: ['modify_us'] });
