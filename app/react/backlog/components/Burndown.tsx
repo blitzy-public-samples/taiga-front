@@ -40,11 +40,15 @@
  * COLORS (line/point stroke) and FILL colors are the exact literals from the
  * directive (main.coffee:1258-1264 `colors`, and each series' `lines.fillColor`).
  *
- * AXES / GRID reproduce the Flot options (main.coffee:1266-1283): grid border
+ * AXES / GRID reproduce the Flot options (main.coffee:1266-1287): grid border
  * colour `#D8DEE9`; x-axis with one tick per sprint and an EMPTY tick formatter
  * (no per-tick text, `tickFormatter: -> ""`); axis labels sourced from the same
  * i18n keys the directive used — `BACKLOG.CHART.XAXIS_LABEL` ("Sprints") and
- * `BACKLOG.CHART.YAXIS_LABEL` ("Points").
+ * `BACKLOG.CHART.YAXIS_LABEL` ("Points"). The `yaxis` sets NO `tickFormatter`
+ * and NO explicit `ticks`, so Flot auto-generated numeric VALUE ticks and drew
+ * a faint horizontal gridline at each (`grid.color` -> derived `tickColor`,
+ * `#D8DEE9` @ 0.22 alpha); both are reproduced here via `computeYTicks`
+ * (finding M-09 — the React chart had dropped them).
  *
  * TOOLTIPS reproduce `tooltipOpts.content` (main.coffee:1305-1318): each plotted
  * point exposes, via a native SVG `<title>`, the interpolated message for its
@@ -112,6 +116,15 @@ const SERIES_FILL = [
 /** Grid / axis border colour (Flot `grid.borderColor` / `grid.color`). */
 const GRID_COLOR = '#D8DEE9';
 
+/**
+ * Internal-gridline colour. Flot derives `grid.tickColor` from `grid.color`
+ * by scaling its alpha to 0.22 when `tickColor` is unset
+ * (`$.color.parse(grid.color).scale('a', 0.22)`), so the horizontal gridlines
+ * legacy drew at each y-tick are `#D8DEE9` (rgb 216,222,233) at 0.22 alpha —
+ * fainter than the solid axis border. Reproduced verbatim (finding M-09).
+ */
+const GRID_TICK_COLOR = 'rgba(216, 222, 233, 0.22)';
+
 /* ------------------------------------------------------------------ *
  * viewBox geometry — 6:1 aspect ratio (legacy `height = width / 6`).
  * ------------------------------------------------------------------ */
@@ -128,6 +141,69 @@ const PLOT_H = VB_H - PAD_T - PAD_B;
 function num(v: unknown): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * "Nice" tick step for a value range, reproducing Flot's default tick-size
+ * algorithm (`setupTickGeneration` in jquery.flot.js). Flot picks a step of
+ * 1, 2, 2.5, 5 or 10 times a power of ten so that roughly `targetTicks` ticks
+ * span the range. The legacy `yaxis` sets NO `tickFormatter` and NO explicit
+ * `ticks`, so Flot generated these value ticks automatically — this restores
+ * the numeric Y-axis ticks the React chart had dropped (finding M-09).
+ */
+export function niceTickSize(range: number, targetTicks: number): number {
+  if (!(range > 0) || !(targetTicks > 0)) {
+    return 1;
+  }
+  const delta = range / targetTicks;
+  const dec = -Math.floor(Math.log(delta) / Math.LN10);
+  const magn = Math.pow(10, -dec);
+  const norm = delta / magn; // normalised delta in [1, 10)
+  let size: number;
+  if (norm < 1.5) {
+    size = 1;
+  } else if (norm < 3) {
+    size = norm > 2.25 ? 2.5 : 2;
+  } else if (norm < 7.5) {
+    size = 5;
+  } else {
+    size = 10;
+  }
+  return size * magn;
+}
+
+/** A Y-axis tick: its data value plus the label Flot's default formatter shows. */
+export interface YTick {
+  value: number;
+  label: string;
+}
+
+/**
+ * Generate the Y-axis value ticks across `[yMin, yMax]`, reproducing Flot's
+ * default axis ticks + label formatting (finding M-09). Ticks fall on multiples
+ * of the {@link niceTickSize} step, span the data range (inclusive, with a small
+ * epsilon for float dust), and are labelled with `toFixed(tickDecimals)` where
+ * `tickDecimals` is derived from the step exactly as Flot does — integer steps
+ * yield integer labels (`0`, `100`, `200`…), fractional steps add decimals.
+ */
+export function computeYTicks(yMin: number, yMax: number, targetTicks = 5): YTick[] {
+  if (!(yMax > yMin)) {
+    return [{ value: yMin, label: String(yMin) }];
+  }
+  const size = niceTickSize(yMax - yMin, targetTicks);
+  const tickDecimals = Math.max(0, -Math.floor(Math.log(size) / Math.LN10));
+  const start = Math.floor(yMin / size) * size;
+  const eps = size * 1e-6;
+  const ticks: YTick[] = [];
+  for (let v = start; v <= yMax + eps; v += size) {
+    if (v < yMin - eps) {
+      continue; // keep only ticks within the plotted data range
+    }
+    // Snap away floating-point accumulation dust before formatting.
+    const snapped = Math.round(v / size) * size;
+    ticks.push({ value: snapped, label: snapped.toFixed(tickDecimals) });
+  }
+  return ticks;
 }
 
 /**
@@ -188,6 +264,12 @@ export function Burndown({ stats }: BurndownProps) {
 
   const baselineY = yScale(0); // zero line — fill areas close to here
 
+  // Y-axis value ticks (finding M-09): Flot auto-generated numeric ticks +
+  // horizontal gridlines at each tick (the legacy `yaxis` set no
+  // `tickFormatter`, and `grid.color` drove the gridlines). Reproduce both via
+  // the pure, unit-tested `computeYTicks` over the plotted [yMin, yMax] range.
+  const yTicks = computeYTicks(yMin, yMax);
+
   /** Build the plotted points for a full-length series (x = 0..n-1). */
   const buildPoints = (vals: number[]): PlotPoint[] =>
     vals.map((v, i) => ({ cx: xScale(i), cy: yScale(v), msIndex: i, yval: v }));
@@ -246,6 +328,38 @@ export function Burndown({ stats }: BurndownProps) {
         stroke={GRID_COLOR}
         strokeWidth={1}
       />
+      {/* Y-axis value ticks + horizontal gridlines (finding M-09): the legacy
+          Flot `yaxis` used the DEFAULT numeric tick formatter and `grid.color`
+          drew a faint gridline across the plot at every tick. Each tick renders
+          a full-width horizontal gridline (GRID_TICK_COLOR = #D8DEE9 @ 0.22) and
+          a right-aligned numeric label to the left of the axis. */}
+      {yTicks.map((tick) => {
+        const ty = yScale(tick.value);
+        return (
+          <g key={`ytick-${tick.value}`} data-testid="burndown-ytick">
+            <line
+              x1={PAD_L}
+              y1={ty}
+              x2={PAD_L + PLOT_W}
+              y2={ty}
+              stroke={GRID_TICK_COLOR}
+              strokeWidth={1}
+              data-testid="burndown-gridline-h"
+            />
+            <text
+              x={PAD_L - 4}
+              y={ty + 3}
+              textAnchor="end"
+              fontSize={8}
+              fontFamily="Verdana, Arial, Helvetica, Tahoma, sans-serif"
+              fill="#788188"
+              data-testid="burndown-ytick-label"
+            >
+              {tick.label}
+            </text>
+          </g>
+        );
+      })}
       {/* x-axis ticks: one per sprint, NO label text (tickFormatter -> "") */}
       {milestones.map((_m, i) => (
         <line

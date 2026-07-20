@@ -553,6 +553,26 @@ describe('BacklogApp - static skeleton & class flags', () => {
     expect(container.querySelector('#backlog-filter')).toBeInTheDocument();
   });
 
+  it('N-13: the Filters toggle truthfully exposes aria-expanded + aria-controls (both states)', () => {
+    // #show-filters-button is a real disclosure toggle for the always-present
+    // `.backlog-manager` (#backlog-filter-panel). `aria-expanded` follows
+    // activeFilters; `aria-controls` points to the stable panel id. Invisible,
+    // no behaviour change. Assert both states.
+    const { container, rerender } = renderApp();
+    const toggle = () => container.querySelector('#show-filters-button') as HTMLElement;
+
+    // Closed (activeFilters === false).
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle()).toHaveAttribute('aria-controls', 'backlog-filter-panel');
+    expect(container.querySelector('#backlog-filter-panel')).toHaveClass('backlog-manager');
+
+    // Open (activeFilters === true).
+    currentBacklog = makeBacklog({ state: { activeFilters: true } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    rerender(<BacklogApp projectSlug={PROJECT_SLUG} />);
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+  });
+
   it('always renders the two js-empty-backlog placeholders', () => {
     const { container } = renderApp();
     expect(container.querySelector('.empty-backlog.js-empty-backlog')).toBeInTheDocument();
@@ -1475,6 +1495,46 @@ describe('BacklogApp - add user story (finding #16)', () => {
     expect(screen.queryByLabelText('Add user story')).toBeNull();
     expect(screen.queryByLabelText('Add user stories in bulk')).toBeNull();
     expect(screen.queryByTitle('Create new user story')).toBeNull();
+  });
+
+  /* ---- M-20 / M-21: accessible-modal semantics on the add/bulk lightboxes ---- */
+  it('M-20: the add-story lightbox is an accessible modal (role/aria-modal/aria-label) and closes on Escape', () => {
+    const addStoryStandard = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryStandard } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user story'));
+    const lightbox = container.querySelector('.lightbox-add-story') as HTMLElement;
+    expect(lightbox).toBeInTheDocument();
+    // Modal semantics restored (parity with common/lightboxes.coffee + SprintForm).
+    expect(lightbox.getAttribute('role')).toBe('dialog');
+    expect(lightbox.getAttribute('aria-modal')).toBe('true');
+    expect(lightbox.getAttribute('aria-label')).toBe('New user story');
+
+    // Escape closes it (legacy keydown.lightbox behavior), not just Cancel.
+    fireEvent.keyDown(lightbox, { key: 'Escape' });
+    expect(container.querySelector('.lightbox-add-story')).toBeNull();
+    // Escape is a pure close: it does NOT submit a create.
+    expect(addStoryStandard).not.toHaveBeenCalled();
+  });
+
+  it('M-21: the bulk-create lightbox is an accessible modal (role/aria-modal/aria-label) and closes on Escape', () => {
+    const addStoryBulk = jest.fn(() => Promise.resolve());
+    currentBacklog = makeBacklog({ actions: { addStoryBulk } });
+    mockUseBacklog.mockReturnValue(currentBacklog);
+    const { container } = renderApp();
+
+    fireEvent.click(screen.getByLabelText('Add user stories in bulk'));
+    const lightbox = container.querySelector('.lightbox-add-story-bulk') as HTMLElement;
+    expect(lightbox).toBeInTheDocument();
+    expect(lightbox.getAttribute('role')).toBe('dialog');
+    expect(lightbox.getAttribute('aria-modal')).toBe('true');
+    expect(lightbox.getAttribute('aria-label')).toBe('Add user stories in bulk');
+
+    fireEvent.keyDown(lightbox, { key: 'Escape' });
+    expect(container.querySelector('.lightbox-add-story-bulk')).toBeNull();
+    expect(addStoryBulk).not.toHaveBeenCalled();
   });
 });
 

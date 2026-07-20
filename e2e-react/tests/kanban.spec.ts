@@ -113,6 +113,13 @@ async function shot(page: Page, step?: string): Promise<void> {
 // Serialize the suite so tests run in declared order and stop on first failure
 // (deterministic, matches retries:0). Some flows also depend on running order
 // (e.g. save-then-remove custom filter) which serial mode guarantees.
+//
+// C-02: the previously observed cascade (one failure skipping the rest) was a
+// SYMPTOM of the stale `input.create-us-subject` create selector (fixed to
+// `input[name="subject"]` above), not of serial mode itself. With the selector
+// corrected the suite runs clean, so serial mode is RETAINED for its
+// deterministic ordering and the order-dependent filter flow — matching the
+// legacy suite this ports.
 test.describe.configure({ mode: 'serial' });
 
 // ---------------------------------------------------------------------------
@@ -762,16 +769,26 @@ test.describe('kanban (react)', () => {
     await waitLightboxOpen(lb);
     await shot(page, 'create-us');
 
-    // React subject field is `input.create-us-subject` (name=create-us-subject),
-    // not the legacy `input[name="subject"]`. Use the controlled-input driver so
-    // React commits the subject state before Save reads it (see
-    // `fillReactControlled`); a plain fill()+click races and silently no-ops.
-    await fillReactControlled(lb.locator('input.create-us-subject'), subject);
+    // C-02: the React Kanban create lightbox renders `<input name="subject">`
+    // (CreateEditUsLightbox.tsx:568) -- it does NOT carry a `create-us-subject`
+    // class (that class belongs only to the Backlog add-story form,
+    // BacklogApp.tsx:1558), so the previous `input.create-us-subject` selector
+    // never matched and the create step silently no-op'd. Target the field by
+    // its real `name="subject"` and use the controlled-input driver so React
+    // commits the subject state before Save reads it (see `fillReactControlled`);
+    // a plain fill()+click races and silently no-ops.
+    await fillReactControlled(lb.locator('input[name="subject"]'), subject);
 
     await shot(page, 'create-us-filled');
 
-    // React saves via `.btn-save` (a type=button control); Enter also submits.
-    await lb.locator('.btn-save').click();
+    // C-02: the React create/edit lightbox (CreateEditUsLightbox.tsx:1079-1086)
+    // saves through its form's `<button id="submitButton" type="submit">`
+    // (class `btn-big add-item`) -- it has NO `.btn-save` class (that class
+    // belongs to the separate `.lightbox-generic-bulk` save button used by the
+    // bulk-create test below). Target the submit button the same way the "edit
+    // user story" test above already does (`button[type="submit"]`); Enter also
+    // submits.
+    await lb.locator('button[type="submit"]').click();
     await waitLightboxClose(lb, 30_000);
 
     // Non-weakened parity for the ported create behaviour: exactly one new story

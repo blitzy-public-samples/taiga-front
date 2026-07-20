@@ -63,11 +63,11 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { createPortal } from 'react-dom';
-import moment from 'moment';
 
 import { useSortableCard } from '../../shared/dnd/sortable';
 import { DND_CLASS } from '../../shared/dnd/types';
 import { t } from '../../shared/i18n';
+import { dueDateColor, dueDateTitle } from '../../shared/dueDate';
 import type { UserStoryData, Project, User } from '../state/kanbanReducer';
 
 /* ------------------------------------------------------------------------- *
@@ -135,14 +135,6 @@ interface AvatarInfo {
   bg: string;
 }
 
-/** A single due-date appearance rule (mirrors due-date.service.coffee `defaultConfig`). */
-interface DueDateAppearance {
-  color: string;
-  name: string;
-  days_to_due: number | null;
-  by_default: boolean;
-}
-
 /* ------------------------------------------------------------------------- *
  * Constants
  * ------------------------------------------------------------------------- */
@@ -154,24 +146,6 @@ interface DueDateAppearance {
  * so the stable public path is used.
  */
 const NOT_ASSIGNED_AVATAR = '/images/unnamed.png';
-
-/**
- * Default due-date appearance rules, copied verbatim from
- * `DueDateService.defaultConfig` (due-date.service.coffee). Used when the
- * project does not define per-object-type `*_duedates`.
- */
-const DEFAULT_DUE_DATE_CONFIG: DueDateAppearance[] = [
-  { color: '#93C45D', name: 'normal due', days_to_due: null, by_default: true },
-  { color: '#EA7B4B', name: 'due soon', days_to_due: 14, by_default: false },
-  { color: '#E44057', name: 'past due', days_to_due: 0, by_default: false },
-];
-
-/**
- * Date format for the due-date title. The legacy service read the translated
- * `COMMON.PICKERDATE.FORMAT`; with no React i18n in scope a sensible default is
- * used (this affects only the tooltip text, never layout).
- */
-const DUE_DATE_FORMAT = 'DD MMM YYYY';
 
 // The AngularJS card ran every user-facing string through
 // `$translate.instant(...)`. The React coexistence layer has an equivalent
@@ -334,63 +308,14 @@ const getAvatar = (user: User | undefined): AvatarInfo => {
 
 /* ------------------------------------------------------------------------- *
  * Due-date helpers — reproduce due-date.service.coffee
- * ------------------------------------------------------------------------- */
-
-/** Resolve the active due-date config for the project (per-type override or default). */
-const getDueDateConfig = (project: Project): DueDateAppearance[] => {
-  const cfg = (project as Record<string, unknown>)['us_duedates'];
-  return Array.isArray(cfg) && cfg.length ? (cfg as DueDateAppearance[]) : DEFAULT_DUE_DATE_CONFIG;
-};
-
-/**
- * Reproduce `DueDateService._getAppearance` exactly:
- *   - start from the `by_default` appearance;
- *   - sort the config descending by `days_to_due` (via `_.sortBy(cfg, o => -o.days_to_due)`,
- *     where a `null` key coerces to 0 — matching CoffeeScript's `-null === 0`);
- *   - walk the sorted rules, skipping `days_to_due == null`, and for each rule
- *     compute `limitDate = dueDate - days_to_due days`; when `now >= limitDate`
- *     the rule becomes current (LAST match wins, so "past due" overrides
- *     "due soon").
+ * ------------------------------------------------------------------------- *
+ * The due-date appearance logic (colour + tooltip title) now lives in the
+ * SHARED module `app/react/shared/dueDate.ts` so the Kanban card and the
+ * Backlog / sprint rows (`components/DueDateBadge.tsx`) compute identical
+ * colours/titles from the same project configuration — matching the legacy,
+ * where every `tg-due-date` directive delegated to the one `DueDateService`.
+ * `dueDateColor` / `dueDateTitle` are imported at the top of this file.
  */
-const getDueDateStatus = (project: Project, dueDate: string | null | undefined): DueDateAppearance | null => {
-  if (!dueDate) {
-    return null;
-  }
-
-  const config = getDueDateConfig(project);
-  let current: DueDateAppearance | null = config.find((c) => c.by_default) ?? null;
-
-  const sorted = [...config].sort((a, b) => -(a.days_to_due ?? 0) - -(b.days_to_due ?? 0));
-
-  const now = moment().valueOf();
-  const due = moment(dueDate);
-
-  for (const appearance of sorted) {
-    if (appearance.days_to_due == null) {
-      continue;
-    }
-    const limitDate = due.clone().subtract(appearance.days_to_due, 'days').valueOf();
-    if (now >= limitDate) {
-      current = appearance;
-    }
-  }
-
-  return current;
-};
-
-/** `color()`: the current appearance colour, or `''` when there is no due date. */
-const dueDateColor = (project: Project, dueDate: string | null | undefined): string =>
-  getDueDateStatus(project, dueDate)?.color ?? '';
-
-/** `title()`: formatted date, suffixed with the status name in parentheses. */
-const dueDateTitle = (project: Project, dueDate: string | null | undefined): string => {
-  if (!dueDate) {
-    return '';
-  }
-  const formatted = moment(dueDate).format(DUE_DATE_FORMAT);
-  const status = getDueDateStatus(project, dueDate);
-  return status?.name ? `${formatted} (${status.name})` : formatted;
-};
 
 
 /* ------------------------------------------------------------------------- *
@@ -549,6 +474,11 @@ const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
         ref={buttonRef}
         type="button"
         className={open ? 'js-popup-button popover-open' : 'js-popup-button'}
+        // N-06: name the icon-only disclosure trigger (legacy `js-popup-button`
+        // was a bare SVG button). `aria-haspopup`/`aria-expanded` truthfully
+        // describe the real popup + its open state; the invisible `aria-label`
+        // completes the control's accessible name without any visual change.
+        aria-label={t('COMMON.CARD.OPTIONS')}
         aria-haspopup="true"
         aria-expanded={open}
         onClick={(event) => {
@@ -567,16 +497,27 @@ const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
         ? createPortal(
             <div
               ref={popoverRef}
+              /*
+               * N-07: the migration added `role="menu"` + `role="menuitem"`,
+               * which announce the ARIA menu KEYBOARD pattern (arrow-key roving
+               * between items). That pattern is NOT implemented (focus stays on
+               * the trigger; ArrowDown is a no-op) - a false affordance, and the
+               * legacy `taiga.globalPopover` [popovers.coffee:256-322] built a
+               * PLAIN `div.popover.global-popover > ul > li > button` with no menu
+               * roles at all. We reproduce that plain structure exactly, removing
+               * the false roving promise. Adding a real roving handler would be a
+               * NEW keyboard behaviour the legacy never had (forbidden by the
+               * exact-parity mandate, same rationale as the DnD KeyboardSensor
+               * omission). Escape-to-dismiss + outside-click close are retained.
+               */
               className="popover global-popover active"
-              role="menu"
               style={popoverStyle}
             >
               <ul>
                 {actions.map((action) => (
-                  <li key={action.key} role="none">
+                  <li key={action.key}>
                     <button
                       type="button"
-                      role="menuitem"
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
@@ -605,31 +546,52 @@ const CardActionsPopover = ({ actions }: { actions: CardAction[] }) => {
  * block), so it is factored out. The `.card-epics` container renders only when
  * the story has epics. Each `.card-epic` shows a colour swatch; the epic NAME is
  * shown only for the FIRST epic and only when `zoomLevel != 0` (matching the
- * `ng-if="$index == 0 && vm.zoomLevel != 0"` guard). The AngularJS `tg-nav`
- * routing is owned by the AngularJS shell outside React, so the anchor is a
- * plain `href="#"` while the exact class names are preserved.
+ * `ng-if="$index == 0 && vm.zoomLevel != 0"` guard).
+ *
+ * N-01: the legacy `.card-epic` anchor is a REAL navigation link -
+ * `tg-nav="project-epics-detail:project=<slug>,ref=<epic ref>"` which the
+ * navurls table [app/coffee/modules/base.coffee:71] resolves to
+ * `/project/:project/epic/:ref`. Reproducing that exact same-origin href (rather
+ * than the inert `href="#"`) lets the AngularJS html5Mode router intercept the
+ * click for client-side navigation to the epic detail - identical behaviour to
+ * the legacy card, pure URL interop with no cross-framework bridge (AAP 0.4.2).
+ * The fallback stays `#` only when the epic ref or project slug is unavailable.
  */
-const CardEpics = ({ epics, zoomLevel }: { epics: EpicView[]; zoomLevel: number }) => {
+const CardEpics = ({
+  epics,
+  zoomLevel,
+  projectSlug,
+}: {
+  epics: EpicView[];
+  zoomLevel: number;
+  projectSlug: string;
+}) => {
   if (!epics.length) {
     return null;
   }
 
   return (
     <div className="card-epics">
-      {epics.map((epic, index) => (
-        <a className="card-epic" href="#" key={epic.id ?? index}>
-          <span
-            className="epic-color"
-            style={{ backgroundColor: epic.color ?? '' }}
-            title={epic.subject ?? ''}
-          />
-          {index === 0 && zoomLevel !== 0 ? (
-            <span className="epic-name" title={epic.subject ?? ''}>
-              {epic.subject ?? ''}
-            </span>
-          ) : null}
-        </a>
-      ))}
+      {epics.map((epic, index) => {
+        const epicHref =
+          epic.ref != null && projectSlug
+            ? `/project/${projectSlug}/epic/${epic.ref}`
+            : '#';
+        return (
+          <a className="card-epic" href={epicHref} key={epic.id ?? index}>
+            <span
+              className="epic-color"
+              style={{ backgroundColor: epic.color ?? '' }}
+              title={epic.subject ?? ''}
+            />
+            {index === 0 && zoomLevel !== 0 ? (
+              <span className="epic-name" title={epic.subject ?? ''}>
+                {epic.subject ?? ''}
+              </span>
+            ) : null}
+          </a>
+        );
+      })}
     </div>
   );
 };
@@ -859,7 +821,7 @@ const Card = ({
           {zoomLevel > 0 && (canModify || canDelete) ? <CardActionsPopover actions={actions} /> : null}
 
           {/* 3. card-epics wrapper (card.jade: div(ng-if="vm.zoomLevel > 0")) */}
-          <div>{zoomLevel > 0 ? <CardEpics epics={epics} zoomLevel={zoomLevel} /> : null}</div>
+          <div>{zoomLevel > 0 ? <CardEpics epics={epics} zoomLevel={zoomLevel} projectSlug={projectSlug} /> : null}</div>
 
           {/* 4. card-title (card-title.jade) */}
           <h2 className="card-title">
@@ -872,7 +834,7 @@ const Card = ({
             </a>
             {zoomLevel === 0 ? (
               <div className="card-compact-epics">
-                <CardEpics epics={epics} zoomLevel={zoomLevel} />
+                <CardEpics epics={epics} zoomLevel={zoomLevel} projectSlug={projectSlug} />
               </div>
             ) : null}
           </h2>

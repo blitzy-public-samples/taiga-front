@@ -150,6 +150,23 @@ function buildWeeks(year: number, month: number, firstDay: number): Array<Array<
 }
 
 /**
+ * Single-open coordination across sibling pickers (M-22).
+ *
+ * The AngularJS sprint lightbox bound one Pikaday per date field, and Pikaday's
+ * own document handler closed a previously-open calendar when another field was
+ * engaged, so at most one calendar was ever open. Each React {@link DatePicker}
+ * owns INDEPENDENT `open` state whose only sibling-close path is an outside
+ * `mousedown`; that path is bypassed by keyboard/programmatic focus (tabbing from
+ * the "estimated start" field into "estimated finish" opens the second calendar
+ * with no mousedown, leaving the first open — the state the QA screenshot
+ * captured). This module-level slot holds the close callback of the currently
+ * open picker so that whenever any picker opens it first closes the previous one,
+ * restoring the legacy at-most-one-open invariant. It is purely behavioral —
+ * zero visual change (AAP 0.3.4).
+ */
+let activeDatePickerClose: (() => void) | null = null;
+
+/**
  * The date picker. Renders the bound text input and, while focused/open, the
  * Pikaday-equivalent calendar popup positioned just beneath it.
  */
@@ -180,6 +197,34 @@ export function DatePicker(props: DatePickerProps) {
   // Page coordinates for the portaled popup, recomputed on open and while it is
   // shown (scroll/resize) — mirrors Pikaday keeping the bound calendar anchored.
   const [position, setPosition] = useState<PopupPosition>({ left: 0, top: 0 });
+
+  // Stable per-instance close used by the single-open registry (M-22). A plain
+  // close (no refocus) so a sibling picker can dismiss this one silently.
+  const closeSelf = useCallback(() => {
+    setOpen(false);
+  }, []);
+
+  // Single-open enforcement (M-22): keep the module-level slot in sync with this
+  // picker's open state. On open, close any OTHER open picker and claim the slot;
+  // on close (any path: select, Escape, outside-click, sibling-close) release the
+  // slot if we own it; on unmount, release it too. This guarantees at most one
+  // calendar is open at a time regardless of pointer vs keyboard/programmatic
+  // focus, matching the legacy single-Pikaday behavior.
+  useEffect(() => {
+    if (open) {
+      if (activeDatePickerClose && activeDatePickerClose !== closeSelf) {
+        activeDatePickerClose();
+      }
+      activeDatePickerClose = closeSelf;
+    } else if (activeDatePickerClose === closeSelf) {
+      activeDatePickerClose = null;
+    }
+    return () => {
+      if (activeDatePickerClose === closeSelf) {
+        activeDatePickerClose = null;
+      }
+    };
+  }, [open, closeSelf]);
 
   // Guards the deliberate "hide, then return focus to the field" sequence: focusing
   // the input would otherwise re-fire `onFocus` and immediately reopen the popup.

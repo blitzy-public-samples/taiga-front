@@ -668,6 +668,12 @@ describe('FilterBar — prop edge cases (branch completeness)', () => {
     expect(avatar.getAttribute('src')).toContain('/images/unnamed.png');
     // No count -> no count badge.
     expect(option.querySelector('.number.e2e-filter-count')).toBeNull();
+    // undefined-avatar-alt: getUnnamed() carries no `fullName`, so the resolved
+    // avatar's fullName is `undefined`. The guard (`?? ''`) must render EMPTY
+    // `alt`/`title` strings, NEVER the JS sentinel "undefined" (which the legacy
+    // directive leaked). Lock this in so the sentinel cannot regress.
+    expect(avatar.getAttribute('alt')).toBe('');
+    expect(avatar.getAttribute('title')).toBe('');
   });
 });
 

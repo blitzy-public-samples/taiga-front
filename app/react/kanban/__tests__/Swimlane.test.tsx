@@ -37,7 +37,7 @@
  *     global (`@types/jest`), never imported.
  */
 
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, cleanup } from '@testing-library/react';
 import '@testing-library/jest-dom';
 
 // ---------------------------------------------------------------------------
@@ -187,6 +187,20 @@ describe('Swimlane — structure', () => {
     // body absent -> no columns
     expect(container.querySelector('.kanban-table-body')).not.toBeInTheDocument();
     expect(screen.queryAllByTestId('column')).toHaveLength(0);
+  });
+
+  it('N-08: the fold title button truthfully exposes aria-expanded (expanded === !folded)', () => {
+    // The fold/unfold state was conveyed to sighted users only by the icon +
+    // `folded` class. `aria-expanded` annotates that SAME visible state for
+    // assistive tech without changing behaviour. Lock in both states so it
+    // cannot regress.
+    render(<Swimlane {...makeProps({ folded: false })} />);
+    expect(screen.getByRole('button')).toHaveAttribute('aria-expanded', 'true');
+
+    cleanup();
+
+    render(<Swimlane {...makeProps({ folded: true })} />);
+    expect(screen.getByRole('button')).toHaveAttribute('aria-expanded', 'false');
   });
 });
 

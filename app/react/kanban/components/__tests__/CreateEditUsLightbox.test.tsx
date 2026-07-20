@@ -594,3 +594,58 @@ describe('CreateEditUsLightbox - EDIT mode', () => {
     expect(((onSubmit as jest.Mock).mock.calls[0][0] as UsFormValues).assignedUsers).toEqual([]);
   });
 });
+
+/* ================================================================== *
+ * M-17 — accessible-modal semantics (aria-modal + Escape-to-close)
+ * ================================================================== */
+describe('CreateEditUsLightbox - M-17 accessible modal', () => {
+  it('the dialog is a complete modal: role=dialog + aria-modal="true" + aria-label', () => {
+    const { container } = render(<CreateEditUsLightbox {...baseProps({ mode: 'create' })} />);
+    const dialog = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    expect(dialog).toBeInTheDocument();
+    expect(dialog.getAttribute('role')).toBe('dialog');
+    // Restores parity with common/lightboxes.coffee + the compliant SprintForm.
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    // Accessible name (the lightbox title) is preserved.
+    expect(dialog.getAttribute('aria-label')).toBeTruthy();
+  });
+
+  it('Escape closes the dialog (onClose) when no inner popover is open', () => {
+    const onClose = jest.fn();
+    const { container } = render(
+      <CreateEditUsLightbox {...baseProps({ mode: 'create', onClose })} />,
+    );
+    const dialog = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('Escape first dismisses an open status dropdown WITHOUT closing the dialog', () => {
+    const onClose = jest.fn();
+    const { container } = render(
+      <CreateEditUsLightbox {...baseProps({ mode: 'create', onClose })} />,
+    );
+    const dialog = container.querySelector('.lightbox-create-edit') as HTMLElement;
+    // Open the status popover, then press Escape at the dialog level.
+    fireEvent.click(container.querySelector('.status-dropdown') as HTMLElement);
+    expect(container.querySelector('.pop-status')).toBeInTheDocument();
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    // The popover is dismissed; the dialog stays open (onClose NOT called).
+    expect(container.querySelector('.pop-status')).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('Escape inside the tag input dismisses only the tag input (stopPropagation), not the dialog', () => {
+    const onClose = jest.fn();
+    const { container } = render(
+      <CreateEditUsLightbox {...baseProps({ mode: 'create', onClose })} />,
+    );
+    fireEvent.click(container.querySelector('.e2e-show-tag-input') as HTMLElement);
+    const tagInput = container.querySelector('.tag-input') as HTMLInputElement;
+    expect(tagInput).toBeInTheDocument();
+    fireEvent.keyDown(tagInput, { key: 'Escape' });
+    // Tag input is gone; the dialog is NOT closed by that Escape.
+    expect(container.querySelector('.tag-input')).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

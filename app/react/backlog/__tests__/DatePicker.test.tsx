@@ -383,3 +383,64 @@ describe('DatePicker — localization + RTL', () => {
     expect(popupEl()?.className.includes('is-rtl')).toBe(false);
   });
 });
+
+/* ================================================================== *
+ * M-22 — single-open enforcement across sibling pickers
+ * ================================================================== */
+describe('DatePicker — M-22 single-open enforcement', () => {
+  /** Render the two sibling pickers the sprint form hosts (start + finish). */
+  function renderTwo() {
+    const onChange = jest.fn();
+    return render(
+      <div>
+        <DatePicker
+          value="15 Jan 2021"
+          className="date-start"
+          name="estimated_start"
+          id="sprint-start"
+          ariaLabel="Estimated Start"
+          onChange={onChange}
+        />
+        <DatePicker
+          value="20 Jan 2021"
+          className="date-end"
+          name="estimated_finish"
+          id="sprint-finish"
+          ariaLabel="Estimated Finish"
+          onChange={onChange}
+        />
+      </div>,
+    );
+  }
+  const openPopupCount = () => document.body.querySelectorAll('.pika-single').length;
+
+  it('opening the second picker via keyboard/programmatic focus closes the first (at most one open)', () => {
+    const { container } = renderTwo();
+    const start = container.querySelector('input[name="estimated_start"]') as HTMLInputElement;
+    const finish = container.querySelector('input[name="estimated_finish"]') as HTMLInputElement;
+
+    // Focus the first field: exactly one calendar is open.
+    fireEvent.focus(start);
+    expect(openPopupCount()).toBe(1);
+
+    // Focus the second field WITHOUT an outside mousedown (the keyboard/tab path
+    // that previously left BOTH open — the QA M-22 state). The registry must have
+    // closed the first, so exactly one calendar remains open.
+    fireEvent.focus(finish);
+    expect(openPopupCount()).toBe(1);
+  });
+
+  it('Escape on the lone open picker closes it (zero open) — registry released', () => {
+    const { container } = renderTwo();
+    const start = container.querySelector('input[name="estimated_start"]') as HTMLInputElement;
+    fireEvent.focus(start);
+    expect(openPopupCount()).toBe(1);
+    // The calendar's own Escape handler closes it.
+    fireEvent.keyDown(document.body.querySelector('.pika-single') as HTMLElement, { key: 'Escape' });
+    expect(openPopupCount()).toBe(0);
+    // With the slot released, re-opening the second works (still single-open).
+    const finish = container.querySelector('input[name="estimated_finish"]') as HTMLInputElement;
+    fireEvent.focus(finish);
+    expect(openPopupCount()).toBe(1);
+  });
+});

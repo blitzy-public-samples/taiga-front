@@ -185,6 +185,20 @@ describe('<tg-card> host element and drag wiring', () => {
     expect(cls).toContain('ng-animate-disabled');
   });
 
+  it('M-15/M-16: does NOT emit the @dnd-kit false-affordance ARIA on the card host', () => {
+    // The `useSortable` mock supplies `role="button"`/`tabIndex` (see nonDragging),
+    // but `useSortableItem` suppresses them so `<tg-card>` matches the legacy inert
+    // drag div — no focusable "sortable button" that no-ops on Enter/Space. Pointer
+    // drag is unaffected (listeners + ref remain).
+    const { container } = renderCard({ usId: 101 });
+    const host = container.querySelector('tg-card') as HTMLElement;
+    expect(host.getAttribute('role')).toBeNull();
+    expect(host.getAttribute('tabindex')).toBeNull();
+    expect(host.getAttribute('aria-roledescription')).toBeNull();
+    expect(host.getAttribute('aria-describedby')).toBeNull();
+    expect(host.getAttribute('aria-pressed')).toBeNull();
+  });
+
   it('passes { usId, statusId, swimlaneId, oldIndex } + disabled:false as the drag config to useSortable', () => {
     // index:4 -> drag-data oldIndex:4 (F-WRITE-1); canModify defaults true -> disabled:false (F-WRITE-3).
     renderCard({ usId: 55, statusId: 9, swimlaneId: 2, index: 4 });
@@ -391,13 +405,46 @@ describe('card-actions popover', () => {
     // .active` body-portaled div (not an inline child of `.card-actions`).
     const menu = document.querySelector('.popover.global-popover.active') as HTMLElement;
     expect(menu).toBeInTheDocument();
-    const items = within(menu).getAllByRole('menuitem');
-    expect(items.map((i) => i.textContent)).toEqual(
+    // N-07: the popover reproduces the legacy `taiga.globalPopover` PLAIN
+    // `ul > li > button` structure with NO `role="menu"`/`menuitem` (those
+    // announced an arrow-key roving pattern that is not implemented). The items
+    // are plain buttons, queried by their button role / label.
+    const items = within(menu).getAllByRole('button');
+    expect(items.map((i) => i.textContent?.trim())).toEqual(
       // Verbatim from the AngularJS `tgCardActions` menu (`COMMON.CARD.*`):
       // "Edit card" / "Assign To" / "Delete card" / "Move to top".
       expect.arrayContaining(['Edit card', 'Assign To', 'Delete card', 'Move to top']),
     );
     expect(items).toHaveLength(4);
+  });
+
+  it('N-07: the options popover carries NO false ARIA menu roles (legacy globalPopover parity)', () => {
+    // VERIFY-AGAINST-LEGACY: `taiga.globalPopover` [popovers.coffee:256-322]
+    // built a PLAIN `div.popover.global-popover > ul > li > button` with no
+    // `role="menu"`/`menuitem`/`none`. The migration had wrongly added those
+    // roles, promising arrow-key roving that is not implemented. Assert the
+    // false affordance is gone so it cannot regress.
+    const { container } = renderCard({ canModify: true, canDelete: true });
+    fireEvent.click(container.querySelector('.js-popup-button') as HTMLElement);
+    const menu = document.querySelector('.popover.global-popover.active') as HTMLElement;
+    expect(menu).toBeInTheDocument();
+    expect(menu.getAttribute('role')).toBeNull();
+    expect(menu.querySelector('[role="menu"]')).toBeNull();
+    expect(menu.querySelector('[role="menuitem"]')).toBeNull();
+    expect(menu.querySelector('[role="none"]')).toBeNull();
+  });
+
+  it('N-06: the options (⋮) trigger has an accessible name + truthful popup ARIA', () => {
+    // The icon-only disclosure button previously had no accessible name. It now
+    // carries `aria-label="Options"` (COMMON.CARD.OPTIONS) plus truthful
+    // `aria-haspopup`/`aria-expanded`. These are INVISIBLE and add no behavior.
+    const { container } = renderCard({ canModify: true, canDelete: true });
+    const button = container.querySelector('.card-actions .js-popup-button') as HTMLElement;
+    expect(button).toHaveAttribute('aria-label', 'Options');
+    expect(button).toHaveAttribute('aria-haspopup', 'true');
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(button);
+    expect(button).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('hides Move to top for the first card', () => {
@@ -512,6 +559,32 @@ describe('card-epics', () => {
   it('omits the epics container when there are no epics', () => {
     const { container } = renderCard();
     expect(container.querySelector('.card-epics')).toBeNull();
+  });
+
+  it('N-01: epic pills link to the real epic destination /project/:slug/epic/:ref', () => {
+    // VERIFY-AGAINST-LEGACY: `card-epics.jade` rendered `a.card-epic` with a
+    // real `tg-nav="project-epics-detail:..."` link. The route
+    // (`base.coffee:71`) is `/project/:project/epic/:ref`. The migration had
+    // left the anchor inert (`href="#"`); this asserts the real destination so
+    // AngularJS html5Mode intercepts it for client-side navigation.
+    const { container } = renderCard({
+      item: epicItem(),
+      zoomLevel: 3,
+      zoom: L3,
+      project: makeProject({ slug: 'proj-x' }),
+    });
+    const epics = container.querySelectorAll('.card-epics .card-epic');
+    expect(epics).toHaveLength(2);
+    expect(epics[0]).toHaveAttribute('href', '/project/proj-x/epic/900');
+    expect(epics[1]).toHaveAttribute('href', '/project/proj-x/epic/901');
+  });
+
+  it('N-01: epic pill falls back to "#" when the project slug is unavailable', () => {
+    // Defensive parity: with no slug on the project the href degrades to "#"
+    // (never a broken/undefined URL) exactly as the guard specifies.
+    const { container } = renderCard({ item: epicItem(), zoomLevel: 3, zoom: L3 });
+    const epic = container.querySelector('.card-epics .card-epic') as HTMLElement;
+    expect(epic).toHaveAttribute('href', '#');
   });
 });
 

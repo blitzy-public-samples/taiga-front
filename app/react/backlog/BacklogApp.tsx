@@ -48,7 +48,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChangeEvent, DetailedHTMLProps, HTMLAttributes } from 'react';
+import type { ChangeEvent, DetailedHTMLProps, HTMLAttributes, KeyboardEvent } from 'react';
 
 // The effectful data layer (data + WebSocket + optimistic move flows). Returns
 // `{ state, actions }`; the presentational layer renders `state` and calls
@@ -1105,6 +1105,15 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                     <div className="backlog-table-options-start">
                       {/* #show-filters-button (backlog.jade:54-67): toggles the sidebar
                           filter + the `.active` class on itself (main.coffee:917-925). */}
+                      {/*
+                       * N-13 (a11y): the Filters button is a real disclosure toggle
+                       * for the `.backlog-manager` filter panel below. Expose the
+                       * toggle state truthfully via `aria-expanded` and associate the
+                       * controlled panel via `aria-controls`. Both attributes are
+                       * INVISIBLE and add no new behavior — they only annotate the
+                       * show/hide the legacy screen conveyed by label text
+                       * ("Filters"/"Hide filters") and the `active` class alone.
+                       */}
                       <button
                         id="show-filters-button"
                         type="button"
@@ -1114,6 +1123,8 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                             : 'btn-filter e2e-open-filter ng-animate-disabled'
                         }
                         onClick={handleToggleFilters}
+                        aria-expanded={state.activeFilters}
+                        aria-controls="backlog-filter-panel"
                       >
                         <Svg icon="icon-filters" />
                         <span className="text">{state.activeFilters ? 'Hide filters' : 'Filters'}</span>
@@ -1125,9 +1136,20 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                       {/* tg-input-search equivalent (backlog.jade:69-72): a debounced free-text
                           search bound to the `q` filter. `tg-input-search` is an AngularJS
                           directive; a plain search input reproduces the interaction. */}
+                      {/*
+                       * (a11y): give the search field an `id`/`name` (the
+                       * `aria-label` already supplies the accessible name) so the
+                       * browser no longer logs "A form field element should have an
+                       * id or name attribute", matching the invisible id/name added
+                       * to the Kanban filter search. These attributes are INVISIBLE
+                       * and non-behavioral; the legacy `tg-input-search` DOM and the
+                       * existing SCSS render byte-identically.
+                       */}
                       <input
                         type="text"
                         className="tg-input-search"
+                        id="backlog-filter-search"
+                        name="backlog-filter-search"
                         aria-label={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
                         placeholder={t('COMMON.FILTERS.INPUT_PLACEHOLDER')}
                         value={queryInput}
@@ -1221,7 +1243,16 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
             </div>
 
             {/* backlog-manager (backlog.jade:124): `.expanded` when NOT activeFilters. */}
-            <div className={state.activeFilters ? 'backlog-manager' : 'backlog-manager expanded'}>
+            {/*
+             * N-13 (a11y): `id` target for the Filters button's `aria-controls`.
+             * The element is always present (it only toggles the `expanded`
+             * class), so it is a stable disclosure target. Adding an `id` is
+             * INVISIBLE and does not alter the reproduced DOM/SCSS.
+             */}
+            <div
+              id="backlog-filter-panel"
+              className={state.activeFilters ? 'backlog-manager' : 'backlog-manager expanded'}
+            >
               {/* #backlog-filter (backlog.jade:126-140, ng-if="activeFilters"): the sidebar
                   filter host. Hosts the shared `tg-filter` FilterBar, populated from the
                   server `filters_data` (BL-11); the container keeps its `#backlog-filter`
@@ -1251,6 +1282,7 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                   showTags={state.showTags}
                   activeFilters={state.activeFilters}
                   displayVelocity={state.displayVelocity}
+                  stats={state.stats}
                   canModifyUs={permsCanModifyUs}
                   selectedIds={selectedIdsSet}
                   onSelectionChange={handleSelectionChange}
@@ -1270,6 +1302,7 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
                   statuses={statuses}
                   points={points}
                   roles={roles}
+                  project={state.project}
                   pointsViewRoleId={state.pointsViewRoleId}
                   canDeleteUs={permsCanDeleteUs}
                   onChangeStatus={actions.changeUsStatus}
@@ -1362,6 +1395,7 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
               canModifyUs={permsCanModifyUs}
               buildTaskboardUrl={buildTaskboardUrl}
               buildUserStoryUrl={buildUserStoryUrl}
+              project={state.project}
               onAddSprint={handleAddSprint}
               onToggleClosedSprints={handleToggleClosedSprints}
               onToggleSprintFold={handleToggleSprintFold}
@@ -1479,6 +1513,27 @@ export function BacklogApp({ projectSlug, projectId }: BacklogAppProps) {
               ? 'lightbox lightbox-generic-bulk lightbox-add-story-bulk open'
               : 'lightbox lightbox-generic-form lightbox-add-story open'
           }
+          /* M-20 / M-21: complete the accessible-modal semantics the AngularJS
+             `lightbox` service applied to these surfaces. The legacy add-story
+             and bulk-create lightboxes opened through that service, which (unless
+             `ignoreEsc`) registered a `keydown.lightbox` handler that closed the
+             lightbox on Escape (`common/lightboxes.coffee:53-62`). The React port
+             rendered a bare `div.lightbox.open` with no role/aria-modal/aria-label
+             and closed only via Cancel; this restores `role="dialog"` +
+             `aria-modal="true"` + an accessible name and the Escape-to-close, in
+             line with the compliant SprintForm dialog. All are invisible
+             attributes/behavior — zero visual change (AAP 0.3.4). */
+          role="dialog"
+          aria-modal="true"
+          aria-label={
+            addStoryLightbox.mode === 'bulk' ? 'Add user stories in bulk' : 'New user story'
+          }
+          onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              handleCloseAddStory();
+            }
+          }}
         >
           <div className="lightbox-header">
             <h2 className="title">

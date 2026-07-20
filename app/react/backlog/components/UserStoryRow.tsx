@@ -85,6 +85,10 @@ import type { UserStory } from '../state/backlogReducer';
 import { useSortableRow } from '../../shared/dnd/sortable';
 import { DND_CLASS } from '../../shared/dnd/types';
 import { t } from '../../shared/i18n';
+// Due-date badge (the native `tg-due-date` icon replacement) + the project type
+// it reads the `us_duedates` appearance config from.
+import { DueDateBadge } from '../../shared/components/DueDateBadge';
+import type { DueDateProject } from '../../shared/dueDate';
 // Pure estimation helpers reproducing `$tgEstimationsService`
 // (`estimation.coffee`): the per-role points math the points widget displays.
 import {
@@ -111,9 +115,11 @@ export interface RowStatusOption {
  *
  * React owns the entire subtree inside `<tg-react-backlog>`, so it renders the
  * SVG sprite `<svg><use>` itself (mirroring the compiled output of the `tgSvg`
- * directive) rather than relying on AngularJS to compile `<tg-svg>`. `<tg-due-date>`
- * is likewise emitted as an INERT custom-element host that carries only the
- * `.due-date` class for structural/style parity (see the SCOPE NOTE above).
+ * directive) rather than relying on AngularJS to compile `<tg-svg>`. The due-date
+ * badge (`<tg-due-date>` + its `<tg-svg.due-date-icon>` clock) is now rendered
+ * NATIVELY by the shared `DueDateBadge` component (M-11): the legacy `tg-due-date`
+ * directive never $compiled inside the React host, so it was an inert, empty
+ * `.due-date` element and the clock icon was missing.
  *
  * The `as unknown as any` cast lets these custom-element tags be used in JSX
  * WITHOUT a cross-file `declare global { namespace JSX }` augmentation, which
@@ -121,7 +127,6 @@ export interface RowStatusOption {
  * pattern (see SprintHeader.tsx).
  */
 const TgSvg = 'tg-svg' as unknown as any;
-const TgDueDate = 'tg-due-date' as unknown as any;
 
 /**
  * Renders a Taiga sprite icon, mirroring the rendered output of the AngularJS
@@ -196,6 +201,12 @@ export interface UserStoryRowProps {
   /** Project roles (`project.roles`); only `computable` ones participate in points. */
   roles?: EstimationRole[];
   /**
+   * The resolved project — passed to the due-date badge so it reads the per-type
+   * `us_duedates` appearance override (colour/title). Optional: when absent the
+   * default appearance config is used (matching `DueDateService`).
+   */
+  project?: DueDateProject;
+  /**
    * "View points per Role" header selection (`null` = totals). When a role is
    * selected AND there is more than one computable role, the points cell shows
    * `"{rolePointName} / {total}"` (legacy `estimation` render, main.coffee:1104).
@@ -237,6 +248,7 @@ export function UserStoryRow(props: UserStoryRowProps) {
     statuses,
     points,
     roles,
+    project,
     pointsViewRoleId = null,
     canDelete = false,
     onChangeStatus,
@@ -445,20 +457,13 @@ export function UserStoryRow(props: UserStoryRowProps) {
           <span className="user-story-number">{`#${String(us.ref)}`}</span>
           <span className="user-story-name">{subject}</span>
         </a>
-        {/* Due-date badge — INERT `<tg-due-date>` host with the `.due-date` class
-            for structural/style parity (see SCOPE NOTE). Rendered only when the
-            story has a due date (the AngularJS `ng-if="us.due_date"`).
-            NOTE: the class is passed as `class` (NOT `className`) inside the spread.
-            React does not apply its `className` -> `class` mapping to a custom
-            element whose type is a string tag (`tg-due-date`); `className` would
-            emit a bogus `classname` attribute and the existing `.due-date` SCSS
-            would never match, breaking the zero-visual-change guarantee. Passing
-            `class` directly makes React set the real `class="due-date"` attribute. */}
-        {Boolean(dueDate) && (
-          <TgDueDate
-            {...({ class: 'due-date', 'due-date': String(dueDate), 'obj-type': 'us' } as any)}
-          />
-        )}
+        {/* Due-date badge (M-11) — the native `.due-date` > `.due-date-icon`
+            clock, rendered by the shared `DueDateBadge`, reproducing the legacy
+            `tg-due-date` directive's `due-date-icon.jade` output. Rendered only
+            when the story has a due date (the AngularJS `ng-if="us.due_date"`).
+            The icon fill = the resolved appearance colour (green/orange/red) and
+            the tooltip = "Due date: <formatted> (<status>)". */}
+        {Boolean(dueDate) && <DueDateBadge dueDate={String(dueDate)} project={project} />}
         {/* Tag pills — gated by `showTags`. `ng-class="{'last':$last}"` -> the
             final tag additionally gets the `last` class; `tag[0]` is the label,
             `tag[1]` is the (nullable) background color. */}
@@ -617,6 +622,21 @@ export function UserStoryRow(props: UserStoryRowProps) {
           `onOptionsClick` (the US options popover lives upstream). */}
       {canModify && (
         <div className="us-option">
+          {/*
+           * N-12 (a11y): the options (⋮) button is an icon-only disclosure
+           * trigger for the Edit/Delete/Move-to-top popover. It previously had
+           * no accessible name and did not announce that it opens a popup or
+           * whether that popup is open. Add TRUTHFUL, INVISIBLE ARIA:
+           *   - `aria-label` gives it an accessible name (no visible label is
+           *     added; the legacy `.us-option-popup-button` carried only the
+           *     icon, so the reproduced DOM/SCSS is unchanged);
+           *   - `aria-haspopup` accurately states a popup is revealed;
+           *   - `aria-expanded` reflects the real open/close state.
+           * The popover itself is a plain `ul > li > button` list (matching the
+           * legacy `taiga.globalPopover`), so NO `role="menu"`/`menuitem` is
+           * added — we must not promise arrow-key roving that is not
+           * implemented (consistent with the Kanban card N-06/N-07 fix).
+           */}
           <button
             type="button"
             className={
@@ -625,6 +645,9 @@ export function UserStoryRow(props: UserStoryRowProps) {
                 : 'us-option-popup-button js-popup-button'
             }
             onClick={handleOptionsClick}
+            aria-label={t('COMMON.CARD.OPTIONS')}
+            aria-haspopup="true"
+            aria-expanded={openPopover === 'options'}
           >
             <Svg icon="icon-more-vertical" />
           </button>

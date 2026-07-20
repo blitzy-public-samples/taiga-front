@@ -493,12 +493,54 @@ function CreateEditUsLightbox(props: CreateEditUsLightboxProps): JSX.Element {
     });
   };
 
+  /**
+   * Dialog-level Escape handling (M-17). The legacy generic create/edit lightbox
+   * closed on Escape via a document `keydown.lightbox-create-edit` listener that
+   * called `checkClose()` (`common/lightboxes.coffee:835-840`); the React port had
+   * `role="dialog"` + `aria-label` but dropped both `aria-modal` and the
+   * Escape-to-close, so it was only a partial modal. This restores parity with
+   * that legacy handler AND with the compliant React SprintForm.
+   *
+   * Escape is popover-aware: if an inner popover is open (status dropdown,
+   * per-role points popover, or the tag input) Escape dismisses THAT first and
+   * does not close the whole lightbox — mirroring how, in the AngularJS form, an
+   * open control captured the key before the lightbox did. Only when nothing is
+   * open does Escape close the dialog. The tag input's own Escape branch already
+   * clears+hides it and now `stopPropagation()`s so it never reaches here while
+   * focused; these state checks are the fallback for the non-focused case.
+   */
+  const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== 'Escape') {
+      return;
+    }
+    if (statusOpen) {
+      event.preventDefault();
+      setStatusOpen(false);
+      return;
+    }
+    if (pointsRoleOpen !== null) {
+      event.preventDefault();
+      setPointsRoleOpen(null);
+      return;
+    }
+    if (tagInputVisible) {
+      event.preventDefault();
+      setTagInput('');
+      setTagInputVisible(false);
+      return;
+    }
+    event.preventDefault();
+    onClose();
+  };
+
   /* --- Render --- */
   return (
     <div
       className="lightbox lightbox-generic-form lightbox-create-edit open"
       role="dialog"
+      aria-modal="true"
       aria-label={title}
+      onKeyDown={handleDialogKeyDown}
     >
       {/* tg-lightbox-close: a.close > tg-svg(icon-close), fixed top-right. */}
       <a
@@ -598,6 +640,10 @@ function CreateEditUsLightbox(props: CreateEditUsLightboxProps): JSX.Element {
                             event.stopPropagation();
                             commitTag();
                           } else if (event.key === 'Escape') {
+                            // Escape dismisses the tag input only; stop it here so
+                            // the dialog-level Escape handler (M-17) does NOT also
+                            // close the whole lightbox while the tag input is focused.
+                            event.stopPropagation();
                             setTagInput('');
                             setTagInputVisible(false);
                           }

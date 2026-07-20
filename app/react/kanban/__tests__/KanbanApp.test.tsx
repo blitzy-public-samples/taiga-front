@@ -527,6 +527,12 @@ describe('KanbanApp - Phase C: shell rendering', () => {
     const section = container.querySelector('section.main.kanban');
     expect(section).toBeInTheDocument();
 
+    // landmark-one-main (a11y): the board section is exposed as the page's
+    // single `main` landmark via `role="main"` on the SAME `<section>` (element
+    // tag + class list preserved verbatim -> zero visual change), consistent
+    // with the sibling BacklogApp's `<main class="main scrum">`.
+    expect(section).toHaveAttribute('role', 'main');
+
     // Header region + the filter toggle button.
     expect(container.querySelector('.kanban-header')).toBeInTheDocument();
     expect(container.querySelector('button.btn-filter.e2e-open-filter')).toBeInTheDocument();
@@ -615,6 +621,19 @@ describe('KanbanApp - Phase E: filter toggle', () => {
     expect(container.querySelector('.mock-filter')).not.toBeInTheDocument();
   });
 
+  it('N-09: the filter toggle truthfully exposes aria-expanded + aria-controls (closed)', () => {
+    // The Filters button is a real disclosure toggle. `aria-expanded` reflects
+    // the panel state and `aria-controls` points to the always-present
+    // `#kanban-filter-panel` (the `.kanban-manager` wrapper). Invisible; no
+    // behaviour change.
+    const { container } = renderApp();
+    const toggle = container.querySelector('button.btn-filter.e2e-open-filter') as HTMLElement;
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(toggle).toHaveAttribute('aria-controls', 'kanban-filter-panel');
+    // The controlled panel exists and carries the referenced id.
+    expect(container.querySelector('#kanban-filter-panel')).toHaveClass('kanban-manager');
+  });
+
   it('opens on toggle click: manager loses .expanded, .kanban-filter + FilterBar appear', () => {
     const { container } = renderApp();
     const toggle = container.querySelector('button.btn-filter.e2e-open-filter') as HTMLElement;
@@ -626,6 +645,8 @@ describe('KanbanApp - Phase E: filter toggle', () => {
     expect(container.querySelector('.kanban-filter')).toBeInTheDocument();
     // FilterBar is rendered INSIDE the sidebar only when open.
     expect(container.querySelector('.kanban-filter .mock-filter')).toBeInTheDocument();
+    // N-09: aria-expanded flips to true when the panel opens.
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('is idempotent: a second click restores the initial CLOSED state', () => {

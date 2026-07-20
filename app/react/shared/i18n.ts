@@ -135,6 +135,20 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
       DELETE: 'Delete card',
       MOVE_TO_TOP: 'Move to top',
       ESTIMATION: 'Estimation',
+      // N-06: accessible name for the icon-only card actions (3-dot) trigger.
+      // The legacy `button.js-popup-button` [card-actions.jade] carried only an
+      // SVG icon and no text/aria, leaving screen readers to announce a nameless
+      // "button". This truthful, invisible label names the disclosure control
+      // (which already advertises `aria-haspopup`/`aria-expanded`) without any
+      // visual or behavioural change. Mirrored in `locale-en.json` COMMON.CARD.
+      OPTIONS: 'Options',
+      // Due-date badge tooltip. Verbatim from `locale-en.json` COMMON.CARD.DUE_DATE
+      // ("Due date: {{date}}"), interpolated with the resolved `vm.title()` value
+      // by `shared/components/DueDateBadge.tsx` (and the legacy card svg title,
+      // `card-templates/card-data.jade:31`). Embedded so the backlog / sprint
+      // due-date badges render the real tooltip text before/without a localized
+      // catalog fetch (the React runtime uses only these embedded defaults).
+      DUE_DATE: 'Due date: {{date}}',
     },
     // Card watchers-statistic tooltip (finding D#4). Verbatim from `locale-en.json`
     // COMMON.WATCHERS, rendered as the `.card-watchers` title by
@@ -270,6 +284,12 @@ const DEFAULT_EN_CATALOG: TranslationCatalog = {
     GO_TO_TASKBOARD: 'Go to the taskboard of {{::name}}',
     CLOSED_POINTS: 'closed',
     TOTAL_POINTS: 'total',
+    // "Project Scope [Doomline]" marker text (finding M-08). The AngularJS
+    // `addDoomLineDom` rendered `$translate.instant("BACKLOG.DOOMLINE")`
+    // (main.coffee:754). Verbatim from `app/locales/taiga/locale-en.json` so the
+    // React doom line reads the exact legacy text (the runtime resolves against
+    // these embedded English defaults — no catalog fetch).
+    DOOMLINE: 'Project Scope [Doomline]',
     SPRINTS: {
       DATE: 'DD MMM YYYY',
     },

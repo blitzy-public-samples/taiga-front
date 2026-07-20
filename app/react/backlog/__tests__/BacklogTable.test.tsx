@@ -61,7 +61,7 @@ import { render, screen, fireEvent, within } from '@testing-library/react';
 
 import { BacklogTable } from '../components/BacklogTable';
 import type { BacklogTableProps } from '../components/BacklogTable';
-import type { UserStory } from '../state/backlogReducer';
+import type { UserStory, BacklogStats } from '../state/backlogReducer';
 // The REAL shared backlog drag-end handler + its structural contract types. These
 // are imported (not mocked) so the "production drag-end integration" suite below
 // proves the container drag data BacklogTable actually registers is SUFFICIENT to
@@ -487,6 +487,58 @@ describe('BacklogTable — header role-view popover (finding #12)', () => {
     fireEvent.click(control(container));
     expect(container.querySelector('.points .pop-role')).toBeNull();
   });
+
+  /* ---- N-11: the popover exposes the dialog role the trigger advertises ---- */
+  it('N-11: the open .pop-role popover carries role="dialog" + an accessible name', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn() })} />,
+    );
+    fireEvent.click(control(container));
+    const popover = container.querySelector('.points .pop-role') as HTMLElement;
+    expect(popover).toBeInTheDocument();
+    // The trigger already declares aria-haspopup="dialog"; the target now matches.
+    expect(popover.getAttribute('role')).toBe('dialog');
+    expect(popover.getAttribute('aria-label')).toBe('Select view per Role');
+    // It is NOT a modal (lightweight popover, dismissed on outside-click/Escape).
+    expect(popover.getAttribute('aria-modal')).toBeNull();
+  });
+
+  /* ---- N-10: Escape + outside-click dismissal (restored legacy behavior) ---- */
+  it('N-10: Escape closes the open role-view popover', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn() })} />,
+    );
+    fireEvent.click(control(container));
+    expect(container.querySelector('.points .pop-role')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+  });
+
+  it('N-10: an outside pointer press closes the open role-view popover (legacy popover-service parity)', () => {
+    const { container } = render(
+      <div>
+        <span data-testid="outside">outside</span>
+        <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn() })} />
+      </div>,
+    );
+    fireEvent.click(control(container));
+    expect(container.querySelector('.points .pop-role')).toBeInTheDocument();
+    // A mousedown anywhere outside the role-view wrapper dismisses it.
+    fireEvent.mouseDown(screen.getByTestId('outside'));
+    expect(container.querySelector('.points .pop-role')).toBeNull();
+  });
+
+  it('N-10: a pointer press INSIDE the popover does NOT close it', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ roles: ROLES, onSelectRoleView: jest.fn() })} />,
+    );
+    fireEvent.click(control(container));
+    const popover = container.querySelector('.points .pop-role') as HTMLElement;
+    expect(popover).toBeInTheDocument();
+    // Pressing within the popover (not selecting a role) keeps it open.
+    fireEvent.mouseDown(popover);
+    expect(container.querySelector('.points .pop-role')).toBeInTheDocument();
+  });
 });
 
 describe('BacklogTable — body ng-class', () => {
@@ -512,6 +564,58 @@ describe('BacklogTable — body ng-class', () => {
     expect(body).toHaveClass('show-tags');
     expect(body).not.toHaveClass('active-filters');
     expect(body).not.toHaveClass('forecasted-stories');
+  });
+});
+
+describe('BacklogTable — "Project Scope [Doomline]" marker (M-08)', () => {
+  // cumulative 4, 8, 12 (assigned_points 0) -> first > total_points(10) at index 2.
+  const doomUss = [
+    makeUs(10, { total_points: 4 }),
+    makeUs(20, { total_points: 4 }),
+    makeUs(30, { total_points: 4 }),
+  ];
+  const doomStats = { total_points: 10, assigned_points: 0 } as unknown as BacklogStats;
+
+  it('renders ONE .doom-line (with a <span>) before the first over-budget row', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ userstories: doomUss, stats: doomStats })} />,
+    );
+    const doom = container.querySelectorAll('.doom-line');
+    expect(doom).toHaveLength(1);
+    const span = doom[0].querySelector('span');
+    expect(span).not.toBeNull();
+    // i18n BACKLOG.DOOMLINE (the en catalog is active in the jsdom test env).
+    expect(span?.textContent).toBe('Project Scope [Doomline]');
+
+    // The doom line is inserted BEFORE the 3rd row (index 2). Query the doom
+    // line and the rows together so they come back in DOCUMENT ORDER regardless
+    // of any per-row sortable wrapper: the `.us-item-row` immediately following
+    // the doom line in that combined order is the over-budget row.
+    const body = getBody(container);
+    const ordered = Array.from(body.querySelectorAll('.doom-line, .us-item-row'));
+    const doomPos = ordered.indexOf(doom[0]);
+    const rows = Array.from(body.querySelectorAll('.us-item-row'));
+    expect(ordered[doomPos + 1]).toBe(rows[2]);
+  });
+
+  it('renders NO doom-line when stats is absent or total_points is 0', () => {
+    const { container: c1 } = render(
+      <BacklogTable {...makeProps({ userstories: doomUss })} />,
+    );
+    expect(c1.querySelectorAll('.doom-line')).toHaveLength(0);
+
+    const zeroStats = { total_points: 0, assigned_points: 0 } as unknown as BacklogStats;
+    const { container: c2 } = render(
+      <BacklogTable {...makeProps({ userstories: doomUss, stats: zeroStats })} />,
+    );
+    expect(c2.querySelectorAll('.doom-line')).toHaveLength(0);
+  });
+
+  it('renders the doom-line REGARDLESS of displayVelocity (dead legacy gate)', () => {
+    const { container } = render(
+      <BacklogTable {...makeProps({ userstories: doomUss, stats: doomStats, displayVelocity: true })} />,
+    );
+    expect(container.querySelectorAll('.doom-line')).toHaveLength(1);
   });
 });
 

@@ -292,6 +292,12 @@ const Swimlane = ({
     <div className="kanban-swimlane" data-swimlane={swimlane.id}>
       <button
         className={titleClassName}
+        // N-08: the fold/unfold state was conveyed to sighted users only by the
+        // icon + `folded` class. `aria-expanded` truthfully annotates that SAME
+        // visible state for assistive tech (expanded === body shown === !folded).
+        // It is invisible and does not alter the toggle's behaviour - the click
+        // still calls the identical `onToggleSwimlane` the legacy directive did.
+        aria-expanded={!folded}
         onMouseOver={handleMouseOver}
         onMouseLeave={handleMouseLeave}
         onClick={() => onToggleSwimlane(swimlane.id)}

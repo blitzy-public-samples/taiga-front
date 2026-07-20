@@ -78,6 +78,8 @@ import type { MouseEvent } from 'react';
 // `Sprint` COMPONENT below. `UserStory` types the `buildUserStoryUrl` prop that
 // is threaded through to each `Sprint`.
 import type { Sprint as SprintModel, UserStory } from '../state/backlogReducer';
+// The resolved-project type threaded to each Sprint's due-date badges (M-11).
+import type { DueDateProject } from '../../shared/dueDate';
 // The sibling presentational child: renders ONE sprint's body inside each wrapper.
 import { Sprint } from './Sprint';
 
@@ -171,6 +173,12 @@ export interface SprintListProps {
   buildTaskboardUrl: (sprint: SprintModel) => string;
   /** Resolves the user-story detail URL for a milestone row (threaded from BacklogApp). */
   buildUserStoryUrl: (us: UserStory) => string;
+  /**
+   * The resolved project — threaded to each `<Sprint>` so its milestone rows'
+   * due-date badges read the per-type `us_duedates` appearance override.
+   * Optional; the default appearance config is used when absent.
+   */
+  project?: DueDateProject;
   /** Config-resolved static URL for the empty-sprint illustration (optional; BacklogApp passes the versioned path). */
   emptySprintImageUrl?: string;
   /** Opens the create-sprint lightbox (`ctrl.addNewSprint`). */
@@ -202,6 +210,7 @@ export function SprintList(props: SprintListProps) {
     canModifyUs,
     buildTaskboardUrl,
     buildUserStoryUrl,
+    project,
     emptySprintImageUrl,
     onAddSprint,
     onToggleClosedSprints,
@@ -283,6 +292,7 @@ export function SprintList(props: SprintListProps) {
             canModifyUs={canModifyUs}
             taskboardUrl={buildTaskboardUrl(sprint)}
             buildUserStoryUrl={buildUserStoryUrl}
+            project={project}
             onToggleFold={() => onToggleSprintFold(sprint.id)}
             onEditSprint={() => onEditSprint(sprint)}
           />
@@ -331,6 +341,7 @@ export function SprintList(props: SprintListProps) {
             canModifyUs={canModifyUs}
             taskboardUrl={buildTaskboardUrl(sprint)}
             buildUserStoryUrl={buildUserStoryUrl}
+            project={project}
             onToggleFold={() => onToggleSprintFold(sprint.id)}
             onEditSprint={() => onEditSprint(sprint)}
           />

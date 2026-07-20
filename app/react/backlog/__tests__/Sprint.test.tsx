@@ -399,6 +399,19 @@ describe('MilestoneRow — row element + state modifiers', () => {
     expect(row.querySelector('.draggable-us-row')).not.toBeInTheDocument();
   });
 
+  it('M-19: the sprint row carries NO false-affordance ARIA (role/roledescription/tabindex)', () => {
+    // The whole row is the drag node, but it must match the legacy inert
+    // `.milestone-us-item-row` div. The real `useSortableRow` suppresses the
+    // @dnd-kit `role="button"`/`aria-roledescription`/`tabindex`/`aria-describedby`
+    // (proven in shared/dnd/__tests__/sortable.test.tsx); this locks in that the
+    // component hardcodes none of them on the row.
+    const { row } = renderSingleRow();
+    expect(row.getAttribute('role')).toBeNull();
+    expect(row.getAttribute('tabindex')).toBeNull();
+    expect(row.getAttribute('aria-roledescription')).toBeNull();
+    expect(row.getAttribute('aria-describedby')).toBeNull();
+  });
+
   it('calls useSortableRow with the story id, the FULL container-identity data bag, and the modify-us drag gate (BL-1 + BL-3)', () => {
     // BL-1: the enclosing sprint id + full container identity is carried in the
     // sortable data bag so a within-sprint reorder dropped over a sibling STORY
@@ -512,23 +525,65 @@ describe('MilestoneRow — `.column-points` cell (total_points guard)', () => {
   });
 });
 
-describe('MilestoneRow — inert custom-element hosts + drag class', () => {
-  it('renders the inert `tg-belong-to-epics.us-epic-container` host only when the story has epics', () => {
-    const withEpics = renderSingleRow({ epics: [{ id: 1 }] }).row.querySelector('.us-epic-container');
-    expect(withEpics).toBeInTheDocument();
-    expect(withEpics!.tagName.toLowerCase()).toBe('tg-belong-to-epics');
-    expect(withEpics).toHaveAttribute('format', 'pill');
+describe('MilestoneRow — native epic pills + due-date badge + drag class', () => {
+  it('renders NATIVE epic pills inside `tg-belong-to-epics.us-epic-container` only when the story has epics (M-10)', () => {
+    // M-10: the sprint rows now render the epic pills NATIVELY (the legacy
+    // `tg-belong-to-epics` directive never $compiled inside the React host, so
+    // the pills were missing). Reproduces `belong-to-epics-pill.jade`:
+    // `.us-epic-container` > one `.belong-to-epic-pill-wrapper > .belong-to-epic-pill`
+    // per epic, each with `background`/`border-color` + a `"#<ref> <subject>"` title.
+    const { row } = renderSingleRow({
+      epics: [
+        { id: 1, ref: 7, subject: 'Epic Alpha', color: '#ff0000' },
+        { id: 2, ref: 8, subject: 'Epic Beta', color: '#00ff00' },
+      ],
+    });
+    const container = row.querySelector('.us-epic-container');
+    expect(container).toBeInTheDocument();
+    expect(container!.tagName.toLowerCase()).toBe('tg-belong-to-epics');
 
-    // No epics -> the host is absent (parity with `ng-if="us.epics"`).
+    const wrappers = container!.querySelectorAll('.belong-to-epic-pill-wrapper');
+    expect(wrappers).toHaveLength(2);
+
+    const pills = container!.querySelectorAll('.belong-to-epic-pill');
+    expect(pills).toHaveLength(2);
+    // First pill: title "#<ref> <subject>" + background = epic colour.
+    // (jest-dom's `toHaveStyle` normalises colours on both sides, sidestepping
+    // jsdom's inconsistent hex-vs-rgb inline-style serialisation — this mirrors
+    // the established pattern in Card.test.tsx for `.epic-color`/tag colours.)
+    expect(pills[0]).toHaveAttribute('title', '#7 Epic Alpha');
+    expect(pills[0]).toHaveStyle({ background: '#ff0000' });
+    // border-color is `darker(#ff0000, -0.2)` = #cc0000 (each channel - 51, clamped).
+    expect(pills[0]).toHaveStyle({ borderColor: '#cc0000' });
+    expect(pills[1]).toHaveAttribute('title', '#8 Epic Beta');
+
+    // No epics -> the container is absent (parity with `ng-if="us.epics"`).
     expect(renderSingleRow({ epics: null }).row.querySelector('.us-epic-container')).not.toBeInTheDocument();
+    expect(renderSingleRow({ epics: [] }).row.querySelector('.us-epic-container')).not.toBeInTheDocument();
   });
 
-  it('renders the inert `tg-due-date.due-date` host only when the story has a due date', () => {
-    const withDue = renderSingleRow({ due_date: '2021-02-01' }).row.querySelector('.due-date');
-    expect(withDue).toBeInTheDocument();
-    expect(withDue!.tagName.toLowerCase()).toBe('tg-due-date');
+  it('renders the NATIVE due-date badge (`.due-date > .due-date-icon` clock) only when the story has a due date (M-11)', () => {
+    // M-11: native `DueDateBadge` reproducing `due-date-icon.jade`. A far-past
+    // due date resolves to the "past due" appearance (#E44057) under the default
+    // config, and the tooltip is "Due date: <formatted> (past due)".
+    const { row } = renderSingleRow({ due_date: '2021-02-01' });
+    const badge = row.querySelector('.due-date');
+    expect(badge).toBeInTheDocument();
+    expect(badge!.tagName.toLowerCase()).toBe('tg-due-date');
 
-    // No due date -> the host is absent (parity with `ng-if="us.due_date"`).
+    const icon = badge!.querySelector('.due-date-icon');
+    expect(icon).toBeInTheDocument();
+    const svg = icon!.querySelector('svg.icon.icon-clock');
+    expect(svg).toBeInTheDocument();
+    // fill = resolved appearance colour (past due -> #E44057). `toHaveStyle`
+    // normalises the colour on both sides (see the epic-pill note above).
+    expect(svg).toHaveStyle({ fill: '#E44057' });
+    // Tooltip = "Due date: <date> (past due)" via COMMON.CARD.DUE_DATE.
+    const title = svg!.querySelector('title');
+    expect(title!.textContent).toContain('Due date:');
+    expect(title!.textContent).toContain('(past due)');
+
+    // No due date -> the badge is absent (parity with `ng-if="us.due_date"`).
     expect(renderSingleRow({ due_date: null }).row.querySelector('.due-date')).not.toBeInTheDocument();
   });
 

@@ -28,7 +28,7 @@
  */
 
 import { render } from '@testing-library/react';
-import { Burndown } from '../components/Burndown';
+import { Burndown, niceTickSize, computeYTicks } from '../components/Burndown';
 import type { BurndownMilestone } from '../components/Burndown';
 import type { BacklogStats } from '../state/backlogReducer';
 
@@ -140,6 +140,80 @@ describe('Burndown — legacy colours / grid / axes', () => {
     const { getByText } = render(<Burndown stats={stats} />);
     expect(getByText('Sprints')).toBeInTheDocument();
     expect(getByText('Points')).toBeInTheDocument();
+  });
+
+  it('renders Y-axis numeric value ticks + horizontal gridlines (M-09)', () => {
+    const { container } = render(<Burndown stats={stats} />);
+    // At least one horizontal gridline at the faint derived tickColor.
+    const hGrid = container.querySelectorAll('[data-testid="burndown-gridline-h"]');
+    expect(hGrid.length).toBeGreaterThanOrEqual(1);
+    hGrid.forEach((line) => {
+      expect(line).toHaveAttribute('stroke', 'rgba(216, 222, 233, 0.22)');
+    });
+    // Numeric value-tick labels are rendered (the legacy default yaxis ticks).
+    const tickLabels = container.querySelectorAll('[data-testid="burndown-ytick-label"]');
+    expect(tickLabels.length).toBeGreaterThanOrEqual(1);
+    // Every label is a finite numeric string (no NaN / empty).
+    tickLabels.forEach((el) => {
+      expect(Number.isFinite(Number(el.textContent))).toBe(true);
+    });
+  });
+
+  it('places one gridline per Y-tick (gridlines and labels are paired)', () => {
+    const { container } = render(<Burndown stats={stats} />);
+    const hGrid = container.querySelectorAll('[data-testid="burndown-gridline-h"]');
+    const tickLabels = container.querySelectorAll('[data-testid="burndown-ytick-label"]');
+    expect(hGrid.length).toBe(tickLabels.length);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Y-tick generation (Flot nice-number parity, M-09)                          */
+/* -------------------------------------------------------------------------- */
+
+describe('niceTickSize — Flot nice-number step (1/2/2.5/5/10 × 10^n)', () => {
+  it('returns a step drawn from the {1,2,2.5,5,10} × 10^n family', () => {
+    const allowed = new Set([1, 2, 2.5, 5, 10]);
+    for (const range of [1, 3, 7, 12, 40, 95, 400, 1234]) {
+      const size = niceTickSize(range, 5);
+      const magn = Math.pow(10, Math.floor(Math.log(size) / Math.LN10));
+      const norm = Math.round((size / magn) * 10) / 10;
+      expect(allowed.has(norm)).toBe(true);
+    }
+  });
+
+  it('guards non-positive range / target (returns 1)', () => {
+    expect(niceTickSize(0, 5)).toBe(1);
+    expect(niceTickSize(-10, 5)).toBe(1);
+    expect(niceTickSize(100, 0)).toBe(1);
+  });
+});
+
+describe('computeYTicks — numeric ticks spanning [yMin, yMax]', () => {
+  it('generates integer ticks on nice multiples for a 0..400 range', () => {
+    const ticks = computeYTicks(0, 400, 5);
+    const values = ticks.map((t) => t.value);
+    // Nice step for 400/5 = 80 -> normalised 8 -> 10*10 = 100.
+    expect(values).toEqual([0, 100, 200, 300, 400]);
+    // Integer step -> integer labels (no decimals).
+    expect(ticks.map((t) => t.label)).toEqual(['0', '100', '200', '300', '400']);
+  });
+
+  it('keeps only ticks within the data range (negative min included)', () => {
+    const ticks = computeYTicks(-100, 300, 5);
+    ticks.forEach((t) => {
+      expect(t.value).toBeGreaterThanOrEqual(-100);
+      expect(t.value).toBeLessThanOrEqual(300);
+    });
+    // Includes the zero crossing and the negative region.
+    expect(ticks.some((t) => t.value === 0)).toBe(true);
+    expect(ticks.some((t) => t.value < 0)).toBe(true);
+  });
+
+  it('degenerate range (min === max) yields a single tick, no NaN', () => {
+    const ticks = computeYTicks(5, 5);
+    expect(ticks).toHaveLength(1);
+    expect(Number.isFinite(ticks[0].value)).toBe(true);
   });
 });
 

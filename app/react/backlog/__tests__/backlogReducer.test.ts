@@ -66,6 +66,7 @@ import {
   findCurrentSprint,
   selectLastSprint,
   computeCompletedPercentage,
+  computeDoomLineIndex,
   buildCreateSprintDefaults,
   // Loading / stats producers
   setUserstories,
@@ -555,6 +556,68 @@ describe('computeCompletedPercentage — round(100*closed/total) with fallback +
   });
 });
 
+describe('computeDoomLineIndex — reloadDoomLine parity (M-08)', () => {
+  it('returns the index of the FIRST story whose running sum exceeds total_points', () => {
+    // assigned_points=0, total_points=10; stories of 4,4,4 -> cumulative 4,8,12.
+    // 12 > 10 first at index 2.
+    const stats = makeStats({ total_points: 10, assigned_points: 0 });
+    const uss = [
+      makeUs({ id: 1, total_points: 4 }),
+      makeUs({ id: 2, total_points: 4 }),
+      makeUs({ id: 3, total_points: 4 }),
+    ];
+    expect(computeDoomLineIndex(stats, uss)).toBe(2);
+  });
+
+  it('seeds the running sum with stats.assigned_points (already-assigned points)', () => {
+    // assigned_points=8, total_points=10; first story of 3 -> cumulative 11 > 10
+    // at index 0 (the doom line lands before the very first backlog story).
+    const stats = makeStats({ total_points: 10, assigned_points: 8 });
+    const uss = [makeUs({ id: 1, total_points: 3 }), makeUs({ id: 2, total_points: 3 })];
+    expect(computeDoomLineIndex(stats, uss)).toBe(0);
+  });
+
+  it('uses strict greater-than (a sum EQUAL to total_points does NOT trip the line)', () => {
+    // cumulative 5,10 — never strictly exceeds 10 -> no doom line.
+    const stats = makeStats({ total_points: 10, assigned_points: 0 });
+    const uss = [makeUs({ id: 1, total_points: 5 }), makeUs({ id: 2, total_points: 5 })];
+    expect(computeDoomLineIndex(stats, uss)).toBe(-1);
+  });
+
+  it('returns -1 when the cumulative sum never exceeds total_points', () => {
+    const stats = makeStats({ total_points: 100, assigned_points: 0 });
+    const uss = [makeUs({ id: 1, total_points: 10 }), makeUs({ id: 2, total_points: 20 })];
+    expect(computeDoomLineIndex(stats, uss)).toBe(-1);
+  });
+
+  it('returns -1 when total_points is 0 (guard: stats.total_points != 0)', () => {
+    const stats = makeStats({ total_points: 0, assigned_points: 0 });
+    const uss = [makeUs({ id: 1, total_points: 5 })];
+    expect(computeDoomLineIndex(stats, uss)).toBe(-1);
+  });
+
+  it('returns -1 when total_points is null/undefined (guard: stats.total_points?)', () => {
+    const uss = [makeUs({ id: 1, total_points: 5 })];
+    expect(computeDoomLineIndex(makeStats({ total_points: undefined }), uss)).toBe(-1);
+    expect(computeDoomLineIndex(makeStats({ total_points: null as unknown as number }), uss)).toBe(-1);
+  });
+
+  it('returns -1 when stats is null and for an empty story list', () => {
+    expect(computeDoomLineIndex(null, [makeUs({ id: 1, total_points: 5 })])).toBe(-1);
+    expect(computeDoomLineIndex(makeStats({ total_points: 10 }), [])).toBe(-1);
+  });
+
+  it('is INDEPENDENT of displayVelocity (the legacy $scope.displayVelocity gate is dead)', () => {
+    // The helper takes only (stats, userstories) — there is no velocity input,
+    // exactly reproducing the AngularJS runtime where `$scope.displayVelocity`
+    // is never assigned so the doom line renders regardless of forecasting.
+    const stats = makeStats({ total_points: 10, assigned_points: 0 });
+    const uss = [makeUs({ id: 1, total_points: 6 }), makeUs({ id: 2, total_points: 6 })];
+    // Same inputs -> same index whether or not the screen is forecasting.
+    expect(computeDoomLineIndex(stats, uss)).toBe(1);
+  });
+});
+
 describe('buildCreateSprintDefaults — injected nowYmd, +2-week finish', () => {
   it('uses nowYmd for the start when there is no prior sprint', () => {
     const defaults = buildCreateSprintDefaults([], '2021-01-01');
@@ -967,6 +1030,42 @@ describe('moveToCurrentSprint', () => {
     expect(result.payload).not.toBeNull();
     expect(result.payload!.milestoneId).toBe(100); // sprints[0].id, NOT currentSprint (200)
     expect(result.payload!.projectId).toBe(7);
+  });
+
+  it('N-15 PARITY: the move decrements userstories.length (squared badge) but does NOT recompute totalUserStories — legacy moveUssToSprint reloads sprints + project stats but NOT userstories (main.coffee:800-801), so the "N stories" total stays stale until the next load', () => {
+    // Arrange a backlog whose header-derived total ("N stories" =
+    // ctrl.totalUserStories, backlog.jade) is 2, matching the two selected
+    // stories. `total` comes from the `Taiga-Info-Backlog-Total-Userstories`
+    // response header (parseLoadUserstoriesResponse, main.coffee:393) and is
+    // ONLY refreshed by a userstories load.
+    let state = createInitialState();
+    state = setProject(state, makeProject({ id: 7 }));
+    const s100 = makeSprint({ id: 100, estimated_start: '2021-01-01', estimated_finish: '2021-01-20', total_points: 0 });
+    const s200 = makeSprint({ id: 200, estimated_start: '2021-02-01', estimated_finish: '2021-02-20', total_points: 0 });
+    state = setSprints(state, { milestones: [s100, s200], closed: 0, open: 2, nowMs: parseYmdToMs('2021-02-05') });
+    state = setUserstories(
+      state,
+      [
+        makeUs({ id: 11, ref: 11, backlog_order: 1, sprint_order: 5, total_points: 3 }),
+        makeUs({ id: 12, ref: 12, backlog_order: 2, sprint_order: 6, total_points: 4 }),
+      ],
+      { total: 2, resetPagination: true },
+    );
+    state = setSelectedIds(state, [11, 12]);
+    expect(state.totalUserStories).toBe(2); // precondition
+    expect(state.userstories.length).toBe(2); // precondition
+
+    const result = moveToCurrentSprint(state);
+
+    // The squared badge ({{userstories.length}}, backlog.jade) decrements
+    // immediately because the moved stories leave the backlog list.
+    expect(result.state.userstories.length).toBe(0);
+    // The "N stories" total (ctrl.totalUserStories) is NOT touched by the move:
+    // legacy reloads sprints + project stats but never reloads userstories, so
+    // the header-derived total stays STALE at 2 until the next load. Decrementing
+    // it would DIVERGE from AngularJS (AAP 0.1.1 exact parity / 0.4.1); this test
+    // locks in the faithful-parity behavior (QA finding N-15 declined as parity).
+    expect(result.state.totalUserStories).toBe(2);
   });
 
   it('payload.bulkStories is [{ us_id, order }] using each story sprint_order', () => {

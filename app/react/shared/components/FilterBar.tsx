@@ -594,20 +594,31 @@ const FilterBar = (props: FilterBarProps) => {
                               onClick={() => selectFilter(filter, it)}
                             >
                               {/*
-                                F30: reproduce the `tg-avatar` directive's DOM contract
-                                exactly -- it set `src=avatar.url`, `title`/`alt` to the
-                                interpolated `"#{avatar.fullName}"` (String coercion, so an
-                                absent full name yields the literal "undefined"/"null" just
-                                as the legacy did), and the element background to
-                                `avatar.bg || ''`. This renders a REAL image (photo, gravatar,
-                                or deterministic local placeholder) rather than `<img src="">`.
+                                F30: reproduce the `tg-avatar` directive's DOM contract --
+                                `src=avatar.url`, `title`/`alt` from the resolved full name,
+                                and the element background to `avatar.bg || ''`. This renders
+                                a REAL image (photo, gravatar, or deterministic local
+                                placeholder) rather than `<img src="">`.
+
+                                undefined-avatar-alt: the legacy directive
+                                [avatar.directive.coffee:20-21] set `alt`/`title` via
+                                `"#{avatar.fullName}"`, which JS-coerces an absent name to the
+                                literal sentinel "undefined"/"null" (verified: `'' + undefined`
+                                === "undefined"), clobbering the template's own static `alt=""`
+                                [filter.jade:159]. We honour that STATIC design intent instead
+                                of the framework's clobbering: a present full name renders
+                                verbatim (exact parity for the common case) while an absent one
+                                falls back to "" -- never leaking a JS sentinel into the DOM.
+                                The change is invisible (the placeholder image always loads, so
+                                `alt` is never painted) and removes the nonsensical "undefined"
+                                hover tooltip no design intends.
                               */}
                               {isUser && avatar && (
                                 <img
                                   className="user-pic"
                                   src={avatar.url}
-                                  title={String(avatar.fullName)}
-                                  alt={String(avatar.fullName)}
+                                  title={avatar.fullName ?? ''}
+                                  alt={avatar.fullName ?? ''}
                                   style={{ background: avatar.bg || '' }}
                                 />
                               )}

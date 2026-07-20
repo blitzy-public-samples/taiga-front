@@ -671,6 +671,64 @@ export function computeCompletedPercentage(stats: BacklogStats): number {
 }
 
 /**
+ * Doom-line index (finding M-08). Reproduces the AngularJS `reloadDoomLine`
+ * (backlog `BacklogDirective` -> `linkDoomLine`, main.coffee:727-752) — the
+ * "Project Scope [Doomline]" marker that is inserted BEFORE the first backlog
+ * story whose running point total overflows the project's `total_points`
+ * budget. Returns that story's zero-based index in `userstories`, or `-1` when
+ * no doom line is shown.
+ *
+ * EXACT RUNTIME PARITY — the dead velocity gate:
+ *   The AngularJS source guards the computation with `!$scope.displayVelocity?`
+ *   and pre-clears with `if $scope.displayVelocity: removeDoomlineDom()`. Those
+ *   read the BARE scope property `$scope.displayVelocity`, which is NEVER
+ *   assigned anywhere in the codebase (verified via a repo-wide grep): the
+ *   controller sets `ctrl.displayVelocity` (published `BacklogController as
+ *   ctrl`, referenced as `ctrl.displayVelocity` in backlog-table.jade:21), a
+ *   DIFFERENT property. CoffeeScript's existential `?` makes the guard
+ *   `$scope.displayVelocity == null`, which is ALWAYS true, so `!(...)` is
+ *   always true and the pre-clear branch never fires. The paired
+ *   `userstories:forecast` removal event (main.coffee:762) is likewise NEVER
+ *   broadcast. Net effect: the doom line renders whenever `stats.total_points`
+ *   is a nonzero number, INDEPENDENT of the velocity-forecasting toggle — and
+ *   it is re-run on every `userstories:loaded` (which `toggleVelocityForecasting`
+ *   broadcasts, main.coffee:254). We therefore deliberately do NOT gate on
+ *   `displayVelocity`; gating on it would hide the line during forecasting and
+ *   DIVERGE from the real AngularJS behaviour.
+ *
+ * COMPUTATION (main.coffee:734-752, verbatim): seed the running sum with
+ * `stats.assigned_points`, then walk `userstories` in order adding each
+ * `total_points`; the doom line goes before the FIRST story where the running
+ * sum exceeds `stats.total_points`, then the loop breaks (only one line). Only
+ * runs when `stats` exists and `stats.total_points` is present and non-zero
+ * (`stats? and stats.total_points? and stats.total_points != 0`).
+ *
+ * `assigned_points` is optional on {@link BacklogStats} but is always present
+ * alongside `total_points` in the Django project-stats response, so the `?? 0`
+ * fallback guards the type without any observable divergence.
+ */
+export function computeDoomLineIndex(
+  stats: BacklogStats | null | undefined,
+  userstories: readonly UserStory[],
+): number {
+  if (!stats) {
+    return -1;
+  }
+  const totalPoints = stats.total_points;
+  if (totalPoints == null || totalPoints === 0) {
+    return -1;
+  }
+  let currentSum = stats.assigned_points ?? 0;
+  for (let i = 0; i < userstories.length; i += 1) {
+    currentSum += userstories[i].total_points;
+    if (currentSum > totalPoints) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
  * Default dates + last-sprint name for the create sprint form. Reproduces the
  * create-form defaults (lightboxes.coffee:152-176) with an INJECTED `nowYmd`
  * (no `moment()` / `Date.now()`):

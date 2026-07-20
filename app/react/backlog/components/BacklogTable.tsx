@@ -58,11 +58,13 @@
  * NOT imported as a value; `useRef` is the only value import.
  */
 
-import { useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, MouseEvent, UIEvent } from 'react';
-import type { UserStory } from '../state/backlogReducer';
+import type { BacklogStats, UserStory } from '../state/backlogReducer';
+import { computeDoomLineIndex } from '../state/backlogReducer';
 import { UserStoryRow, type RowStatusOption } from './UserStoryRow';
 import type { EstimationPoint, EstimationRole } from '../../shared/estimation';
+import type { DueDateProject } from '../../shared/dueDate';
 import { t } from '../../shared/i18n';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useDroppable } from '@dnd-kit/core';
@@ -119,6 +121,19 @@ export interface BacklogTableProps {
   activeFilters: boolean;
   /** ng-class 'forecasted-stories' on the body (velocity forecasting). */
   displayVelocity: boolean;
+  /**
+   * Project stats -> drives the "Project Scope [Doomline]" marker (finding
+   * M-08). Only `total_points` and `assigned_points` are read; see
+   * {@link computeDoomLineIndex} for the exact `reloadDoomLine` parity,
+   * including why the marker is INDEPENDENT of `displayVelocity`.
+   */
+  stats?: BacklogStats | null;
+  /**
+   * The resolved project -> threaded to each `<UserStoryRow>` so the due-date
+   * badge reads the per-type `us_duedates` appearance override. Optional; the
+   * default appearance config is used when absent.
+   */
+  project?: DueDateProject;
   /** modify_us permission -> header draggable/input columns + row readonly/drag. */
   canModifyUs: boolean;
   /** Current selection (owned by BacklogApp so the move-to-sprint toolbar + drag getSelectedIds can read it). */
@@ -212,6 +227,7 @@ export function BacklogTable(props: BacklogTableProps) {
     showTags,
     activeFilters,
     displayVelocity,
+    stats,
     canModifyUs,
     selectedIds,
     onSelectionChange,
@@ -230,6 +246,7 @@ export function BacklogTable(props: BacklogTableProps) {
     statuses,
     points,
     roles,
+    project,
     pointsViewRoleId = null,
     canDeleteUs = false,
     onChangeStatus,
@@ -245,9 +262,58 @@ export function BacklogTable(props: BacklogTableProps) {
   // control, main.coffee:1024-1030). Only the header popover lives here; each
   // row owns its own status/points/options popovers.
   const [roleViewOpen, setRoleViewOpen] = useState(false);
+  // Wrapper around the role-view control + its popover, used to detect
+  // outside-pointer presses (N-10 outside-click close).
+  const roleViewRef = useRef<HTMLDivElement | null>(null);
+
+  // N-10: restore the legacy popover dismissal behavior for the header role-view
+  // popover. The AngularJS `popover` service closed an open popover on an outside
+  // body click (`popovers.coffee:232-233`); the React port dropped that, so the
+  // popover only closed on item-select or a second trigger click. This effect
+  // reinstates outside-click close AND adds Escape-to-close — the latter is the
+  // expected dismissal for the `role="dialog"` the trigger already advertises via
+  // `aria-haspopup="dialog"` (see the popover markup below, N-11). Both are
+  // invisible behaviors — zero visual change (AAP 0.3.4). Only wired while open.
+  useEffect(() => {
+    if (!roleViewOpen) {
+      return undefined;
+    }
+    const onDocMouseDown = (event: globalThis.MouseEvent) => {
+      const target = event.target as Node;
+      if (!(roleViewRef.current?.contains(target) ?? false)) {
+        setRoleViewOpen(false);
+      }
+    };
+    const onDocKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setRoleViewOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocMouseDown);
+    document.addEventListener('keydown', onDocKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onDocMouseDown);
+      document.removeEventListener('keydown', onDocKeyDown);
+    };
+  }, [roleViewOpen]);
+
   // Computable roles for the header popover (the header only lists roles that
   // participate in estimation — filter mirrors estimation.coffee:182).
   const computableRolesForHeader = (roles ?? []).filter((r) => Boolean(r.computable));
+
+  // "Project Scope [Doomline]" marker index (finding M-08). Reproduces the
+  // AngularJS `reloadDoomLine` (main.coffee:727-752) via the pure, unit-tested
+  // `computeDoomLineIndex`, which walks `userstories` in order accumulating
+  // `total_points` from `stats.assigned_points` and returns the first index
+  // whose running sum overflows `stats.total_points` (or -1 for none). The
+  // marker is INDEPENDENT of `displayVelocity` — the AngularJS velocity gate
+  // reads a bare `$scope.displayVelocity` that is never assigned, so it is
+  // always active (see `computeDoomLineIndex` for the full parity rationale).
+  const doomLineIndex = useMemo(
+    () => computeDoomLineIndex(stats, userstories),
+    [stats, userstories],
+  );
 
   // Anchor index for an inclusive shift-range selection: the index of the last
   // row whose checkbox was toggled. Reproduces `lastChecked` (main.coffee:820-861).
@@ -384,7 +450,7 @@ export function BacklogTable(props: BacklogTableProps) {
           {canModifyUs ? <div className="input" /> : null}
           <div className="user-stories">User Story</div>
           <div className="status">Status</div>
-          <div className="points" title="Select view per Role">
+          <div className="points" title="Select view per Role" ref={roleViewRef}>
             {/* Role-points filter control (`div.inner(tg-us-role-points-selector)`
                 in backlog-table.jade:14). It STAYS a `<div>` — not a `<button>` —
                 so the class-based SCSS (`.points .inner { display: flex }`,
@@ -417,7 +483,22 @@ export function BacklogTable(props: BacklogTableProps) {
                 entry drives the reducer `pointsViewRoleId` via `onSelectRoleView`
                 so every row's points cell switches display together. */}
             {roleViewOpen && onSelectRoleView && (
-              <ul className="popover pop-role" style={{ display: 'block' }}>
+              /* N-11: give the popover the dialog semantics the trigger already
+                 advertises (`aria-haspopup="dialog"`, above). The AngularJS
+                 template was a bare `ul.popover.pop-role` with no role; the trigger
+                 accessibility (M-25) was added earlier but left the target without
+                 a matching role, so AT was told a dialog would open yet none was
+                 exposed. `role="dialog"` + `aria-label` (matching the trigger name)
+                 close that gap. It is NOT `aria-modal` — this is a lightweight,
+                 non-focus-trapping popover that dismisses on outside-click/Escape
+                 (N-10), exactly as the legacy popover did. Invisible attributes
+                 only — zero visual change (AAP 0.3.4). */
+              <ul
+                className="popover pop-role"
+                style={{ display: 'block' }}
+                role="dialog"
+                aria-label="Select view per Role"
+              >
                 <li>
                   <a
                     className={
@@ -462,10 +543,21 @@ export function BacklogTable(props: BacklogTableProps) {
 
       <div ref={setNodeRef} className={bodyClasses.join(' ')} onScroll={handleScroll}>
         <SortableContext items={itemIds} strategy={verticalListSortingStrategy}>
-          {userstories.map((us) => (
-            <UserStoryRow
-              key={us.id}
-              us={us}
+          {userstories.map((us, index) => (
+            <Fragment key={us.id}>
+              {/* "Project Scope [Doomline]" marker (finding M-08): reproduces
+                  `addDoomLineDom` (main.coffee:754-756) — inserted BEFORE the
+                  first `.us-item-row` whose cumulative points overflow the
+                  project budget. Same DOM the underscore template emitted
+                  (`<div class="doom-line"><span>…</span></div>`), so
+                  `app/styles/components/doomline.scss` styles it unchanged. */}
+              {index === doomLineIndex ? (
+                <div className="doom-line">
+                  <span>{t('BACKLOG.DOOMLINE')}</span>
+                </div>
+              ) : null}
+              <UserStoryRow
+                us={us}
               showTags={showTags}
               selected={selectedIds.has(us.id)}
               canModify={canModifyUs}
@@ -488,6 +580,7 @@ export function BacklogTable(props: BacklogTableProps) {
               statuses={statuses}
               points={points}
               roles={roles}
+              project={project}
               pointsViewRoleId={pointsViewRoleId}
               canDelete={canDeleteUs}
               onChangeStatus={onChangeStatus}
@@ -495,7 +588,8 @@ export function BacklogTable(props: BacklogTableProps) {
               onEditStory={onEditStory}
               onDeleteStory={onDeleteStory}
               onMoveToTop={onMoveToTop}
-            />
+              />
+            </Fragment>
           ))}
         </SortableContext>
         {/* Trailing `div(tg-loading="ctrl.loadingUserstories")`: carries the

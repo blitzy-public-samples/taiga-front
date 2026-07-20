@@ -234,6 +234,20 @@ describe('root row element and drag state', () => {
     renderRow({ us: makeUs({ id: 1 }) });
     expect(mockUseSortableRow).toHaveBeenCalledWith(1, { usId: 1 });
   });
+
+  it('M-18/M-19: the drag grip carries NO false-affordance ARIA (role/roledescription/tabindex)', () => {
+    // The row grip must match the legacy inert `.draggable-us-row` div. The real
+    // `useSortableRow` suppresses the @dnd-kit `role="button"`/`aria-roledescription`
+    // /`tabindex`/`aria-describedby` (proven in shared/dnd/__tests__/sortable.test.tsx);
+    // here we lock in that the component itself hardcodes none of them on the grip.
+    const { root } = renderRow({ canModify: true });
+    const grip = root.querySelector('.draggable-us-row') as HTMLElement;
+    expect(grip).toBeInTheDocument();
+    expect(grip.getAttribute('role')).toBeNull();
+    expect(grip.getAttribute('tabindex')).toBeNull();
+    expect(grip.getAttribute('aria-roledescription')).toBeNull();
+    expect(grip.getAttribute('aria-describedby')).toBeNull();
+  });
 });
 
 /* ========================================================================== *
@@ -351,14 +365,32 @@ describe('main data: link, due-date, tags and epics', () => {
     expect(root.querySelector('.belong-to-epic-pill')).toBeNull();
   });
 
-  it('renders the due-date host only when the story has a due date', () => {
+  it('renders the NATIVE due-date badge (clock icon + fill + tooltip) only when the story has a due date (M-11)', () => {
+    // M-11: the backlog row now renders the due-date NATIVELY via the shared
+    // `DueDateBadge` (the legacy `tg-due-date` directive never $compiled inside
+    // the React host, so no clock badge appeared). Reproduces `due-date-icon.jade`:
+    // `tg-due-date.due-date > tg-svg.due-date-icon > svg.icon.icon-clock`.
     const withDue = renderRow({ us: makeUs({ due_date: '2025-01-01' }) });
-    expect(withDue.root.querySelector('tg-due-date')).toBeInTheDocument();
-    // The inert host carries the `.due-date` class (structural/style parity).
-    expect(withDue.root.querySelector('.due-date')).toBeInTheDocument();
+    const host = withDue.root.querySelector('.due-date');
+    expect(host).toBeInTheDocument();
+    expect(host!.tagName.toLowerCase()).toBe('tg-due-date');
 
+    const icon = host!.querySelector('.due-date-icon');
+    expect(icon).toBeInTheDocument();
+    const svg = icon!.querySelector('svg.icon.icon-clock');
+    expect(svg).toBeInTheDocument();
+    // A far-past due date resolves to the "past due" appearance (#E44057).
+    // `toHaveStyle` normalises the colour on both sides (jsdom hex/rgb quirk).
+    expect(svg).toHaveStyle({ fill: '#E44057' });
+    // Tooltip via COMMON.CARD.DUE_DATE ("Due date: <formatted> (past due)").
+    const title = svg!.querySelector('title');
+    expect(title!.textContent).toContain('Due date:');
+    expect(title!.textContent).toContain('(past due)');
+
+    // No due date -> the badge is absent (parity with `ng-if="us.due_date"`).
     const withoutDue = renderRow({ us: makeUs({ due_date: null }) });
     expect(withoutDue.root.querySelector('tg-due-date')).toBeNull();
+    expect(withoutDue.root.querySelector('.due-date')).toBeNull();
   });
 });
 
@@ -733,6 +765,34 @@ describe('inline ⋮ options menu', () => {
     expect(menu.querySelector('.e2e-edit.move-to-top')).toBeInTheDocument();
     // No Delete item without the delete_us permission.
     expect(menu.querySelector('.e2e-delete')).toBeNull();
+  });
+
+  it('N-12: the options (⋮) trigger has an accessible name + truthful popup ARIA', () => {
+    // The icon-only trigger previously had no accessible name and announced
+    // neither that it opens a popup nor whether it is open. It now carries
+    // `aria-label="Options"`, `aria-haspopup="true"`, and an `aria-expanded`
+    // that follows the popover state. Invisible; no behaviour change.
+    const { root } = renderRow({ ...optionProps });
+    const button = root.querySelector('.us-option-popup-button') as HTMLElement;
+    expect(button).toHaveAttribute('aria-label', 'Options');
+    expect(button).toHaveAttribute('aria-haspopup', 'true');
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(button);
+    expect(button).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('N-12: the options popover carries NO false ARIA menu roles (legacy globalPopover parity)', () => {
+    // VERIFY-AGAINST-LEGACY: the legacy `us-edit-popover` was a plain
+    // `ul.popover > li > button` list with no menu roles. Assert the React
+    // popover adds none (so no unimplemented arrow-key roving is promised),
+    // consistent with the Kanban card N-07 fix.
+    const { root } = renderRow({ ...optionProps, canDelete: true });
+    fireEvent.click(root.querySelector('.us-option-popup-button') as HTMLElement);
+    const menu = root.querySelector('.us-option-popup') as HTMLElement;
+    expect(menu).toBeInTheDocument();
+    expect(menu.getAttribute('role')).toBeNull();
+    expect(menu.querySelector('[role="menu"]')).toBeNull();
+    expect(menu.querySelector('[role="menuitem"]')).toBeNull();
   });
 
   it('shows the Delete item only when canDelete is true', () => {

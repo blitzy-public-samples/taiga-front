@@ -82,7 +82,6 @@ import { useSortable, arrayMove } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type {
   DragEndEvent,
-  DraggableAttributes,
   DraggableSyntheticListeners,
 } from '@dnd-kit/core';
 import type { CSSProperties } from 'react';
@@ -505,8 +504,25 @@ export function removeDoomLines(root: ParentNode = document): void {
 export interface SortableItemState {
   /** `@dnd-kit` node ref setter — attach as the draggable element's `ref`. */
   setNodeRef: (node: HTMLElement | null) => void;
-  /** ARIA + role attributes to spread onto the draggable element. */
-  attributes: DraggableAttributes;
+  /**
+   * Attributes to spread onto the draggable element — INTENTIONALLY EMPTY.
+   *
+   * `@dnd-kit`'s `useSortable` normally returns a bundle of accessibility
+   * attributes (`role="button"`, `tabIndex={0}`, `aria-roledescription="sortable"`,
+   * `aria-describedby`, `aria-pressed`, `aria-disabled`) intended to expose its
+   * KEYBOARD drag affordance. The legacy dragula drag handles were plain, INERT
+   * `<div>`s with none of that markup, and the migration deliberately ships NO
+   * `KeyboardSensor` (pointer-only parity — see `sensors.ts` / `DndProvider`).
+   * Spreading the `@dnd-kit` attributes therefore produced a FALSE affordance: a
+   * focusable `role="button"` element that announces "sortable" yet does nothing on
+   * Enter/Space (QA M-15/M-16 on the Kanban card; M-18/M-19 on the Backlog & sprint
+   * rows). `useSortableItem` suppresses them so the draggable elements match the
+   * legacy inert divs exactly (behavioral parity, zero visual change). Pointer drag
+   * is unaffected — it flows entirely through `listeners` + `setNodeRef`, which never
+   * depend on these attributes. Kept as a field (rather than removed) so call sites
+   * continue to spread `{...attributes}` unchanged; the object is simply empty.
+   */
+  attributes: Record<string, never>;
   /** Pointer/keyboard drag listeners to spread onto the draggable element. */
   listeners: DraggableSyntheticListeners;
   /** Inline transform/transition style produced by `@dnd-kit` during a drag. */
@@ -551,12 +567,25 @@ export interface SortableItemOptions {
   disabled?: boolean | { draggable?: boolean; droppable?: boolean };
 }
 
+/**
+ * Frozen empty attribute bag returned in place of `@dnd-kit`'s default a11y
+ * attributes. See {@link SortableItemState.attributes} for the full rationale
+ * (M-15/M-16/M-18/M-19 false-affordance suppression / legacy inert-div parity).
+ */
+const SUPPRESSED_DRAG_ATTRIBUTES: Record<string, never> = Object.freeze({});
+
 export function useSortableItem(
   usId: UsId,
   data?: Record<string, unknown>,
   options?: SortableItemOptions,
 ): SortableItemState {
-  const { setNodeRef, attributes, listeners, transform, transition, isDragging } =
+  // NOTE: `attributes` from `useSortable` is deliberately NOT destructured/returned.
+  // It carries the `role="button"` + `tabIndex` + `aria-roledescription="sortable"`
+  // + `aria-describedby` false affordance that the legacy inert dragula divs never
+  // had and that no-ops here (pointer-only sensors). Pointer drag needs only
+  // `listeners` + `setNodeRef` + the transform `style`, so dropping `attributes`
+  // preserves drag behavior while restoring legacy accessibility parity.
+  const { setNodeRef, listeners, transform, transition, isDragging } =
     useSortable({ id: usId, data, disabled: options?.disabled });
 
   const style: CSSProperties = {
@@ -568,7 +597,14 @@ export function useSortableItem(
   // item, so the existing SCSS keeps styling the "in transit" slot identically.
   const className = isDragging ? DND_CLASS.transit : '';
 
-  return { setNodeRef, attributes, listeners, style, isDragging, className };
+  return {
+    setNodeRef,
+    attributes: SUPPRESSED_DRAG_ATTRIBUTES,
+    listeners,
+    style,
+    isDragging,
+    className,
+  };
 }
 
 /**

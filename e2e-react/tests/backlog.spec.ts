@@ -322,6 +322,19 @@ async function shot(page: Page, step?: string): Promise<void> {
 // ordering + fail-fast with retries:0, and — like the legacy suite — it lets
 // state created by earlier tests (real /api/v1/ mutations against the seeded
 // project) support later sprint-dependent tests.
+//
+// C-02: the prior "serial-cascade abandonment" (a single failure skipping all
+// following tests, so 23 flows "did not run") was a DOWNSTREAM SYMPTOM of two
+// upstream flakes — the kanban create selector (fixed in kanban.spec) and this
+// file's "milestones edit" controlled-input race + close-wait (fixed above).
+// With those root causes removed the suite runs green end-to-end and nothing is
+// abandoned. Serial mode is RETAINED intentionally: these flows are genuinely
+// stateful and order-dependent (create -> edit -> delete a sprint share DB
+// state; save-then-remove a custom filter), exactly like the legacy Protractor
+// suites they port, so switching to a non-serial mode would let a failed test
+// leave later stateful tests running against an unexpected DB state and produce
+// WORSE non-determinism. Seed-isolation is instead achieved per-test via
+// explicit precondition establishment (`ensureSprints`, `createBacklogUs`).
 test.describe.configure({ mode: 'serial' });
 
 // ---------------------------------------------------------------------------
@@ -999,7 +1012,19 @@ async function uploadAttachments(page: Page): Promise<void> {
 const filters = {
   /** Open the filters panel if the trigger exists. Port of `helper.open`. */
   open: async (page: Page): Promise<void> => {
-    const panel = page.locator(SEL.filterPanel);
+    // C-02 (strict-mode fix): the React FilterBar renders its ROOT as a
+    // `<tg-filter>` custom element (FilterBar.tsx:80 `const TgFilter = 'tg-filter'`;
+    // the legacy tag name is reproduced verbatim so the existing SCSS applies)
+    // NESTED inside the `<div id="backlog-filter">` host (BacklogApp.tsx:1263).
+    // The combined `SEL.filterPanel` ('tg-filter, #backlog-filter') therefore
+    // resolves to TWO elements on React (the wrapper div AND the nested
+    // `<tg-filter>`) and trips Playwright strict mode. Target the ONE outer host
+    // per variant: the id'd wrapper `#backlog-filter` on React, and `<tg-filter>`
+    // on baseline (where the Angular element is the top-level host, no wrapper div).
+    const panel =
+      resolveVariant() === 'react'
+        ? page.locator('#backlog-filter')
+        : page.locator('tg-filter');
     if (await panel.isVisible().catch(() => false)) return;
     // The open-filters affordance is the header toggle `button.btn-filter`
     // (its `.e2e-open-filter` hook is stripped in deploy builds). It carries the
@@ -1010,11 +1035,13 @@ const filters = {
       .filter({ has: page.locator('[svg-icon="icon-filters"], .icon-filters') });
     if (!(await opener.count())) return; // no filter affordance available
     await opener.first().click();
-    // parity: the baseline `tg-filter` panel is a fully-sized, visible sidebar. The
-    // React `#backlog-filter` host is a class-accurate STUB (BacklogApp.tsx:652 — the
-    // detailed widgets are not ported; only the toolbar free-text search is), so it is
-    // present-but-empty with no intrinsic box and reads as "hidden". Assert ATTACHED on
-    // React (the toggle wired `activeFilters` -> the host rendered) and VISIBLE on baseline.
+    // parity: the baseline `tg-filter` panel is a fully-sized, visible sidebar.
+    // The React `#backlog-filter` host renders the fully-ported FilterBar (its
+    // `<tg-filter>` root carries the reproduced classes/SCSS) and is attached
+    // whenever `activeFilters` is set (BacklogApp.tsx:1263, `ng-if` parity).
+    // Assert ATTACHED on React and VISIBLE on baseline — both confirm the toggle
+    // wired the panel into the DOM. (ATTACHED is retained for React because the
+    // panel mounts synchronously with the toggle and a bounded settle follows.)
     if (resolveVariant() === 'react') {
       await expect(panel).toBeAttached();
     } else {
@@ -1138,6 +1165,69 @@ async function fillSprintDateIfEmpty(lb: Locator, fieldName: string, iso: string
 }
 
 /**
+ * Fill a CONTROLLED React text input so React commits the value before the next
+ * action reads it (C-02, backlog twin of kanban.spec's `fillReactControlled`).
+ *
+ * The sprint-name field is a controlled input (`value={name}` +
+ * `onChange={setName}`, SprintForm.tsx:464-466). Playwright `fill()` sets the
+ * DOM value and dispatches a SINGLE `input` event, but an immediately-following
+ * submit click can invoke `handleSubmit` BEFORE React commits `setName`, so the
+ * handler's closure still holds the STALE name. When the field was just cleared
+ * (`fill('')`) the stale value is empty, `validateSprint` fails on the required
+ * name, the form does NOT close, and `waitLightboxClose` times out — the exact
+ * C-02 "milestones edit" flake. A real user types over hundreds of ms so React
+ * always flushes first; only the instantaneous fill()+click races. Re-dispatching
+ * the `input` event and yielding a short settle makes React commit the controlled
+ * state deterministically before Save reads it. This is a TEST-DRIVING fix — the
+ * React source is unchanged.
+ *
+ * @param input - The controlled input Locator.
+ * @param value - The value to commit.
+ */
+async function fillReactControlled(input: Locator, value: string): Promise<void> {
+  await input.click();
+  await input.fill(value);
+  // Re-fire React's onChange with the filled value, then yield long enough for
+  // React to COMMIT the controlled-state update before the next action reads it.
+  await input.dispatchEvent('input');
+  await input.page().waitForTimeout(300);
+}
+
+/**
+ * Build a sprint name that is unique among the sprints CURRENTLY present, not
+ * merely unique per-process (C-02 determinism).
+ *
+ * `uniqueName('sprintName')` is deterministic per Node process and resets to
+ * `sprintName-1` on every run. That is correct ONLY when the run starts from a
+ * freshly-reset database (the `reseed.ts` / F13 contract): the seeded sprints
+ * are all `Sprint <date>`-named, so `sprintName-N` never collides. When the run
+ * instead executes against a PERSISTED / shared database (reseed skipped — the
+ * documented `TAIGA_SKIP_RESEED` mode, and any environment that preserves the
+ * volume), earlier runs leave `sprintName-1`, `sprintName-2`, … behind. Taiga
+ * enforces a UNIQUE `(project, name)` constraint on milestones (a duplicate PATCH
+ * returns `400 {"name":["Duplicated name"]}`), so reusing an existing name makes
+ * the create POST / edit PATCH reject, the lightbox never closes, and
+ * `waitLightboxClose` times out — the exact C-02 "milestones edit" flake.
+ *
+ * This helper advances the shared monotonic counter past any name already shown
+ * in the sprint list, returning the first free `sprintName-N`. On a freshly-reset
+ * database it yields exactly the same sequence `uniqueName` would (so baseline
+ * and React captures remain byte-comparable, F13), while on a persisted database
+ * it deterministically skips collisions so the write always succeeds.
+ *
+ * @param page - The page under test.
+ * @returns A `sprintName-N` guaranteed not to collide with an existing sprint.
+ */
+async function uniqueSprintName(page: Page): Promise<string> {
+  const existing = new Set(await sprintTitles(page));
+  let candidate = uniqueName('sprintName');
+  while (existing.has(candidate)) {
+    candidate = uniqueName('sprintName');
+  }
+  return candidate;
+}
+
+/**
  * Fill the sprint (milestone) lightbox: always set the name; fill the required
  * start/finish dates only when empty (see {@link fillSprintDateIfEmpty}).
  *
@@ -1145,7 +1235,8 @@ async function fillSprintDateIfEmpty(lb: Locator, fieldName: string, iso: string
  * @param name - The sprint name to set.
  */
 async function fillSprintForm(lb: Locator, name: string): Promise<void> {
-  await lb.locator(SEL.sprintNameInput).first().fill(name);
+  // C-02: drive the controlled name input so React commits before submit reads it.
+  await fillReactControlled(lb.locator(SEL.sprintNameInput).first(), name);
   await fillSprintDateIfEmpty(lb, 'estimated_start', isoDate(0));
   await fillSprintDateIfEmpty(lb, 'estimated_finish', isoDate(14));
 }
@@ -1763,11 +1854,16 @@ test.describe('backlog (react)', () => {
   // --- E.17 — milestones (create / edit / delete) ------------------------
   test.describe('milestones', () => {
     test('create', async ({ page }) => {
+      // C-02: pick a name free in the CURRENT sprint list (read before opening
+      // the lightbox) so the create POST cannot reject with Taiga's unique-name
+      // 400 on a persisted DB. On a freshly-reset DB this is identical to
+      // `uniqueName('sprintName')` (F13 comparability preserved).
+      const name = await uniqueSprintName(page);
+
       const lb = await openNewSprint(page);
 
       await shot(page, 'create-milestone');
 
-      const name = uniqueName('sprintName'); // deterministic per-process (F13)
       await fillSprintForm(lb, name);
       await lb.locator('button[type="submit"]').click();
 
@@ -1777,20 +1873,44 @@ test.describe('backlog (react)', () => {
     });
 
     test('edit', async ({ page }) => {
+      // C-02: self-establish the precondition so the test is independent of the
+      // sibling "create" test's serial ordering / prior DB state (a fresh reseed
+      // could otherwise leave project-3 with zero sprints and no `.edit-sprint`).
+      await ensureSprints(page, 1);
+
+      // C-02: pick a rename target free in the CURRENT sprint list so the edit
+      // PATCH cannot reject with Taiga's unique-name 400 on a persisted DB (a
+      // duplicate name is exactly what left the lightbox open and timed out
+      // `waitLightboxClose` before). On a freshly-reset DB this matches the
+      // deterministic `uniqueName('sprintName')` sequence (F13 comparability).
+      const name = await uniqueSprintName(page);
+
       const lb = await openEditSprint(page, 0);
 
       const nameInput = lb.locator(SEL.sprintNameInput).first();
       await nameInput.fill(''); // clear
-      const name = uniqueName('sprintName'); // deterministic per-process (F13)
-      await nameInput.fill(name);
+      // C-02: drive the controlled name input so React COMMITS the new name
+      // before the submit click reads `handleSubmit`'s closure. A plain fill()
+      // after a clear() can leave React holding the empty value, failing the
+      // required-name validation so the lightbox never closes (a second cause of
+      // the reported `waitLightboxClose` timeout).
+      await fillReactControlled(nameInput, name);
 
       await lb.locator('button[type="submit"]').click();
-      await waitLightboxClose(page, SEL.lbCreateEditSprint);
+      // C-02: the edit submit awaits the `milestones.save` PATCH round-trip
+      // before `closeSprintForm()` removes `.open`; allow the same generous
+      // window the delete flow uses so a slow round-trip is absorbed rather than
+      // flaked (stabilize the edit-close wait).
+      await waitLightboxClose(page, SEL.lbCreateEditSprint, 30_000);
 
       await expect.poll(async () => sprintTitles(page)).toContain(name);
     });
 
     test('delete', async ({ page }) => {
+      // C-02: self-establish the precondition (seed-isolation) so the test does
+      // not depend on a sibling test having left a sprint in place.
+      await ensureSprints(page, 1);
+
       const lb = await openEditSprint(page, 0);
 
       // Capture the name BEFORE deleting (the legacy read it after close, which
@@ -1798,13 +1918,20 @@ test.describe('backlog (react)', () => {
       const name = (await lb.locator(SEL.sprintNameInput).first().inputValue()).trim();
 
       await lb.locator('.delete-sprint').click();
-      // Confirmation differs by variant: the AngularJS baseline routes deletion
-      // through `$tgConfirm.askDelete` -> the shared `.lightbox-generic-delete`
-      // dialog, whereas React's `handleDeleteSprint` calls `actions.removeSprint`
-      // directly with no confirm step (BacklogApp.tsx:379-384 — the confirm dialog
-      // was not ported). Run the confirm interaction only on the baseline; on React
-      // the click alone performs the deletion.
-      if (resolveVariant() !== 'react') {
+      // C-02: BOTH variants show a delete CONFIRMATION dialog — the `.delete-sprint`
+      // click alone never deletes. The AngularJS baseline routes through
+      // `$tgConfirm.askDelete` -> the shared `.lightbox-generic-delete` dialog
+      // (`.js-confirm`). React now reproduces the same `$confirm.askOnDelete`
+      // step (BacklogApp.tsx:1472-1499 `.lightbox-confirm-delete-sprint`, confirm
+      // button `.btn-delete`), which a prior agent PORTED for parity — so the
+      // earlier "confirm dialog was not ported / click alone deletes on React"
+      // assumption is stale and left the sprint undeleted. Accept the confirm on
+      // whichever dialog the running variant renders.
+      if (resolveVariant() === 'react') {
+        const confirmLb = await waitLightboxOpen(page, '.lightbox-confirm-delete-sprint');
+        await confirmLb.locator('.btn-delete').click();
+        await waitLightboxClose(page, '.lightbox-confirm-delete-sprint', 30_000);
+      } else {
         await confirmDelete(page);
       }
       await page.waitForTimeout(SETTLE_MS);

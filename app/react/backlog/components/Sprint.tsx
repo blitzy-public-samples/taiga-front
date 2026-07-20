@@ -76,33 +76,41 @@ import { ProgressBar } from './ProgressBar';
 import { useSortableRow } from '../../shared/dnd/sortable';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { useDroppable } from '@dnd-kit/core';
+// Native due-date badge + epic-pill colour helper (M-10 / M-11): replace the
+// previously-inert `tg-belong-to-epics` / `tg-due-date` directive hosts.
+import { DueDateBadge } from '../../shared/components/DueDateBadge';
+import type { DueDateProject } from '../../shared/dueDate';
+import { darker } from '../../shared/color';
 
 /**
- * Module-local references to the AngularJS custom-element host tags rendered
- * inside a milestone row.
+ * Milestone-row sub-widgets — the epic pills and the due-date badge — are now
+ * rendered NATIVELY (M-10 / M-11), replacing the previously-inert
+ * `tg-belong-to-epics` / `tg-due-date` custom-element hosts (their AngularJS
+ * directives never $compiled inside `<tg-react-backlog>`, so the epic pills and
+ * the due-date clock were missing entirely on the sprint rows):
  *
- * `tg-belong-to-epics` and `tg-due-date` are AngularJS directives that are OUT of
- * this folder's component scope to fully re-implement (their Angular directives
- * are not loaded inside `<tg-react-backlog>`). Per the presentational-split rule
- * they are reproduced here as INERT custom-element host tags carrying only the
- * correct tag name + class + primary attributes, so the DOM/SCSS structure
- * matches with zero visual change. This mirrors how `UserStoryRow.tsx` handled
- * `tg-due-date`.
+ *   - Epic pills reproduce `belong-to-epics-pill.jade` (the `format="pill"`
+ *     template the `tg-belong-to-epics(class="us-epic-container" format="pill")`
+ *     host used): a `.us-epic-container` wrapper holding one
+ *     `.belong-to-epic-pill-wrapper > .belong-to-epic-pill` per epic, each with
+ *     `background: epic.color` + `border-color: darker(color, -0.2)` and a
+ *     `"#<ref> <subject>"` title (rendered inline below).
+ *   - The due-date badge reproduces `due-date-icon.jade` via the shared
+ *     `DueDateBadge` component (identical to `UserStoryRow.tsx`).
  *
- * The `as unknown as any` cast lets these custom-element tags be used in JSX
- * WITHOUT a cross-file `declare global { namespace JSX }` augmentation, which
- * would conflict with the sibling React files that use this same established
- * pattern (see `UserStoryRow.tsx`, `SprintHeader.tsx`).
- *
- * NOTE (visual-parity critical): the structural class is passed as `class` (NOT
- * `className`) inside the spread. React does not apply its `className` -> `class`
- * mapping to a custom element whose type is a string tag, so `className` would
- * emit a bogus `classname` attribute and the existing `.due-date` /
- * `.us-epic-container` SCSS would never match. Passing `class` directly makes
- * React set the real `class` attribute (matching `UserStoryRow.tsx`).
+ * The `.us-epic-container` host keeps the original `tg-belong-to-epics` tag name
+ * so the compiled DOM matches; `class` (NOT `className`) is used on it for the
+ * same reason as elsewhere (React does not map `className -> class` on custom
+ * elements, and the existing `.us-epic-container` SCSS matches on the class).
  */
 const TgBelongToEpics = 'tg-belong-to-epics' as unknown as any;
-const TgDueDate = 'tg-due-date' as unknown as any;
+
+/** A single epic as read off a milestone row's `us.epics` list. */
+interface SprintRowEpic {
+  ref: number | string;
+  subject: string;
+  color?: string;
+}
 
 /**
  * Props for the module-local {@link MilestoneRow}. Mirrors the per-row data the
@@ -133,6 +141,12 @@ interface MilestoneRowProps {
   canModifyUs: boolean;
   /** Pre-resolved user-story detail URL for the row anchor. */
   detailUrl: string;
+  /**
+   * The resolved project — passed to the due-date badge so it reads the per-type
+   * `us_duedates` appearance override. Optional; the default appearance config is
+   * used when absent.
+   */
+  project?: DueDateProject;
 }
 
 /**
@@ -145,7 +159,7 @@ interface MilestoneRowProps {
  * grip: the WHOLE row is the drag handle (`sortable.coffee:43-47`), so both
  * `attributes` and `listeners` are spread onto the row element itself.
  */
-function MilestoneRow({ us, sprintId, index, canModifyUs, detailUrl }: MilestoneRowProps) {
+function MilestoneRow({ us, sprintId, index, canModifyUs, detailUrl, project }: MilestoneRowProps) {
   // Whole-row drag: `setNodeRef`/`style` mark the sortable node and `attributes`/
   // `listeners` are spread onto the same row element (no `.draggable-us-row`
   // grip). `className` carries `gu-transit` while the row is being dragged so the
@@ -178,7 +192,10 @@ function MilestoneRow({ us, sprintId, index, canModifyUs, detailUrl }: Milestone
   const isBlocked = Boolean(rec.is_blocked);
   const subject = String(rec.subject ?? '');
   const dueDate = rec.due_date;
-  const epics = rec.epics;
+  // Coerce `us.epics` (arriving via the reducer's `[key: string]: unknown` index
+  // signature) to the concrete shape the epic pills need; empty when absent
+  // (the legacy `ng-if="us.epics"` gate).
+  const epics = (rec.epics as SprintRowEpic[] | undefined) ?? [];
   const totalPoints = us.total_points;
 
   // Row class list. `closedRow`/`blockedRow` reproduce
@@ -222,24 +239,33 @@ function MilestoneRow({ us, sprintId, index, canModifyUs, detailUrl }: Milestone
                 CSS margin on `.us-ref-text`). */}
             <span className="us-ref-text">{`#${us.ref} `}</span>
             <span className="us-name-text">{subject}</span>
-            {/* Inert epic-pills host (`ng-if="us.epics"`). */}
-            {epics ? (
-              <TgBelongToEpics
-                {...({ class: 'us-epic-container', format: 'pill' } as Record<string, unknown>)}
-              />
+            {/* Epic pills (M-10) — native reproduction of the
+                `tg-belong-to-epics(format="pill")` directive (`ng-if="us.epics"`).
+                One `.belong-to-epic-pill-wrapper > .belong-to-epic-pill` per epic;
+                each pill's background is the epic colour and its border-color is
+                `darker(color, -0.2)` (belong-to-epics-pill.jade), with a
+                `"#<ref> <subject>"` title. The pill is an empty coloured dot. */}
+            {epics.length ? (
+              <TgBelongToEpics {...({ class: 'us-epic-container' } as Record<string, unknown>)}>
+                {epics.map((epic, i) => (
+                  <span className="belong-to-epic-pill-wrapper" key={`epic-${i}`}>
+                    <div
+                      className="belong-to-epic-pill"
+                      title={`#${String(epic.ref)} ${epic.subject}`}
+                      style={
+                        epic.color
+                          ? { background: epic.color, borderColor: darker(epic.color, -0.2) }
+                          : undefined
+                      }
+                    />
+                  </span>
+                ))}
+              </TgBelongToEpics>
             ) : null}
-            {/* Inert due-date host (`ng-if="us.due_date"`); `class` (not
-                `className`) so the real `.due-date` attribute is emitted. */}
-            {dueDate ? (
-              <TgDueDate
-                {...({
-                  class: 'due-date',
-                  'due-date': dueDate,
-                  'is-closed': isClosed,
-                  'obj-type': 'us',
-                } as Record<string, unknown>)}
-              />
-            ) : null}
+            {/* Due-date badge (M-11) — native `.due-date` > `.due-date-icon`
+                clock (`ng-if="us.due_date"`), rendered by the shared
+                `DueDateBadge` (identical to the backlog rows). */}
+            {dueDate ? <DueDateBadge dueDate={String(dueDate)} project={project} /> : null}
           </a>
         ) : null}
       </div>
@@ -281,6 +307,12 @@ export interface SprintProps {
   taskboardUrl: string;
   /** Builds the user-story detail URL for a milestone row anchor. */
   buildUserStoryUrl: (us: UserStory) => string;
+  /**
+   * The resolved project — threaded to each milestone row's due-date badge so it
+   * reads the per-type `us_duedates` appearance override. Optional; the default
+   * appearance config is used when absent.
+   */
+  project?: DueDateProject;
   /** Toggles this sprint's fold state (wired to the `.compact-sprint` button inside SprintHeader). */
   onToggleFold: () => void;
   /** Opens the edit-sprint lightbox (wired to the `.edit-sprint` pencil inside SprintHeader). */
@@ -309,6 +341,7 @@ export function Sprint(props: SprintProps) {
     buildUserStoryUrl,
     onToggleFold,
     onEditSprint,
+    project,
   } = props;
 
   // Point values. `sprint.total_points` is a declared `number`, but
@@ -410,6 +443,7 @@ export function Sprint(props: SprintProps) {
                 index={index}
                 canModifyUs={canModifyUs}
                 detailUrl={buildUserStoryUrl(us)}
+                project={project}
               />
             ))
           )}

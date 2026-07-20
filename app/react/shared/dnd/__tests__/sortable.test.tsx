@@ -546,7 +546,41 @@ describe('useSortableItem / useSortableCard / useSortableRow', () => {
     expect(result.current.isDragging).toBe(false);
     expect(result.current.style.transform).toBeUndefined();
     expect(typeof result.current.setNodeRef).toBe('function');
-    expect(result.current.attributes).toEqual({ role: 'button', tabIndex: 0 });
+  });
+
+  it('SUPPRESSES the @dnd-kit a11y attributes (M-15/M-16/M-18/M-19 false-affordance)', () => {
+    // `useSortable` returns `role="button"`/`tabIndex` (its keyboard/SR affordance),
+    // but the migration is pointer-only (no KeyboardSensor) and the legacy dragula
+    // divs were inert. `useSortableItem` must therefore DROP those attributes so the
+    // draggable elements do not advertise a focusable "sortable" button that no-ops
+    // on Enter/Space. The hook returns an EMPTY attribute bag regardless of what
+    // `useSortable` provides. Pointer drag still flows through `listeners`/`setNodeRef`.
+    mockUseSortable.mockReturnValue({
+      ...baseReturn,
+      attributes: {
+        role: 'button',
+        tabIndex: 0,
+        'aria-roledescription': 'sortable',
+        'aria-describedby': 'DndDescribedBy-0',
+        'aria-pressed': undefined,
+        'aria-disabled': false,
+      },
+    });
+    const { result } = renderHook(() => useSortableCard(7));
+    expect(result.current.attributes).toEqual({});
+    // The pointer listeners are preserved (drag still works by pointer).
+    expect(result.current.listeners).toBe(baseReturn.listeners);
+    // Sanity: none of the false-affordance keys survive.
+    for (const key of [
+      'role',
+      'tabIndex',
+      'aria-roledescription',
+      'aria-describedby',
+      'aria-pressed',
+      'aria-disabled',
+    ]) {
+      expect(Object.prototype.hasOwnProperty.call(result.current.attributes, key)).toBe(false);
+    }
   });
 
   it('maps a DRAGGING item: className gu-transit + transform via CSS.Transform.toString', () => {

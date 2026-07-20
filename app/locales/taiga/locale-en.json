@@ -61,6 +61,7 @@
             "DUE_DATE": "Due date: {{date}}",
             "NO_PTS": "N/E",
             "ESTIMATION": "Estimation",
+            "OPTIONS": "Options",
             "TASKS": "{{completed}} tasks of {{total}} completed",
             "EXTRA_ASSIGNED_USERS": "{{total}} more assigned users"
         },

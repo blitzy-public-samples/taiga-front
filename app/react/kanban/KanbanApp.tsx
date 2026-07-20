@@ -1298,7 +1298,21 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
    * ----------------------------------------------------------------------- */
   return (
     <div className="wrapper">
-      <section className={`main kanban${hasSwimlanes ? ' swimlane' : ''}`}>
+      {/*
+       * landmark-one-main (a11y): the board's content region is exposed as the
+       * page's single `main` landmark. The legacy board shell was
+       * `section.main.kanban` (a `<section>` whose "main" is a CSS class, NOT the
+       * `<main>` element), so it carried no `main` landmark; the sibling React
+       * BacklogApp already renders a real `<main class="main scrum">`, leaving the
+       * two migrated screens inconsistent (Lighthouse: Kanban has no `main`).
+       * We add ONLY `role="main"` to the existing `<section>` — the element tag
+       * and the `main kanban` class list are preserved verbatim, so this is a
+       * STRUCTURE-PRESERVING, INVISIBLE attribute (exactly like the `aria-*`
+       * attributes added elsewhere): the reproduced DOM and existing SCSS render
+       * byte-identically, no visual change, no new behavior, and the page now
+       * exposes exactly one `main` landmark, consistent with the Backlog.
+       */}
+      <section role="main" className={`main kanban${hasSwimlanes ? ' swimlane' : ''}`}>
         <div className="kanban-header">
           {/* mainTitle include reproduced (header > h1). */}
           <header>
@@ -1306,10 +1320,21 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
           </header>
           <div className="taskboard-actions">
             <div className="kanban-table-options-start">
+              {/*
+               * N-09 (a11y): the Filters button is a real disclosure toggle for
+               * the `.kanban-manager` filter panel below. Expose the toggle state
+               * truthfully via `aria-expanded` and associate the controlled panel
+               * via `aria-controls`. Both attributes are INVISIBLE and add no new
+               * behavior — they only annotate the already-existing show/hide the
+               * legacy screen conveyed by label text ("Filters"/"Hide filters")
+               * and the `active` class alone.
+               */}
               <button
                 type="button"
                 className={`btn-filter e2e-open-filter${openFilter ? ' active' : ''}`}
                 onClick={toggleOpenFilter}
+                aria-expanded={openFilter}
+                aria-controls="kanban-filter-panel"
               >
                 <Svg icon="icon-filters" />
                 <span className="text">
@@ -1347,7 +1372,13 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
           </div>
         </div>
 
-        <div className={`kanban-manager${!openFilter ? ' expanded' : ''}`}>
+        {/*
+         * N-09 (a11y): `id` target for the Filters button's `aria-controls`.
+         * The element is always present (it only toggles the `expanded` class),
+         * so it is a stable disclosure target. Adding an `id` is INVISIBLE and
+         * does not alter the reproduced DOM/SCSS.
+         */}
+        <div id="kanban-filter-panel" className={`kanban-manager${!openFilter ? ' expanded' : ''}`}>
           {openFilter ? (
             <div className="kanban-filter">
               <FilterBar
