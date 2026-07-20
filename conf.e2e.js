@@ -48,9 +48,11 @@ var config = {
         userProfile: "e2e/suites/user-profile/*.e2e.js",
         epics: "e2e/suites/epics/*.e2e.js",
         userStories: "e2e/suites/user-stories/*.e2e.js",
-        backlog: "e2e/suites/backlog.e2e.js",
         home: "e2e/suites/home.e2e.js",
-        kanban: "e2e/suites/kanban.e2e.js",
+        // NOTE: the `backlog` and `kanban` suite mappings were removed here (F07).
+        // Those Protractor specs (e2e/suites/{backlog,kanban}.e2e.js) were deleted
+        // when the two screens migrated to the React + Playwright harness
+        // (`npm run e2e`); run-e2e.js now also rejects those retired aliases.
         projectHome: "e2e/suites/project-home.e2e.js",
         search: "e2e/suites/search.e2e.js",
         team: "e2e/suites/team.e2e.js",

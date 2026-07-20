@@ -17,7 +17,25 @@ var gulp = require("gulp"),
     rename = require("gulp-rename"),
     gulpif = require("gulp-if"),
     replace = require("gulp-replace"),
-    sass = require('gulp-sass')(require('node-sass'));
+    // node-sass (a native addon built via `nan`) cannot compile its V8 binding against
+    // Node >= 20/22 headers (the bundled nan.h calls the removed
+    // `v8::ObjectTemplate::SetAccessor` overload). Because the host dev runtime is Node
+    // v22 (mandated by the I3 tool restriction, overriding the .nvmrc v16 pin), eagerly
+    // `require('node-sass')` here would throw at gulpfile load time and break EVERY gulp
+    // task — including the React `react` (esbuild) bundle task, which does not use SCSS
+    // at all. It is therefore loaded LAZILY: the gulp-sass compiler is only constructed
+    // the first time the `sass-compile` task runs. Inside the Node-16 `docker/Dockerfile`
+    // build image node-sass loads normally at first use, so production SCSS output is
+    // byte-identical — only the require timing changed. [setup fix for I3 Node override]
+    sass = (function () {
+        var _compiler = null;
+        return function (options) {
+            if (_compiler === null) {
+                _compiler = require('gulp-sass')(require('node-sass'));
+            }
+            return _compiler(options);
+        };
+    })();
     minifyCSS = require("gulp-clean-css"),
     stylelint = require('gulp-stylelint');
     cache = require("gulp-cache"),
@@ -38,6 +56,12 @@ var gulp = require("gulp"),
     jsonminify = require('gulp-jsonminify'),
     classPrefix = require('gulp-class-prefix'),
     coffeelint = require('gulp-coffeelint');
+
+// esbuild — bundler for the React coexistence source under app/react/**. Invoked by the
+// `react` task below through its Node build() API (never the dev-server mode). esbuild is a
+// native Go binary invoked from Node, so it runs comfortably under the pinned Node v16.19.1.
+// Declared in package.json devDependencies (0.19.12).
+var esbuild = require("esbuild");
 
 var argv = require('minimist')(process.argv.slice(2));
 
@@ -91,6 +115,8 @@ paths.css_vendor = [
 paths.locales = paths.app + "locales/**/*.json";
 paths.modulesLocales = paths.app + "modules/**/locales/*.json";
 paths.elements = `./elements.js`;
+paths.reactEntry = paths.app + "react/index.tsx";      // esbuild entry point
+paths.react = paths.app + "react/**/*.{ts,tsx}";        // watched source glob
 
 paths.sass = [
     paths.app + "**/*.scss",
@@ -565,6 +591,23 @@ gulp.task("elements", function() {
         .pipe(gulp.dest(paths.distVersion + "js/"));
 });
 
+// React bundle for the AngularJS->React coexistence migration (Kanban + Backlog screens).
+// Emits dist/<version>/js/react.js, loaded by app-loader.coffee between elements.js and app.js
+// so customElements.define('tg-react-kanban' / 'tg-react-backlog') runs before angular.bootstrap.
+gulp.task("react", function() {
+    return esbuild.build({
+        entryPoints: [paths.reactEntry],
+        bundle: true,
+        outfile: paths.distVersion + "js/react.js",
+        format: "iife",
+        target: "es2019",
+        jsx: "automatic",
+        minify: true,
+        sourcemap: true,
+        logLevel: "info"
+    });
+});
+
 gulp.task("app-watch", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader"));
 
 gulp.task("app-deploy", gulp.series("coffee", "conf", "locales", "moment-locales", "app-loader", function() {
@@ -708,6 +751,7 @@ gulp.task("watch", function(cb) {
     gulp.watch(paths.coffee, gulp.parallel(["app-watch"]));
     gulp.watch(paths.libs, gulp.parallel(["jslibs-watch"]));
     gulp.watch(paths.elements, gulp.parallel(["elements"]));
+    gulp.watch(paths.react, gulp.parallel(["react"]));
     gulp.watch([paths.locales, paths.modulesLocales], gulp.parallel(["locales"]));
     gulp.watch(paths.images, gulp.parallel(["copy-images"]));
 
@@ -724,6 +768,7 @@ gulp.task("deploy", gulp.series(
         "app-deploy",
         "jslibs-deploy",
         "elements",
+        "react",
         "link-images",
         "compile-themes"
     )
@@ -740,6 +785,7 @@ gulp.task("default", gulp.series(
         "jslibs-watch",
         "jade-deploy",
         "elements",
+        "react",
         "express",
         "watch"
     ))

@@ -11,9 +11,18 @@ var child_process = require('child_process');
 var inquirer = require("inquirer");
 var Promise = require('bluebird');
 
-// npm run e2e -- --s userStories, auth
-
+// Legacy Protractor runner. Invoked via the `e2e:protractor` npm script
+// (the `e2e` script now launches the Playwright harness instead). Example:
+//   npm run e2e:protractor -- --s userStories,auth
 var taigaBackPath = '';
+
+// Suites retired when the Kanban and Backlog screens were migrated to the React
+// + Playwright harness (`npm run e2e`). Their Protractor specs under
+// e2e/suites/{kanban,backlog}.e2e.js were deleted and their conf.e2e.js
+// mappings removed, so selecting them through this runner is an error and must
+// be rejected rather than silently attempting to load a missing spec (F07).
+var RETIRED_SUITES = ['backlog', 'kanban'];
+
 var suites = [
     'auth',
     'public',
@@ -24,9 +33,7 @@ var suites = [
     'tasks',
     'userProfile',
     'userStories',
-    'backlog',
     'home',
-    'kanban',
     'projectHome',
     'search',
     'team',
@@ -36,7 +43,22 @@ var suites = [
 var lunchSuites = [];
 
 if (argv.s) {
-    suites = argv.s.split(',');
+    // Normalise the comma-separated list (tolerating stray whitespace such as
+    // "userStories, auth") and drop empty entries.
+    suites = argv.s.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+
+    // Reject any retired suite alias up front. These aliases used to map to the
+    // now-deleted Kanban/Backlog Protractor specs; those screens are covered by
+    // the Playwright harness (`npm run e2e`) instead (F07).
+    var retired = suites.filter(function (s) { return RETIRED_SUITES.indexOf(s) !== -1; });
+    if (retired.length) {
+        console.error(
+            'Error: the following Protractor suite(s) have been retired and migrated to the ' +
+            'Playwright harness (run `npm run e2e`): ' + retired.join(', ') + '. ' +
+            'Please remove them from the --s list; all other suites remain available.'
+        );
+        process.exit(1);
+    }
 }
 
 function backup() {

@@ -7,63 +7,64 @@
 
 doctype html
 
+//- ---------------------------------------------------------------------------
+//- AngularJS 1.5.10 -> React 18 coexistence route cutover (Blitzy AAP 0.2.1 /
+//- 0.4.1). The Kanban board previously rendered by the AngularJS kanban
+//- controller (and its tgKanban / tgKanbanSwimlane / tgKanbanWipLimit
+//- directives, plus the kanban-table partial and the create/edit + bulk-create
+//- lightboxes) is now rendered in place by the <tg-react-kanban> custom element.
+//- React 18 owns everything INSIDE that tag: connectedCallback mounts a React
+//- root and renders the board (columns, swimlanes, WIP limits, sidebar filters,
+//- zoom, and the lightboxes), reproducing the same DOM structure and CSS class
+//- names so the existing SCSS styles the React output unchanged.
+//-
+//- HOW THE ELEMENT IS LIVE: <tg-react-kanban> is registered (customElements.define)
+//- by the react.js bundle, which app-loader/app-loader.coffee loads BETWEEN
+//- elements.js and app.js -- i.e. before angular.bootstrap(document, ['taiga']).
+//- Because the element is already defined when AngularJS $compile first
+//- encounters this template, AngularJS treats it as an ordinary custom element
+//- and passes its internals through inertly: React owns everything INSIDE the
+//- tag while AngularJS owns the navigation chrome OUTSIDE it. This re-applies the
+//- coexistence pattern the repository already ships for its Angular-Elements
+//- bundle (tg-main / tg-navigation-bar / tg-live-announcement in app/index.jade).
+//-
+//- CHROME OUTSIDE THE BOUNDARY: the project archived-warning banner and the left
+//- tg-project-menu sidebar are self-contained AngularJS components (driven by the
+//- shared project service and the route's `section` property, not by the former
+//- controller), so they remain here as siblings. React's createRoot wipes the
+//- host element's children, so the menu must be a sibling of -- not a child of --
+//- the custom element. The `.wrapper` flex row (display:flex; height:100%, see
+//- app/styles/core/base.scss) lays the project menu beside the board exactly as
+//- before, and ng-init sets the `section` scope variable the menu reads to
+//- highlight the active screen.
+//-
+//- NO project-slug ATTRIBUTE is passed on purpose: TgReactKanban resolves the
+//- slug as getAttribute('project-slug') ?? getProjectSlug(), so it only falls
+//- back to the reliable URL (/project/:pslug/kanban) when the attribute is
+//- ABSENT; an AngularJS-interpolated {{project.slug}} would be an empty string at
+//- mount time and would suppress that fallback.
+//-
+//- The inline flex style reproduces the `.main { flex: 1; min-width: 0 }` rule on
+//- the host tag so the React board occupies the exact same width the AngularJS
+//- section.main did, beside the fixed-width project menu -- keeping the layout
+//- pixel-identical without editing any stylesheet. KanbanApp itself renders the
+//- board shell (`.wrapper > section.main.kanban`, header, filters, zoom,
+//- swimlanes, columns/cards) and its own create/edit + bulk lightboxes.
+//-
+//- SCOPE NOTE: only the ROUTE-LEVEL rendering is superseded here. The AngularJS
+//- taigaKanban module registration is deliberately RETAINED elsewhere because the
+//- out-of-scope taskboard screen registers services onto it; those legacy
+//- controllers/directives simply become unreachable dead code on this route.
+//- ---------------------------------------------------------------------------
+
+//- AngularJS chrome -- stays OUTSIDE the React boundary.
 tg-project-archived-warning
-div.wrapper(
-    ng-controller="KanbanController as ctrl"
-    ng-init="section='kanban'"
-)
+
+div.wrapper(ng-init="section='kanban'")
+    //- AngularJS navigation sidebar -- chrome, OUTSIDE the React boundary.
     tg-project-menu
 
-    section.main.kanban(ng-class="{ 'swimlane': swimlanesList.size }")
-        .kanban-header
-            include ../includes/components/mainTitle
-            .taskboard-actions
-                .kanban-table-options-start
-                    button.btn-filter.e2e-open-filter(
-                        ng-click="ctrl.openFilter = !ctrl.openFilter"
-                        title="{{ctrl.selectedFilters.length}} {{'COMMON.FILTERS.APPLIED_FILTERS_NUM' | translate}}"
-                        ng-class="{active: ctrl.openFilter}"
-                    )
-                        tg-svg(svg-icon="icon-filters")
-                        span.text(
-                            ng-if="!ctrl.openFilter"
-                            translate="BACKLOG.FILTERS.TITLE"
-                        )
-                        span.text(
-                            ng-if="ctrl.openFilter"
-                            translate="BACKLOG.FILTERS.HIDE_TITLE"
-                        )
-                        span.selected-filters(ng-if="ctrl.selectedFilters.length") {{ctrl.selectedFilters.length}}
-
-                    tg-input-search(
-                        q="ctrl.filterQ"
-                        change="ctrl.changeQ(q)"
-                    )
-
-                .kanban-table-options-end
-                    tg-kanban-board-zoom(
-                        on-zoom-change="ctrl.setZoom(zoomLevel, zoom)"
-                    )
-
-        .kanban-manager(ng-class="{'expanded': !ctrl.openFilter}")
-            .kanban-filter(
-                ng-if="ctrl.openFilter"
-            )
-                tg-filter(
-                    filters="ctrl.filters"
-                    custom-filters="ctrl.customFilters"
-                    selected-filters="ctrl.selectedFilters"
-                    customFilters="ctl.customFilters"
-                    on-save-custom-filter="ctrl.saveCustomFilter(name)"
-                    on-add-filter="ctrl.addFilter(filter)"
-                    on-select-custom-filter="ctrl.selectCustomFilter(filter)"
-                    on-remove-custom-filter="ctrl.removeCustomFilter(filter)"
-                    on-remove-filter="ctrl.removeFilter(filter)"
-                )
-
-            include ../includes/modules/kanban-table
-
-    div.lightbox.lightbox-generic-form.lightbox-create-edit(tg-lb-create-edit)
-
-    div.lightbox.lightbox-generic-bulk(tg-lb-create-bulk-userstories)
-        include ../includes/modules/lightbox-us-bulk
+    //- React Kanban board host. The inline flex style makes the host occupy the
+    //- exact width the former section.main did (flex:1; min-width:0), beside the
+    //- fixed-width project menu. No project-slug attribute is passed (see above).
+    tg-react-kanban(style="flex: 1 1 0%; min-width: 0;")
