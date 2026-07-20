@@ -177,6 +177,23 @@ describe('milestones.list — GET /milestones with header totals (sprints.coffee
 
     expect(result.milestones).toEqual([]);
   });
+
+  it('coerces a malformed (non-array) 200 body to [] rather than passing it through (M-04)', async () => {
+    // A malformed HTTP 200 whose body is a JSON object (not an array). The
+    // downstream reducer maps over this list with NATIVE `Array.prototype.map`,
+    // which would throw and collapse the sprints panel; the adapter must degrade
+    // to [] to reproduce the legacy lodash tolerance.
+    mockHttp.getWithHeaders.mockResolvedValueOnce({
+      data: { detail: 'not-an-array' } as unknown as Milestone[],
+      headers: headersWith({}),
+      status: 200,
+    } as never);
+
+    const result = await list(7);
+
+    expect(Array.isArray(result.milestones)).toBe(true);
+    expect(result.milestones).toEqual([]);
+  });
 });
 
 describe('milestones.get — GET /milestones/{id} (sprints.coffee:16-21)', () => {

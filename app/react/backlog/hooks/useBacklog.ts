@@ -539,7 +539,16 @@ export function useBacklog(params: UseBacklogParams): UseBacklogResult {
 
       dispatch({
         type: 'SET_USERSTORIES',
-        userstories: data ?? [],
+        // Resilience guard (finding M-04). The legacy `parseLoadUserstoriesResponse`
+        // fed the body straight into `_.sortBy`/`_.map` (main.coffee:373-378), and
+        // lodash tolerates a non-array (object/null) by degrading to `[]` rather
+        // than throwing. The React port sorts with NATIVE `Array.prototype.map`,
+        // which throws `TypeError: x.map is not a function` on a non-array body and
+        // collapses the whole screen. `Array.isArray(data) ? data : []` restores the
+        // legacy's graceful degradation. With the frozen backend's array responses
+        // this is a pure pass-through (identical to the prior `data ?? []`), so it
+        // cannot change any real behavior — it only contains a malformed 200 body.
+        userstories: Array.isArray(data) ? data : [],
         opts: {
           resetPagination,
           hasNext,

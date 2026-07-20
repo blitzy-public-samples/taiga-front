@@ -362,6 +362,47 @@ describe('sortByBacklogOrder / sortBySprintOrder — stable ascending, no mutati
     expect(out.map((u) => u.id)).toEqual([1, 2]);
     expect(input.map((u) => u.id)).toEqual([2, 1]);
   });
+
+  /*
+   * Finding M-04 — non-array resilience. The legacy sorted via lodash
+   * `_.sortBy`, which coerces a non-array collection to `[]` instead of
+   * throwing. The React port's shared sort choke point (`stableSortByNumber`)
+   * mirrors that tolerance so a malformed (non-array) collection degrades to an
+   * empty list rather than propagating a native `TypeError: x.map is not a
+   * function` that would collapse the whole board. Exercised through the two
+   * exported sort wrappers (the choke point itself is module-private).
+   */
+  it('sortByBacklogOrder returns [] for a non-array input (M-04, matches lodash tolerance)', () => {
+    expect(sortByBacklogOrder(null as unknown as UserStory[])).toEqual([]);
+    expect(sortByBacklogOrder(undefined as unknown as UserStory[])).toEqual([]);
+    expect(sortByBacklogOrder({} as unknown as UserStory[])).toEqual([]);
+    expect(sortByBacklogOrder('not-an-array' as unknown as UserStory[])).toEqual([]);
+  });
+
+  it('sortBySprintOrder returns [] for a non-array input (M-04, matches lodash tolerance)', () => {
+    expect(sortBySprintOrder(null as unknown as UserStory[])).toEqual([]);
+    expect(sortBySprintOrder({ bogus: true } as unknown as UserStory[])).toEqual([]);
+  });
+});
+
+describe('setUserstories — non-array body degrades to [] without throwing (M-04)', () => {
+  it('a malformed (object) userstories body resets to an empty list rather than crashing', () => {
+    let s = createInitialState();
+    s = setProject(s, makeProject());
+    // First a legitimate array load so there is prior state to reset.
+    s = setUserstories(s, [makeUs({ id: 1, backlog_order: 1 }), makeUs({ id: 2, backlog_order: 2 })], {
+      resetPagination: true,
+    });
+    expect(s.userstories.map((u) => u.id)).toEqual([1, 2]);
+    // Now a malformed (non-array) 200 body arrives. The reducer must NOT throw;
+    // it degrades to an empty list (reset), mirroring the legacy lodash path.
+    expect(() =>
+      setUserstories(s, {} as unknown as UserStory[], { resetPagination: true }),
+    ).not.toThrow();
+    const next = setUserstories(s, {} as unknown as UserStory[], { resetPagination: true });
+    expect(next.userstories).toEqual([]);
+    expect(next.visibleUserStories).toEqual([]);
+  });
 });
 
 describe('keyById — LAST-WINS single-object map (parity with utils.coffee:80-85)', () => {

@@ -252,6 +252,25 @@ describe('useBacklog — initial load & header parsing', () => {
     expect(result.current.state.noSwimlaneUserStories).toBe(false);
   });
 
+  it('degrades a malformed (non-array) userstories body to [] without crashing (M-04)', async () => {
+    const { result } = await renderReady();
+    // The mount load populated the list; now a malformed HTTP 200 arrives whose
+    // body is a JSON object rather than an array. The boundary guard
+    // (`Array.isArray(data) ? data : []`) must coerce it to [] so the reducer's
+    // native-map sort path cannot throw — reproducing the legacy lodash
+    // tolerance instead of collapsing the whole board.
+    http.getWithHeaders.mockResolvedValueOnce({
+      data: { detail: 'not-an-array' },
+      headers: makeHeaders(),
+      status: 200,
+    });
+    await act(async () => {
+      await result.current.actions.loadUserstories(true);
+    });
+    expect(result.current.state.userstories).toEqual([]);
+    expect(result.current.state.visibleUserStories).toEqual([]);
+  });
+
   it('resolves the project id from the slug when projectId is omitted', async () => {
     const { result } = await renderReady({ projectSlug: 'proj' });
     expect(http.get).toHaveBeenCalledWith('projects/by_slug', { slug: 'proj' });

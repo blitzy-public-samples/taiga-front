@@ -195,7 +195,13 @@ export async function list(
 
   return {
     // Empty/`204` bodies resolve to `null` in httpClient; default to `[]`.
-    milestones: res.data ?? [],
+    // Resilience guard (finding M-04): also coerce a non-array (malformed 200)
+    // body to `[]`. `setSprints`/`setClosedSprints` map over this list with
+    // NATIVE `Array.prototype.map` (backlogReducer.ts), which would throw on a
+    // non-array and collapse the sprints panel; the legacy consumed milestones
+    // through lodash and degraded gracefully. Array bodies pass through
+    // unchanged, so the frozen-contract behavior is identical.
+    milestones: Array.isArray(res.data) ? res.data : [],
     // `Headers.get` is case-insensitive and returns `null` when absent;
     // `parseInt(null ?? '', 10)` -> `NaN`, matching the AngularJS behavior.
     closed: parseInt(res.headers.get('Taiga-Info-Total-Closed-Milestones') ?? '', 10),

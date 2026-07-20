@@ -442,6 +442,17 @@ export function reset(prev?: Partial<BacklogState>): BacklogState {
  * of engine. Returns a NEW array; the input is never mutated.
  */
 function stableSortByNumber<T>(list: T[], key: (item: T) => number): T[] {
+  // Resilience guard (finding M-04). This is the single sort choke point for both
+  // `sortByBacklogOrder` (userstories) and `sortBySprintOrder` (a sprint's nested
+  // `user_stories`). The legacy sorted via `_.sortBy`, which coerces a non-array
+  // input to `[]`; the native `.map` below would instead throw and crash the
+  // board. Mirror the lodash tolerance so a malformed (non-array) collection —
+  // e.g. a milestone whose `user_stories` field is not an array — degrades to an
+  // empty list rather than propagating a `TypeError`. Well-formed arrays are
+  // unaffected.
+  if (!Array.isArray(list)) {
+    return [];
+  }
   return list
     .map((item, index) => ({ item, index }))
     .sort((a, b) => {
