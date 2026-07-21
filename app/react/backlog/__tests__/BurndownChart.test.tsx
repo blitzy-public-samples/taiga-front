@@ -139,6 +139,27 @@ describe('BurndownChart', () => {
       expect(getByText('Sprints')).toBeInTheDocument();
       expect(getByText('Points')).toBeInTheDocument();
     });
+
+    it('F-VIS-05: renders a numeric Y-axis tick scale', () => {
+      // Data max is 392 → nice ticks step 100 over [0, 400]: 0/100/200/300/400.
+      const { container } = render(<BurndownChart milestones={milestones} />);
+      const yAxis = container.querySelector('.burndown-yaxis');
+      expect(yAxis).not.toBeNull();
+
+      const tickLabels = Array.from(
+        container.querySelectorAll('.burndown-axis-tick-y'),
+      ).map((n) => n.textContent);
+      // A multi-tick numeric scale is present (>= 2 ticks) …
+      expect(tickLabels.length).toBeGreaterThanOrEqual(2);
+      // … bounding the data at nice round values (baseline-style scale).
+      expect(tickLabels).toContain('0');
+      expect(tickLabels).toContain('400');
+      // Every tick label is a bare integer string (no thousands separator on the
+      // burndown axis — matches the baseline "1000 / 750 / 500 / 250 / 0").
+      tickLabels.forEach((label) => {
+        expect(label).toMatch(/^-?\d+(\.\d+)?$/);
+      });
+    });
   });
 
   describe('edge cases', () => {

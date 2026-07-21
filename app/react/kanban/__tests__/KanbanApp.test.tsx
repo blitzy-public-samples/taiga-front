@@ -858,6 +858,22 @@ describe('KanbanApp', () => {
       expect(input).not.toBeNull();
       expect(input?.getAttribute('aria-label')).toBeTruthy();
     });
+
+    it('renders the search magnifier as a `<tg-svg>` inside the host (F-VIS-02)', async () => {
+      primeLoadedNoSwimlane();
+      const { container } = await renderApp();
+
+      // F-VIS-02: the magnifier must be the shared `<tg-svg>` primitive (not a
+      // bare inline `<svg>`), so the retained `tg-input-search tg-svg` SCSS
+      // paints it teal, 14x14 and absolutely positioned at the right edge. A
+      // bare `<svg>` would leave it black, static and mis-positioned.
+      const host = container.querySelector('tg-input-search');
+      const tgSvg = host?.querySelector('tg-svg');
+      expect(tgSvg).not.toBeNull();
+      // The sprite reference is the search glyph.
+      const use = tgSvg?.querySelector('use');
+      expect(use?.getAttribute('href')).toBe('#icon-search');
+    });
   });
 
   describe('F-UI-01 filter host element', () => {

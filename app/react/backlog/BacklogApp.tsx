@@ -49,8 +49,8 @@
  * `dist/js/react.js`.
  */
 
-import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import type { FC, ChangeEvent, FormEvent, KeyboardEvent } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect, Fragment } from 'react';
+import type { FC, ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react';
 
 import { useBacklog } from './state/useBacklog';
 import { BacklogDndContext } from './dnd/BacklogDndContext';
@@ -86,9 +86,15 @@ import { navigateToUserStoryDetail } from '../shared/session';
 // AAP §0.2.2); we call the same `/api/v1/userstories` endpoint directly.
 import { createUserStory } from '../shared/api/userstories';
 import { useResolvedProjectId } from '../shared/useResolvedProjectId';
-// F-UI-02: the ONE shared SVG-sprite icon primitive (replaces the container's
-// broken empty-span placeholder).
-import { TgIcon } from '../shared/icon';
+// F-UI-02: the ONE shared SVG-sprite icon primitives (replaces the container's
+// broken empty-span placeholder). `TgSvg` emits the `<tg-svg>` host directly so
+// the retained `tg-input-search tg-svg` SCSS paints the search magnifier
+// (F-VIS-02); `TgIcon` is the decorative forwarding alias used elsewhere.
+import { TgIcon, TgSvg } from '../shared/icon';
+// F-VIS-06: locale-aware label lookup (`translate`) + grouped number formatting
+// (`formatNumber`) for the Backlog summary — replaces the hardcoded English
+// labels and the separator-less local number formatter.
+import { translate, formatNumber } from '../shared/i18n';
 import { NotificationError } from '../shared/NotificationError';
 import type { Project, UserStory, Milestone, Status, FilterOption } from '../shared/types';
 
@@ -166,17 +172,26 @@ function readIsAdmin(project: Project | null): boolean {
 }
 
 /**
- * Format a numeric stat for the summary block, tolerating `null`/`undefined`
- * (the AngularJS `| number` filter rendered nothing for missing values; we
- * render `0`). Kept deliberately small — the summary/burndown region is
- * layout-only (see the burndown scope note in the render).
+ * F-VIS-06: render a translated summary label that carries literal `<br />`
+ * markup (the backlog summary labels are stored two-line, e.g.
+ * `"project<br />points"`, `"points /<br />sprint"`) as SAFE React nodes:
+ * split on the `<br>` tag and interleave real `<br/>` elements.
+ *
+ * The legacy `summary.jade` rendered these through the angular-translate
+ * `translate` directive; because the shell configures
+ * `useSanitizeValueStrategy('escapeParameters')` (escapes interpolation
+ * PARAMETERS only, never the translation text), the raw `<br />` in the table
+ * value reached the DOM and produced the baseline's two-line labels. This
+ * reproduces that EXACTLY without `dangerouslySetInnerHTML` — only `<br/>`
+ * elements are ever emitted, so no untrusted markup can be injected.
  */
-function formatNumber(value: unknown): string {
-    const n = Number(value);
-    if (!Number.isFinite(n)) {
-        return '0';
-    }
-    return String(Math.round(n * 100) / 100);
+function renderBrLabel(text: string): ReactNode {
+    return text.split(/<br\s*\/?>/i).map((part, index) => (
+        <Fragment key={index}>
+            {index > 0 && <br />}
+            {part}
+        </Fragment>
+    ));
 }
 
 // F-UI-02: icons render through the ONE shared `TgSvg` sprite primitive
@@ -959,6 +974,22 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                 >
                 <section className="backlog">
                     {/*
+                      F-VIS-03: the section page title. The retired `backlog.jade`
+                      opened `section.backlog` with `include mainTitle` — a
+                      `header > h1(tg-main-title i18n-section-name)` rendering the
+                      translated `BACKLOG.SECTION_NAME` ("Scrum") as the page's
+                      top-level heading. The React port had dropped this `h1` and
+                      (via the reverted N-11 tweak) promoted "Backlog" to level 1,
+                      losing the baseline "Scrum" heading. It is restored here as a
+                      real `<h1>` so the global `h1` typography + baseline hierarchy
+                      match exactly (Scrum = h1, Backlog = h2 below, Sprints = h1 in
+                      the sidebar). Mirrors the Kanban header (`KanbanApp` renders
+                      the identical `<header><h1>{SECTION_NAME}</h1></header>`).
+                    */}
+                    <header>
+                        <h1>{translate('BACKLOG.SECTION_NAME', undefined, 'Scrum')}</h1>
+                    </header>
+                    {/*
                       Burndown / summary region (tg-toggle-burndown-visibility).
                       F-CQ-04: the `loading`/`error` classes let the retained
                       summary SCSS dim the meter while stats are in flight or a
@@ -994,20 +1025,53 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             {stats?.total_points != null && (
                                 <div className="summary-stats">
                                     <span className="number">{formatNumber(stats.total_points)}</span>
-                                    <span className="description">Project points</span>
+                                    <span className="description">
+                                        {renderBrLabel(
+                                            translate(
+                                                'BACKLOG.SUMMARY.PROJECT_POINTS',
+                                                undefined,
+                                                'project<br />points',
+                                            ),
+                                        )}
+                                    </span>
                                 </div>
                             )}
                             <div className="summary-stats">
                                 <span className="number">{formatNumber(stats?.defined_points)}</span>
-                                <span className="description">Defined points</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.DEFINED_POINTS',
+                                            undefined,
+                                            'defined<br />points',
+                                        ),
+                                    )}
+                                </span>
                             </div>
                             <div className="summary-stats">
                                 <span className="number">{formatNumber(stats?.closed_points)}</span>
-                                <span className="description">Closed points</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.CLOSED_POINTS',
+                                            undefined,
+                                            'closed<br />points',
+                                        ),
+                                    )}
+                                </span>
                             </div>
                             <div className="summary-stats">
-                                <span className="number">{formatNumber(stats?.speed)}</span>
-                                <span className="description">Points per sprint</span>
+                                {/* Speed uses the legacy `| number:0` (0 fraction digits). */}
+                                <span className="number">{formatNumber(stats?.speed, 0)}</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.POINTS_PER_SPRINT',
+                                            undefined,
+                                            'points /<br />sprint',
+                                        ),
+                                    )}
+                                </span>
                             </div>
 
                             {!showGraphPlaceholder && (
@@ -1069,23 +1133,17 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                 <div className="backlog-header">
                                     <div className="backlog-header-title">
                                         {/*
-                                          N-11 (heading order): the Backlog is the
-                                          page's PRIMARY content, but its heading was
-                                          an <h2> while the secondary Sprints sidebar
-                                          used <h1>, so assistive tech saw an
-                                          out-of-order H2→H1. The visual sizes are
-                                          driven by the global h1/h2 typography plus
-                                          the tag-scoped rules `.backlog-header h2`
-                                          and `.sprints h1`, so SWAPPING the tags
-                                          would change the rendered sizes and break
-                                          baseline fidelity. Instead we keep the tags
-                                          (visual byte-identical) and override only
-                                          the SEMANTIC level via `aria-level`: Backlog
-                                          becomes level 1, Sprints level 2 (below),
-                                          giving a correct 1→2 heading hierarchy with
-                                          zero visual change.
+                                          F-VIS-03: "Backlog" is the section's SECOND
+                                          heading (`<h2>`), subordinate to the "Scrum"
+                                          `<h1>` restored at the top of `section.backlog`
+                                          above — exactly as the baseline `backlog.jade`
+                                          rendered it (`h2 Backlog`). The earlier N-11
+                                          `aria-level={1}` promotion is removed: per D1
+                                          the committed AngularJS baseline is the
+                                          authoritative design contract, and it renders
+                                          Scrum=h1 / Backlog=h2 / Sprints=h1.
                                         */}
-                                        <h2 aria-level={1}>Backlog</h2>
+                                        <h2>Backlog</h2>
                                         {selectedFilterCount > 0 ? (
                                             <>
                                                 <span className="backlog-stories-number squared">
@@ -1149,16 +1207,30 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                             )}
                                         </button>
 
-                                        <input
-                                            id="backlog-search"
-                                            name="backlog-search"
-                                            type="text"
-                                            className="tg-input-search"
-                                            value={filterQ}
-                                            onChange={handleChangeQ}
-                                            placeholder="Search"
-                                            aria-label="Search backlog"
-                                        />
+                                        {/* F-VIS-02: the host is the `<tg-input-search>`
+                                            custom element (was a plain
+                                            `<input class="tg-input-search">`), so the
+                                            retained `.backlog-table-options-start
+                                            tg-input-search` TAG selector matches — the
+                                            box collapses to its compact ~185px baseline
+                                            width. The magnifier is emitted through the
+                                            shared `TgSvg` primitive (a real `<tg-svg>`
+                                            host) so `tg-input-search tg-svg` paints it
+                                            teal, 14×14, absolutely positioned at the
+                                            right edge (mirrors the Kanban search fix).
+                                            The input keeps its id/name/binding/label. */}
+                                        <tg-input-search>
+                                            <input
+                                                id="backlog-search"
+                                                name="backlog-search"
+                                                type="text"
+                                                value={filterQ}
+                                                onChange={handleChangeQ}
+                                                placeholder="Search"
+                                                aria-label="Search backlog"
+                                            />
+                                            <TgSvg icon="icon-search" />
+                                        </tg-input-search>
 
                                         {userstories.length > 0 && (
                                             <div className="display-tags-button" id="show-tags">
@@ -1231,15 +1303,32 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                             </div>
                         </div>
 
-                        {/* C2 fix (dest#5): inline standard single-story create
-                            input. Revealed by the "Add" button
-                            (`addNewUs('standard')`) and the empty-state
-                            "Create your first user story" button; the subject is
-                            submitted to `POST /userstories` on Enter / Create.
-                            This is the visible React create input that replaces
-                            the deleted common-module `genericform:new` lightbox
-                            (OOS, AAP §0.2.2) while preserving the create behavior
-                            the AngularJS Backlog offered. */}
+                        {/* Inline standard single-story create input. Revealed by
+                            the "Add" button (`addNewUs('standard')`) and the
+                            empty-state "Create your first user story" button; the
+                            subject is submitted to `POST /userstories` on Enter /
+                            Create.
+
+                            F-VIS-07 — DOCUMENTED SCOPE-LIMITED DEVIATION (not a
+                            defect): the AngularJS Backlog's "+ USER STORY" opened a
+                            RICH two-column modal (subject/tags/description/
+                            attachments on the left; status/swimlane/location/
+                            assign/points-per-role on the right). That modal was the
+                            shared COMMON-module `genericform:new`/`lightbox-us`
+                            lightbox, which is explicitly OUT OF SCOPE (AAP §0.2.2 —
+                            "common … modules are likewise out of scope") and is NOT
+                            among the components the AAP directs this migration to
+                            create (§0.3.1 lists only `BulkCreateUsLightbox` for the
+                            Backlog create surfaces). Reproducing that rich modal
+                            here would add net-new UI beyond the migration and so
+                            violate the Minimal Change Clause (§0.7.1). This inline
+                            quick-add therefore reproduces the IN-SCOPE create
+                            capability (subject → `POST /userstories`); the richer
+                            fields remain reachable via the in-scope bulk-create
+                            lightbox (status/swimlane/location) and via full editing
+                            on the shell-owned US-detail screen. This mirrors the
+                            rigor of the M-11/M-12 card Edit/Assign navigation
+                            deviations. */}
                         {standardCreateOpen && (
                             <form
                                 className="new-us-inline"
@@ -1329,6 +1418,14 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                                             showTags={showTags}
                                             activeFilters={filtersSidebarOpen}
                                             displayVelocity={displayVelocity}
+                                            /* F-VIS-04: doomline inputs — the port of
+                                               `linkDoomLine` in BacklogTable walks the
+                                               rows accumulating `us.total_points` from
+                                               an `assigned_points` offset and marks the
+                                               row where the running sum first exceeds
+                                               the project `total_points`. */
+                                            totalPoints={stats?.total_points}
+                                            assignedPoints={stats?.assigned_points}
                                             checkedIds={checkedIds}
                                             visibleUserStories={
                                                 displayVelocity ? visibleUserStories : undefined
@@ -1413,15 +1510,14 @@ export const BacklogApp: FC<BacklogAppProps> = (props) => {
                     <section className="sprints">
                         <header className="sprint-header">
                             {/*
-                              N-11 (heading order): keep the <h1> tag so the
-                              `.sprints h1` rule + global h1 typography render this
-                              sidebar heading exactly as the baseline did, but mark
-                              it `aria-level={2}` so it is semantically SUBORDINATE
-                              to the primary "Backlog" heading (level 1 above). This
-                              corrects the previous H2→H1 order for assistive tech
-                              without any visual change.
+                              F-VIS-03: the sidebar "Sprints" heading is an `<h1>`
+                              (the `.sprints h1` rule + global h1 typography size it,
+                              and `.sprints h1 .title` uppercases it to the baseline
+                              "SPRINTS"). The earlier N-11 `aria-level={2}` override is
+                              removed: per D1 the committed baseline is authoritative
+                              and renders this sidebar title as a level-1 heading.
                             */}
-                            <h1 aria-level={2}>
+                            <h1>
                                 {totalMilestones > 0 && (
                                     <span className="number">{totalMilestones}</span>
                                 )}

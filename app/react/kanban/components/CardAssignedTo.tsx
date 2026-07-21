@@ -33,6 +33,10 @@
 import type { MouseEvent } from 'react';
 import type { BoardCard, Project, AssignedUser } from '../../shared/types';
 import { translate } from '../../shared/i18n';
+// F-VIS-01: the shared avatar resolver reproduces the AngularJS
+// `AvatarService.getAvatar` identicon logic (gravatar_id → murmurhash →
+// deterministic coloured avatar image + background). See `../../shared/avatar`.
+import { getUserAvatar } from '../../shared/avatar';
 
 /**
  * Props for {@link CardAssignedTo}.
@@ -72,24 +76,27 @@ interface ResolvedAvatar {
 }
 
 /**
- * Pure, dependency-free avatar resolver.
+ * Avatar resolver (F-VIS-01).
  *
- * This uses the user's uploaded `photo` and falls back to the shared `unnamed.png`
- * placeholder — identical to `AvatarService.getUnnamed()`
- * (`app/modules/services/avatar.service.coffee`). The gravatar / murmurhash
- * default-avatar generation performed by `AvatarService.getAvatar` is deliberately
- * NOT re-implemented in this render-only leaf: it depends on runtime config and
- * hashing and does not change the DOM structure produced here. `bg` is preserved
- * when a resolved user object carries a background colour.
+ * Delegates to the shared {@link getUserAvatar} helper, which is a faithful port
+ * of `AvatarService.getAvatar` (`app/modules/services/avatar.service.coffee`):
+ *   - an uploaded `photo` wins (no background colour);
+ *   - otherwise, when a `gravatar_id` is present, a DETERMINISTIC coloured
+ *     identicon is generated — one of five avatar images on one of five
+ *     background colours, chosen by `murmurhash3_32_gc(gravatar_id, 42) % 25`;
+ *   - only a truly unidentifiable user falls back to the gray `unnamed.png`.
+ *
+ * Previously this leaf re-implemented only the `photo || unnamed.png` fallback
+ * and OMITTED the identicon branch, so every assigned card (Taiga members rarely
+ * upload a photo) rendered an identical flat-gray circle instead of the
+ * baseline's coloured identicon. Resolution moved into `shared/avatar.ts` so the
+ * hashing/colour logic is shared and unit-tested, while this component stays
+ * render-only. The returned shape (`{ url, fullName, bg }`) is unchanged, so the
+ * two `<img style={{ backgroundColor: … }}>` call sites below now paint the
+ * identicon colour instead of a transparent background.
  */
 function resolveAvatar(user: AssignedUser): ResolvedAvatar {
-  return {
-    url: user.photo || `${version}/images/unnamed.png`,
-    fullName: user.full_name_display || '',
-    // `bg` is not a first-class field on AssignedUser; read it through a narrow cast
-    // (the index signature otherwise widens it to `unknown`).
-    bg: (user as { bg?: string }).bg,
-  };
+  return getUserAvatar(user);
 }
 
 /**

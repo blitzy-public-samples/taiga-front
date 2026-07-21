@@ -197,3 +197,37 @@ export function formatDate(
     }
     return m.locale(getLocale()).format(format);
 }
+
+/**
+ * Format a number in the shell's locale with grouped thousands, mirroring the
+ * AngularJS `number` filter the legacy Backlog summary used
+ * (`span.number(ng-bind="stats.total_points | number")`, `summary.jade`).
+ *
+ * AngularJS's `| number` groups thousands per the active locale and rounds to
+ * at most `maximumFractionDigits` fraction digits (its bare form defaults to a
+ * maximum of 3); `| number:0` — used by the "points / sprint" stat — maps to
+ * `maximumFractionDigits = 0`. This restores the baseline "1,344" rendering
+ * that the previous hand-rolled `Math.round(n*100)/100` (which produced the
+ * separator-less "1344") had dropped (F-VIS-06).
+ *
+ * @param value  The numeric value (or anything coercible via `Number(...)`).
+ * @param maximumFractionDigits  Max fraction digits (default 3; pass 0 for the
+ *   legacy `| number:0`).
+ * @returns The grouped, localized string; `"0"` for a null/NaN/±Infinity input
+ *   — matching the previous container fallback so a summary cell never renders
+ *   blank before the stats payload loads.
+ */
+export function formatNumber(value: unknown, maximumFractionDigits = 3): string {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(n)) {
+        return '0';
+    }
+    try {
+        return new Intl.NumberFormat(getLocale(), { maximumFractionDigits }).format(n);
+    } catch {
+        // `Intl`/the resolved locale is unavailable on an extremely old engine:
+        // fall back to a plain rounded string so the number still renders.
+        const factor = 10 ** maximumFractionDigits;
+        return String(Math.round(n * factor) / factor);
+    }
+}

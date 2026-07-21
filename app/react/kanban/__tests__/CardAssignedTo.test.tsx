@@ -182,6 +182,85 @@ describe('assigned preview + extra chip math', () => {
 });
 
 /* ========================================================================== *
+ * describe('avatar identicon (F-VIS-01)')
+ * ------------------------------------------------------------------------
+ * When an assignee has no uploaded `photo` (the common case for Taiga members)
+ * but has a `gravatar_id`, the avatar `<img>` must render the DETERMINISTIC
+ * coloured identicon — the correct `user-avatar-0N.png` image on a non-empty
+ * background colour — instead of the flat-gray `unnamed.png` with a transparent
+ * background it previously showed. The exact hash→(image,colour) mapping is
+ * pinned in `shared/__tests__/avatar.test.ts`; this spec proves the component
+ * actually PAINTS it on both the preview and single-assignee branches.
+ * ========================================================================== */
+describe('avatar identicon (F-VIS-01)', () => {
+  // admin's gravatar_id → logo index 16 → user-avatar-02.png on COLORS[3].
+  const ADMIN_GRAVATAR = 'e64c7d89f26bd1972efa854d13d7dd61';
+
+  it('renders the coloured identicon (image + non-empty bg) for the single-assignee branch', () => {
+    // A single `assigned_to` with NO preview array → the fallback branch.
+    const card = makeBoardCard({
+      assigned_to: makeAssignedUser({
+        id: 5,
+        full_name_display: 'Administrator',
+        photo: null,
+        gravatar_id: ADMIN_GRAVATAR,
+      }),
+      assigned_users: [],
+      assigned_users_preview: [],
+    });
+
+    const { container } = render(
+      <CardAssignedTo item={card} project={makeProject()} zoom={['assigned_to']} zoomLevel={1} />,
+    );
+
+    const img = container.querySelector('img') as HTMLImageElement;
+    expect(img).not.toBeNull();
+    // The correct identicon image (was the flat-gray `unnamed.png`).
+    expect(img.getAttribute('src')).toContain('user-avatars/user-avatar-02.png');
+    expect(img.getAttribute('src')).not.toContain('unnamed.png');
+    // A real background colour is applied (was empty / transparent).
+    expect(img.style.backgroundColor).not.toBe('');
+    // …and it is the admin identicon colour rgb(214, 161, 212), not gray.
+    expect(img.style.backgroundColor.replace(/\s+/g, '')).toContain('214,161,212');
+  });
+
+  it('renders the coloured identicon for assignees in the preview branch', () => {
+    const user = makeAssignedUser({
+      id: 5,
+      full_name_display: 'Administrator',
+      photo: null,
+      gravatar_id: ADMIN_GRAVATAR,
+    });
+    const card = makeBoardCard({
+      assigned_users: [user],
+      assigned_users_preview: [user],
+    });
+
+    const { container } = render(
+      <CardAssignedTo item={card} project={makeProject()} zoom={['assigned_to']} zoomLevel={1} />,
+    );
+
+    const img = container.querySelector('img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toContain('user-avatars/user-avatar-02.png');
+    expect(img.style.backgroundColor).not.toBe('');
+  });
+
+  it('still falls back to unnamed.png (no bg) when the assignee has no gravatar_id', () => {
+    // Guards the branch that must NOT paint a colour.
+    const user = makeAssignedUser({ id: 9, full_name_display: 'No Gravatar', photo: null });
+    const card = makeBoardCard({ assigned_users: [user], assigned_users_preview: [user] });
+
+    const { container } = render(
+      <CardAssignedTo item={card} project={makeProject()} zoom={['assigned_to']} zoomLevel={1} />,
+    );
+
+    const img = container.querySelector('img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toContain('unnamed.png');
+    expect(img.style.backgroundColor).toBe('');
+  });
+});
+
+/* ========================================================================== *
  * describe('avatar click guard')
  * ------------------------------------------------------------------------
  * A plain click on an assignee avatar emits the card id through

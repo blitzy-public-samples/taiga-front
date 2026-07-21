@@ -61,6 +61,11 @@ import { NotificationError } from '../shared/NotificationError';
 import { filtersData, createUserStory } from '../shared/api/userstories';
 import { useResolvedProjectId } from '../shared/useResolvedProjectId';
 import { translate } from '../shared/i18n';
+// F-VIS-02: the search magnifier must be the shared `<tg-svg>` primitive (not a
+// bare inline `<svg>`), so the retained `tg-input-search tg-svg` SCSS positions
+// it (absolute, right-edge, 14x14, teal fill) instead of leaving it black,
+// static and mis-positioned.
+import { TgSvg } from '../shared/icon';
 import type { Project, Status, FiltersData, FilterOption, UserStory } from '../shared/types';
 
 /*
@@ -1467,7 +1472,11 @@ export function KanbanApp(props: KanbanAppProps): JSX.Element {
                                     value={searchInput}
                                     onChange={handleSearchChange}
                                 />
-                                {svgIcon('icon-search')}
+                                {/* F-VIS-02: emit the `<tg-svg>` host (not a
+                                    bare `<svg>`) so `tg-input-search tg-svg`
+                                    SCSS paints the magnifier teal, 14x14 and
+                                    absolutely positioned at the right edge. */}
+                                <TgSvg icon="icon-search" />
                             </tg-input-search>
                         </div>
                         <div className="kanban-table-options-end">

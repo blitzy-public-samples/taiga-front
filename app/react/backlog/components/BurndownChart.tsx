@@ -75,6 +75,9 @@ const PLOT_HEIGHT = VIEWBOX_HEIGHT - MARGIN.top - MARGIN.bottom;
 /* Per-series line + fill colours, copied verbatim from the legacy directive's
  * `colors` array and the per-series `lines.fillColor` values. */
 const GRID_COLOR = '#D8DEE9';
+/* F-VIS-05: Y-axis numeric tick labels — a readable gray (slightly darker than
+ * the faint gridlines) matching the baseline Flot axis numbers. */
+const AXIS_TICK_COLOR = '#A0A9B4';
 const SERIES_STYLE = {
     optimal: { line: 'rgba(216,222,233,1)', fill: 'rgba(200,201,196,0.2)' },
     evolution: { line: 'rgba(168,228,64,1)', fill: 'rgba(147,196,0,0.2)' },
@@ -99,6 +102,45 @@ interface ResolvedSeries {
     /** i18n key + English fallback for the per-point hover tooltip. */
     tipKey: string;
     tipFallback: string;
+}
+
+/**
+ * F-VIS-05: compute a "nice" ascending set of Y-axis tick values spanning
+ * `[min, max]`, reproducing the numeric scale the legacy Flot plot drew (e.g.
+ * `0 / 250 / 500 / 750 / 1000` for a ~806-point project). Targets roughly
+ * `target` intervals and snaps the step to a nice `1 / 2.5 / 5 / 10 × 10^k`
+ * value — Flot uses the same `2.5` step — then extends the range outward to
+ * whole steps so the outermost ticks bound the data. Returns `[]` for a
+ * degenerate or non-finite range (caller then keeps the raw data scale).
+ */
+function computeYTicks(min: number, max: number, target = 5): number[] {
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+        return [];
+    }
+    const rawStep = (max - min) / target;
+    const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+    const normalized = rawStep / magnitude; // 1 .. 10
+    let niceNormalized: number;
+    if (normalized < 1.5) {
+        niceNormalized = 1;
+    } else if (normalized < 3) {
+        niceNormalized = 2.5;
+    } else if (normalized < 7) {
+        niceNormalized = 5;
+    } else {
+        niceNormalized = 10;
+    }
+    const step = niceNormalized * magnitude;
+    const start = Math.floor(min / step) * step;
+    const end = Math.ceil(max / step) * step;
+    const ticks: number[] = [];
+    // Half-step epsilon guards the loop bound against floating-point dust.
+    for (let value = start; value <= end + step / 2; value += step) {
+        // Snap to the step grid to erase accumulated FP error (and -0).
+        const snapped = Math.round(value / step) * step;
+        ticks.push(snapped === 0 ? 0 : snapped);
+    }
+    return ticks;
 }
 
 /**
@@ -201,6 +243,15 @@ export function BurndownChart(props: BurndownChartProps) {
         yMax += 1;
         yMin -= 1;
     }
+    // F-VIS-05: derive the nice numeric Y ticks, then SNAP the scale to the
+    // outermost ticks so the plotted series rest on the same gridlines the
+    // baseline Flot plot used (e.g. the ~750 evolution line sits on the "750"
+    // tick with a 0..1000 scale). Degenerate ranges keep the raw data scale.
+    const yTicks = computeYTicks(yMin, yMax);
+    if (yTicks.length >= 2) {
+        yMin = yTicks[0];
+        yMax = yTicks[yTicks.length - 1];
+    }
     const yRange = yMax - yMin;
 
     const xFor = (i: number): number =>
@@ -277,6 +328,41 @@ export function BurndownChart(props: BurndownChartProps) {
                 ))}
                 <line x1={plotRight} y1={MARGIN.top} x2={plotRight} y2={plotBottom} />
                 <line x1={MARGIN.left} y1={zeroY} x2={plotRight} y2={zeroY} />
+            </g>
+
+            {/* F-VIS-05: numeric Y-axis scale (Flot `yaxis.ticks`) — a faint
+                horizontal gridline plus a right-aligned value label per tick in
+                the left gutter. Restores the baseline "1000 / 750 / 500 / 250 /
+                0" scale the React port had omitted. Rendered before the series so
+                the gridlines sit behind them; the labels live left of the plot
+                (x < MARGIN.left) so the series never cover them. */}
+            <g className="burndown-yaxis">
+                {yTicks.map((tick) => {
+                    const tickY = yFor(tick);
+                    return (
+                        <g key={tick}>
+                            <line
+                                x1={MARGIN.left}
+                                y1={tickY}
+                                x2={plotRight}
+                                y2={tickY}
+                                stroke={GRID_COLOR}
+                                strokeWidth={1}
+                                opacity={0.4}
+                            />
+                            <text
+                                className="burndown-axis-tick burndown-axis-tick-y"
+                                x={MARGIN.left - 6}
+                                y={tickY + 3}
+                                textAnchor="end"
+                                fontSize={9}
+                                fill={AXIS_TICK_COLOR}
+                            >
+                                {String(tick)}
+                            </text>
+                        </g>
+                    );
+                })}
             </g>
 
             {/* Data series, in Flot paint order. */}

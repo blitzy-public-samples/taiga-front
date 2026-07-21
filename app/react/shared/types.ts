@@ -103,6 +103,14 @@ export interface AssignedUser {
     username?: string;
     full_name_display?: string;
     photo?: string | null;
+    /**
+     * The user's Gravatar hash (an MD5 hex string). Taiga members almost never
+     * upload a `photo`; instead the shell derives a DETERMINISTIC coloured
+     * identicon by hashing this `gravatar_id` (see `shared/avatar.ts`, the port
+     * of `avatar.service.coffee`). It flows through to the board via the full
+     * member objects stored in `usersById`, so it is modelled explicitly here.
+     */
+    gravatar_id?: string;
     [key: string]: unknown;
 }
 

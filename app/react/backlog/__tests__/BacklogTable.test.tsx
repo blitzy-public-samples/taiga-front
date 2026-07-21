@@ -145,6 +145,11 @@ interface RenderConfig {
   showTags?: boolean;
   /** Optional infinite-scroll sentinel callback (maps the legacy `infinite-scroll`). */
   onLoadMore?: () => void;
+  /** F-VIS-04 doomline inputs. */
+  totalPoints?: number;
+  assignedPoints?: number;
+  /** Velocity/forecast mode — suppresses the doomline (legacy parity). */
+  displayVelocity?: boolean;
   handlers?: Handlers;
 }
 
@@ -181,6 +186,9 @@ function renderTable(config: RenderConfig = {}) {
       checkedIds={config.checkedIds}
       visibleUserStories={config.visibleUserStories}
       showTags={config.showTags}
+      displayVelocity={config.displayVelocity}
+      totalPoints={config.totalPoints}
+      assignedPoints={config.assignedPoints}
       onLoadMore={config.onLoadMore}
       onEditUs={handlers.onEditUs ?? jest.fn()}
       onDeleteUs={handlers.onDeleteUs ?? jest.fn()}
@@ -997,6 +1005,90 @@ describe('BacklogTable', () => {
       const img = name.querySelector('img.emoji');
       expect(img).not.toBeNull();
       expect(img?.getAttribute('src')).toBe('/v9/emojis/smile.png');
+    });
+  });
+
+  /* ------------------------------------------------------------------ *
+   * F-VIS-04 — "Project Scope [Doomline]" divider (port of linkDoomLine)
+   * ------------------------------------------------------------------ */
+  describe('F-VIS-04 doomline divider', () => {
+    const DOOM = '.doom-line';
+
+    it('inserts the doomline BEFORE the row where the running total first exceeds total_points', () => {
+      // assigned=90; rows 5,10,20 → 95 (ok), 105 (> 100) at the 2nd row.
+      const { container } = renderTable({
+        totalPoints: 100,
+        assignedPoints: 90,
+        userstories: [
+          makeUserStory({ id: 1, ref: 1, total_points: 5 }),
+          makeUserStory({ id: 2, ref: 2, total_points: 10 }),
+          makeUserStory({ id: 3, ref: 3, total_points: 20 }),
+        ],
+      });
+
+      const doom = container.querySelector(DOOM) as HTMLElement;
+      expect(doom).not.toBeNull();
+      expect(doom.textContent).toContain('Project Scope [Doomline]');
+      // Inserted immediately before the crossing row (data-id=2).
+      expect(doom.nextElementSibling).toHaveAttribute('data-id', '2');
+      // Exactly one doomline is ever rendered.
+      expect(container.querySelectorAll(DOOM)).toHaveLength(1);
+      // The doomline is NOT a `.us-item-row`, so the row count is unchanged.
+      expect(
+        mustQuery(container, BODY).querySelectorAll(ROW),
+      ).toHaveLength(3);
+    });
+
+    it('places the doomline before the FIRST row when assigned already exceeds capacity (baseline p3)', () => {
+      // Mirrors project-3: assigned_points already > total_points → doomline
+      // above the very first backlog row.
+      const { container } = renderTable({
+        totalPoints: 100,
+        assignedPoints: 200,
+        userstories: [
+          makeUserStory({ id: 71, ref: 71, total_points: 5 }),
+          makeUserStory({ id: 72, ref: 72, total_points: 10 }),
+        ],
+      });
+      const doom = container.querySelector(DOOM) as HTMLElement;
+      expect(doom).not.toBeNull();
+      expect(doom.nextElementSibling).toHaveAttribute('data-id', '71');
+    });
+
+    it('renders NO doomline in velocity/forecast mode', () => {
+      const { container } = renderTable({
+        totalPoints: 100,
+        assignedPoints: 200,
+        displayVelocity: true,
+        userstories: [makeUserStory({ id: 1, ref: 1, total_points: 50 })],
+      });
+      expect(container.querySelector(DOOM)).toBeNull();
+    });
+
+    it('renders NO doomline when total_points is missing or zero', () => {
+      const missing = renderTable({
+        userstories: [makeUserStory({ id: 1, ref: 1, total_points: 50 })],
+      });
+      expect(missing.container.querySelector(DOOM)).toBeNull();
+
+      const zero = renderTable({
+        totalPoints: 0,
+        assignedPoints: 200,
+        userstories: [makeUserStory({ id: 1, ref: 1, total_points: 50 })],
+      });
+      expect(zero.container.querySelector(DOOM)).toBeNull();
+    });
+
+    it('renders NO doomline when the backlog never crosses capacity', () => {
+      const { container } = renderTable({
+        totalPoints: 1000,
+        assignedPoints: 0,
+        userstories: [
+          makeUserStory({ id: 1, ref: 1, total_points: 10 }),
+          makeUserStory({ id: 2, ref: 2, total_points: 20 }),
+        ],
+      });
+      expect(container.querySelector(DOOM)).toBeNull();
     });
   });
 });

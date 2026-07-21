@@ -586,7 +586,7 @@ describe('BacklogApp', () => {
       expect(screen.getAllByTestId('sprint')).toHaveLength(2);
     });
 
-    it('N-11: exposes a correct heading hierarchy — "Backlog" semantically level 1, "Sprints" level 2', () => {
+    it('F-VIS-03: renders the baseline heading hierarchy — "Scrum" h1, "Backlog" h2, "Sprints" h1', () => {
       primeHook({
         project: makeProject({ is_backlog_activated: true }),
         isBacklogActivated: true,
@@ -597,22 +597,29 @@ describe('BacklogApp', () => {
 
       const { container } = renderApp();
 
-      // The primary "Backlog" heading keeps its visual <h2> tag (baseline
-      // fidelity — the SCSS + global typography style it via the tag) but is
-      // marked aria-level=1 so assistive tech sees it as the top-level heading.
+      // F-VIS-03: the baseline (authoritative per D1) renders the section title
+      // "Scrum" as the top-level <h1> (from `mainTitle.jade`), restored at the
+      // top of `section.backlog`. The earlier N-11 aria-level tweak (which
+      // promoted "Backlog" to level 1 and demoted "Sprints" to level 2) is gone.
+      const scrum = container.querySelector('section.backlog > header h1') as HTMLElement;
+      expect(scrum).not.toBeNull();
+      expect(scrum.textContent).toContain('Scrum');
+      // No aria-level override — it is a genuine level-1 heading.
+      expect(scrum).not.toHaveAttribute('aria-level');
+
+      // "Backlog" is the section's second heading: a plain <h2> with NO
+      // aria-level override (subordinate to "Scrum" by tag alone).
       const backlog = container.querySelector('.backlog-header-title h2') as HTMLElement;
       expect(backlog).not.toBeNull();
       expect(backlog.textContent).toContain('Backlog');
-      expect(backlog).toHaveAttribute('aria-level', '1');
+      expect(backlog).not.toHaveAttribute('aria-level');
 
-      // The "Sprints" sidebar heading keeps its visual <h1> tag but is marked
-      // aria-level=2 so it is semantically subordinate — fixing the previous
-      // out-of-order H2(Backlog) -> H1(Sprints) heading sequence with NO visual
-      // change.
+      // The sidebar "Sprints" heading is a plain <h1> (matching the baseline
+      // `.sprints h1`), with NO aria-level override.
       const sprints = container.querySelector('.sprint-header h1') as HTMLElement;
       expect(sprints).not.toBeNull();
       expect(sprints.textContent).toContain('Sprints');
-      expect(sprints).toHaveAttribute('aria-level', '2');
+      expect(sprints).not.toHaveAttribute('aria-level');
     });
   });
 
@@ -1272,6 +1279,103 @@ describe('BacklogApp', () => {
       expect(burndown).not.toBeNull();
       // No milestones in this fixture → the chart renders nothing (guard parity).
       expect(burndown?.querySelector('svg')).toBeNull();
+    });
+  });
+
+  /* ------------------------------------------------------------------------ *
+   * F-VIS-03 / F-VIS-06 / F-VIS-02 — Backlog visual-fidelity fixes:
+   *   - the "Scrum" section <h1> is restored;
+   *   - summary stat NUMBERS are grouped ("1,344", not "1344") and LABELS are
+   *     routed through the i18n bridge (two-line, lowercase "defined / points"),
+   *     not hardcoded "Defined points";
+   *   - the toolbar search is a `<tg-input-search>` host with a `<tg-svg>`
+   *     magnifier.
+   * ------------------------------------------------------------------------ */
+  describe('Backlog header / summary / search visual fidelity (F-VIS-03/06/02)', () => {
+    /** A fully-populated `BacklogStats` fixture for the summary bar. */
+    function makeSummaryStats(): NonNullable<BacklogState['stats']> {
+      return {
+        completedPercentage: 4,
+        showGraphPlaceholder: false,
+        speed: 0,
+        total_points: 806,
+        defined_points: 1344,
+        closed_points: 35,
+        assigned_points: 866,
+      } as NonNullable<BacklogState['stats']>;
+    }
+
+    function renderWithSummary() {
+      primeHook({
+        project: makeProject({ is_backlog_activated: true }),
+        isBacklogActivated: true,
+        userstories: makeUserStories(3),
+        sprints: [makeMilestone()],
+        totalMilestones: 1,
+        stats: makeSummaryStats(),
+      });
+      return renderApp();
+    }
+
+    it('F-VIS-03: renders the "Scrum" section heading as an <h1>', () => {
+      const { container } = renderWithSummary();
+      const scrum = container.querySelector('section.backlog > header h1');
+      expect(scrum).not.toBeNull();
+      expect(scrum?.textContent).toContain('Scrum');
+    });
+
+    it('F-VIS-06: formats summary numbers with a thousands separator ("1,344")', () => {
+      const { container } = renderWithSummary();
+      const summary = container.querySelector('.summary') as HTMLElement;
+      expect(summary).not.toBeNull();
+      // The defined-points total is grouped …
+      expect(summary.textContent).toContain('1,344');
+      // … and the separator-less form is gone.
+      expect(summary.textContent).not.toMatch(/(^|\D)1344(\D|$)/);
+    });
+
+    it('F-VIS-06: routes summary labels through i18n as two-line lowercase text', () => {
+      const { container } = renderWithSummary();
+      const descriptions = Array.from(
+        container.querySelectorAll('.summary-stats .description'),
+      );
+      expect(descriptions.length).toBeGreaterThanOrEqual(4);
+
+      // Every label renders as two lines (a <br> between the words) …
+      descriptions.forEach((d) => {
+        expect(d.querySelector('br')).not.toBeNull();
+      });
+      // … using the lowercase locale wording, NOT the old hardcoded English.
+      const joined = descriptions.map((d) => d.textContent).join('|');
+      expect(joined).toMatch(/project/);
+      expect(joined).toMatch(/defined/);
+      expect(joined).toMatch(/closed/);
+      expect(joined).toMatch(/sprint/);
+      // The previous hardcoded capitalized single-line labels are gone.
+      const summaryEl = container.querySelector('.summary') as HTMLElement;
+      expect(summaryEl).not.toBeNull();
+      const html = summaryEl.innerHTML;
+      expect(html).not.toContain('Defined points');
+      expect(html).not.toContain('Project points');
+    });
+
+    it('F-VIS-02: renders the search box as a <tg-input-search> host with a <tg-svg> magnifier', () => {
+      const { container } = renderWithSummary();
+      const host = container.querySelector('tg-input-search');
+      expect(host).not.toBeNull();
+      // The bound input lives INSIDE the host (id preserved for the label assoc).
+      const input = host?.querySelector('input#backlog-search');
+      expect(input).not.toBeNull();
+      // The magnifier is a real <tg-svg> referencing the #icon-search sprite …
+      const svgHost = host?.querySelector('tg-svg');
+      expect(svgHost).not.toBeNull();
+      const use = svgHost?.querySelector('use');
+      expect(use?.getAttribute('href') || use?.getAttribute('xlink:href')).toBe(
+        '#icon-search',
+      );
+      // The class was moved off the <input> onto the host (so the TAG selector
+      // matches) — the input no longer carries `tg-input-search`.
+      expect(input?.classList.contains('tg-input-search')).toBe(false);
     });
   });
 

@@ -23,7 +23,7 @@
 
 import { renderHook } from '@testing-library/react';
 
-import { translate, t, getLocale, formatDate, useTranslation } from '../i18n';
+import { translate, t, getLocale, formatDate, formatNumber, useTranslation } from '../i18n';
 
 /** Install a stub `window.angular` whose `$translate.instant` uses `table`. */
 function installAngular(
@@ -182,5 +182,54 @@ describe('formatDate', () => {
     it('formats with the locale default short date ("L") by default', () => {
         // "L" in the "en" locale is MM/DD/YYYY.
         expect(formatDate('2023-04-15')).toBe('04/15/2023');
+    });
+});
+
+describe('formatNumber (F-VIS-06)', () => {
+    it('groups thousands in the default "en" locale (the baseline "1,344")', () => {
+        expect(formatNumber(1344)).toBe('1,344');
+        expect(formatNumber(1234567)).toBe('1,234,567');
+    });
+
+    it('does not group values below 1000', () => {
+        expect(formatNumber(806)).toBe('806');
+        expect(formatNumber(0)).toBe('0');
+    });
+
+    it('rounds to at most 3 fraction digits by default (bare `| number`)', () => {
+        expect(formatNumber(100.333333)).toBe('100.333');
+        expect(formatNumber(2.5)).toBe('2.5');
+    });
+
+    it('honours maximumFractionDigits=0 (the legacy `| number:0` for speed)', () => {
+        expect(formatNumber(5.5, 0)).toBe('6');
+        expect(formatNumber(0, 0)).toBe('0');
+    });
+
+    it('returns "0" for null/undefined/NaN/±Infinity (never a blank cell)', () => {
+        expect(formatNumber(null)).toBe('0');
+        expect(formatNumber(undefined)).toBe('0');
+        expect(formatNumber(Number.NaN)).toBe('0');
+        expect(formatNumber(Number.POSITIVE_INFINITY)).toBe('0');
+        expect(formatNumber('not-a-number')).toBe('0');
+    });
+
+    it('uses the shell locale for grouping (delegates to getLocale, not hardcoded "en")', () => {
+        // Prove the formatter reads the SAME resolved locale as `translate`
+        // rather than hardcoding "en". The "de" locale groups thousands with a
+        // period. Comparing against the reference `Intl` output for that locale
+        // keeps the assertion correct on any ICU build (both sides fall back
+        // identically on a reduced-ICU runtime), while still catching a hardcoded
+        // "en" on a full-ICU runtime (where "en" → "1,344" ≠ "de" → "1.344").
+        document.documentElement.setAttribute('lang', 'de');
+        expect(getLocale()).toBe('de');
+        const expected = new Intl.NumberFormat('de', { maximumFractionDigits: 3 }).format(1344);
+        expect(formatNumber(1344)).toBe(expected);
+        // On a full-ICU runtime "de" resolves to itself and uses the period
+        // separator — a visible difference from the "en" comma, proving the
+        // delegation is locale-driven. Skipped on a reduced-ICU fallback.
+        if (new Intl.NumberFormat('de').resolvedOptions().locale === 'de') {
+            expect(formatNumber(1344)).toBe('1.344');
+        }
     });
 });

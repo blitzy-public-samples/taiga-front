@@ -59,7 +59,7 @@
  * `import React` statement — only the hooks actually used are imported.
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, Fragment } from 'react';
 
 import { useDroppable, useDraggable } from '@dnd-kit/core';
 
@@ -103,6 +103,20 @@ export interface BacklogTableProps {
   activeFilters?: boolean;
   /** Body `forecasted-stories` class (velocity forecast). Default `false`. */
   displayVelocity?: boolean;
+  /**
+   * F-VIS-04 (doomline): the project's total available points
+   * (`stats.total_points`). When set and non-zero (and not in velocity mode),
+   * the table inserts the "Project Scope [Doomline]" divider before the first
+   * row at which the running point total crosses this capacity. `undefined`
+   * (stats not yet loaded) => no doomline, exactly like the legacy guard.
+   */
+  totalPoints?: number;
+  /**
+   * F-VIS-04 (doomline): the points already committed to sprints
+   * (`stats.assigned_points`) — the starting offset the legacy `linkDoomLine`
+   * added `us.total_points` onto while walking the backlog. Default `0`.
+   */
+  assignedPoints?: number;
   /** Selected US ids → each row's checkbox `checked` state. Default `[]`. */
   checkedIds?: number[];
   /**
@@ -788,6 +802,8 @@ export const BacklogTable = ({
   showTags = false,
   activeFilters = false,
   displayVelocity = false,
+  totalPoints,
+  assignedPoints = 0,
   checkedIds = [],
   visibleUserStories,
   firstUsInBacklog,
@@ -821,6 +837,27 @@ export const BacklogTable = ({
   // First backlog US id → the `first` class on its options trigger. Defaults to
   // the first rendered story (mirrors `first_us_in_backlog`).
   const resolvedFirstUsId = firstUsInBacklog ?? userstories[0]?.id;
+
+  // F-VIS-04 doomline index — faithful port of the legacy `linkDoomLine`
+  // (`backlog/main.coffee:727-748`): guarded by `total_points != 0` and NOT in
+  // velocity mode; starting the running sum at `assigned_points`, accumulate
+  // each story's `total_points` and mark the FIRST row whose running sum
+  // exceeds the project `total_points` — the "Project Scope [Doomline]" divider
+  // is inserted BEFORE that row. `-1` = no doomline (velocity mode, missing/zero
+  // `total_points`, or the backlog never crosses capacity). Computed over the
+  // RENDERED `rows` so the divider lands on the same visible row the legacy
+  // `$el.find('.backlog-table-body .us-item-row')[i]` lookup targeted.
+  let doomlineIndex = -1;
+  if (!displayVelocity && totalPoints != null && totalPoints !== 0) {
+    let runningPoints = assignedPoints;
+    for (let i = 0; i < rows.length; i += 1) {
+      runningPoints += rows[i].total_points ?? 0;
+      if (runningPoints > totalPoints) {
+        doomlineIndex = i;
+        break;
+      }
+    }
+  }
 
   // The `.backlog-table-body` is a `@dnd-kit` DROP TARGET (id `'backlog'`).
   const { setNodeRef: setBodyDropRef } = useDroppable({
@@ -905,25 +942,38 @@ export const BacklogTable = ({
           activeFilters ? ' active-filters' : ''
         }${displayVelocity ? ' forecasted-stories' : ''}`}
       >
-        {rows.map((us) => (
-          <BacklogRow
-            key={us.ref ?? us.id}
-            us={us}
-            project={project}
-            statuses={statuses}
-            canModify={canModify}
-            showTags={showTags}
-            selectedRoleId={selectedRoleId}
-            isChecked={checkedIds.includes(us.id)}
-            isFirst={us.id === resolvedFirstUsId}
-            getLinkParams={getLinkParams}
-            onEditUs={onEditUs}
-            onDeleteUs={onDeleteUs}
-            onMoveUsToTop={onMoveUsToTop}
-            onToggleCheck={onToggleCheck}
-            onUpdateStatus={onUpdateStatus}
-            onUpdatePoints={onUpdatePoints}
-          />
+        {rows.map((us, index) => (
+          <Fragment key={us.ref ?? us.id}>
+            {/* F-VIS-04: the "Project Scope [Doomline]" divider — a full-width
+                row inserted BEFORE the story at which the running point total
+                first exceeds the project capacity (see `doomlineIndex` above).
+                Reuses the retained `.doom-line` SCSS (purple full-width bar,
+                centered white text) from `backlog-table.scss` — no new styles. */}
+            {index === doomlineIndex && (
+              <div className="doom-line">
+                <span>
+                  {translate('BACKLOG.DOOMLINE', undefined, 'Project Scope [Doomline]')}
+                </span>
+              </div>
+            )}
+            <BacklogRow
+              us={us}
+              project={project}
+              statuses={statuses}
+              canModify={canModify}
+              showTags={showTags}
+              selectedRoleId={selectedRoleId}
+              isChecked={checkedIds.includes(us.id)}
+              isFirst={us.id === resolvedFirstUsId}
+              getLinkParams={getLinkParams}
+              onEditUs={onEditUs}
+              onDeleteUs={onDeleteUs}
+              onMoveUsToTop={onMoveUsToTop}
+              onToggleCheck={onToggleCheck}
+              onUpdateStatus={onUpdateStatus}
+              onUpdatePoints={onUpdatePoints}
+            />
+          </Fragment>
         ))}
         {loading && <div className="loading" />}
         {onLoadMore && <div ref={sentinelRef} />}
