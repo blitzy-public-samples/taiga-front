@@ -59,9 +59,9 @@
  * event and not the bulk lightbox:
  *   • CREATE US — open the real create lightbox from a column's "+" control
  *     (`.add-action`), fill the subject (and, for full-form parity, description /
- *     tags / due-date / blocked), submit (`.js-submit-button`). A bare create
- *     persists via `POST /userstories/bulk_create`; a filled create adds a
- *     follow-up `PATCH /userstories/{id}`. The card then appears on the board.
+ *     tags / due-date / blocked), submit (`.js-submit-button`). [#5] Every create
+ *     persists via ONE atomic `POST /userstories` carrying the whole form object
+ *     (no follow-up PATCH). The card then appears on the board.
  *   • EDIT US — open the real edit lightbox from the card-actions menu
  *     (`.card-action-edit`), change fields, submit. Persists via
  *     `PATCH /userstories/{id}` with subject/description/tags/due_date/is_blocked
@@ -405,17 +405,33 @@ async function submitLightbox(page: Page, lb: Locator): Promise<void> {
 }
 
 /**
- * Await the single-US create persist (`POST /userstories/bulk_create`, which the
- * generic-form CREATE branch uses for subject+status+swimlane). Start BEFORE the
- * submit, `await` after.
+ * Await the single-US create persist. [#5 QA fidelity] The generic-form CREATE
+ * branch now issues ONE ATOMIC `POST /userstories` carrying the whole form
+ * object (subject + status + swimlane AND description/due-date/points/assignee/…
+ * in a single request), mirroring the legacy `$repo.create('userstories', obj)`
+ * (common/lightboxes.coffee L786-790). It REPLACED the former
+ * `bulk_create` + follow-up `PATCH` flow, which orphaned a subject-only story
+ * whenever the PATCH failed (e.g. an invalid assignee). Match the atomic-create
+ * endpoint: a POST whose path ends EXACTLY in `/userstories` — never
+ * `/userstories/bulk_create`, `/userstories/{id}`, `/userstories/attachments`,
+ * nor any `/userstories/bulk_update_*` subpath. Start BEFORE the submit,
+ * `await` after.
  *
  * @param page The authenticated Playwright page.
  */
 function waitCreatePersist(page: Page) {
-    return page.waitForResponse(
-        (r) => /\/userstories\/bulk_create/.test(r.url()) && r.request().method() === 'POST',
-        { timeout: 20_000 },
-    );
+    return page.waitForResponse((r) => {
+        if (r.request().method() !== 'POST') {
+            return false;
+        }
+        let pathname: string;
+        try {
+            pathname = new URL(r.url()).pathname;
+        } catch {
+            return false;
+        }
+        return /\/userstories\/?$/.test(pathname);
+    }, { timeout: 20_000 });
 }
 
 /**
@@ -620,10 +636,11 @@ test.describe('kanban', () => {
      * column's "+" (`.add-action`). It is DISTINCT from the bulk lightbox (a
      * separate affordance, covered by `bulk create` below). The prior suite
      * wrongly drove bulk-create as the single-US create path; these cases drive
-     * the real form and cover:
-     *   1. happy path      — subject only → one bulk_create POST → card appears;
-     *   2. full-form parity — subject + description + due date → bulk_create then
-     *                         a follow-up PATCH persists the rich fields;
+     * the real form and cover ([#5] the create is now ONE atomic POST /userstories,
+     * porting the legacy `$repo.create('userstories', obj)`):
+     *   1. happy path      — subject only → one atomic POST /userstories → card appears;
+     *   2. full-form parity — subject + description + due date → the SAME single
+     *                         POST /userstories carries every rich field (no PATCH);
      *   3. negative path   — empty subject → inline required error, NO persist,
      *                         lightbox stays open.
      */
@@ -637,8 +654,9 @@ test.describe('kanban', () => {
             const subject = `test subject${Date.now()}`;
             await lb.locator(LB_EDIT_SUBJECT).fill(subject);
 
-            // A bare subject-only create is EXACTLY one request (bulk_create); the
-            // follow-up PATCH is skipped when no rich field is set.
+            // [#5] A subject-only create is EXACTLY one atomic request
+            // (`POST /userstories`) — there is no follow-up PATCH; the whole
+            // form object ships in that single create.
             const persisted = waitCreatePersist(page);
             await submitLightbox(page, lb);
             await persisted;
@@ -668,13 +686,15 @@ test.describe('kanban', () => {
                 await dueDate.fill('2025-12-31');
             }
 
-            // subject+status ship in bulk_create; the rich fields (description,
-            // due date) follow in a PATCH /userstories/{id}. Both must fire.
+            // [#5] The atomic create sends the WHOLE form object — subject,
+            // status AND the rich fields (description, due date) — in ONE
+            // `POST /userstories`. There is NO separate follow-up PATCH (the
+            // former bulk_create+PATCH flow was replaced to avoid orphaning a
+            // subject-only story when the PATCH failed), so exactly one create
+            // request must fire and fully persist the form.
             const created = waitCreatePersist(page);
-            const patched = waitEditPersist(page);
             await submitLightbox(page, lb);
             await created;
-            await patched;
 
             // The unique-subject card appearing on the board is the authoritative,
             // race-free signal that the create round-tripped (the create flow ends
@@ -698,9 +718,21 @@ test.describe('kanban', () => {
             await lb.locator(LB_EDIT_SUBJECT).fill('');
 
             // Guard: NO create request may leave the browser for an invalid form.
+            // [#5] The atomic single-US create is `POST /userstories` (path ending
+            // exactly in /userstories — not bulk_create / {id} / attachments), so
+            // watch that endpoint to prove the invalid submit persisted nothing.
             let persistFired = false;
             page.on('request', (r) => {
-                if (/\/userstories\/bulk_create/.test(r.url()) && r.method() === 'POST') {
+                if (r.method() !== 'POST') {
+                    return;
+                }
+                let pathname: string;
+                try {
+                    pathname = new URL(r.url()).pathname;
+                } catch {
+                    return;
+                }
+                if (/\/userstories\/?$/.test(pathname)) {
                     persistFired = true;
                 }
             });

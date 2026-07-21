@@ -42,9 +42,9 @@
  *     kanban lightbox: `.lightbox.lightbox-generic-form.lightbox-create-edit`).
  *     "standard create" (the `.new-us` "+" button → addNewUs("standard")) and
  *     "edit" (each row's options-popup Edit item) open that real form; submitting
- *     persists DIRECTLY (onCreateUserStory → POST /userstories/bulk_create + an
- *     optional follow-up PATCH; onSaveUserStoryEdit → PATCH /userstories/{id}).
- *     The `genericform:*` bridge no longer exists.
+ *     persists DIRECTLY ([#5] onCreateUserStory → ONE atomic POST /userstories
+ *     carrying the whole form object, no follow-up PATCH; onSaveUserStoryEdit →
+ *     PATCH /userstories/{id}). The `genericform:*` bridge no longer exists.
  *   - The BULK user-story lightbox (`.lightbox-generic-bulk`,
  *     BulkUserStoriesLightbox.tsx) is a SEPARATE affordance (`.new-us` icon
  *     button → addNewUs("bulk")); "bulk create US" and the XSS-safety assertion
@@ -435,17 +435,33 @@ async function submitLightbox(page: Page, lb: Locator): Promise<void> {
 }
 
 /**
- * Await the single-US create persist (`POST /userstories/bulk_create`, which the
- * generic-form CREATE branch uses for subject+status). Start BEFORE the submit,
+ * Await the single-US create persist. [#5 QA fidelity] The generic-form CREATE
+ * branch now issues ONE ATOMIC `POST /userstories` carrying the whole form
+ * object (subject + status AND description/due-date/points/assignee/… in a
+ * single request), mirroring the legacy `$repo.create('userstories', obj)`
+ * (common/lightboxes.coffee L786-792). It REPLACED the former
+ * `bulk_create` + follow-up `PATCH` flow, which orphaned a subject-only story
+ * whenever the PATCH failed (e.g. an invalid assignee). Match the atomic-create
+ * endpoint: a POST whose path ends EXACTLY in `/userstories` — never
+ * `/userstories/bulk_create`, `/userstories/{id}`, `/userstories/attachments`,
+ * nor any `/userstories/bulk_update_*` subpath. Start BEFORE the submit,
  * `await` after.
  *
  * @param page The authenticated Playwright page.
  */
 function waitCreatePersist(page: Page) {
-    return page.waitForResponse(
-        (r) => /\/userstories\/bulk_create/.test(r.url()) && r.request().method() === 'POST',
-        { timeout: 20_000 },
-    );
+    return page.waitForResponse((r) => {
+        if (r.request().method() !== 'POST') {
+            return false;
+        }
+        let pathname: string;
+        try {
+            pathname = new URL(r.url()).pathname;
+        } catch {
+            return false;
+        }
+        return /\/userstories\/?$/.test(pathname);
+    }, { timeout: 20_000 });
 }
 
 /**
@@ -943,10 +959,11 @@ test.describe('backlog', () => {
      * [C-07] "standard create" opens the REAL React create/edit lightbox
      * (backlog/UserStoryEditLightbox.tsx) from the `.new-us` "+" button — NOT the
      * removed genericform:new bridge, and NOT the bulk lightbox (a separate
-     * affordance covered by "bulk create US"). Cases:
-     *   1. happy path       — subject only → one bulk_create POST → US appears;
-     *   2. full-form parity — subject + description + due date → bulk_create then
-     *                         a follow-up PATCH persists the rich fields;
+     * affordance covered by "bulk create US"). Cases ([#5] the create is now ONE
+     * atomic POST /userstories, porting the legacy `$repo.create('userstories', obj)`):
+     *   1. happy path       — subject only → one atomic POST /userstories → US appears;
+     *   2. full-form parity — subject + description + due date → the SAME single
+     *                         POST /userstories carries every rich field (no PATCH);
      *   3. negative path    — empty subject → inline required error, NO persist,
      *                         lightbox stays open;
      *   4. attachment       — a file selected in the real `input[type="file"]`
@@ -981,12 +998,15 @@ test.describe('backlog', () => {
                 await dueDate.fill('2025-12-31');
             }
 
-            // subject+status ship in bulk_create; the rich fields follow in a PATCH.
+            // [#5] The atomic create sends the WHOLE form object — subject,
+            // status AND the rich fields (description, due date) — in ONE
+            // `POST /userstories`. There is NO separate follow-up PATCH (the
+            // former bulk_create+PATCH flow was replaced to avoid orphaning a
+            // subject-only story when the PATCH failed), so exactly one create
+            // request must fire and fully persist the form.
             const created = waitCreatePersist(page);
-            const patched = waitEditPersist(page);
             await submitLightbox(page, lb);
             await created;
-            await patched;
 
             await expect(userStories(page)).toHaveCount(before + 1, { timeout: 20_000 });
         });
@@ -998,9 +1018,21 @@ test.describe('backlog', () => {
             await lb.locator(LB_EDIT_SUBJECT).fill('');
 
             // Guard: NO create request may leave the browser for an invalid form.
+            // [#5] The atomic single-US create is `POST /userstories` (path ending
+            // exactly in /userstories — not bulk_create / {id} / attachments), so
+            // watch that endpoint to prove the invalid submit persisted nothing.
             let persistFired = false;
             page.on('request', (r) => {
-                if (/\/userstories\/bulk_create/.test(r.url()) && r.method() === 'POST') {
+                if (r.method() !== 'POST') {
+                    return;
+                }
+                let pathname: string;
+                try {
+                    pathname = new URL(r.url()).pathname;
+                } catch {
+                    return;
+                }
+                if (/\/userstories\/?$/.test(pathname)) {
                     persistFired = true;
                 }
             });
