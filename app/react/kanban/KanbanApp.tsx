@@ -23,6 +23,7 @@ import type { QueryParams, HttpResponse } from "../shared/api/httpClient";
 import {
     bulkCreate,
     bulkUpdateKanbanOrder,
+    createUserstory,
     filtersData,
     getUserstory,
     listUserstories,
@@ -2142,6 +2143,15 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             baseUserstoriesRef.current = userstories;
             kanban.init(project, swimlaneResponse.data ?? [], buildUsersById(project));
             kanban.setUserstories(composeBoardUserstories());
+            // QA-FUNC (empty-state symmetry): manage `notFound` here exactly as
+            // `reloadUserstories` (L1925) does, so the initial load and every
+            // subsequent reload agree on the empty-state. A "no results" flag set
+            // by a prior filtered `reloadUserstories` is cleared when a fresh
+            // `loadInitialData` (Retry affordance / project refresh) restores the
+            // full board (the query is dropped on load per `loadKanbanFilters`, so
+            // this resolves to `false` unless a search is active). Without this the
+            // stale empty-state could outlive the reload that repopulated the board.
+            setNotFound(userstories.length === 0 && !!filterQRef.current);
 
             // Load the sidebar filter categories (auxiliary; never blocks the board).
             void loadFilters();
@@ -2641,15 +2651,22 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
 
     /**
      * [#2] Persist a NEW single story from {@link UserStoryEditLightbox}. Ports
-     * the generic-form `mode == 'new'` branch onto the AAP-enumerated endpoints:
-     * `bulk_create` carries subject + status (+ the swimlane on a swimlane board,
-     * defaulting to the project `default_swimlane`), and — because that endpoint
-     * does NOT accept points/assignee — a follow-up `PATCH userstories/{id}`
-     * persists those when set. When the user chose "on top", the created ids are
-     * ordered ahead of the column's current first story via
-     * `bulk_update_kanban_order` (mirrors `moveUsToTop`). Then the board is
-     * re-read. Rejects on failure so the lightbox keeps itself open and surfaces
-     * the error.
+     * the generic-form `mode == 'new'` branch, which issued ONE ATOMIC
+     * `$repo.create('userstories', obj)` carrying the WHOLE form object
+     * (common/lightboxes.coffee L786-790). This is a single `POST /userstories`
+     * with subject + status (+ the swimlane on a swimlane board, defaulting to
+     * the project `default_swimlane`) AND points/assignee/description/tags/etc.
+     * all in one request — never a create followed by a separate PATCH.
+     *
+     * [#5] The prior `bulk_create` + follow-up `PATCH` flow left an ORPHAN story
+     * persisted whenever the PATCH failed (e.g. an invalid assignee): the row was
+     * already created, yet the form reported failure. The atomic create validates
+     * every field before persisting anything, so a rejected create leaves NO row.
+     *
+     * When the user chose "on top", the created id is ordered ahead of the
+     * column's current first story via `bulk_update_kanban_order` (mirrors
+     * `moveUsToTop`). Then the board is re-read. Rejects on failure so the
+     * lightbox keeps itself open and surfaces the error.
      */
     const onCreateUs = async (fields: UserStoryCreateFields): Promise<void> => {
         const id = resolvedIdRef.current;
@@ -2665,60 +2682,47 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
             fields.position === "top"
                 ? firstUsInColumn(kanban.state, fields.statusId, swimlaneId)
                 : null;
-        const response = await bulkCreate(
-            id,
-            fields.statusId,
-            fields.subject,
-            swimlaneId,
-        );
-        const created = (response.data ?? []) as Array<{ id: number; version?: number }>;
-        const first = created[0];
-        const hasPoints = Object.keys(fields.points).length > 0;
-        // bulk_create carries only subject/status/swimlane. Everything else the
-        // generic form collects is persisted in a follow-up PATCH — but only when
-        // at least one such field departs from its create default (so a bare
-        // "subject only" create still makes exactly one request, as before).
-        const needsFollowUp =
-            hasPoints ||
-            fields.assignedTo !== null ||
-            fields.description !== "" ||
-            fields.tags.length > 0 ||
-            fields.due_date !== null ||
-            fields.is_blocked ||
-            fields.team_requirement ||
-            fields.client_requirement;
-        if (first && needsFollowUp) {
-            await httpPatch(`/userstories/${first.id}`, {
-                points: fields.points,
-                assigned_to: fields.assignedTo,
-                description: fields.description,
-                tags: fields.tags,
-                due_date: fields.due_date,
-                is_blocked: fields.is_blocked,
-                blocked_note: fields.blocked_note,
-                team_requirement: fields.team_requirement,
-                client_requirement: fields.client_requirement,
-                version: first.version,
-            });
-        }
+        // [#5] ATOMIC single-story create — ports the generic new-story lightbox
+        // `$repo.create('userstories', obj)` (common/lightboxes.coffee L786-790),
+        // where the WHOLE form object is sent in ONE `POST /userstories`. The
+        // previous `bulk_create` + follow-up `PATCH` flow left an ORPHAN story
+        // persisted whenever the PATCH failed (e.g. an invalid assignee), because
+        // the row already existed. A single create validates and applies every
+        // field in one transaction, so a rejected create persists NOTHING and the
+        // lightbox stays open on the error (no orphan, no spurious success toast).
+        const response = await createUserstory({
+            project: id,
+            subject: fields.subject,
+            status: fields.statusId,
+            swimlane: swimlaneId,
+            points: fields.points,
+            assigned_to: fields.assignedTo,
+            description: fields.description,
+            tags: fields.tags,
+            due_date: fields.due_date,
+            is_blocked: fields.is_blocked,
+            blocked_note: fields.blocked_note,
+            team_requirement: fields.team_requirement,
+            client_requirement: fields.client_requirement,
+        });
+        const created = response.data;
+        // A "top" placement orders the freshly-created story ahead of the
+        // column's previous first story (mirrors moveUsToTop). The kanban_order is
+        // applied by a follow-up bulk-order call — a purely positional operation
+        // that leaves the (already valid) story untouched even if it fails.
         if (fields.position === "top" && beforeFirstId !== null) {
-            const createdIds = created.map((us) => us.id);
-            if (createdIds.length > 0) {
-                await bulkUpdateKanbanOrder(
-                    id,
-                    fields.statusId,
-                    swimlaneId,
-                    null,
-                    beforeFirstId,
-                    createdIds,
-                );
-            }
+            await bulkUpdateKanbanOrder(
+                id,
+                fields.statusId,
+                swimlaneId,
+                null,
+                beforeFirstId,
+                [created.id],
+            );
         }
         // Upload any chosen files against the freshly-created story (ports
         // `createAttachments(data)`), then re-read the board.
-        if (first) {
-            await createAttachments(first.id, fields.attachmentsToAdd);
-        }
+        await createAttachments(created.id, fields.attachmentsToAdd);
         if (!aliveRef.current) {
             return;
         }
@@ -3161,6 +3165,16 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         resolved: ResolvedDrop,
         neighbors: DropNeighbors,
     ): Promise<void> => {
+        // Multi-select group drag (QA-FUNC-01): clear the card selection on EVERY
+        // drop, mirroring legacy `moveUs` which called `cleanSelectedUss()` as its
+        // first line (kanban/main.coffee L597) — before persistence and regardless
+        // of success/failure. `resolved.draggedIds` was already captured upstream
+        // (resolveDrop -> resolveKanbanDrop) from the pre-clear `selectedIdList`,
+        // so clearing here cannot shrink the group being moved; it simply ensures
+        // the highlight/selection does not outlive the drag. On a rollback the
+        // stories return to their prior positions but the selection stays cleared,
+        // exactly as the legacy board behaved.
+        setSelectedUss({});
         const { statusId, swimlaneId } = parseContainerKey(
             resolved.target.containerKey,
         );
@@ -3258,6 +3272,12 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         const { statusId, swimlaneId } = parseContainerKey(location.key);
         const apiSwimlane =
             swimlaneId === UNCLASSIFIED_SWIMLANE_ID ? null : swimlaneId;
+
+        // Multi-select group drag (QA-FUNC-01): the move-to-top action routes
+        // through the same legacy `moveUs` path (`moveUsToTop -> moveUs`,
+        // main.coffee L157-185/L596), which cleared the selection first. Clear it
+        // here too so the two reorder paths behave identically.
+        setSelectedUss({});
 
         // M-05-style snapshot for rollback (immer-frozen immutable reference).
         const snapshot = kanban.state;

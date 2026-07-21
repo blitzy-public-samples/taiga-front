@@ -50,6 +50,33 @@ interface BulkCreateBody {
     swimlane_id: number | null;
 }
 
+/**
+ * Request body for `POST /userstories` — an ATOMIC single-story create.
+ * `project` and `subject` are required; every other field is optional and, when
+ * provided, is persisted in the SAME request (never a follow-up PATCH). Field
+ * names are the standard user-story serializer names (`project` / `status` /
+ * `swimlane` — NOT the `_id`-suffixed bulk names), matching the generic
+ * new-story form object sent to `$repo.create('userstories', obj)`
+ * (common/lightboxes.coffee L786-790).
+ */
+export interface CreateUserstoryBody {
+    project: number;
+    subject: string;
+    status?: number | null;
+    swimlane?: number | null;
+    /** `roleId` (string key) -> `pointId`; omit or `{}` for no estimation. */
+    points?: Record<string, number>;
+    assigned_to?: number | null;
+    description?: string;
+    /** `[value, color]` tag pairs. */
+    tags?: Array<[string, string | null]>;
+    due_date?: string | null;
+    is_blocked?: boolean;
+    blocked_note?: string;
+    team_requirement?: boolean;
+    client_requirement?: boolean;
+}
+
 /** Request body for `POST /userstories/bulk_update_backlog_order`. */
 interface BulkUpdateOrderBody {
     project_id: number;
@@ -140,6 +167,25 @@ export function bulkCreate(
     };
 
     return httpPost<UserStory[]>("/userstories/bulk_create", body);
+}
+
+/**
+ * `POST /userstories` — ATOMICALLY create a single user story with ALL of its
+ * fields in one request. Ports the generic new-story lightbox
+ * `$repo.create('userstories', obj)` (common/lightboxes.coffee L786-790), where
+ * the ENTIRE form object was sent in a SINGLE create — never a create followed
+ * by a separate patch.
+ *
+ * This atomicity is the fix for the data-integrity finding: the previous
+ * `bulk_create` + follow-up `PATCH` flow left an ORPHAN story persisted when the
+ * PATCH failed (e.g. an invalid assignee), because the row was already created.
+ * The standard create endpoint validates and applies every field in one
+ * transaction, so a rejected create persists NOTHING.
+ */
+export function createUserstory(
+    body: CreateUserstoryBody,
+): Promise<HttpResponse<UserStory>> {
+    return httpPost<UserStory>("/userstories", body);
 }
 
 /**

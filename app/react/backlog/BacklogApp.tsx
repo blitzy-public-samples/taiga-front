@@ -74,6 +74,7 @@ import type {
     UserStoryActions,
 } from "./types";
 import { useBacklogState, calculateForecasting } from "./useBacklogState";
+import { loadBacklogFilters, saveBacklogFilters } from "./persistence";
 import { Burndown } from "./Burndown";
 import { BacklogTable } from "./BacklogTable";
 import { SprintList } from "./SprintList";
@@ -1803,10 +1804,24 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         }
     }, [setCustomFilters]);
 
-    /** Port of `loadBacklog` (main.coffee L410): stats + sprints + first US page in parallel. */
-    const loadBacklog = useCallback(async (): Promise<void> => {
-        await Promise.all([loadProjectStats(), loadSprints(), loadUserstories({ reset: true })]);
-    }, [loadProjectStats, loadSprints, loadUserstories]);
+    /**
+     * Port of `loadBacklog` (main.coffee L410): stats + sprints + first US page in
+     * parallel. `selectedOverride` lets the initial load pass the RESTORED sidebar
+     * filter selection (QA finding #4) straight to the first user-story fetch, so
+     * the board loads already filtered without waiting for the async state update
+     * (mirrors the Kanban `loadInitialData`, which seeds `selectedFiltersRef`
+     * before its first `listUserstories`).
+     */
+    const loadBacklog = useCallback(
+        async (selectedOverride?: SelectedFilter[]): Promise<void> => {
+            await Promise.all([
+                loadProjectStats(),
+                loadSprints(),
+                loadUserstories({ reset: true, selected: selectedOverride }),
+            ]);
+        },
+        [loadProjectStats, loadSprints, loadUserstories],
+    );
 
     /**
      * [M16] Retry the board data after a board-fetch failure. Clears the error
@@ -2007,6 +2022,28 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
         initializeSubscription();
 
+        // QA finding #4: restore the persisted sidebar filter selection BEFORE the
+        // first user-story / filters fetch so the backlog loads already filtered
+        // (port of the AngularJS filtersMixin `applyStoredFilters`, storeFiltersName
+        // "backlog-filters"; mirrors the Kanban `loadInitialData`). Uses the RESOLVED
+        // id (published synchronously by loadProject above). `loadBacklogFilters`
+        // drops the stored `q` on load (legacy `delete data.q`), so only the
+        // `selected` chips are restored — the search box stays empty, exactly as on
+        // the Kanban board.
+        const restoredFilters = loadBacklogFilters<SelectedFilter>(
+            resolvedIdRef.current,
+        );
+        if (restoredFilters) {
+            // Publish the restored selection (and the always-empty restored query)
+            // to state so the sidebar chips + search box reflect it immediately.
+            // Categories aren't loaded yet, so keep the current (empty) `filters`
+            // and `customFilters`; `loadFilters` below repopulates the categories
+            // while preserving this same selection.
+            const s = stateRef.current;
+            setFilters(s.filters, s.customFilters, restoredFilters.selected);
+            setFilterQ(restoredFilters.q);
+        }
+
         // Restore the persisted show-tags preference (port of `getShowTags`).
         // Uses the RESOLVED id (published synchronously by loadProject above).
         try {
@@ -2035,11 +2072,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             /* ignore storage access failures */
         }
 
-        await loadBacklog();
+        await loadBacklog(restoredFilters?.selected);
         if (!aliveRef.current) {
             return;
         }
-        await loadFilters();
+        await loadFilters(restoredFilters?.selected);
         if (!aliveRef.current) {
             return;
         }
@@ -2058,6 +2095,8 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         loadCustomFilters,
         setFirstLoadComplete,
         bsToggleShowTags,
+        setFilters,
+        setFilterQ,
     ]);
 
     /* ---------------------------------------------------------------------- */
@@ -2710,68 +2749,63 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
     /**
      * [#2] Persist a NEW single story from {@link UserStoryEditLightbox}. Ports
-     * the generic-form `mode == 'new'` branch (common/lightboxes.coffee L786-792)
-     * onto the AAP-enumerated endpoints: `bulk_create` carries subject + status,
-     * and — because that endpoint does NOT accept points/assignee — a follow-up
-     * `PATCH userstories/{id}` persists those when set. Then `onBulkCreated`
-     * re-reads the backlog (and reorders to the top when the user chose "top"),
-     * mirroring `usform:new:success`. Rejects on failure so the lightbox keeps
-     * itself open and surfaces the error.
+     * the generic-form `mode == 'new'` branch, which issued ONE ATOMIC
+     * `$repo.create('userstories', obj)` carrying the WHOLE form object
+     * (common/lightboxes.coffee L786-792). This is a single `POST /userstories`
+     * with subject + status + swimlane AND points/assignee/description/tags/etc.
+     * all in one request — never a create followed by a separate PATCH.
+     *
+     * [#5] The prior `bulk_create` + follow-up `PATCH` flow left an ORPHAN story
+     * persisted whenever the PATCH failed (e.g. an invalid assignee): the row was
+     * already created, yet the form reported failure. The atomic create validates
+     * every field before persisting anything, so a rejected create leaves NO row.
+     *
+     * Then `onBulkCreated` re-reads the backlog (and reorders to the top when the
+     * user chose "top"), mirroring `usform:new:success`. Rejects on failure so the
+     * lightbox keeps itself open and surfaces the error.
      */
     const onCreateUserStory = useCallback(
         async (fields: UserStoryCreateFields): Promise<void> => {
-            const res = await userstoriesApi.bulkCreate(
-                resolvedId,
-                fields.statusId,
-                fields.subject,
+            // [#5] ATOMIC single-story create — ports the generic new-story
+            // lightbox `$repo.create('userstories', obj)` (common/lightboxes.coffee
+            // L786-792): the WHOLE form object is sent in ONE `POST /userstories`.
+            // The previous `bulk_create` + follow-up `PATCH` flow left an ORPHAN
+            // story persisted whenever the PATCH failed (e.g. an invalid assignee),
+            // because the row already existed. A single create validates and
+            // applies every field in one transaction, so a rejected create
+            // persists NOTHING and the lightbox stays open on the error (no
+            // orphan story, no spurious success blink).
+            const res = await userstoriesApi.createUserstory({
+                project: resolvedId,
+                subject: fields.subject,
                 // BL-01: create the story into the chosen swimlane (parity with
                 // the Kanban create flow); `null` = unclassified / no-swimlane.
-                fields.swimlane,
-            );
-            // The bulk_create endpoint returns full story objects; the API
-            // adapter types them with the minimal `{ id }` shape, so narrow to the
-            // richer domain `UserStory` (mirrors BulkUserStoriesLightbox). No
-            // `any` is used.
-            let created = res.data as unknown as UserStory[];
-            const first = created[0];
-            const hasPoints = Object.keys(fields.points).length > 0;
-            // bulk_create carries only subject/status. Everything else the
-            // generic form collects is persisted in a follow-up PATCH — but only
-            // when at least one such field departs from its create default (so a
-            // bare "subject only" create still makes exactly one request).
-            const needsFollowUp =
-                hasPoints ||
-                fields.assignedTo !== null ||
-                fields.description !== "" ||
-                fields.tags.length > 0 ||
-                fields.due_date !== null ||
-                fields.is_blocked ||
-                fields.team_requirement ||
-                fields.client_requirement;
-            if (first && needsFollowUp) {
-                const patchRes = await httpPatch<UserStory>(`userstories/${first.id}`, {
-                    points: fields.points,
-                    assigned_to: fields.assignedTo,
-                    description: fields.description,
-                    tags: fields.tags,
-                    due_date: fields.due_date,
-                    is_blocked: fields.is_blocked,
-                    blocked_note: fields.blocked_note,
-                    team_requirement: fields.team_requirement,
-                    client_requirement: fields.client_requirement,
-                    version: first.version,
-                });
-                if (!aliveRef.current) {
-                    return;
-                }
-                created = [patchRes.data, ...created.slice(1)];
+                swimlane: fields.swimlane,
+                status: fields.statusId,
+                points: fields.points,
+                assigned_to: fields.assignedTo,
+                description: fields.description,
+                tags: fields.tags,
+                due_date: fields.due_date,
+                is_blocked: fields.is_blocked,
+                blocked_note: fields.blocked_note,
+                team_requirement: fields.team_requirement,
+                client_requirement: fields.client_requirement,
+            });
+            // The create endpoint returns the FULL story object; the shared API
+            // adapter types it with the minimal `{ id, ... }` shape, so narrow to
+            // the richer domain `UserStory` for `onBulkCreated` (mirrors the
+            // previous `as unknown as UserStory[]` bridge). No `any` is used.
+            const created = res.data as unknown as UserStory;
+            if (!aliveRef.current) {
+                return;
             }
             // Upload any chosen files against the freshly-created story (ports
             // `createAttachments(data)`).
-            if (first) {
-                await createAttachments(first.id, fields.attachmentsToAdd);
-            }
-            await onBulkCreated(created, fields.position);
+            await createAttachments(created.id, fields.attachmentsToAdd);
+            // Flag + reload the backlog (and reorder to the top when the user
+            // chose "top"), mirroring `usform:new:success`.
+            await onBulkCreated([created], fields.position);
         },
         [resolvedId, onBulkCreated],
     );
@@ -2939,6 +2973,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const changeQ = useCallback(
         (q: string): void => {
             setFilterQ(q);
+            // QA finding #4: persist the search query alongside the active filter
+            // selection so the selection survives a reload (port of the AngularJS
+            // filtersMixin `storeFilters`; the Kanban `changeQ` does the same).
+            // Persisting is immediate; only the board reload below is debounced.
+            saveBacklogFilters(resolvedIdRef.current, {
+                q,
+                selected: stateRef.current.selectedFilters,
+            });
             if (searchTimerRef.current !== null) {
                 clearTimeout(searchTimerRef.current);
             }
@@ -3039,6 +3081,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             // (filter.controller.coffee `selectFilter` sets activeCustomFilter = null).
             setActiveCustomFilter(null);
             setFilters(s.filters, s.customFilters, nextSelected);
+            // QA finding #4: persist the updated filter selection (with the current
+            // search query) so it survives a reload (port of `storeFilters`).
+            saveBacklogFilters(resolvedIdRef.current, {
+                q: s.filterQ,
+                selected: nextSelected,
+            });
             void loadUserstories({ reset: true, selected: nextSelected });
             void loadFilters(nextSelected);
         },
@@ -3054,6 +3102,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             );
             setActiveCustomFilter(null);
             setFilters(s.filters, s.customFilters, nextSelected);
+            // QA finding #4: persist the reduced filter selection (port of
+            // `storeFilters`).
+            saveBacklogFilters(resolvedIdRef.current, {
+                q: s.filterQ,
+                selected: nextSelected,
+            });
             void loadUserstories({ reset: true, selected: nextSelected });
             void loadFilters(nextSelected);
         },
@@ -3107,6 +3161,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             const nextSelected = reconstructSelectedFromParamMap(filter.filter ?? {}, s.filters);
             setActiveCustomFilter(filter.id);
             setFilters(s.filters, s.customFilters, nextSelected);
+            // QA finding #4: persist the applied saved-filter selection (port of
+            // `storeFilters`), so a reload keeps the same active selection.
+            saveBacklogFilters(resolvedIdRef.current, {
+                q: s.filterQ,
+                selected: nextSelected,
+            });
             void loadUserstories({ reset: true, selected: nextSelected });
             void loadFilters(nextSelected);
         },

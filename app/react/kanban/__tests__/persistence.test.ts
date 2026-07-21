@@ -142,11 +142,28 @@ describe("kanban/persistence", () => {
             { id: "9", name: "urgent", dataType: "tags", color: "#f00" },
         ];
 
-        it("round-trips the query and selected filters", () => {
+        // Legacy parity (controllerMixins.coffee `getFilters` L131): the mixin
+        // does `delete data.q` before returning, so the search query is NEVER
+        // restored on load — only the `selected` sidebar chips are. `saveKanban-
+        // Filters` still persists `q` (harmless), but `loadKanbanFilters` always
+        // returns `q: ""`.
+        it("restores selected filters but strips the search query on load", () => {
             saveKanbanFilters<TestFilter>(7, { q: "login", selected: selection });
 
             expect(loadKanbanFilters<TestFilter>(7)).toEqual({
-                q: "login",
+                q: "",
+                selected: selection,
+            });
+        });
+
+        it("always returns q:\"\" even when a non-empty q was stored (delete data.q)", () => {
+            window.localStorage.setItem(
+                "kanban-filters.7",
+                JSON.stringify({ q: "should-be-dropped", selected: selection }),
+            );
+
+            expect(loadKanbanFilters<TestFilter>(7)).toEqual({
+                q: "",
                 selected: selection,
             });
         });
@@ -159,12 +176,13 @@ describe("kanban/persistence", () => {
             saveKanbanFilters<TestFilter>(7, { q: "a", selected: [] });
             saveKanbanFilters<TestFilter>(8, { q: "b", selected: selection });
 
+            // The `selected` selection is project-scoped; `q` is dropped on load.
             expect(loadKanbanFilters<TestFilter>(7)).toEqual({
-                q: "a",
+                q: "",
                 selected: [],
             });
             expect(loadKanbanFilters<TestFilter>(8)).toEqual({
-                q: "b",
+                q: "",
                 selected: selection,
             });
         });
@@ -187,8 +205,9 @@ describe("kanban/persistence", () => {
                 JSON.stringify({ q: "x", selected: "not-an-array" }),
             );
 
+            // `q` is stripped on load regardless of what was stored.
             expect(loadKanbanFilters<TestFilter>(7)).toEqual({
-                q: "x",
+                q: "",
                 selected: [],
             });
         });

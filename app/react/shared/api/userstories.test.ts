@@ -11,6 +11,7 @@ import {
     bulkUpdateBacklogOrder,
     bulkUpdateKanbanOrder,
     bulkUpdateMilestone,
+    createUserstory,
     filtersData,
     getUserstory,
     listUserstories,
@@ -142,6 +143,59 @@ describe("shared/api/userstories", () => {
             const sent = lastRequest();
             expect(sent.body).toHaveProperty("swimlane_id");
             expect((sent.body as Record<string, unknown>).swimlane_id).toBeNull();
+        });
+    });
+
+    describe("createUserstory", () => {
+        it("POSTs /userstories ATOMICALLY with the WHOLE story body in a single request (no follow-up PATCH)", async () => {
+            await createUserstory({
+                project: 42,
+                subject: "Atomic story",
+                status: 3,
+                swimlane: 9,
+                points: { "1": 5 },
+                assigned_to: 7,
+                description: "desc",
+                tags: [["urgent", "#ff0000"]],
+                due_date: "2024-01-31",
+                is_blocked: true,
+                blocked_note: "waiting",
+                team_requirement: true,
+                client_requirement: false,
+            });
+
+            // Exactly ONE request is issued (the atomic create): the previous
+            // bulk_create + PATCH flow made two. The endpoint is the standard
+            // single-story create using the serializer field names.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            const sent = lastRequest();
+            expect(sent.method).toBe("POST");
+            expect(sent.url).toBe("http://localhost:8000/api/v1/userstories");
+            expect(sent.body).toEqual({
+                project: 42,
+                subject: "Atomic story",
+                status: 3,
+                swimlane: 9,
+                points: { "1": 5 },
+                assigned_to: 7,
+                description: "desc",
+                tags: [["urgent", "#ff0000"]],
+                due_date: "2024-01-31",
+                is_blocked: true,
+                blocked_note: "waiting",
+                team_requirement: true,
+                client_requirement: false,
+            });
+        });
+
+        it("sends a minimal body (project + subject only) when no optional fields are provided", async () => {
+            await createUserstory({ project: 42, subject: "Bare" });
+
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            const sent = lastRequest();
+            expect(sent.method).toBe("POST");
+            expect(sent.url).toBe("http://localhost:8000/api/v1/userstories");
+            expect(sent.body).toEqual({ project: 42, subject: "Bare" });
         });
     });
 

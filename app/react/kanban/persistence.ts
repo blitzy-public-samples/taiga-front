@@ -197,9 +197,16 @@ export function saveSwimlaneFolds(
 /**
  * Restore the persisted sidebar filters + search query for a project, or
  * `null` when nothing is stored. Port of the `filtersMixin` `applyStoredFilters`
- * (`storeFiltersName = "kanban-filters"`). A missing/invalid `q` degrades to
- * an empty string and a missing/invalid `selected` degrades to an empty array
- * so a partially-corrupt entry never throws.
+ * (`storeFiltersName = "kanban-filters"`).
+ *
+ * Legacy parity (QA-FUNC, controllerMixins.coffee `getFilters` L125-133): the
+ * mixin explicitly `delete data.q` before returning the stored filters, so the
+ * free-text search query is NEVER restored on load — only the `selected`
+ * sidebar chips are. Reloading the board therefore shows the FULL story set
+ * (search cleared) while preserving the active filter selection. We reproduce
+ * that here by always returning `q: ""`, regardless of any `q` that
+ * `saveKanbanFilters` may have written. A missing/invalid `selected` still
+ * degrades to an empty array so a partially-corrupt entry never throws.
  */
 export function loadKanbanFilters<TFilter>(
     projectId: number,
@@ -221,7 +228,8 @@ export function loadKanbanFilters<TFilter>(
             return null;
         }
         const obj = parsed as { q?: unknown; selected?: unknown };
-        const q = typeof obj.q === "string" ? obj.q : "";
+        // Mirror legacy `delete data.q`: the search query is dropped on load.
+        const q = "";
         const selected = Array.isArray(obj.selected)
             ? (obj.selected as TFilter[])
             : [];

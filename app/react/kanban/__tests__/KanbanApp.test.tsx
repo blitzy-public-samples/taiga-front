@@ -987,6 +987,54 @@ describe("KanbanApp — WebSocket", () => {
         ).toBe(before);
     });
 
+    it("clears a stale not-found empty-state on a project refresh (loadInitialData setNotFound symmetry)", async () => {
+        // QA-FUNC (Issue #1b): `loadInitialData` must manage `notFound` exactly
+        // like `reloadUserstories`. Pre-fix it never called `setNotFound`, so a
+        // "no results" empty-state raised by a prior filtered reload stuck on the
+        // board even after a full refresh repopulated it.
+        const { projCb } = await loadAndGetCallbacks();
+        // Faithfully mirror the real transport: each GET yields a FRESH object
+        // reference (as fetch + JSON.parse does) so a second loadInitialData can
+        // re-sort `us_statuses` (the default shared-reference mock is frozen by
+        // immer after the first load). Userstories return empty first (search),
+        // then repopulate for the refresh.
+        let usEmpty = true;
+        mockHttpGet.mockImplementation((...args: readonly unknown[]) => {
+            const path = String(args[0]);
+            if (path.startsWith("/projects/") || path === "projects/by_slug") {
+                return Promise.resolve(mkRes({ ...currentProject }));
+            }
+            if (path === "/swimlanes") {
+                return Promise.resolve(mkRes(currentSwimlanes));
+            }
+            if (path === "/userstories/filters_data") {
+                return Promise.resolve(mkRes(currentFiltersData));
+            }
+            return Promise.resolve(mkRes({}));
+        });
+        mockListUserstories.mockImplementation(() =>
+            Promise.resolve(mkRes(usEmpty ? [] : currentUserstories)),
+        );
+        // Drive a search that returns no results -> reloadUserstories sets notFound.
+        const search = document.querySelector(".kanban-search") as HTMLInputElement;
+        await act(async () => {
+            fireEvent.change(search, { target: { value: "zzz" } });
+        });
+        await waitFor(() => expect(mockCaptured.boardProps?.notFound).toBe(true), {
+            timeout: WS_REFRESH_TIMEOUT,
+        });
+        // Results come back and a projects event fires a full refresh via
+        // loadInitialData. The stale not-found placeholder must be cleared.
+        usEmpty = false;
+        await act(async () => {
+            projCb({ matches: "projects.swimlane" });
+        });
+        await waitFor(
+            () => expect(mockCaptured.boardProps?.notFound).toBe(false),
+            { timeout: WS_REFRESH_TIMEOUT },
+        );
+    });
+
     it("does NOT tear down and recreate the socket on a data refresh (QA F2)", async () => {
         const { projCb } = await loadAndGetCallbacks();
 
@@ -1549,6 +1597,42 @@ describe("KanbanApp — drag persist", () => {
         await renderLoaded();
         expect(mockCaptured.boardProps?.resolveDrop(dragEnd(1, null))).toBeNull();
     });
+
+    /* ---- multi-select clear after drag (QA-FUNC-01, legacy moveUs L597) ----- */
+
+    it("clears the whole card selection after a (group) drag persists", async () => {
+        await renderLoaded();
+        // Select cards 1 and 2 (ctrl/meta-click), mirroring `toggleSelectedUs`.
+        await act(async () => {
+            mockCaptured.boardProps?.onToggleSelect?.(1);
+            mockCaptured.boardProps?.onToggleSelect?.(2);
+        });
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({ 1: true, 2: true });
+        // A drop persists — legacy `moveUs` called `cleanSelectedUss()` first
+        // line on EVERY drop, so the selection must be empty afterwards.
+        const neighbors: DropNeighbors = { previous: 2, next: null };
+        await act(async () => {
+            await mockCaptured.boardProps?.persist(resolvedFor("100::-1"), neighbors);
+        });
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({});
+    });
+
+    it("clears the selection even when the drag persist FAILS (cleared on every drop)", async () => {
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onToggleSelect?.(1);
+            mockCaptured.boardProps?.onToggleSelect?.(2);
+        });
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({ 1: true, 2: true });
+        // Make the bulk-order POST reject; the board rolls back BUT the selection
+        // is still cleared (legacy cleared it before persistence, unconditionally).
+        mockHttpPost.mockRejectedValueOnce(new Error("persist failed"));
+        const neighbors: DropNeighbors = { previous: 2, next: null };
+        await act(async () => {
+            await mockCaptured.boardProps?.persist(resolvedFor("100::-1"), neighbors);
+        });
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({});
+    });
 });
 
 /* ========================================================================== */
@@ -1602,6 +1686,21 @@ describe("KanbanApp — move to top (M-13)", () => {
             (c) => c[0] === "/userstories/bulk_update_kanban_order",
         );
         expect(call).toBeUndefined();
+    });
+
+    it("clears the card selection when moving a card to the top (legacy moveUs path)", async () => {
+        await renderLoaded();
+        // Select cards 1 and 2, then move card 2 to the top.
+        await act(async () => {
+            mockCaptured.boardProps?.onToggleSelect?.(1);
+            mockCaptured.boardProps?.onToggleSelect?.(2);
+        });
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({ 1: true, 2: true });
+        await act(async () => {
+            mockCaptured.boardProps?.onClickMoveToTop?.(2);
+        });
+        // moveUsToTop -> moveUs cleared the selection first, like the drag path.
+        expect(mockCaptured.boardProps?.selectedUss).toEqual({});
     });
 
     it("rolls the board back to the pre-move snapshot and notifies when the move fails", async () => {
@@ -1840,14 +1939,19 @@ describe("KanbanApp — standard create (F1)", () => {
             "Status 100",
         );
         // A standard create must NOT open the bulk textarea, and must not create
-        // until the form is submitted.
+        // (no atomic POST /userstories, no bulk_create) until the form is submitted.
         expect(document.querySelector(".bulk-subjects")).toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(
+            mockHttpPost.mock.calls.some((c) => c[0] === "/userstories"),
+        ).toBe(false);
     });
 
-    it("persists a new story via bulk_create on the clicked column when the form is submitted", async () => {
-        mockBulkCreate.mockImplementation(() =>
-            Promise.resolve(mkRes([{ id: 555, version: 1 }])),
+    it("persists a new story ATOMICALLY via a single POST /userstories on the clicked column when the form is submitted (#5)", async () => {
+        mockHttpPost.mockImplementation((...args: readonly unknown[]) =>
+            args[0] === "/userstories"
+                ? Promise.resolve(mkRes({ id: 555, version: 1 }))
+                : Promise.resolve(mkRes([])),
         );
         await renderLoaded();
         await act(async () => {
@@ -1860,17 +1964,63 @@ describe("KanbanApp — standard create (F1)", () => {
             fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
             await Promise.resolve();
         });
-        // Persists to the frozen contract: bulk_create on the resolved project id
-        // + clicked column status (no points/assignee → no follow-up PATCH).
-        expect(mockBulkCreate).toHaveBeenCalledWith(
-            PROJECT_ID,
-            100,
-            "Brand new story",
-            null,
+        // [#5] ATOMIC create: the WHOLE story is persisted in ONE POST /userstories
+        // (standard serializer field names), NEVER a bulk_create + follow-up PATCH.
+        // bulkCreate is no longer used by the single-story create path.
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        const createCall = mockHttpPost.mock.calls.find(
+            (c) => c[0] === "/userstories",
         );
+        expect(createCall).toBeTruthy();
+        expect(createCall?.[1]).toMatchObject({
+            project: PROJECT_ID,
+            subject: "Brand new story",
+            status: 100,
+            swimlane: null,
+        });
+        // No follow-up PATCH — a subject-only create makes exactly one write, so a
+        // rejected create can never leave an orphan story.
+        expect(mockHttpPatch).not.toHaveBeenCalled();
         // Form closes on success.
         await waitFor(() =>
             expect(document.querySelector(".lightbox-create-edit.open")).toBeNull(),
+        );
+    });
+
+    // [#5] A REJECTED atomic create must persist NOTHING (no orphan story): the
+    // single POST /userstories is the ONLY write, there is NO follow-up PATCH, and
+    // the lightbox stays OPEN surfacing the error. The old bulk_create + PATCH flow
+    // would have already created the row before the PATCH, so a PATCH failure left
+    // an orphan; the atomic create leaves nothing behind on failure.
+    it("a failed create makes a single POST with NO follow-up PATCH and keeps the lightbox open (#5 orphan-prevention)", async () => {
+        mockHttpPost.mockImplementation((...args: readonly unknown[]) =>
+            args[0] === "/userstories"
+                ? Promise.reject(new Error("invalid assignee"))
+                : Promise.resolve(mkRes([])),
+        );
+        await renderLoaded();
+        await act(async () => {
+            mockCaptured.boardProps?.onAddUs?.("standard", 100);
+        });
+        const lb = document.querySelector(".lightbox-create-edit.open") as HTMLElement;
+        fireEvent.change(lb.querySelector('input[name="subject"]') as HTMLInputElement, {
+            target: { value: "Doomed story" },
+        });
+        await act(async () => {
+            fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
+            await Promise.resolve();
+        });
+        // Exactly one create attempt, and crucially NO follow-up PATCH.
+        expect(
+            mockHttpPost.mock.calls.filter((c) => c[0] === "/userstories").length,
+        ).toBe(1);
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(mockHttpPatch).not.toHaveBeenCalled();
+        // The lightbox stays OPEN so the user can correct the input.
+        await waitFor(() =>
+            expect(
+                document.querySelector(".lightbox-create-edit.open"),
+            ).not.toBeNull(),
         );
     });
 
@@ -1889,9 +2039,13 @@ describe("KanbanApp — standard create (F1)", () => {
                 mockCaptured.boardProps?.onAddUs?.("standard", 100);
             });
         }).not.toThrow();
-        // The React form opens with no AngularJS present, and no create fires yet.
+        // The React form opens with no AngularJS present, and no create fires yet
+        // (neither the atomic POST /userstories nor bulk_create).
         expect(document.querySelector(".lightbox-create-edit.open")).not.toBeNull();
         expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(
+            mockHttpPost.mock.calls.some((c) => c[0] === "/userstories"),
+        ).toBe(false);
     });
 });
 
@@ -1991,9 +2145,11 @@ describe("KanbanApp — edit & assignee callbacks (F3)", () => {
 /* ========================================================================== */
 
 describe("KanbanApp — user-story form persistence (M-10)", () => {
-    it("create persists the secondary fields via a follow-up PATCH and uploads chosen files", async () => {
-        mockBulkCreate.mockImplementation(() =>
-            Promise.resolve(mkRes([{ id: 555, version: 1 }])),
+    it("create persists ALL secondary fields in a single ATOMIC POST /userstories (no follow-up PATCH) and uploads chosen files (#5)", async () => {
+        mockHttpPost.mockImplementation((...args: readonly unknown[]) =>
+            args[0] === "/userstories"
+                ? Promise.resolve(mkRes({ id: 555, version: 1 }))
+                : Promise.resolve(mkRes([])),
         );
         await renderLoaded();
         await act(async () => {
@@ -2015,20 +2171,26 @@ describe("KanbanApp — user-story form persistence (M-10)", () => {
             fireEvent.submit(lb.querySelector("form") as HTMLFormElement);
         });
 
-        // bulk_create carries only subject/status/swimlane.
-        expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 100, "Rich US", null);
-        // The follow-up PATCH carries the extended generic-form field set.
-        await waitFor(() =>
-            expect(mockHttpPatch).toHaveBeenCalledWith(
-                "/userstories/555",
-                expect.objectContaining({
-                    description: "the description",
-                    team_requirement: true,
-                    tags: [],
-                    version: 1,
-                }),
-            ),
-        );
+        // [#5] The atomic create carries subject/status/swimlane AND the extended
+        // generic-form field set (description, team_requirement, tags, ...) in ONE
+        // request — bulk_create is not used and there is NO follow-up PATCH.
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        await waitFor(() => {
+            const createCall = mockHttpPost.mock.calls.find(
+                (c) => c[0] === "/userstories",
+            );
+            expect(createCall).toBeTruthy();
+            expect(createCall?.[1]).toMatchObject({
+                project: PROJECT_ID,
+                subject: "Rich US",
+                status: 100,
+                swimlane: null,
+                description: "the description",
+                team_requirement: true,
+                tags: [],
+            });
+        });
+        expect(mockHttpPatch).not.toHaveBeenCalled();
         // The chosen file is uploaded as an attachment of the CREATED story via a
         // multipart POST to the frozen `/userstories/attachments` endpoint.
         await waitFor(() =>
@@ -2046,9 +2208,11 @@ describe("KanbanApp — user-story form persistence (M-10)", () => {
         expect((fd.get("attached_file") as File).name).toBe("attach.png");
     });
 
-    it("a subject-only create makes NO follow-up PATCH and uploads nothing", async () => {
-        mockBulkCreate.mockImplementation(() =>
-            Promise.resolve(mkRes([{ id: 556, version: 1 }])),
+    it("a subject-only create makes exactly ONE atomic POST /userstories (no PATCH) and uploads nothing (#5)", async () => {
+        mockHttpPost.mockImplementation((...args: readonly unknown[]) =>
+            args[0] === "/userstories"
+                ? Promise.resolve(mkRes({ id: 556, version: 1 }))
+                : Promise.resolve(mkRes([])),
         );
         await renderLoaded();
         await act(async () => {
@@ -2064,6 +2228,12 @@ describe("KanbanApp — user-story form persistence (M-10)", () => {
         await waitFor(() =>
             expect(document.querySelector(".lightbox-create-edit.open")).toBeNull(),
         );
+        // [#5] Exactly ONE atomic create — no bulk_create, no follow-up PATCH — so a
+        // rejected create can never leave an orphan story behind.
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(
+            mockHttpPost.mock.calls.filter((c) => c[0] === "/userstories").length,
+        ).toBe(1);
         expect(mockHttpPatch).not.toHaveBeenCalled();
         expect(
             mockHttpPost.mock.calls.some((c) => c[0] === "/userstories/attachments"),
@@ -2370,7 +2540,10 @@ describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () 
 
     // --- QA-FUNC-09: sidebar filters + search query ---
 
-    it("persists the search query on change", async () => {
+    it("writes the search query to storage on change (dropped again on load)", async () => {
+        // The search handler still WRITES `q` to storage (harmless, mirrors the
+        // legacy `storeFilters` which stored the whole filter object). The raw
+        // entry therefore carries the query...
         await renderLoaded();
         const search = document.querySelector(
             'input[type="search"]',
@@ -2380,10 +2553,19 @@ describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () 
             fireEvent.change(search, { target: { value: "login" } });
         });
 
-        expect(loadKanbanFilters(PROJECT_ID)?.q).toBe("login");
+        const raw = window.localStorage.getItem(`kanban-filters.${PROJECT_ID}`);
+        expect(raw).not.toBeNull();
+        expect(JSON.parse(raw as string).q).toBe("login");
+        // ...but `loadKanbanFilters` strips it on read (legacy `delete data.q`),
+        // so the query is never restored.
+        expect(loadKanbanFilters(PROJECT_ID)?.q).toBe("");
     });
 
-    it("restores a persisted search query, fills the box, and feeds the first fetch", async () => {
+    it("does NOT restore a persisted search query on load (legacy delete data.q): box empty, full board", async () => {
+        // Legacy parity (controllerMixins.coffee `getFilters` L131): the search
+        // query is dropped on load, so the reloaded board shows the FULL set with
+        // an empty search box — this is exactly the QA finding (Issue #1a) that a
+        // restored `q` incorrectly narrowed the board on reload.
         saveKanbanFilters(PROJECT_ID, { q: "login", selected: [] });
 
         await renderLoaded();
@@ -2391,9 +2573,9 @@ describe("KanbanApp — fold + filter persistence (QA-FUNC-03, QA-FUNC-09)", () 
         const search = document.querySelector(
             'input[type="search"]',
         ) as HTMLInputElement;
-        expect(search.value).toBe("login");
-        // The very first userstories request must already carry the query.
-        expect(mockListUserstories).toHaveBeenCalledWith(
+        expect(search.value).toBe("");
+        // The dropped query must NOT feed the first userstories request.
+        expect(mockListUserstories).not.toHaveBeenCalledWith(
             PROJECT_ID,
             expect.objectContaining({ q: "login" }),
         );

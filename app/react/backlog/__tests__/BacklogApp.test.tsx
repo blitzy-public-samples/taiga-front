@@ -64,6 +64,7 @@ import {
     bulkUpdateBacklogOrder,
     bulkUpdateMilestone,
     bulkCreate,
+    createUserstory,
 } from "../../shared/api/userstories";
 import { createEventsClient } from "../../shared/events/websocket";
 import { createBacklogPersister, isDragEnabled } from "../../shared/dnd/DndProvider";
@@ -187,6 +188,9 @@ jest.mock("../../shared/api/userstories", () => ({
     bulkCreate: jest.fn(() =>
         Promise.resolve({ data: [], status: 200, headers: new Headers() }),
     ),
+    createUserstory: jest.fn(() =>
+        Promise.resolve({ data: { id: 501 }, status: 201, headers: new Headers() }),
+    ),
 }));
 
 jest.mock("../../shared/api/milestones", () => ({
@@ -298,6 +302,7 @@ const mockFiltersData = filtersData as unknown as AsyncMock;
 const mockBulkUpdateBacklogOrder = bulkUpdateBacklogOrder as unknown as AsyncMock;
 const mockBulkUpdateMilestone = bulkUpdateMilestone as unknown as AsyncMock;
 const mockBulkCreate = bulkCreate as unknown as AsyncMock;
+const mockCreateUserstory = createUserstory as unknown as AsyncMock;
 const mockCreateEventsClient = jest.mocked(createEventsClient);
 const mockCreateBacklogPersister = createBacklogPersister as unknown as jest.Mock;
 const mockIsDragEnabled = isDragEnabled as unknown as jest.Mock;
@@ -1275,14 +1280,15 @@ test("[#3] onBulkCreated at the bottom refreshes project stats (not just the 'to
 
 // These exercise the `onCreate` / `onEdit` contract callbacks that BacklogApp
 // hands to `UserStoryEditLightbox`. They prove the round-trip that jsdom's
-// runtime cannot: create -> POST bulk_create (+ optional follow-up PATCH) ->
-// backlog re-read; edit -> PATCH userstories/{id} -> stats + backlog re-read.
+// runtime cannot: create -> ONE atomic POST /userstories (#5: the whole story in
+// a single request — NOT bulk_create + a follow-up PATCH) -> backlog re-read;
+// edit -> PATCH userstories/{id} -> stats + backlog re-read.
 
-test("onCreate (no points/assignee) POSTs bulk_create with subject+status and reloads", async () => {
+test("onCreate (no points/assignee) POSTs a single atomic /userstories with subject+status and reloads (#5)", async () => {
     await renderApp();
-    // bulk_create returns the freshly created story so `onBulkCreated` has data.
-    mockBulkCreate.mockImplementationOnce(() =>
-        Promise.resolve(mkRes([makeUs({ id: 2000, subject: "Fresh", version: 1 })])),
+    // The atomic create returns the freshly created story so `onBulkCreated` has data.
+    mockCreateUserstory.mockImplementationOnce(() =>
+        Promise.resolve(mkRes(makeUs({ id: 2000, subject: "Fresh", version: 1 }))),
     );
     const usBefore = countGet((p) => p === "userstories");
 
@@ -1307,9 +1313,18 @@ test("onCreate (no points/assignee) POSTs bulk_create with subject+status and re
         });
     });
 
-    // subject + status carried by bulk_create; swimlane is null on the backlog.
-    expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "Fresh", null);
-    // No points/assignee and every secondary field at default => no follow-up PATCH.
+    // [#5] ONE atomic POST /userstories carrying project + subject + status
+    // (+ swimlane, null on the backlog). bulk_create is NOT used and there is NO
+    // follow-up PATCH — so a rejected create can never leave an orphan story.
+    expect(mockBulkCreate).not.toHaveBeenCalled();
+    expect(mockCreateUserstory).toHaveBeenCalledWith(
+        expect.objectContaining({
+            project: PROJECT_ID,
+            subject: "Fresh",
+            status: 1,
+            swimlane: null,
+        }),
+    );
     expect(mockHttpPatch).not.toHaveBeenCalled();
     // Backlog re-read (onBulkCreated).
     await waitFor(() =>
@@ -1317,10 +1332,10 @@ test("onCreate (no points/assignee) POSTs bulk_create with subject+status and re
     );
 });
 
-test("onCreate with points/assignee issues a follow-up PATCH on the new story", async () => {
+test("onCreate with points/assignee persists them in the single atomic create (NO follow-up PATCH) (#5)", async () => {
     await renderApp();
-    mockBulkCreate.mockImplementationOnce(() =>
-        Promise.resolve(mkRes([makeUs({ id: 2001, subject: "WithMeta", version: 4 })])),
+    mockCreateUserstory.mockImplementationOnce(() =>
+        Promise.resolve(mkRes(makeUs({ id: 2001, subject: "WithMeta", version: 4 }))),
     );
 
     await act(async () => {
@@ -1342,30 +1357,28 @@ test("onCreate with points/assignee issues a follow-up PATCH on the new story", 
         });
     });
 
-    expect(mockBulkCreate).toHaveBeenCalledWith(PROJECT_ID, 1, "WithMeta", null);
-    // Follow-up PATCH persists points + assignee (plus the full generic-form
-    // field set, at defaults here) against the created story's id, carrying the
-    // created story's version for optimistic concurrency.
-    await waitFor(() =>
-        expect(mockHttpPatch).toHaveBeenCalledWith("userstories/2001", {
+    // [#5] points + assignee (and the whole generic-form field set) are carried in
+    // the SINGLE atomic create request using the standard serializer field names —
+    // never a follow-up PATCH. This is the data-integrity fix: a rejected create
+    // persists nothing, so no orphan story can be left behind.
+    expect(mockCreateUserstory).toHaveBeenCalledWith(
+        expect.objectContaining({
+            project: PROJECT_ID,
+            subject: "WithMeta",
+            status: 1,
+            swimlane: null,
             points: { "1": 11 },
             assigned_to: 42,
-            description: "",
-            tags: [],
-            due_date: null,
-            is_blocked: false,
-            blocked_note: "",
-            team_requirement: false,
-            client_requirement: false,
-            version: 4,
         }),
     );
+    expect(mockBulkCreate).not.toHaveBeenCalled();
+    expect(mockHttpPatch).not.toHaveBeenCalled();
 });
 
 test("onCreate with position 'top' reorders the new story to the top", async () => {
     await renderApp();
-    mockBulkCreate.mockImplementationOnce(() =>
-        Promise.resolve(mkRes([makeUs({ id: 2002, subject: "TopStory", version: 1 })])),
+    mockCreateUserstory.mockImplementationOnce(() =>
+        Promise.resolve(mkRes(makeUs({ id: 2002, subject: "TopStory", version: 1 }))),
     );
 
     await act(async () => {
@@ -1396,6 +1409,48 @@ test("onCreate with position 'top' reorders the new story to the top", async () 
             [2002],
         ),
     );
+});
+
+// [#5] A REJECTED atomic create must persist NOTHING (no orphan story): the single
+// POST /userstories is the ONLY write, there is NO follow-up PATCH, and the backlog
+// is NOT re-read (no success path). The old bulk_create + PATCH flow would already
+// have created the row before the PATCH, so a PATCH failure left an orphan.
+test("a failed create makes a single POST /userstories with NO follow-up PATCH and does not reload the backlog (#5 orphan-prevention)", async () => {
+    await renderApp();
+    // The atomic create REJECTS (e.g. an invalid assignee).
+    mockCreateUserstory.mockImplementationOnce(() =>
+        Promise.reject(new Error("invalid assignee")),
+    );
+    const usBefore = countGet((p) => p === "userstories");
+
+    await expect(
+        act(async () => {
+            await mockCaptured.userStoryEditProps?.onCreate({
+                subject: "Doomed",
+                statusId: 1,
+                points: {},
+                assignedTo: 999999,
+                position: "bottom",
+                description: "",
+                tags: [],
+                due_date: null,
+                is_blocked: false,
+                blocked_note: "",
+                team_requirement: false,
+                client_requirement: false,
+                swimlane: null,
+                attachmentsToAdd: [],
+            });
+        }),
+    ).rejects.toThrow("invalid assignee");
+
+    // Exactly ONE create attempt, and crucially NO follow-up PATCH — nothing is
+    // persisted on failure, so no orphan story can exist. No bulk_create either,
+    // and the backlog is NOT re-read (onBulkCreated never runs on the failure path).
+    expect(mockCreateUserstory).toHaveBeenCalledTimes(1);
+    expect(mockBulkCreate).not.toHaveBeenCalled();
+    expect(mockHttpPatch).not.toHaveBeenCalled();
+    expect(countGet((p) => p === "userstories")).toBe(usBefore);
 });
 
 test("onEdit PATCHes userstories/{id} with the changed fields + version and reloads", async () => {
@@ -1507,10 +1562,10 @@ test("onEdit reloads the backlog and rethrows on a version conflict (HTTP 400 + 
 /* ========================================================================== */
 
 describe("BacklogApp — user-story form persistence (M-10)", () => {
-    test("onCreate persists the secondary fields via a follow-up PATCH and uploads chosen files", async () => {
+    test("onCreate persists ALL secondary fields in a single atomic /userstories (no follow-up PATCH) and uploads chosen files (#5)", async () => {
         await renderApp();
-        mockBulkCreate.mockImplementationOnce(() =>
-            Promise.resolve(mkRes([makeUs({ id: 2000, subject: "Rich US", version: 1 })])),
+        mockCreateUserstory.mockImplementationOnce(() =>
+            Promise.resolve(mkRes(makeUs({ id: 2000, subject: "Rich US", version: 1 }))),
         );
         const file = new File(["data"], "attach.png", { type: "image/png" });
 
@@ -1533,29 +1588,34 @@ describe("BacklogApp — user-story form persistence (M-10)", () => {
             });
         });
 
-        // The follow-up PATCH carries the extended generic-form field set,
-        // targeting the freshly-created story with its version.
-        await waitFor(() =>
-            expect(mockHttpPatch).toHaveBeenCalledWith(
-                "userstories/2000",
-                expect.objectContaining({
-                    description: "the description",
-                    team_requirement: true,
-                    tags: [],
-                    version: 1,
-                }),
-            ),
+        // [#5] The atomic create carries subject/status/swimlane AND the extended
+        // generic-form field set (description, team_requirement, tags, ...) in ONE
+        // request — no bulk_create and no follow-up PATCH.
+        expect(mockBulkCreate).not.toHaveBeenCalled();
+        expect(mockCreateUserstory).toHaveBeenCalledWith(
+            expect.objectContaining({
+                project: PROJECT_ID,
+                subject: "Rich US",
+                status: 1,
+                swimlane: null,
+                description: "the description",
+                team_requirement: true,
+                tags: [],
+            }),
         );
+        expect(mockHttpPatch).not.toHaveBeenCalled();
         // The chosen file is uploaded as an attachment of the CREATED story via a
         // multipart POST to the frozen `/userstories/attachments` endpoint.
-        const attachCall = mockHttpPost.mock.calls.find(
-            (c) => c[0] === "/userstories/attachments",
-        ) as unknown[] | undefined;
-        expect(attachCall).toBeTruthy();
-        const fd = attachCall?.[1] as FormData;
-        expect(fd.get("object_id")).toBe("2000");
-        expect(fd.get("project")).toBe(String(PROJECT_ID));
-        expect((fd.get("attached_file") as File).name).toBe("attach.png");
+        await waitFor(() => {
+            const attachCall = mockHttpPost.mock.calls.find(
+                (c) => c[0] === "/userstories/attachments",
+            ) as unknown[] | undefined;
+            expect(attachCall).toBeTruthy();
+            const fd = attachCall?.[1] as FormData;
+            expect(fd.get("object_id")).toBe("2000");
+            expect(fd.get("project")).toBe(String(PROJECT_ID));
+            expect((fd.get("attached_file") as File).name).toBe("attach.png");
+        });
     });
 
     test("a subject-only create makes NO follow-up PATCH and uploads nothing", async () => {
@@ -1875,6 +1935,71 @@ test("typing in the search box debounces a reset reload carrying q", async () =>
             ).toBe(true),
         { timeout: 2000 },
     );
+});
+
+/* -------------------------------------------------------------------------- */
+/* [#4] Sidebar filter + search persistence across a reload                   */
+/*                                                                            */
+/* Port of the AngularJS `filtersMixin`: the active quick-filter selection is */
+/* stored under a project-scoped key and restored on the next load, while the */
+/* free-text search query is dropped on restore (legacy `getFilters` does     */
+/* `delete data.q`). These two integration tests exercise the full            */
+/* restore-on-load and save-on-change wiring through the real component.      */
+/* -------------------------------------------------------------------------- */
+
+test("restores the persisted sidebar filter selection on load and applies it to the first fetch, dropping the stored search query (#4)", async () => {
+    // Seed a stored selection WITH a search query. The legacy restore path
+    // (`delete data.q`) drops the query, so the first reload must carry the
+    // restored `tags` selection but NEVER the stored `q`.
+    window.localStorage.setItem(
+        `backlog-filters.${PROJECT_ID}`,
+        JSON.stringify({
+            q: "should-be-dropped",
+            selected: [
+                { id: "9", name: "urgent", dataType: "tags", mode: "include" },
+            ],
+        }),
+    );
+
+    await renderApp();
+
+    // The first `userstories` fetch carries the restored `tags` filter param
+    // (pickSelectedFilterParams maps the include-mode tags filter -> tags="9").
+    const usCall = mockHttpGet.mock.calls.find(
+        (c) => String(c[0]) === "userstories",
+    );
+    expect(usCall).toBeTruthy();
+    expect(usCall?.[1] as Record<string, unknown>).toMatchObject({ tags: "9" });
+    // ...and NO userstories fetch ever carried the dropped search query.
+    expect(
+        mockHttpGet.mock.calls.some(
+            (c) =>
+                String(c[0]) === "userstories" &&
+                (c[1] as Record<string, unknown>)?.q === "should-be-dropped",
+        ),
+    ).toBe(false);
+});
+
+test("persists the search query to localStorage on change so it survives a reload (#4)", async () => {
+    const { container } = await renderApp();
+    const input = container.querySelector(
+        "tg-input-search input.backlog-search",
+    ) as HTMLInputElement;
+
+    await act(async () => {
+        fireEvent.change(input, { target: { value: "hello" } });
+    });
+
+    // The persister writes SYNCHRONOUSLY (only the board reload is debounced),
+    // under the backlog-scoped key, carrying the stored q + current selection.
+    const raw = window.localStorage.getItem(`backlog-filters.${PROJECT_ID}`);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw as string) as {
+        q: string;
+        selected: unknown[];
+    };
+    expect(parsed.q).toBe("hello");
+    expect(Array.isArray(parsed.selected)).toBe(true);
 });
 
 test("show-tags toggle flips the checkbox and persists the preference", async () => {

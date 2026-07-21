@@ -50,6 +50,9 @@ describe("computeWipLimit (ported from KanbanWipLimitDirective)", () => {
     it("returns null when there is no limit", () => {
         expect(computeWipLimit(10, null)).toBeNull();
         expect(computeWipLimit(10, undefined)).toBeNull();
+        // Legacy parity: a wip_limit of 0 is falsy => "no limit" (no marker).
+        expect(computeWipLimit(10, 0)).toBeNull();
+        expect(computeWipLimit(0, 0)).toBeNull();
     });
     it("returns one-left when count is one below the limit", () => {
         expect(computeWipLimit(2, 3)).toEqual({ className: "one-left", afterIndex: 1 });
@@ -83,6 +86,21 @@ describe("AnimatedCounter (QA-VIS-06 — WIP denominator)", () => {
         expect(middleFrame(container).textContent).toBe("3");
         expect(counter.textContent).not.toContain("/");
         expect(container.querySelector(".animated-counter-inner.wip-amount")).toBeNull();
+    });
+
+    it("treats a wip limit of 0 as NO limit — bare count, no denominator, no colour class", () => {
+        // Legacy parity (animated-counter.directive.coffee L15/L18-25): the
+        // directive keys every WIP affordance off the TRUTHY `data.wip`, so a
+        // limit of 0 is falsy and means "no limit". The column must render a
+        // plain count with no `/ 0` denominator and neither the `.wip-amount`
+        // nor `.limit-over` colour class (which would paint a spurious green/red
+        // state). This guards the QA-VIS finding that 0 was treated as a limit.
+        const { container } = render(<AnimatedCounter count={5} wip={0} />);
+        const counter = container.querySelector("tg-animated-counter")!;
+        expect(middleFrame(container).textContent).toBe("5");
+        expect(counter.textContent).not.toContain("/");
+        expect(container.querySelector(".animated-counter-inner.wip-amount")).toBeNull();
+        expect(container.querySelector(".animated-counter-inner.limit-over")).toBeNull();
     });
 
     it("shows 'count / wip' and the .wip-amount class when a wip limit is set", () => {

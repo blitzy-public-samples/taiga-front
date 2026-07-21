@@ -130,7 +130,14 @@ export function computeWipLimit(
     cardCount: number,
     wipLimit: number | null | undefined,
 ): WipLimitMarker | null {
-    if (wipLimit == null) {
+    // Legacy parity (KanbanWipLimitDirective `redrawWipLimit`): the directive
+    // only ever inserted a marker when it resolved a real anchor card, which a
+    // `wip_limit` of 0 never does (`cards[wip_limit - 1]` -> `cards[-1]` ->
+    // undefined), so 0 behaves as "no limit" — no marker. Treat any falsy
+    // `wip_limit` (0 / null / undefined) as no-limit here, consistently with the
+    // `!!wip` denominator gate in `AnimatedCounter`, rather than emitting a
+    // marker with a negative anchor index that a downstream guard must discard.
+    if (!wipLimit) {
         return null;
     }
     if (cardCount + 1 === wipLimit) {
@@ -171,7 +178,15 @@ export interface AnimatedCounterProps {
 
 export function AnimatedCounter(props: AnimatedCounterProps): JSX.Element {
     const { count, wip, vertical } = props;
-    const hasWip = wip != null;
+    // Legacy parity (QA-VIS, animated-counter.directive.coffee): the directive
+    // keys every WIP affordance off the TRUTHY value of `data.wip` —
+    // `ng-class="{'wip-amount': data.wip, 'limit-over': data.count > data.wip}"`
+    // (L15) and the denominator span `ng-if="renderCount.wip"` (template L18-25).
+    // A `wip_limit` of 0 is therefore falsy and means "no limit": the column
+    // renders a BARE count with no `/ 0` denominator and no wip-amount/limit-over
+    // colouring. Using `!!wip` (not `wip != null`) reproduces this exactly, so a
+    // 0 limit no longer paints a spurious "N / 0" or green/red state.
+    const hasWip = !!wip;
     // Mirrors the directive's `ng-class`: wip-amount when a limit exists,
     // limit-over when the count exceeds it.
     const innerClass =
