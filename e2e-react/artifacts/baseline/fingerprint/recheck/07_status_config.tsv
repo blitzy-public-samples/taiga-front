@@ -1,0 +1,42 @@
+1	1	New		f	f
+2	1	Ready		f	f
+3	1	In progress		f	f
+4	1	Ready for test		f	f
+5	1	Done		t	f
+6	1	Archived		t	t
+7	2	New		f	f
+8	2	Ready		f	f
+9	2	In progress		f	f
+10	2	Ready for test		f	f
+11	2	Done		t	f
+12	2	Archived		t	t
+13	3	New		f	f
+14	3	Ready		f	f
+15	3	In progress		f	f
+16	3	Ready for test		f	f
+17	3	Done		t	f
+18	3	Archived		t	t
+19	4	New		f	f
+20	4	Ready		f	f
+21	4	In progress		f	f
+22	4	Ready for test		f	f
+23	4	Done		t	f
+24	4	Archived		t	t
+25	5	New		f	f
+26	5	Ready		f	f
+27	5	In progress		f	f
+28	5	Ready for test		f	f
+29	5	Done		t	f
+30	5	Archived		t	t
+31	6	New		f	f
+32	6	Ready		f	f
+33	6	In progress		f	f
+34	6	Ready for test		f	f
+35	6	Done		t	f
+36	6	Archived		t	t
+37	7	New		f	f
+38	7	Ready		f	f
+39	7	In progress		f	f
+40	7	Ready for test		f	f
+41	7	Done		t	f
+42	7	Archived		t	t

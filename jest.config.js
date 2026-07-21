@@ -1,0 +1,103 @@
+/**
+ * Jest configuration — browserless UNIT test layer for the migrated React
+ * screens (Kanban + Backlog) that live under `app/react/`.
+ *
+ * WHY THIS EXISTS
+ *   The Kanban and Backlog screens were migrated from AngularJS 1.5.10 to
+ *   React 18 and run in-place inside the existing AngularJS shell. Their
+ *   component / state / logic units are exercised here with Jest in a jsdom
+ *   (browserless) environment. Every other screen is still AngularJS and keeps
+ *   its own retained Karma unit suite (`npm run ci:test`); this config never
+ *   touches those legacy specs.
+ *
+ * TEST-LAYER ISOLATION (hard requirement)
+ *   `npm test` must run ONLY these Jest specs and pass headlessly in a bare
+ *   container: no real or headless browser engine, no network access, and NONE
+ *   of the separate end-to-end (e2e) specs under `e2e-react/` — the additive,
+ *   isolated layer that is invoked exclusively via `npm run e2e`. Discovery is
+ *   therefore constrained twice over:
+ *     1. `roots` limits Jest's file crawler to the `app/react` tree, so the
+ *        sibling `e2e-react/` tree is never even scanned; and
+ *     2. `testMatch` only accepts `*.test.*` / `*.spec.*` files that live
+ *        inside an `__tests__` directory under `app/react`.
+ *   As a result nothing outside `app/react/**` — most importantly the e2e
+ *   specs in `e2e-react/tests/**` — is ever picked up by `npm test`.
+ *
+ * RUNTIME
+ *   Node (pinned to v16.19.1 for this project) loads this file as a CommonJS
+ *   module, hence `module.exports`. TypeScript / TSX specs and the source they
+ *   import are compiled by ts-jest using the project's root `tsconfig.json`.
+ */
+module.exports = {
+  // Browserless DOM environment, supplied by `jest-environment-jsdom`. React
+  // components mount into jsdom; no real browser is launched.
+  testEnvironment: 'jsdom',
+
+  // Confine Jest's file crawler to the React tree only. On its own this
+  // guarantees the e2e specs (the sibling `e2e-react/` tree) are never scanned.
+  roots: ['<rootDir>/app/react'],
+
+  // Only files named `*.test.(ts|tsx)` / `*.spec.(ts|tsx)` that live inside an
+  // `__tests__` directory under `app/react` are treated as unit tests. This
+  // deliberately excludes `e2e-react/tests/*.spec.ts` (the e2e layer).
+  testMatch: ['<rootDir>/app/react/**/__tests__/**/*.(test|spec).(ts|tsx)'],
+
+  // Compile TypeScript / TSX (specs and imported source) with ts-jest, reusing
+  // the project's root TypeScript configuration for consistent type settings.
+  //
+  // `isolatedModules: true` makes ts-jest transpile each file INDEPENDENTLY
+  // (the single-file transpile path) instead of driving a shared TypeScript
+  // LanguageService program. This is required for CORRECTNESS, not merely
+  // speed: `tsconfig.json`'s `include: ["app/react/**/*"]` pulls every spec into
+  // one program, and two specs that share a basename but differ only by
+  // extension in the same directory
+  // (`app/react/kanban/__tests__/KanbanDndContext.test.ts` and
+  // `.../KanbanDndContext.test.tsx`) collide in the LanguageService's
+  // emit-output map — both map to `KanbanDndContext.test.js`. That collision
+  // makes `program.emit()` yield no output for one of the files, so ts-jest
+  // throws "Unable to process '...', please make sure that `outDir` in your
+  // tsconfig is neither '' or '.'" on a COLD cache and one suite fails to run
+  // (only a warm cache masked it). Single-file transpile sidesteps the shared
+  // emit map entirely, so `npm test` passes headlessly on a clean/CI cache.
+  // Full type-checking is unaffected: it is enforced separately by
+  // `tsc --noEmit -p tsconfig.json`. (The root `tsconfig.json` already sets
+  // `isolatedModules: true`, so all source already conforms to its single-file
+  // transpile constraints; ts-jest needs the flag in its OWN options to take
+  // that transpile path.)
+  transform: {
+    '^.+\\.(ts|tsx)$': [
+      'ts-jest',
+      { tsconfig: '<rootDir>/tsconfig.json', isolatedModules: true },
+    ],
+  },
+
+  // Module resolution order — TS/TSX first so React source is preferred, then
+  // the plain JS/JSON fallbacks.
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
+
+  // Setup executed after the test framework is installed, before each spec file:
+  //   1. `./jest.setup.js` assigns `globalThis.moment` from the real `moment` package
+  //      so the browserless React sources that read the shell's global Moment via
+  //      `app/react/shared/moment.ts` work under jsdom (see F-PERF-01); and
+  //   2. `@testing-library/jest-dom` registers the extended DOM assertion matchers
+  //      (e.g. `toBeInTheDocument`) relied on by the component tests.
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js', '@testing-library/jest-dom'],
+
+  // Always collect coverage so the threshold below is enforced on every run.
+  collectCoverage: true,
+
+  // Measure coverage across the React source while excluding the tests
+  // themselves, ambient type declarations, and the thin custom-element bundle
+  // entry point (which is exercised at runtime, not by unit tests).
+  collectCoverageFrom: [
+    'app/react/**/*.{ts,tsx}',
+    '!app/react/**/__tests__/**',
+    '!app/react/**/*.d.ts',
+    '!app/react/index.tsx',
+  ],
+
+  // Enforce the mandated minimum line coverage for the migrated screens.
+  coverageThreshold: {
+    global: { lines: 70 },
+  },
+};

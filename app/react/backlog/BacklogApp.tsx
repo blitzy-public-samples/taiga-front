@@ -1,0 +1,1641 @@
+/*
+ * This source code is licensed under the terms of the
+ * GNU Affero General Public License found in the LICENSE file in
+ * the root directory of this source tree.
+ *
+ * Copyright (c) 2021-present Kaleidos INC
+ */
+
+/**
+ * BacklogApp.tsx — the CONTAINER component for the migrated React
+ * Backlog / Sprint-planning screen.
+ *
+ * WHAT THIS IS
+ *   The React re-expression of the AngularJS `BacklogController`
+ *   (`app/coffee/modules/backlog/main.coffee`, class L25, registered L715) and
+ *   the backlog Jade template (`app/partials/backlog/backlog.jade` +
+ *   `app/partials/includes/modules/sprints.jade`). `../index.tsx` mounts this
+ *   component as the `<tg-react-backlog>` custom element via
+ *   `../shared/mount.tsx`.
+ *
+ * ARCHITECTURE — Container / Presentational split (AAP §0.3.3)
+ *   This file OWNS: props ingestion, the `useBacklog` state hook (data fetching
+ *   + WebSocket subscription + dispatch), every coordinating callback
+ *   (add/edit/delete US, add/edit/delete sprint, move-to-sprint toolbar,
+ *   velocity toggle, tags toggle, filter apply, closed-sprints toggle, burndown
+ *   toggle), lightbox open/close state, and the composition of the DnD context
+ *   + presentational children. The children only RENDER: `BacklogTable`,
+ *   `Sprint` (+ nested `SprintHeader`/`ProgressBar`), `CreateEditSprintLightbox`,
+ *   and `BulkCreateUsLightbox`.
+ *
+ * BEHAVIOURAL PARITY (hard requirement — AAP §0.1.1, §0.7.1)
+ *   Reproduces the existing AngularJS behaviour EXACTLY (zero feature change).
+ *   The DOM structure and SCSS class names of `backlog.jade` / `sprints.jade`
+ *   are reproduced verbatim so the RETAINED stylesheets style the React DOM;
+ *   there is deliberately NO `.scss` import here. Source line references are
+ *   cited inline throughout.
+ *
+ * STRICT DEPENDENCY BOUNDARY
+ *   Imports come ONLY from this file's declared dependencies: the sibling
+ *   `./state`, `./dnd`, `./components/*` and the `../shared/*` infrastructure.
+ *   It NEVER imports Immutable.js, dragula, dom-autoscroller, checksley, any
+ *   `.coffee` / AngularJS module (esp. `resources.coffee`), nor the low-level
+ *   `shared/api/client`: all backend / session / events / permissions access
+ *   flows through the `useBacklog` hook + the permission helpers. `immer` and
+ *   `@dnd-kit/core` are used only inside `state/` and `dnd/` respectively.
+ *
+ * Toolchain: TypeScript 5.4.5 under `strict`, `jsx: "react-jsx"` (NO
+ * `import React`), Node v16.19.1 compatible. Bundled by esbuild into
+ * `dist/js/react.js`.
+ */
+
+import { useState, useRef, useCallback, useMemo, useEffect, Fragment } from 'react';
+import type { FC, ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react';
+
+import { useBacklog } from './state/useBacklog';
+import { BacklogDndContext } from './dnd/BacklogDndContext';
+import type { BacklogMovePayload } from './dnd/BacklogDndContext';
+import { BacklogTable } from './components/BacklogTable';
+import { Sprint } from './components/Sprint';
+import { ProgressBar } from './components/ProgressBar';
+import { BurndownChart } from './components/BurndownChart';
+import { CreateEditSprintLightbox } from './components/CreateEditSprintLightbox';
+import { BulkCreateUsLightbox } from './components/BulkCreateUsLightbox';
+// F-CQ-06: the sidebar filter panel. `FiltersSidebar` is the presentational port
+// of the shared AngularJS `<tg-filter>` component that BOTH the Kanban board and
+// the Backlog hosted verbatim (retired `backlog.jade` `.backlog-filter > tg-filter`
+// with the identical `filters`/`custom-filters`/`selected-filters` bindings). It is
+// purely presentational ("props down, events up"), so it is reused here; the
+// data-shaping is done by the shared `UsFiltersMixin` port in `../shared/filters`.
+import { FiltersSidebar } from '../kanban/components/FiltersSidebar';
+import type { CustomFilter } from '../kanban/components/FiltersSidebar';
+import {
+    buildDataCollection,
+    buildCategories,
+    buildSelectedFilters,
+    addFilterSelection,
+    removeFilterSelection,
+} from '../shared/filters';
+import type { FilterCategory, SelectedFilter } from '../shared/filters';
+import { canModifyUs, canAddUs, canAddMilestone, canMutate } from '../shared/permissions';
+// M-13 parity fix: the backlog "Edit" option routes to the shell-owned US detail
+// screen (the common-module edit lightbox is OOS — AAP §0.2.2 / §0.4.1).
+import { navigateToUserStoryDetail } from '../shared/session';
+// C2 fix (dest#5): the standard single-story create action. The deleted Backlog
+// controller delegated `genericform:new` to the common-module lightbox (OOS,
+// AAP §0.2.2); we call the same `/api/v1/userstories` endpoint directly.
+import { createUserStory } from '../shared/api/userstories';
+import { useResolvedProjectId } from '../shared/useResolvedProjectId';
+// F-UI-02: the ONE shared SVG-sprite icon primitives (replaces the container's
+// broken empty-span placeholder). `TgSvg` emits the `<tg-svg>` host directly so
+// the retained `tg-input-search tg-svg` SCSS paints the search magnifier
+// (F-VIS-02); `TgIcon` is the decorative forwarding alias used elsewhere.
+import { TgIcon, TgSvg } from '../shared/icon';
+// F-VIS-06: locale-aware label lookup (`translate`) + grouped number formatting
+// (`formatNumber`) for the Backlog summary — replaces the hardcoded English
+// labels and the separator-less local number formatter.
+import { translate, formatNumber } from '../shared/i18n';
+import { NotificationError } from '../shared/NotificationError';
+import type { Project, UserStory, Milestone, Status, FilterOption } from '../shared/types';
+
+/* ========================================================================== *
+ * Props
+ *
+ * `../shared/mount.tsx` converts the lower-kebab HTML attributes on
+ * `<tg-react-backlog project-id="1" project-slug="foo">` into camelCase props
+ * whose values are ALWAYS strings. The container is responsible for coercing
+ * them to their real types (here, `projectId` -> number).
+ * ========================================================================== */
+
+export interface BacklogAppProps {
+    /** e.g. "1" — COERCED to a number with `Number(projectId)`. */
+    projectId: string;
+    /** e.g. "my-project" — informational; children read `project.slug` instead. */
+    projectSlug?: string;
+    /** Tolerate any extra attributes the mount wrapper passes through. */
+    [key: string]: string | undefined;
+}
+
+/** Which lightbox (if any) is currently open. */
+type LightboxKind = 'none' | 'sprint-create' | 'sprint-edit' | 'bulk-us';
+
+/* ========================================================================== *
+ * Pure helpers — coerce the loosely-typed `Project` extras
+ *
+ * The shared `Project` type carries an index signature (`[key: string]:
+ * unknown`) for the many backend fields the migration does not model
+ * explicitly, so these accessors narrow the specific extras the backlog needs.
+ * ========================================================================== */
+
+/**
+ * The project's user-story statuses, sorted ascending by id. Reproduces
+ * `@scope.usStatusList = _.sortBy(project.us_statuses, "id")`
+ * (`main.coffee:482`). Returns `[]` before the project has loaded.
+ */
+function readSortedStatuses(project: Project | null): Status[] {
+    const raw = (project?.us_statuses as Status[] | undefined) ?? [];
+    return [...raw].sort((a, b) => a.id - b.id);
+}
+
+/**
+ * The default US status id used to seed the bulk-create lightbox
+ * (`@scope.project.default_us_status`, `main.coffee:690-691`). Falls back to the
+ * first available status id (then `0`) when the field is absent so the child
+ * never receives `NaN`.
+ */
+function readDefaultUsStatus(project: Project | null, statuses: Status[]): number {
+    const raw = Number(project?.default_us_status);
+    if (Number.isFinite(raw)) {
+        return raw;
+    }
+    return statuses[0]?.id ?? 0;
+}
+
+/** Whether the project has the Kanban board activated (gates the swimlane UI). */
+function readIsKanbanActivated(project: Project | null): boolean {
+    return Boolean(project?.is_kanban_activated);
+}
+
+/** The project's default swimlane id (or `null`), used by the bulk-create form. */
+function readDefaultSwimlane(project: Project | null): number | null {
+    const raw = project?.default_swimlane as number | null | undefined;
+    return raw ?? null;
+}
+
+/**
+ * Whether the current user is a project admin — gates the `empty-burndown`
+ * customise-graph hint (`ng-if="showGraphPlaceholder && project.i_am_admin"`,
+ * `backlog.jade:23`).
+ */
+function readIsAdmin(project: Project | null): boolean {
+    return Boolean(project?.i_am_admin);
+}
+
+/**
+ * F-VIS-06: render a translated summary label that carries literal `<br />`
+ * markup (the backlog summary labels are stored two-line, e.g.
+ * `"project<br />points"`, `"points /<br />sprint"`) as SAFE React nodes:
+ * split on the `<br>` tag and interleave real `<br/>` elements.
+ *
+ * The legacy `summary.jade` rendered these through the angular-translate
+ * `translate` directive; because the shell configures
+ * `useSanitizeValueStrategy('escapeParameters')` (escapes interpolation
+ * PARAMETERS only, never the translation text), the raw `<br />` in the table
+ * value reached the DOM and produced the baseline's two-line labels. This
+ * reproduces that EXACTLY without `dangerouslySetInnerHTML` — only `<br/>`
+ * elements are ever emitted, so no untrusted markup can be injected.
+ */
+function renderBrLabel(text: string): ReactNode {
+    return text.split(/<br\s*\/?>/i).map((part, index) => (
+        <Fragment key={index}>
+            {index > 0 && <br />}
+            {part}
+        </Fragment>
+    ));
+}
+
+// F-UI-02: icons render through the ONE shared `TgSvg` sprite primitive
+// (`../shared/icon`). The container previously emitted an empty
+// `<span class="icon …">`, which CANNOT paint a Taiga SVG-sprite icon (the
+// retained SCSS targets the `tg-svg` host + `svg.icon` `<use href="#…">`
+// reference). The `TgIcon` compat alias forwards a decorative `name` to the
+// shared primitive so every `<TgIcon name="icon-…"/>` call site below renders
+// the real sprite reference, matching the sibling child components.
+
+/* ========================================================================== *
+ * The container component
+ * ========================================================================== */
+
+export const BacklogApp: FC<BacklogAppProps> = (props) => {
+    // F-REG-01 (blank board): the host `<tg-react-backlog project-id="{{project.id}}"
+    // project-slug="{{project.slug}}">` receives EMPTY attributes because the deleted
+    // Backlog controller no longer populates the AngularJS `project` scope var (AAP
+    // §0.2.1) — exactly what the `backlog.jade` host comment anticipates ("React
+    // self-resolves the project from URL/session"). `useResolvedProjectId` performs
+    // that resolution: a valid `project-id` attribute is used directly; otherwise the
+    // slug is derived from the URL (`/project/<slug>/backlog`) and resolved via `GET
+    // /projects/by_slug` (the same endpoint the AngularJS shell uses). `resolving` is
+    // true only while the lookup is in flight so the render below shows a loading
+    // shell instead of a permanent blank backlog.
+    const { projectId, projectIdValid, resolving: projectResolving } =
+        useResolvedProjectId(props);
+
+    // The effectful Backlog state hook (data load + WebSocket subscription +
+    // thunks). Called UNCONDITIONALLY (Rules of Hooks); when `projectId` is not
+    // a real number the hook's own `if (!projectId)` effect guard no-ops, so no
+    // request is issued.
+    const { state, actions } = useBacklog(projectId);
+
+    const {
+        project,
+        isBacklogActivated,
+        userstories,
+        sprints,
+        closedSprints,
+        stats,
+        filtersData,
+        selectedFilters,
+        currentSprint,
+        totalMilestones,
+        totalClosedMilestones,
+        totalUserStories,
+        visibleUserStories,
+        displayVelocity,
+        forecastNewSprint,
+        showTags,
+        swimlanesList,
+        firstUsInBacklog,
+        // F-CQ-05: pagination view fields (drive the load-more sentinel + spinner).
+        loadingUserstories,
+        disablePagination,
+        // F-AAP-10: distinguish a genuine load FAILURE from a legitimately empty
+        // backlog so the container can render an error state (with retry).
+        loadError,
+        // F-AAP-03 (dest#8): the user-facing message set when a drag reorder /
+        // move / single-story mutation write is rejected. Rendered as a
+        // dismissible <NotificationError> toast; the hook has already reconciled
+        // the board to server truth, so this only tells the user WHY it reverted.
+        moveError,
+    } = state;
+
+    /* ---- Local UI state (the ephemeral view state the AngularJS controller
+     * kept on `$scope` or directly in the DOM). ------------------------------ */
+
+    // Which lightbox is open + the sprint being edited (edit mode only).
+    const [lightbox, setLightbox] = useState<LightboxKind>('none');
+    const [editingSprint, setEditingSprint] = useState<Milestone | null>(null);
+
+    // C2 fix (dest#5): standard single-story create. `addNewUs('standard')` now
+    // reveals a visible inline create input (the dest report's required UX;
+    // `standardCreateOpen`), whose subject is submitted to `POST /userstories`.
+    // `creatingUs` guards against re-entrant submits; `createUsError` surfaces a
+    // backend rejection inline without closing the input.
+    const [standardCreateOpen, setStandardCreateOpen] = useState(false);
+    const [newUsSubject, setNewUsSubject] = useState('');
+    const [creatingUs, setCreatingUs] = useState(false);
+    const [createUsError, setCreateUsError] = useState<string | null>(null);
+
+    // Checked backlog rows (drives the move-to-sprint toolbar + multi-drag).
+    const [checkedIds, setCheckedIds] = useState<number[]>([]);
+    // Last checked row id — anchors shift-range selection (main.coffee:820).
+    // A ref (not state): mutated synchronously, must not trigger re-renders,
+    // mirroring the AngularJS `lastChecked` closure variable.
+    const lastCheckedIdRef = useRef<number | null>(null);
+
+    // Closed-sprints visibility. `excludeClosedSprints` started TRUE in the
+    // source (closed sprints hidden), so this starts `false` (sprints.coffee:124).
+    const [showClosedSprints, setShowClosedSprints] = useState(false);
+
+    // Custom-filters sidebar open flag (the AngularJS `activeFilters` for the
+    // `#show-filters-button` / `.backlog-filter` region + `backlog-manager`
+    // `expanded` class). Kept local because the filter-chip directive
+    // (`tg-filter`) is out of migration scope.
+    const [filtersSidebarOpen, setFiltersSidebarOpen] = useState(false);
+
+    // Text search bound to the `tg-input-search` box (`ctrl.filterQ`).
+    const [filterQ, setFilterQ] = useState('');
+
+    // Burndown graph collapsed flag (ToggleBurndownVisibility, main.coffee:1166).
+    const [burndownCollapsed, setBurndownCollapsed] = useState(false);
+
+    // `showGraphPlaceholder` defaults the burndown to collapsed, exactly as the
+    // directive's watch did: `isBurndownGraphCollapsed ||= showGraphPlaceholder`.
+    const showGraphPlaceholder = Boolean(stats?.showGraphPlaceholder);
+    useEffect(() => {
+        if (showGraphPlaceholder) {
+            setBurndownCollapsed(true);
+        }
+    }, [showGraphPlaceholder]);
+
+    // Browser-tab title parity: the deleted `BacklogController` set the document
+    // title through `appMetaService` once the project loaded. Reproduce it here so
+    // the tab reads "Backlog - <project name>" as before. Runs whenever the
+    // resolved project changes.
+    useEffect(() => {
+        const projectName = project?.name;
+        if (projectName) {
+            document.title = `Backlog - ${projectName}`;
+        }
+    }, [project]);
+
+    // F-CQ-04 summary loading/error signals. `stats` is populated by the initial
+    // load and every `reloadStats`; until it first arrives the summary meter has
+    // no data. `statsLoading` marks that pre-data window so the region renders a
+    // loading treatment (rather than a misleading "0%"); `statsError` is a load
+    // failure while content is present — the summary keeps the last-known values
+    // and flags the staleness instead of blanking (the board-level error state
+    // at the top handles the genuinely empty + failed case).
+    const statsLoading = stats == null && !loadError;
+    const statsError = loadError && stats == null && userstories.length > 0;
+
+    /* ---- Derived values ---------------------------------------------------- */
+
+    const usStatusList = useMemo(() => readSortedStatuses(project), [project]);
+    const defaultUsStatus = readDefaultUsStatus(project, usStatusList);
+    const isKanbanActivated = readIsKanbanActivated(project);
+    const defaultSwimlane = readDefaultSwimlane(project);
+    const iAmAdmin = readIsAdmin(project);
+
+    // F-CQ-06 sidebar filters. The hook keeps the raw `filtersData` facets and the
+    // applied `selectedFilters` (a `Record<dataType, csv-of-values>`); the shared
+    // `UsFiltersMixin` port shapes them into the display structures `FiltersSidebar`
+    // renders. The Backlog uses NO facet exclusions (`excludeFilters = []` in the
+    // legacy `BacklogController`, unlike Kanban which hid `status`), so the STATUS
+    // facet is offered here.
+    const filterDataCollection = useMemo(
+        () => buildDataCollection(filtersData),
+        [filtersData],
+    );
+    const filterCategories = useMemo(
+        () => buildCategories(filterDataCollection, []),
+        [filterDataCollection],
+    );
+    const appliedFilters = useMemo(
+        () => buildSelectedFilters(filterDataCollection, selectedFilters),
+        [filterDataCollection, selectedFilters],
+    );
+
+    // Number of applied FACET filters (the AngularJS `ctrl.selectedFilters.length`
+    // — the count of applied options, NOT the number of populated buckets).
+    const selectedFilterCount = appliedFilters.length;
+
+    // The checked user stories, in backlog order (getUsToMove, main.coffee:769-777).
+    const checkedUserstories = useMemo(
+        () => userstories.filter((us) => checkedIds.includes(us.id)),
+        [userstories, checkedIds],
+    );
+    // The move-to-sprint toolbar is shown only when >=1 story is checked AND at
+    // least one open sprint exists (checkSelected, main.coffee:828-831).
+    const hasSelection = checkedIds.length > 0 && sprints.length > 0;
+
+    // The most recent OPEN sprint (sorted ascending by `estimated_finish`,
+    // getLastSprint) — used to prefill the create-sprint lightbox dates.
+    const lastSprint = useMemo<Milestone | null>(() => {
+        if (sprints.length === 0) {
+            return null;
+        }
+        const sorted = [...sprints].sort((a, b) =>
+            String(a.estimated_finish).localeCompare(String(b.estimated_finish)),
+        );
+        return sorted[sorted.length - 1];
+    }, [sprints]);
+
+    /* ---- Permission gates (the AngularJS `tg-check-permission` directives) -- */
+    const mayAddUs = canAddUs(project);
+    const mayAddMilestone = canAddMilestone(project);
+    const mayModifyUs = canModifyUs(project);
+    // F-REG-03: deleting a sprint is a mutation -> archive-aware gate.
+    const mayDeleteMilestone = canMutate(project, 'delete_milestone');
+
+    /* ====================================================================== *
+     * Toolbar / action callbacks
+     * ====================================================================== */
+
+    // addNewUs (main.coffee:683-691). F-CQ-03 — the two create paths are NOT
+    // interchangeable and must open DISTINCT surfaces (routing 'standard' to the
+    // bulk lightbox — the prior cut — was WRONG):
+    //   - 'standard' broadcast `genericform:new` -> the COMMON module's generic
+    //     US form (AAP §0.2.2 common OOS; its Jade/controller were deleted). C2
+    //     fix (dest#5) reveals an in-scope inline create input that POSTs a single
+    //     story to the SAME `/userstories` endpoint (contract unchanged).
+    //   - 'bulk' broadcast `usform:bulk` -> the in-scope `BulkCreateUsLightbox`
+    //     (AAP §0.4.1), posting to `/userstories/bulk_create`.
+    const addNewUs = useCallback((type: 'standard' | 'bulk') => {
+        if (type === 'bulk') {
+            setLightbox('bulk-us');
+            return;
+        }
+        // C2 fix (dest#5): 'standard' single-create. The AngularJS controller
+        // broadcast `genericform:new` to open the common-module US form; that
+        // module is OOS (AAP §0.2.2) and its Jade/controller were deleted, so we
+        // reveal an inline create input in React and POST to the same
+        // `/userstories` endpoint on submit (contract unchanged).
+        setCreateUsError(null);
+        setNewUsSubject('');
+        setStandardCreateOpen(true);
+    }, []);
+
+    // C2 fix (dest#5): submit the inline standard-create form. Posts a single
+    // user story to `/userstories` (project + subject; the backend applies the
+    // project's `default_us_status`), then refreshes the backlog list + stats —
+    // the React equivalent of the AngularJS `usform:new:success` handler which
+    // reloaded the backlog so the new row appears with its server-assigned
+    // fields (ref, status, order, points). Empty/whitespace subjects are ignored
+    // and `creatingUs` debounces re-entrant submits (mirrors the legacy 2s
+    // submit debounce).
+    const handleSubmitStandardUs = useCallback(
+        async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+            event.preventDefault();
+            const subject = newUsSubject.trim();
+            if (!subject || creatingUs) {
+                return;
+            }
+            if (!Number.isInteger(projectId) || projectId <= 0) {
+                return;
+            }
+            setCreatingUs(true);
+            setCreateUsError(null);
+            try {
+                await createUserStory({ project: projectId, subject });
+                actions.reloadUserstories();
+                actions.reloadStats();
+                setNewUsSubject('');
+                setStandardCreateOpen(false);
+            } catch (err) {
+                setCreateUsError(
+                    err instanceof Error
+                        ? err.message
+                        : 'Could not create the user story.',
+                );
+            } finally {
+                setCreatingUs(false);
+            }
+        },
+        [newUsSubject, creatingUs, projectId, actions],
+    );
+
+    // C2 fix (dest#5): dismiss the inline create input without submitting
+    // (Cancel button / Escape key).
+    const handleCancelStandardCreate = useCallback(() => {
+        setStandardCreateOpen(false);
+        setNewUsSubject('');
+        setCreateUsError(null);
+    }, []);
+
+    // C2 fix (dest#5): Escape closes the inline create input (parity with the
+    // lightboxes' Escape-to-close afforded by `useModalDialog`).
+    const handleStandardCreateKeyDown = useCallback(
+        (event: KeyboardEvent<HTMLInputElement>) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                handleCancelStandardCreate();
+            }
+        },
+        [handleCancelStandardCreate],
+    );
+
+    // addNewSprint (main.coffee:693-694) -> open the sprint lightbox in create mode.
+    const addNewSprint = useCallback(() => {
+        setEditingSprint(null);
+        setLightbox('sprint-create');
+    }, []);
+
+    // Edit-sprint pencil (Sprint -> SprintHeader) -> open the lightbox in edit
+    // mode. Reproduces `$rootScope.$broadcast("sprintform:edit", sprint)`.
+    const handleEditSprint = useCallback((sprint: Milestone) => {
+        setEditingSprint(sprint);
+        setLightbox('sprint-edit');
+    }, []);
+
+    const clearSelection = useCallback(() => {
+        setCheckedIds([]);
+        lastCheckedIdRef.current = null;
+    }, []);
+
+    // Move-to-current-sprint (moveToCurrentSprint, main.coffee:807-810):
+    // target = currentSprint || sprints[0]. Delegates to the hook's
+    // `moveToSprint` thunk (the genuine `bulkUpdateMilestone` use-site, which
+    // reloads sprints + stats), then clears the selection.
+    const moveToCurrentSprint = useCallback(() => {
+        if (checkedUserstories.length === 0 || sprints.length === 0) {
+            return;
+        }
+        const target = currentSprint ?? sprints[0];
+        // F-REG-06: await the move; clear the selection ONLY on success. On
+        // failure the hook has surfaced `moveError` and reconciled the board to
+        // server truth (the optimistically-removed stories return) — keep the
+        // selection so the user can retry rather than losing it silently.
+        void actions
+            .moveToSprint(checkedUserstories, target.id)
+            .then(() => clearSelection())
+            .catch(() => {
+                /* selection intentionally retained on failure */
+            });
+    }, [actions, checkedUserstories, currentSprint, sprints, clearSelection]);
+
+    // Move-to-latest-sprint (moveToLatestSprint, main.coffee:812-813):
+    // target = sprints[0].
+    const moveToLatestSprint = useCallback(() => {
+        if (checkedUserstories.length === 0 || sprints.length === 0) {
+            return;
+        }
+        // F-REG-06: await + clear selection only on success (see moveToCurrentSprint).
+        void actions
+            .moveToSprint(checkedUserstories, sprints[0].id)
+            .then(() => clearSelection())
+            .catch(() => {
+                /* selection intentionally retained on failure */
+            });
+    }, [actions, checkedUserstories, sprints, clearSelection]);
+
+    // toggleTags (main.coffee:501). The AngularJS source persisted the flag via
+    // `rs.userstories.storeShowTags(projectId, value)` and rehydrated it via
+    // `getShowTags(projectId)` on load. The migrated `useBacklog` hook owns
+    // `showTags` in reducer state AND reproduces both halves of that contract
+    // (F-CQ-09): `toggleTags` writes the project-scoped preference to
+    // localStorage, and a mount effect re-reads it on projectId change. The
+    // container therefore just dispatches the toggle; persistence + rehydration
+    // are handled by the hook.
+    const handleToggleTags = useCallback(() => {
+        actions.toggleTags();
+    }, [actions]);
+
+    // Velocity forecasting toggle (toggleVelocityForecasting, main.coffee:244-254).
+    // The forecast math (using `stats.speed`) lives in the reducer/hook; the
+    // container flips the flag and renders the toggle state + forecast region.
+    const handleToggleVelocity = useCallback(() => {
+        actions.toggleVelocity();
+    }, [actions]);
+
+    // Custom-filters sidebar visibility (`toggleActiveFilters`, main.coffee:241-242).
+    const toggleFiltersSidebar = useCallback(() => {
+        setFiltersSidebarOpen((open) => !open);
+    }, []);
+
+    // F-CQ-06 addFilterBacklog (main.coffee:706-708): add the chosen option to the
+    // include/exclude bucket, then reload. `setFilters` replaces the whole
+    // selections map and re-runs the backlog fetch + facet regeneration, so a
+    // single call covers `selectFilter` + `filtersReloadContent` + `generateFilters`.
+    const handleAddFilter = useCallback(
+        (payload: {
+            category: FilterCategory;
+            filter: FilterOption;
+            mode: 'include' | 'exclude';
+        }) => {
+            const next = addFilterSelection(
+                selectedFilters,
+                payload.category.dataType,
+                payload.filter,
+                payload.mode,
+            );
+            actions.setFilters(next);
+        },
+        [actions, selectedFilters],
+    );
+
+    // F-CQ-06 removeFilterBacklog (main.coffee:710-713): drop the applied option
+    // from its bucket, then reload.
+    const handleRemoveFilter = useCallback(
+        (filter: SelectedFilter) => {
+            const next = removeFilterSelection(selectedFilters, filter);
+            actions.setFilters(next);
+        },
+        [actions, selectedFilters],
+    );
+
+    // F-CQ-06 SAVED "custom filters" (named, server-persisted filter SETS) — the
+    // same principled deferral the Kanban board makes: the legacy
+    // `saveCustomFilter`/`selectCustomFilter`/`removeCustomFilter`
+    // (main.coffee via `FiltersMixin`, `controllerMixins.coffee:197-247`) persist
+    // through `filterRemoteStorageService` -> the `/user-storage` endpoint
+    // (`resources.coffee:46`). That service is NOT in the AAP §0.4.1 `shared/api/**`
+    // manifest and belongs to the COMMON module the AAP lists OUT OF SCOPE (§0.2.2),
+    // so there is no in-scope adapter to own saved-filter persistence. The AD-HOC
+    // facet filters above ARE fully implemented (they use the in-scope
+    // `filters_data` endpoint); only the named saved-set feature is deferred, so
+    // the sidebar renders an empty saved-filter list and these three handlers are
+    // documented, AAP-scoped no-ops.
+    const handleSelectCustomFilter = useCallback((_customFilter: CustomFilter) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
+    }, []);
+    const handleRemoveCustomFilter = useCallback((_customFilter: CustomFilter) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
+    }, []);
+    const handleSaveCustomFilter = useCallback((_name: string) => {
+        /* DEFERRED (AAP §0.2.2 common OOS; §0.4.1 no /user-storage adapter). */
+    }, []);
+
+    // Search box (`tg-input-search` -> `ctrl.changeQ`). Binds the `q` text
+    // filter and reloads the backlog with it via `setFilters` — the only
+    // reload-with-filters action the hook exposes (`params.q = @.filterQ`,
+    // main.coffee:353). NOTE: `setFilters` recomputes `activeFilters` from the
+    // filter-key count, so a non-empty search marks filters active (a benign,
+    // arguably-correct effect — search IS an active filter).
+    const handleChangeQ = useCallback(
+        (event: ChangeEvent<HTMLInputElement>) => {
+            const q = event.target.value;
+            setFilterQ(q);
+            const nextFilters: Record<string, string> = { ...selectedFilters };
+            if (q) {
+                nextFilters.q = q;
+            } else {
+                delete nextFilters.q;
+            }
+            actions.setFilters(nextFilters);
+        },
+        [actions, selectedFilters],
+    );
+
+    // Closed-sprints toggle (ToggleExcludeClosedSprintsVisualization,
+    // sprints.coffee:122-165). Toggling to VISIBLE lazily loads the closed
+    // sprints if none are present yet (backlog:load-closed-sprints); toggling to
+    // hidden simply stops rendering them (the source's unload cleared the list,
+    // equivalent for the UI).
+    const toggleClosedSprints = useCallback(() => {
+        setShowClosedSprints((prev) => {
+            const next = !prev;
+            if (next && closedSprints.length === 0) {
+                actions.reloadClosedSprints();
+            }
+            return next;
+        });
+    }, [actions, closedSprints.length]);
+
+    // Burndown graph visibility toggle (ToggleBurndownVisibility, main.coffee:1198).
+    const toggleBurndown = useCallback(() => {
+        setBurndownCollapsed((collapsed) => !collapsed);
+    }, []);
+
+    /* ====================================================================== *
+     * BacklogTable row callbacks
+     * ====================================================================== */
+
+    // onToggleCheck reproduces the shift-range multiselect (main.coffee:819-860):
+    // on a shift-click, select the contiguous range (in rendered backlog order)
+    // between the last checked row and the clicked row; otherwise toggle the
+    // single row. `lastChecked` is updated on every interaction.
+    const handleToggleCheck = useCallback(
+        (us: UserStory, checked: boolean, shiftKey: boolean) => {
+            // M-14 shift-range fix: snapshot the previous anchor HERE, in the
+            // handler body, BEFORE calling `setCheckedIds`. React 18 runs the
+            // functional state updater during the render phase — i.e. AFTER this
+            // synchronous handler body has already executed, including the
+            // `lastCheckedIdRef.current = us.id` assignment at the end. Reading the
+            // ref *inside* the updater therefore observed the just-overwritten value
+            // (the current row's own id), collapsing every shift-range to a single
+            // row (`from === to`) and selecting only the two endpoints. Capturing it
+            // up-front preserves the genuine anchor set by the previous interaction.
+            const lastId = lastCheckedIdRef.current;
+            setCheckedIds((prev) => {
+                const next = new Set(prev);
+
+                if (shiftKey && lastId != null) {
+                    const ids = userstories.map((u) => u.id);
+                    const from = ids.indexOf(lastId);
+                    const to = ids.indexOf(us.id);
+                    if (from !== -1 && to !== -1) {
+                        const lo = Math.min(from, to);
+                        const hi = Math.max(from, to);
+                        for (let i = lo; i <= hi; i += 1) {
+                            next.add(ids[i]);
+                        }
+                    } else if (checked) {
+                        next.add(us.id);
+                    } else {
+                        next.delete(us.id);
+                    }
+                } else if (checked) {
+                    next.add(us.id);
+                } else {
+                    next.delete(us.id);
+                }
+
+                return Array.from(next);
+            });
+            lastCheckedIdRef.current = us.id;
+        },
+        [userstories],
+    );
+
+    // Move a story to the top of the backlog (moveUsToTopOfBacklog, main.coffee:511-521).
+    const handleMoveUsToTop = useCallback(
+        (us: UserStory) => {
+            actions.moveUsToTopOfBacklog(us);
+        },
+        [actions],
+    );
+
+    // Delete a story (deleteUserStory, main.coffee:662-681). F-CQ-03 — this
+    // control was OWNED by the legacy controller: `@confirm.askOnDelete` then
+    // `@repo.remove(us)` (a real `DELETE /userstories/{id}`). The prior React cut
+    // only removed the story from the LOCAL list (no backend DELETE) — the
+    // "delete is local-only" bug. Now: archive-aware `delete_us` gate +
+    // `window.confirm` (the established stand-in for `$confirm.askOnDelete`) +
+    // the hook's `deleteUs` thunk (optimistic remove + `api.del` + reload/rollback).
+    const handleDeleteUs = useCallback(
+        (us: UserStory) => {
+            if (!canMutate(project, 'delete_us')) {
+                return;
+            }
+            const confirmed = window.confirm(
+                `Are you sure you want to delete the user story "${us.subject}"?`,
+            );
+            if (!confirmed) {
+                return;
+            }
+            void actions.deleteUs(us);
+        },
+        [actions, project],
+    );
+
+    // Edit a story. M-13 parity fix: the AngularJS backlog "Edit" option
+    // (`ctrl.editUserStory`) opened the COMMON-module `genericform:edit` dialog
+    // (AAP §0.2.2 common OOS; §0.4.1 defines no React US-edit component). Rather
+    // than a no-op, route to the shell-owned US DETAIL screen — the SAME
+    // destination as the row's subject link and the Kanban card actions — which
+    // owns viewing/editing. Gated on `modify_us` to mirror the affordance itself
+    // (`BacklogTable` renders `UsEditSelector` only under `canModify`,
+    // `tg-check-permission="modify_us"`); the hook's live refresh reflects any
+    // persisted change back into the backlog.
+    const handleEditUs = useCallback(
+        (us: UserStory) => {
+            if (!canModifyUs(project)) {
+                return;
+            }
+            navigateToUserStoryDetail(project?.slug, us.ref);
+        },
+        [project],
+    );
+
+    // Inline status change (tgUsStatus popover). F-CQ-03 — the status popover UI
+    // is reproduced in-scope by `BacklogTable`; the persistence was missing. Now
+    // the container gates `modify_us` (archive-aware) and delegates to the hook's
+    // `updateUsStatus` thunk (optimistic `replaceUs` + `PATCH /userstories/{id}`
+    // { status, version } + reload stats/filters + reload-on-error reconcile).
+    const handleUpdateStatus = useCallback(
+        (us: UserStory, newStatusId: number) => {
+            if (!canMutate(project, 'modify_us')) {
+                return;
+            }
+            void actions.updateUsStatus(us, newStatusId);
+        },
+        [actions, project],
+    );
+
+    // Inline points change (tgBacklogUsPoints estimation edit). F-CQ-03 — the
+    // points editor persists via the hook's `updateUsPoints` thunk (optimistic
+    // `replaceUs` + `PATCH /userstories/{id}` { points, version } + reload stats +
+    // reload-on-error reconcile). The point VALUES come from in-scope
+    // `project.points`, so no common-module estimation service is required. The
+    // container gates `modify_us` (archive-aware); `roleId`/`pointId` are chosen
+    // in the inline popover rendered by `BacklogTable`.
+    const handleUpdatePoints = useCallback(
+        (us: UserStory, roleId: number, pointId: number) => {
+            if (!canMutate(project, 'modify_us')) {
+                return;
+            }
+            void actions.updateUsPoints(us, roleId, pointId);
+        },
+        [actions, project],
+    );
+
+    /* ====================================================================== *
+     * DnD move adapter
+     *
+     * `BacklogDndContext` emits a `BacklogMovePayload` OBJECT on drop; the hook's
+     * `moveUs` thunk takes POSITIONAL arguments. This adapter bridges the two,
+     * preserving the exact `{usList, index, sprint, previousUs, nextUs}` shape.
+     * ====================================================================== */
+    const handleMove = useCallback(
+        (payload: BacklogMovePayload) => {
+            actions.moveUs(
+                payload.usList,
+                payload.index,
+                payload.sprint,
+                payload.previousUs,
+                payload.nextUs,
+            );
+        },
+        [actions],
+    );
+
+    /* ====================================================================== *
+     * Lightbox success handlers (initializeEventHandlers parity, main.coffee:152)
+     * ====================================================================== */
+
+    // BulkCreateUsLightbox onSuccess -> usform:bulk:success (main.coffee:158-166):
+    // insert the created stories at the chosen position + refresh stats.
+    const handleBulkSuccess = useCallback(
+        (result: UserStory[], position: 'top' | 'bottom') => {
+            actions.bulkCreateUs(result, position);
+            setLightbox('none');
+        },
+        [actions],
+    );
+
+    // CreateEditSprintLightbox onCreated -> sprintform:create:success
+    // (main.coffee:170-176): reload sprints + stats, and (if the user chose
+    // stories to move into the new sprint) move them to the current sprint
+    // (sprintform:create:success:callback -> moveToCurrentSprint, main.coffee:815-817).
+    const handleSprintCreated = useCallback(
+        (_createdMilestone: Milestone, ussToMove?: UserStory[]) => {
+            // F-REG-07: delegate to the hook's `finishSprintCreation`, which
+            // AWAITS the sprint reload and only THEN moves the chosen stories
+            // into `currentSprint || sprints[0]` computed from the REFRESHED
+            // list — faithful to `sprintform:create:success` →
+            // `moveToCurrentSprint` (main.coffee:170-176,807-817). The previous
+            // version fired `reloadSprints()` WITHOUT awaiting it and computed
+            // the target from STALE pre-create `currentSprint`/`sprints`, so the
+            // stories went to the wrong (old) sprint and the just-created
+            // milestone was ignored.
+            void actions.finishSprintCreation(ussToMove);
+            setLightbox('none');
+        },
+        [actions],
+    );
+
+    // onSaved -> sprintform:edit:success (main.coffee:189-190). The lightbox has
+    // already persisted the edit; reload the sprint lists (open + closed, so an
+    // edit that flips `closed` is reflected) and the project stats.
+    const handleSprintSaved = useCallback(
+        (_milestone: Milestone) => {
+            actions.reloadSprints();
+            actions.reloadClosedSprints();
+            actions.reloadStats();
+            setLightbox('none');
+        },
+        [actions],
+    );
+
+    // onRemoved -> sprintform:remove:success (main.coffee:192-203). Here the
+    // CONTAINER owns the actual removal: the hook's `removeSprint` performs the
+    // DELETE and reloads sprints/closed-sprints/userstories/stats.
+    const handleSprintRemoved = useCallback(
+        (milestone: Milestone) => {
+            void actions.removeSprint(milestone.id);
+            setLightbox('none');
+        },
+        [actions],
+    );
+
+    const closeLightbox = useCallback(() => {
+        setLightbox('none');
+    }, []);
+
+    /* ====================================================================== *
+     * Guards (rendered AFTER every hook so hook order stays stable)
+     * ====================================================================== */
+
+    // F-REG-01: while the project id is being resolved from the URL slug via `GET
+    // /projects/by_slug`, render a transient, accessible LOADING shell so the
+    // backlog is never a permanent blank during the lookup.
+    if (!projectIdValid && projectResolving) {
+        return (
+            <div className="wrapper" data-tg-react-backlog="resolving" aria-busy="true">
+                <div className="loading-spinner" role="status" aria-live="polite">
+                    <span>Loading...</span>
+                </div>
+            </div>
+        );
+    }
+
+    // A malformed / unresolvable `project-id`: render a minimal, inert host.
+    if (!projectIdValid) {
+        return <div className="wrapper" data-tg-react-backlog="invalid-project" />;
+    }
+
+    // F-AAP-10: a genuine load FAILURE (initial or refresh) with no content to
+    // show renders a DISTINCT error state — never the empty-backlog CTA, which
+    // would misrepresent a failure as a successful empty screen. The retry
+    // button re-runs the centralized, awaited load (`actions.reload`). When the
+    // board already has content, a failed live refresh does NOT blank the screen
+    // (the flag is set but this gate only fires on an empty board).
+    if (loadError && userstories.length === 0) {
+        return (
+            <div className="wrapper">
+                <main className="main scrum">
+                    <section className="backlog">
+                        <div className="empty-large js-backlog-load-error" role="alert">
+                            <p className="title">The backlog could not be loaded.</p>
+                            <button
+                                type="button"
+                                className="button button-green js-backlog-retry"
+                                onClick={() => {
+                                    void actions.reload();
+                                }}
+                            >
+                                Try again
+                            </button>
+                        </div>
+                    </section>
+                </main>
+            </div>
+        );
+    }
+
+    // `is_backlog_activated` gate (loadProject, main.coffee:472-473): once the
+    // project has loaded and the backlog is NOT activated, render an empty
+    // state. (Before load, `isBacklogActivated` defaults to true, so there is no
+    // empty-state flash while data is in flight.)
+    if (project && !isBacklogActivated) {
+        return (
+            <div className="wrapper">
+                <main className="main scrum">
+                    <section className="backlog">
+                        <div className="empty-large">
+                            <p className="title">The backlog is not activated for this project.</p>
+                        </div>
+                    </section>
+                </main>
+            </div>
+        );
+    }
+
+    /* ====================================================================== *
+     * Render — reproduces backlog.jade + sprints.jade (exact class names/ids)
+     * ====================================================================== */
+
+    return (
+        <div className="wrapper">
+            <main className="main scrum">
+                {/*
+                  F-AAP-03 (dest#8): dismissible error toast for a REJECTED drag
+                  reorder / move / single-story mutation. Previously the hook set
+                  `moveError` and silently reconciled the board, so the user got no
+                  feedback. It reuses Taiga's existing global error-banner SCSS
+                  (.notification-message-error) and is fixed-positioned, so its
+                  placement in the tree is layout-neutral; it renders nothing while
+                  `moveError` is null. Dismiss clears the state (board already
+                  reconciled to server truth at failure time).
+                */}
+                <NotificationError message={moveError} onClose={actions.clearMoveError} />
+                {/*
+                  Group B fix (dest#3): a SINGLE <BacklogDndContext> provider now
+                  encloses BOTH the backlog <section> (draggable story rows via
+                  <BacklogTable>) AND the sprint sidebar (<Sprint> drop zones of
+                  type:'sprint';sprintId). Previously the provider wrapped only
+                  <BacklogTable>, so the sprint drop targets had no @dnd-kit
+                  ancestor at runtime and dropping a story into a sprint
+                  (bulk_update_milestone) was unreachable. Lifting the boundary is
+                  layout-neutral: @dnd-kit's <DndContext> renders no DOM wrapper and
+                  <DragOverlay> is a portal/overlay. `project` may be null before
+                  load (prop widened to Project|null); the provider is inert then
+                  (no draggables/droppables exist yet). Each consumer keeps its own
+                  `{project && …}` guard, so BacklogTable/Sprint still receive a
+                  non-null project.
+                */}
+                <BacklogDndContext
+                    project={project}
+                    canModifyUs={mayModifyUs}
+                    userstories={userstories}
+                    sprints={sprints}
+                    selectedUsIds={checkedIds}
+                    onMove={handleMove}
+                >
+                <section className="backlog">
+                    {/*
+                      F-VIS-03: the section page title. The retired `backlog.jade`
+                      opened `section.backlog` with `include mainTitle` — a
+                      `header > h1(tg-main-title i18n-section-name)` rendering the
+                      translated `BACKLOG.SECTION_NAME` ("Scrum") as the page's
+                      top-level heading. The React port had dropped this `h1` and
+                      (via the reverted N-11 tweak) promoted "Backlog" to level 1,
+                      losing the baseline "Scrum" heading. It is restored here as a
+                      real `<h1>` so the global `h1` typography + baseline hierarchy
+                      match exactly (Scrum = h1, Backlog = h2 below, Sprints = h1 in
+                      the sidebar). Mirrors the Kanban header (`KanbanApp` renders
+                      the identical `<header><h1>{SECTION_NAME}</h1></header>`).
+                    */}
+                    <header>
+                        <h1>{translate('BACKLOG.SECTION_NAME', undefined, 'Scrum')}</h1>
+                    </header>
+                    {/*
+                      Burndown / summary region (tg-toggle-burndown-visibility).
+                      F-CQ-04: the `loading`/`error` classes let the retained
+                      summary SCSS dim the meter while stats are in flight or a
+                      refresh failed (the last-known numbers are kept, never
+                      blanked). `aria-busy` mirrors the loading state for AT.
+                    */}
+                    <div
+                        className={`backlog-summary${statsLoading ? ' loading' : ''}${
+                            statsError ? ' error' : ''
+                        }`}
+                        aria-busy={statsLoading}
+                    >
+                        <div className="summary">
+                            {/*
+                              F-CQ-04: the REAL backlog-summary progress meter
+                              (`ProgressBar`, the port of `tgBacklogProgressBar` +
+                              `progress-bar.jade`). It was implemented but never
+                              mounted — the container rendered an empty
+                              `.summary-progress-bar` placeholder, so the meter was
+                              always blank. It now receives the live `stats`
+                              (structurally a `ProgressBarStats`) and computes the
+                              two sub-bar widths itself; a null `stats` renders 0%
+                              bars (its documented pre-load behavior).
+                            */}
+                            <ProgressBar stats={stats} />
+
+                            <div className="data">
+                                <span className="number">
+                                    {(stats?.completedPercentage ?? 0)}%
+                                </span>
+                            </div>
+
+                            {stats?.total_points != null && (
+                                <div className="summary-stats">
+                                    <span className="number">{formatNumber(stats.total_points)}</span>
+                                    <span className="description">
+                                        {renderBrLabel(
+                                            translate(
+                                                'BACKLOG.SUMMARY.PROJECT_POINTS',
+                                                undefined,
+                                                'project<br />points',
+                                            ),
+                                        )}
+                                    </span>
+                                </div>
+                            )}
+                            <div className="summary-stats">
+                                <span className="number">{formatNumber(stats?.defined_points)}</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.DEFINED_POINTS',
+                                            undefined,
+                                            'defined<br />points',
+                                        ),
+                                    )}
+                                </span>
+                            </div>
+                            <div className="summary-stats">
+                                <span className="number">{formatNumber(stats?.closed_points)}</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.CLOSED_POINTS',
+                                            undefined,
+                                            'closed<br />points',
+                                        ),
+                                    )}
+                                </span>
+                            </div>
+                            <div className="summary-stats">
+                                {/* Speed uses the legacy `| number:0` (0 fraction digits). */}
+                                <span className="number">{formatNumber(stats?.speed, 0)}</span>
+                                <span className="description">
+                                    {renderBrLabel(
+                                        translate(
+                                            'BACKLOG.SUMMARY.POINTS_PER_SPRINT',
+                                            undefined,
+                                            'points /<br />sprint',
+                                        ),
+                                    )}
+                                </span>
+                            </div>
+
+                            {!showGraphPlaceholder && (
+                                <button
+                                    type="button"
+                                    className={`stats js-toggle-burndown-visibility-button${
+                                        burndownCollapsed ? '' : ' active'
+                                    }`}
+                                    title="Toggle backlog graph"
+                                    onClick={toggleBurndown}
+                                >
+                                    <TgIcon name="icon-graph" />
+                                </button>
+                            )}
+                        </div>
+
+                        {showGraphPlaceholder && iAmAdmin && (
+                            <div className="empty-burndown">
+                                <TgIcon name="icon-graph" />
+                                <div className="empty-text">
+                                    <p className="title">Customize your burndown graph</p>
+                                    <p>Configure the project modules to display the burndown chart.</p>
+                                </div>
+                            </div>
+                        )}
+
+                        {/*
+                          Burndown CHART (the plotted graph). QA dest#6 / w023#4:
+                          the legacy chart (`tgBurndownBacklogGraph`, retired
+                          backlog/main.coffee) plotted five series via the jQuery
+                          Flot plugin (`element.plot(data, options)`). Flot — or
+                          any charting library — is NOT in the AAP React dependency
+                          inventory (§0.5.1) and the Minimal Change Clause (§0.7.1)
+                          forbids adding one, so `BurndownChart` reproduces the SAME
+                          five series (zero baseline, optimal, evolution, client &
+                          team increments) as a dependency-free inline SVG. It reads
+                          the ALREADY-fetched `stats.milestones` slice
+                          (`useBacklog.reloadStats` → GET /projects/{id}/stats), so
+                          no new burndown-data request and no contract change are
+                          introduced. `burndown.scss` is retained as REFERENCE
+                          (§0.2.1); the collapse classes (`shown open`) + toggle
+                          above and the admin `empty-burndown` hint remain intact.
+                        */}
+                        <div
+                            className={`graphics-container js-burndown-graph${
+                                burndownCollapsed ? '' : ' shown open'
+                            }`}
+                        >
+                            <div className="burndown">
+                                <BurndownChart milestones={stats?.milestones} />
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Backlog table + toolbar. */}
+                    <div className="backlog-table">
+                        <div className="backlog-top">
+                            <div className="backlog-menu">
+                                <div className="backlog-header">
+                                    <div className="backlog-header-title">
+                                        {/*
+                                          F-VIS-03: "Backlog" is the section's SECOND
+                                          heading (`<h2>`), subordinate to the "Scrum"
+                                          `<h1>` restored at the top of `section.backlog`
+                                          above — exactly as the baseline `backlog.jade`
+                                          rendered it (`h2 Backlog`). The earlier N-11
+                                          `aria-level={1}` promotion is removed: per D1
+                                          the committed AngularJS baseline is the
+                                          authoritative design contract, and it renders
+                                          Scrum=h1 / Backlog=h2 / Sprints=h1.
+                                        */}
+                                        <h2>Backlog</h2>
+                                        {selectedFilterCount > 0 ? (
+                                            <>
+                                                <span className="backlog-stories-number squared">
+                                                    {userstories.length}
+                                                </span>
+                                                <span className="backlog-stories-number">
+                                                    {totalUserStories} stories (filtered)
+                                                </span>
+                                            </>
+                                        ) : (
+                                            <span className="backlog-stories-number">
+                                                {totalUserStories} stories
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="backlog-header-options">
+                                        {/* addnewus include (add user story buttons). */}
+                                        <div className="new-us">
+                                            {mayAddUs && (
+                                                <button
+                                                    type="button"
+                                                    className="btn-small"
+                                                    onClick={() => addNewUs('standard')}
+                                                >
+                                                    <TgIcon name="icon-add" />
+                                                    <span className="text">Add</span>
+                                                </button>
+                                            )}
+                                            {mayAddUs && (
+                                                <button
+                                                    type="button"
+                                                    className="btn-icon"
+                                                    aria-label="Add user stories in bulk"
+                                                    onClick={() => addNewUs('bulk')}
+                                                >
+                                                    <TgIcon name="icon-bulk" />
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="backlog-table-options">
+                                    <div className="backlog-table-options-start">
+                                        <button
+                                            type="button"
+                                            className={`btn-filter e2e-open-filter${
+                                                filtersSidebarOpen ? ' active' : ''
+                                            }`}
+                                            id="show-filters-button"
+                                            onClick={toggleFiltersSidebar}
+                                        >
+                                            <TgIcon name="icon-filters" />
+                                            <span className="text">
+                                                {filtersSidebarOpen ? 'Hide filters' : 'Filters'}
+                                            </span>
+                                            {selectedFilterCount > 0 && (
+                                                <span className="selected-filters">
+                                                    {selectedFilterCount}
+                                                </span>
+                                            )}
+                                        </button>
+
+                                        {/* F-VIS-02: the host is the `<tg-input-search>`
+                                            custom element (was a plain
+                                            `<input class="tg-input-search">`), so the
+                                            retained `.backlog-table-options-start
+                                            tg-input-search` TAG selector matches — the
+                                            box collapses to its compact ~185px baseline
+                                            width. The magnifier is emitted through the
+                                            shared `TgSvg` primitive (a real `<tg-svg>`
+                                            host) so `tg-input-search tg-svg` paints it
+                                            teal, 14×14, absolutely positioned at the
+                                            right edge (mirrors the Kanban search fix).
+                                            The input keeps its id/name/binding/label. */}
+                                        <tg-input-search>
+                                            <input
+                                                id="backlog-search"
+                                                name="backlog-search"
+                                                type="text"
+                                                value={filterQ}
+                                                onChange={handleChangeQ}
+                                                placeholder="Search"
+                                                aria-label="Search backlog"
+                                            />
+                                            <TgSvg icon="icon-search" />
+                                        </tg-input-search>
+
+                                        {userstories.length > 0 && (
+                                            <div className="display-tags-button" id="show-tags">
+                                                <div className={`check js-check${showTags ? ' active' : ''}`}>
+                                                    <input
+                                                        type="checkbox"
+                                                        id="show-tags-input"
+                                                        checked={showTags}
+                                                        onChange={handleToggleTags}
+                                                    />
+                                                    <div />
+                                                </div>
+                                                <label htmlFor="show-tags-input">Show tags</label>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="backlog-table-options-end">
+                                        {hasSelection && currentSprint && (
+                                            <button
+                                                type="button"
+                                                className="btn-filter move-to-current-sprint move-to-sprint e2e-move-to-sprint"
+                                                id="move-to-current-sprint"
+                                                title="Move user stories to the current sprint"
+                                                onClick={moveToCurrentSprint}
+                                            >
+                                                <span className="text">Move to current sprint</span>
+                                                <TgIcon name="icon-add-to-sprint" />
+                                            </button>
+                                        )}
+                                        {hasSelection && !currentSprint && (
+                                            <button
+                                                type="button"
+                                                className="btn-filter move-to-latest-sprint move-to-sprint e2e-move-to-sprint"
+                                                id="move-to-latest-sprint"
+                                                title="Move user stories to the latest sprint"
+                                                onClick={moveToLatestSprint}
+                                            >
+                                                <span className="text">Move to latest sprint</span>
+                                                <TgIcon name="icon-add-to-sprint" />
+                                            </button>
+                                        )}
+
+                                        {userstories.length > 0 && displayVelocity && mayAddMilestone && (
+                                            <button
+                                                type="button"
+                                                className="btn-filter active velocity-forecasting-btn e2e-velocity-forecasting"
+                                                title="Forecasting"
+                                                onClick={handleToggleVelocity}
+                                            >
+                                                <TgIcon name="icon-fold-column" />
+                                                <span className="text">Backlog</span>
+                                            </button>
+                                        )}
+                                        {userstories.length > 0 &&
+                                            !displayVelocity &&
+                                            (stats?.speed ?? 0) > 0 &&
+                                            mayAddMilestone && (
+                                                <button
+                                                    type="button"
+                                                    className="btn-filter velocity-forecasting-btn e2e-velocity-forecasting"
+                                                    title="Backlog"
+                                                    onClick={handleToggleVelocity}
+                                                >
+                                                    Forecasting
+                                                </button>
+                                            )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Inline standard single-story create input. Revealed by
+                            the "Add" button (`addNewUs('standard')`) and the
+                            empty-state "Create your first user story" button; the
+                            subject is submitted to `POST /userstories` on Enter /
+                            Create.
+
+                            F-VIS-07 — DOCUMENTED SCOPE-LIMITED DEVIATION (not a
+                            defect): the AngularJS Backlog's "+ USER STORY" opened a
+                            RICH two-column modal (subject/tags/description/
+                            attachments on the left; status/swimlane/location/
+                            assign/points-per-role on the right). That modal was the
+                            shared COMMON-module `genericform:new`/`lightbox-us`
+                            lightbox, which is explicitly OUT OF SCOPE (AAP §0.2.2 —
+                            "common … modules are likewise out of scope") and is NOT
+                            among the components the AAP directs this migration to
+                            create (§0.3.1 lists only `BulkCreateUsLightbox` for the
+                            Backlog create surfaces). Reproducing that rich modal
+                            here would add net-new UI beyond the migration and so
+                            violate the Minimal Change Clause (§0.7.1). This inline
+                            quick-add therefore reproduces the IN-SCOPE create
+                            capability (subject → `POST /userstories`); the richer
+                            fields remain reachable via the in-scope bulk-create
+                            lightbox (status/swimlane/location) and via full editing
+                            on the shell-owned US-detail screen. This mirrors the
+                            rigor of the M-11/M-12 card Edit/Assign navigation
+                            deviations. */}
+                        {standardCreateOpen && (
+                            <form
+                                className="new-us-inline"
+                                onSubmit={handleSubmitStandardUs}
+                            >
+                                <input
+                                    type="text"
+                                    className="new-us-inline-subject"
+                                    name="new-us-subject"
+                                    aria-label="New user story subject"
+                                    placeholder="New user story subject"
+                                    value={newUsSubject}
+                                    onChange={(e) => setNewUsSubject(e.target.value)}
+                                    onKeyDown={handleStandardCreateKeyDown}
+                                    disabled={creatingUs}
+                                    autoFocus
+                                />
+                                <button
+                                    type="submit"
+                                    className="btn-small"
+                                    disabled={
+                                        creatingUs || newUsSubject.trim().length === 0
+                                    }
+                                >
+                                    <span className="text">
+                                        {creatingUs ? 'Creating…' : 'Create'}
+                                    </span>
+                                </button>
+                                <button
+                                    type="button"
+                                    className="btn-small btn-cancel"
+                                    onClick={handleCancelStandardCreate}
+                                    disabled={creatingUs}
+                                >
+                                    <span className="text">Cancel</span>
+                                </button>
+                                {createUsError && (
+                                    <span className="new-us-inline-error" role="alert">
+                                        {createUsError}
+                                    </span>
+                                )}
+                            </form>
+                        )}
+
+                        <div className={`backlog-manager${filtersSidebarOpen ? '' : ' expanded'}`}>
+                            {filtersSidebarOpen && (
+                                <div className="backlog-filter" id="backlog-filter">
+                                    {/*
+                                      F-CQ-06: the shared `<tg-filter>` panel, reproduced by
+                                      the reused presentational `FiltersSidebar`. The retired
+                                      `backlog.jade` hosted the identical component here
+                                      (`.backlog-filter > tg-filter` with the same
+                                      `filters`/`custom-filters`/`selected-filters` inputs and
+                                      `on-*` outputs); the data is shaped by the shared
+                                      `UsFiltersMixin` port (`../shared/filters`). The Backlog
+                                      applies NO facet exclusions, so ALL facets (incl. status)
+                                      are offered. Saved custom filters are an AAP-scoped
+                                      deferral (see the handler comments above), hence
+                                      `customFilters={[]}`.
+                                    */}
+                                    <FiltersSidebar
+                                        filters={filterCategories}
+                                        customFilters={[]}
+                                        selectedFilters={appliedFilters}
+                                        onAddFilter={handleAddFilter}
+                                        onRemoveFilter={handleRemoveFilter}
+                                        onSelectCustomFilter={handleSelectCustomFilter}
+                                        onRemoveCustomFilter={handleRemoveCustomFilter}
+                                        onSaveCustomFilter={handleSaveCustomFilter}
+                                    />
+                                </div>
+                            )}
+
+                            <section
+                                className={`backlog-table${userstories.length === 0 ? ' hidden' : ''}`}
+                            >
+                                {/* Group B fix (dest#3): the <BacklogDndContext>
+                                    provider was lifted up to <main> (see comment
+                                    there) so it also encloses the sprint sidebar.
+                                    <BacklogTable> keeps its own `{project && …}`
+                                    guard so it still receives a non-null project. */}
+                                {project && (
+                                        <BacklogTable
+                                            userstories={userstories}
+                                            statuses={usStatusList}
+                                            project={project}
+                                            showTags={showTags}
+                                            activeFilters={filtersSidebarOpen}
+                                            displayVelocity={displayVelocity}
+                                            /* F-VIS-04: doomline inputs — the port of
+                                               `linkDoomLine` in BacklogTable walks the
+                                               rows accumulating `us.total_points` from
+                                               an `assigned_points` offset and marks the
+                                               row where the running sum first exceeds
+                                               the project `total_points`. */
+                                            totalPoints={stats?.total_points}
+                                            assignedPoints={stats?.assigned_points}
+                                            checkedIds={checkedIds}
+                                            visibleUserStories={
+                                                displayVelocity ? visibleUserStories : undefined
+                                            }
+                                            firstUsInBacklog={firstUsInBacklog}
+                                            /* F-CQ-05: spinner while a page fetch is in flight. */
+                                            loading={loadingUserstories}
+                                            /* F-CQ-05: mount the infinite-scroll sentinel ONLY while
+                                               more pages remain; omitting `onLoadMore` when
+                                               `disablePagination` unmounts the sentinel so no further
+                                               fetches are attempted (the last page had no
+                                               `x-pagination-next`). */
+                                            onLoadMore={
+                                                disablePagination ? undefined : actions.loadMore
+                                            }
+                                            onEditUs={handleEditUs}
+                                            onDeleteUs={handleDeleteUs}
+                                            onMoveUsToTop={handleMoveUsToTop}
+                                            onToggleCheck={handleToggleCheck}
+                                            onUpdateStatus={handleUpdateStatus}
+                                            onUpdatePoints={handleUpdatePoints}
+                                        />
+                                )}
+
+                                {displayVelocity && (
+                                    <div className="forecasting-add-sprint e2e-velocity-forecasting-add">
+                                        <span className="forecasting-text">
+                                            {forecastNewSprint
+                                                ? 'A new sprint is forecasted for these stories.'
+                                                : 'These stories fit in the current sprint.'}
+                                        </span>
+                                        {forecastNewSprint && mayAddMilestone && (
+                                            <button
+                                                type="button"
+                                                className="button btn-link"
+                                                onClick={addNewSprint}
+                                            >
+                                                <TgIcon name="icon-add" />
+                                                <span className="text">Add new sprint</span>
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                            </section>
+
+                            {/* No-match empty state (a filter is active but nothing matches). */}
+                            <div
+                                className={`empty-backlog js-empty-backlog${
+                                    userstories.length > 0 || filterQ.length === 0 ? ' hidden' : ''
+                                }`}
+                            >
+                                <p className="no-match">No user stories match your search.</p>
+                                <p className="no-match-help">Try a different search term or filter.</p>
+                            </div>
+
+                            {/* Empty-backlog CTA (no stories and no active search). */}
+                            <div
+                                className={`empty-large js-empty-backlog${
+                                    userstories.length > 0 || filterQ.length > 0 ? ' hidden' : ''
+                                }`}
+                            >
+                                <p className="title">Your backlog is empty.</p>
+                                {mayAddUs && (
+                                    <button
+                                        type="button"
+                                        className="btn-small"
+                                        title="Create a new user story"
+                                        onClick={() => addNewUs('standard')}
+                                    >
+                                        <TgIcon name="icon-add" />
+                                        <span className="text">Create your first user story</span>
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                {/* Sprint sidebar (sprints.jade). `sidebar` is a non-standard tag in
+                    the Jade; rendered as a <div class="sidebar"> for DOM validity. */}
+                <div className="sidebar">
+                    <section className="sprints">
+                        <header className="sprint-header">
+                            {/*
+                              F-VIS-03: the sidebar "Sprints" heading is an `<h1>`
+                              (the `.sprints h1` rule + global h1 typography size it,
+                              and `.sprints h1 .title` uppercases it to the baseline
+                              "SPRINTS"). The earlier N-11 `aria-level={2}` override is
+                              removed: per D1 the committed baseline is authoritative
+                              and renders this sidebar title as a level-1 heading.
+                            */}
+                            <h1>
+                                {totalMilestones > 0 && (
+                                    <span className="number">{totalMilestones}</span>
+                                )}
+                                <span className="title">Sprints</span>
+                            </h1>
+                            {totalMilestones > 0 && mayAddMilestone && (
+                                <button
+                                    type="button"
+                                    className="btn-link"
+                                    title="Add a new sprint"
+                                    onClick={addNewSprint}
+                                >
+                                    <span>Add</span>
+                                    <TgIcon name="icon-add" />
+                                </button>
+                            )}
+                        </header>
+
+                        {totalMilestones === 0 && (
+                            <div className="empty-small">
+                                <p className="title">You have no sprints yet.</p>
+                                {mayAddMilestone && (
+                                    <button
+                                        type="button"
+                                        className="btn-link"
+                                        onClick={addNewSprint}
+                                    >
+                                        <span>New sprint</span>
+                                        <TgIcon name="icon-add" />
+                                    </button>
+                                )}
+                            </div>
+                        )}
+
+                        {project &&
+                            sprints.map((sprint) => (
+                                <div className="sprint sprint-open" key={sprint.id}>
+                                    <Sprint
+                                        project={project}
+                                        sprint={sprint}
+                                        onEditSprint={handleEditSprint}
+                                    />
+                                </div>
+                            ))}
+
+                        {totalClosedMilestones > 0 && (
+                            <button
+                                type="button"
+                                className="filter-closed-sprints"
+                                onClick={toggleClosedSprints}
+                            >
+                                <TgIcon name="icon-folder" />
+                                <span className="text">
+                                    {showClosedSprints ? 'Hide closed sprints' : 'Show closed sprints'}
+                                </span>
+                            </button>
+                        )}
+
+                        {project &&
+                            showClosedSprints &&
+                            closedSprints.map((sprint) => (
+                                <div className="sprint sprint-closed" key={sprint.id}>
+                                    <Sprint
+                                        project={project}
+                                        sprint={sprint}
+                                        onEditSprint={handleEditSprint}
+                                    />
+                                </div>
+                            ))}
+                    </section>
+                </div>
+                </BacklogDndContext>
+            </main>
+
+            {/*
+             * Lightboxes (toggled by container state via the `lightbox` value).
+             *
+             * Group D fix (dest#7 / w023#5): each inner lightbox component already
+             * renders its OWN `.lightbox lightbox-<type>` root element, toggling the
+             * `open` class itself (`className={`lightbox …${open ? ' open' : ''}`}`)
+             * and wiring `role="dialog"` + `aria-modal` + `useModalDialog` (focus
+             * trap, Escape-to-close, focus restoration). Previously these components
+             * were wrapped in a STATIC outer `<div className="lightbox lightbox-…">`
+             * that carried the `lightbox` class WITHOUT `open`. Per the shared
+             * `@mixin lightbox` (styles/dependencies/mixins/lightbox.scss) a bare
+             * `.lightbox` is `display:none`, and a `display:none` ancestor removes its
+             * whole subtree from layout — so even though the inner element correctly
+             * became `.lightbox.open` (`display:flex`), it was collapsed to a 0×0,
+             * invisible box and could never be seen or interacted with. Removing the
+             * redundant outer wrappers lets each inner component's own `.lightbox.open`
+             * root be the top-level lightbox element and render full-screen as designed.
+             */}
+            {project && (
+                <BulkCreateUsLightbox
+                    open={lightbox === 'bulk-us'}
+                    projectId={projectId}
+                    defaultStatusId={defaultUsStatus}
+                    statuses={usStatusList}
+                    swimlanes={swimlanesList}
+                    isKanbanActivated={isKanbanActivated}
+                    defaultSwimlane={defaultSwimlane}
+                    onSuccess={handleBulkSuccess}
+                    onClose={closeLightbox}
+                />
+            )}
+
+            <CreateEditSprintLightbox
+                open={lightbox === 'sprint-create' || lightbox === 'sprint-edit'}
+                mode={lightbox === 'sprint-edit' ? 'edit' : 'create'}
+                sprint={editingSprint}
+                projectId={projectId}
+                canDeleteMilestone={mayDeleteMilestone}
+                lastSprint={lastSprint}
+                onCreated={handleSprintCreated}
+                onSaved={handleSprintSaved}
+                onRemoved={handleSprintRemoved}
+                onClose={closeLightbox}
+            />
+        </div>
+    );
+};

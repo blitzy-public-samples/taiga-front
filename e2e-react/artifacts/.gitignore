@@ -1,0 +1,10 @@
+# Curated visual evidence under baseline/ and react/ (screenshots, fingerprints,
+# manifests) IS committed — this file does NOT ignore it. It ONLY excludes the
+# Playwright RUNTIME output that `npm run e2e` regenerates and that must never be
+# committed as evidence (F-SEC-01, CWE-532/CWE-200): the per-phase output/
+# folder (videos/traces/last-run) and the generated HTML report/. This is the
+# targeted opposite of the legacy "ignore the whole directory" trick — it keeps
+# the curated evidence tracked while keeping regenerated, potentially
+# credential-bearing runtime files out of version control.
+*/output/
+report/
