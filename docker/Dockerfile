@@ -67,7 +67,27 @@ RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.co
 # install from the committed lockfile first (fails fast on a stale lock —
 # this is WHY package-lock.json is regenerated in the root)
 COPY package.json package-lock.json ./
-RUN npm ci
+# [C-01] Deterministic install: `--ignore-scripts` skips package lifecycle
+# (pre/post-install) scripts during `npm ci`. This is REQUIRED for a reproducible,
+# non-hanging build inside this hermetic node:16.19.1 stage. gulp-imagemin's transitive
+# image optimizers — gifsicle@5.1.0, mozjpeg@6, optipng-bin@6 — each run a postinstall
+# that downloads a prebuilt platform binary from a remote host, and that fetch stalls
+# indefinitely here (no fail-fast timeout), hanging `npm ci`. Skipping install scripts
+# is safe and does NOT break the build because:
+#   * esbuild's native binary is delivered by its @esbuild/linux-x64 optionalDependency
+#     (a normal package install that ships the statically-linked Go binary inside its
+#     tarball), NOT by esbuild's own postinstall — so the react-app.js esbuild build in
+#     `npx gulp deploy` still works.
+#   * dart-sass (sass@1.77.8, the node-sass replacement) is pure JS — no native postinstall.
+#   * gulp-imagemin degrades gracefully when an optimizer binary is absent: it logs
+#     "Couldn't load default plugin" and passes images through unoptimized, so
+#     `npx gulp deploy` still emits a COMPLETE dist/ (verified: full image set, every JS
+#     bundle, and theme-taiga.css all build with these binaries absent; the source tree
+#     has zero .gif assets, so gifsicle has nothing to optimize regardless).
+#   * No dependency is dropped — gulp-imagemin / gifsicle / mozjpeg / optipng-bin all
+#     remain installed (AAP §0.5.1 "no dependency removal"); only their network
+#     binary-fetch postinstall is skipped.
+RUN npm ci --ignore-scripts
 
 # copy the rest of the source and build:
 # coffee + jade + elements + NEW esbuild react-app.js + themes

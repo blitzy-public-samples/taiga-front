@@ -174,6 +174,17 @@ export function BulkUserStoriesLightbox(
         useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState<boolean>(false);
+    // [M11] SYNCHRONOUS single-write latch. The `submitting` STATE above drives
+    // the disabled/busy affordance on the Save button, but React state updates
+    // asynchronously: a rapid second activation (double-click, or click+Enter)
+    // dispatched BEFORE the re-render still observes the stale `submitting ===
+    // false` in this callback's closure, so a state-only guard lets a second
+    // `bulkCreate` through and persists duplicate stories (QF-M11). A ref mutates
+    // synchronously and is shared across renders, so the first submit latches it
+    // to `true` before awaiting and every subsequent call sees `true` and bails —
+    // the same single-write guarantee the Kanban parent gets from
+    // `bulkSubmittingRef` (KanbanApp `submitBulk`).
+    const submittingRef = useRef<boolean>(false);
 
     // Focus target for validation errors (ports checksley focusing the invalid field).
     const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -252,8 +263,11 @@ export function BulkUserStoriesLightbox(
         async (event: FormEvent<HTMLFormElement>): Promise<void> => {
             event.preventDefault();
 
-            // Anti-double-submit guard (replaces the CoffeeScript `debounce 2000`).
-            if (submitting) {
+            // [M11] Anti-double-submit guard (replaces the CoffeeScript `debounce
+            // 2000`). This MUST read the synchronous ref, not the `submitting`
+            // state — a rapid second activation before the re-render would still
+            // see the stale state value and slip a duplicate `bulkCreate` through.
+            if (submittingRef.current) {
                 return;
             }
 
@@ -275,6 +289,9 @@ export function BulkUserStoriesLightbox(
             }
 
             setError(null);
+            // Latch the synchronous guard BEFORE any await so a concurrent second
+            // activation dispatched in the same tick observes it immediately.
+            submittingRef.current = true;
             setSubmitting(true);
             try {
                 // BL-01: create the stories into the chosen swimlane when the
@@ -293,10 +310,14 @@ export function BulkUserStoriesLightbox(
                 // slot (ports form.setErrors + $confirm.notify, L378-388).
                 setError(t("LIGHTBOX.BULK.CREATE_ERROR", GENERIC_ERROR_MESSAGE));
             } finally {
+                // Release the synchronous latch and the busy state together so a
+                // legitimate retry after an error (the lightbox stays open) is
+                // allowed once the in-flight write has settled.
+                submittingRef.current = false;
                 setSubmitting(false);
             }
         },
-        [submitting, bulk, project.id, statusId, swimlaneId, usPosition, onCreated, onClose],
+        [bulk, project.id, statusId, swimlaneId, usPosition, onCreated, onClose],
     );
 
     return (

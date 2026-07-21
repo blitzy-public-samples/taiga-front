@@ -1335,6 +1335,13 @@ interface BulkLightboxProps {
     onClose: () => void;
     /** Inline error surfaced when a bulk-create request fails (QA-FUNC-06). */
     error?: string | null;
+    /**
+     * [N02] Whether a bulk-create request is currently in flight. Drives the
+     * visible busy/disabled state on the Save button so a slow submit is
+     * distinguishable and cannot be double-activated from the UI, matching the
+     * in-flight affordance the sibling lightboxes provide.
+     */
+    submitting?: boolean;
 }
 
 function BulkLightbox(props: BulkLightboxProps): JSX.Element {
@@ -1348,6 +1355,7 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
         onSubmit,
         onClose,
         error,
+        submitting = false,
     } = props;
 
     const [text, setText] = useState("");
@@ -1405,8 +1413,17 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
     );
     const BULK_PLACEHOLDER = t("COMMON.ONE_ITEM_LINE", "One item per line...");
     const BULK_SAVE = t("COMMON.SAVE", "Save");
+    // [N02] Busy label shown on the Save button while a bulk-create request is
+    // in flight, so a slow/offline submit has a visible in-flight distinction.
+    const BULK_SAVING = t("COMMON.LOADING", "Loading...");
 
     const handleSubmit = (): void => {
+        // [N02] Ignore activations while a request is already in flight so the
+        // disabled Save button cannot be bypassed (e.g. Enter key), giving the
+        // same single-write guarantee as the parent's `bulkSubmittingRef`.
+        if (submitting) {
+            return;
+        }
         const message = validateBulkText(text);
         if (message !== null) {
             setValidationError(message);
@@ -1628,10 +1645,15 @@ function BulkLightbox(props: BulkLightboxProps): JSX.Element {
                     <div className="lb-action-wrapper">
                         <button
                             type="submit"
-                            className="btn-small js-submit-button e2e-bulk-submit"
-                            title={BULK_SAVE}
+                            className={
+                                "btn-small js-submit-button e2e-bulk-submit" +
+                                (submitting ? " is-loading" : "")
+                            }
+                            title={submitting ? BULK_SAVING : BULK_SAVE}
+                            disabled={submitting}
+                            aria-busy={submitting}
                         >
-                            {BULK_SAVE}
+                            {submitting ? BULK_SAVING : BULK_SAVE}
                         </button>
                     </div>
                 </form>
@@ -1668,11 +1690,30 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         "Search by subject or reference",
     );
     const NOTIFY_ERROR_MESSAGE = t("NOTIFICATION.WARNING_TEXT", "Your changes were not saved!");
+    // [N02] Distinct bulk-create failure messages so an offline failure reads
+    // differently from a server rejection instead of collapsing to one string.
+    const BULK_OFFLINE_ERROR_MESSAGE = t(
+        "COMMON.CONNECTION_ERROR",
+        "Unable to reach the server. Your text is kept — check your connection and try again.",
+    );
+    const BULK_SERVER_ERROR_MESSAGE = t(
+        "NOTIFICATION.WARNING_TEXT",
+        "The server could not create the stories. Your text is kept — please try again.",
+    );
     const PERMISSION_DENIED_TITLE = t("ERROR.PERMISSION_DENIED", "Permission denied");
     const PERMISSION_DENIED_TEXT = t(
         "ERROR.PERMISSION_DENIED_TEXT",
         "You don't have permission to access this page.",
     );
+    // [N10] Board load-error copy + retry label. The AngularJS Kanban left the
+    // global `tgLoader` spinner up on a failed initial load (recoverable only by
+    // a full browser reload); the React root surfaces an explicit, in-board error
+    // with a Retry affordance that re-runs `loadInitialData` instead.
+    const LOAD_ERROR_TEXT = t(
+        "KANBAN.ERROR_LOADING_KANBAN",
+        "The board could not be loaded.",
+    );
+    const RETRY_LABEL = t("COMMON.RETRY", "Retry");
 
     // The EFFECTIVE project id the whole board keys off. It is the prop id when
     // that is already a valid positive integer; otherwise it stays `NaN` until
@@ -1716,6 +1757,11 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
     // (QA-FUNC-06). `null` = hidden.
     const [errorNotice, setErrorNotice] = useState<string | null>(null);
     const [bulkError, setBulkError] = useState<string | null>(null);
+    // [N02] Visible in-flight state for the bulk-create submit. `bulkSubmittingRef`
+    // (a ref) guards double-submit synchronously but does not re-render; this
+    // STATE drives the disabled/busy affordance on the lightbox's Save button so
+    // the pending request is visible.
+    const [bulkSubmitting, setBulkSubmitting] = useState<boolean>(false);
     // [N-03] Themed delete-confirmation dialog state (replaces window.confirm).
     // `open` toggles the shared ConfirmDialog; `busy` disables its buttons while
     // the DELETE is in flight; `us` carries the id + subject for the message.
@@ -1978,6 +2024,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
         if (!isValidProjectId(projectId) && slugFromLocation() === null) {
             return;
         }
+        // [N10] Clear any prior gate state before (re)loading so a stale denial
+        // or a recovered load error never sticks across reloads — this is what
+        // makes the load-error "Retry" affordance below actually recover the
+        // board (mirrors the Backlog root's `loadProject`, which resets
+        // `permissionDenied` / `loadError` at the start of every load).
+        setLoadError(false);
+        setPermissionDenied(false);
         // M-04: claim the newest generation for this full (re)load. A prior load
         // still in flight — e.g. from the previous project id on a same-instance
         // transition, or an overlapping projects-event refresh — becomes stale and
@@ -2429,6 +2482,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 ? firstUsInColumn(kanban.state, statusId, swimlaneId)
                 : null;
         bulkSubmittingRef.current = true;
+        setBulkSubmitting(true);
         setBulkError(null);
         // Use the RESOLVED project id (whether it came from the prop or the
         // by-slug lookup) for the bulk-create + reorder writes (QA finding —
@@ -2462,12 +2516,13 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 if (!aliveRef.current) {
                     return;
                 }
+                setBulkSubmitting(false);
                 // Close the lightbox ONLY on success, then refresh the board.
                 setBulkStatusId(null);
                 setBulkError(null);
                 void reloadUserstories();
             })
-            .catch(() => {
+            .catch((err: unknown) => {
                 // QA-FUNC-06: on failure keep the lightbox open (do NOT clear
                 // `bulkStatusId`) so the typed text is retained, and surface an
                 // inline error so the user can correct and retry. Mirrors the
@@ -2476,7 +2531,16 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 if (!aliveRef.current) {
                     return;
                 }
-                setBulkError(NOTIFY_ERROR_MESSAGE);
+                setBulkSubmitting(false);
+                // [N02] Distinct error types: a rejected `fetch` with no HTTP
+                // response is an offline/network failure; anything else is a
+                // server rejection. Show the matching message rather than one
+                // collapsed string.
+                setBulkError(
+                    err instanceof HttpError
+                        ? BULK_SERVER_ERROR_MESSAGE
+                        : BULK_OFFLINE_ERROR_MESSAGE,
+                );
             });
     };
 
@@ -3401,7 +3465,29 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                 ) : null}
 
                 {loadError ? (
-                    <div className="kanban-load-error">Unable to load the board.</div>
+                    // [N10] Explicit, recoverable load-error surface. The message
+                    // itself was already QA-praised; the added Retry button turns
+                    // the previous dead-end "no-action" state into a recoverable
+                    // one that re-runs the initial load (which clears `loadError`
+                    // on entry) rather than forcing a full browser reload.
+                    <div className="kanban-load-error" role="alert">
+                        <p>{LOAD_ERROR_TEXT}</p>
+                        <button
+                            type="button"
+                            className="button button-green"
+                            onClick={() => void loadInitialData()}
+                        >
+                            {RETRY_LABEL}
+                        </button>
+                    </div>
+                ) : null}
+
+                {/* [N10] Initial load still in flight — no project resolved yet and
+                    no load error. Render an in-board loading indicator instead of a
+                    blank board region, matching the global `tgLoader` spinner the
+                    AngularJS Kanban showed during initial load. */}
+                {!project && !loadError ? (
+                    <div className="loading-spinner" role="status" aria-live="polite" />
                 ) : null}
 
                 {errorNotice ? (
@@ -3459,6 +3545,7 @@ export function KanbanApp(props: HostElementProps): JSX.Element {
                         setBulkError(null);
                     }}
                     error={bulkError}
+                    submitting={bulkSubmitting}
                 />
             ) : null}
 

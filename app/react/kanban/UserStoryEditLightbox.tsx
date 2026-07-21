@@ -599,9 +599,20 @@ export function UserStoryEditLightbox(
         if (!open || mode !== "edit" || !us?.id || !fetchAttachments) {
             return undefined;
         }
-        const alreadyLoaded = Array.isArray(us.attachments);
-        const hasAttachments = (us.total_attachments ?? 0) > 0;
-        if (alreadyLoaded || !hasAttachments) {
+        // M10 — the board LIST serializer returns an EMPTY `attachments` array
+        // ALONGSIDE a non-zero `total_attachments`, so the mere PRESENCE of the
+        // array must NOT be read as "already hydrated" (the previous
+        // `Array.isArray(us.attachments)` guard did exactly that and skipped the
+        // fetch, so a story with attachments showed a "0 Attachments" count). We
+        // genuinely hold the attachments only when the known array length
+        // matches the reported total (e.g. a zoomed-in `include_attachments`
+        // response); otherwise the list endpoint gave us a placeholder and we
+        // must fetch the real attachments so the count/list is correct.
+        const totalAttachments = us.total_attachments ?? 0;
+        const knownCount = Array.isArray(us.attachments)
+            ? us.attachments.length
+            : 0;
+        if (totalAttachments === 0 || knownCount >= totalAttachments) {
             return undefined;
         }
         let alive = true;
@@ -1074,7 +1085,48 @@ export function UserStoryEditLightbox(
                 ✕
             </button>
 
-            <form onSubmit={handleSubmit} noValidate>
+            <form
+                onSubmit={handleSubmit}
+                noValidate
+                onKeyDown={(e) => {
+                    // M13 — nested-picker Escape isolation. When a status,
+                    // points, assignee, or due-date picker popover is open,
+                    // Escape must close ONLY that popover — never the whole
+                    // story lightbox, which would silently discard the user's
+                    // in-progress edits. The assignee/due-date popovers already
+                    // stop Escape at their own focused <input>, but the status
+                    // and points popovers keep focus on their trigger (a
+                    // role="button" element with no Escape-aware input), so the
+                    // key would otherwise bubble to the shared document-level
+                    // dialog Escape listener (useDialogA11y) and dismiss the
+                    // modal. Catching Escape here — at the <form>, beneath that
+                    // document listener — and calling stopPropagation() keeps
+                    // the lightbox open regardless of which element inside a
+                    // popover holds focus. When no popover is open the key is
+                    // left to bubble, so Escape still closes the lightbox as
+                    // before (like-for-like with the AngularJS lightbox).
+                    if (e.key !== "Escape") {
+                        return;
+                    }
+                    if (statusOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setStatusOpen(false);
+                    } else if (pointsPopoverRoleId !== null) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setPointsPopoverRoleId(null);
+                    } else if (assigneePopoverOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setAssigneePopoverOpen(false);
+                    } else if (dueDatePopoverOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDueDatePopoverOpen(false);
+                    }
+                }}
+            >
                 <h2 className="title" id={titleId}>
                     {mode === "edit"
                         ? t("LIGHTBOX.CREATE_EDIT.EDIT_US", TITLE_EDIT)

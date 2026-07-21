@@ -20,8 +20,14 @@
 // Jest fake timers make the socket lifecycle fully observable without any real
 // network, mirroring the QA's "real ws server + fake-timer MockWS" harness.
 
-import { createEventsClient } from "./websocket";
+// The events client is a module-level SHARED singleton (one socket per document,
+// mirroring the single AngularJS EventsService — AAP §0.6.1, QA C02). To keep
+// every test fully isolated, the module registry is reset in beforeEach and a
+// FRESH copy of the module (with a new, un-connected singleton) is re-required
+// per test; a static top-level import would leak socket/subscription state.
 import type { EventsClient } from "./websocket";
+
+let createEventsClient: typeof import("./websocket").createEventsClient;
 
 const TOKEN = "jwt-token-abc";
 const SESSION_ID = "shared-session-42";
@@ -49,8 +55,19 @@ class MockWebSocket {
         return MockWebSocket.instances[MockWebSocket.instances.length - 1];
     }
 
+    // Faithful readyState contract (mirrors the WHATWG WebSocket constants) so the
+    // client's idempotent-reuse check (`readyState === OPEN | CONNECTING`) is
+    // genuinely exercised rather than accidentally satisfied by `undefined ===
+    // undefined`. C-02: the shared singleton reuses an already-open/connecting
+    // socket instead of tearing it down on a second board's connect().
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
     public readonly url: string;
     public closed = false;
+    public readyState: number = MockWebSocket.CONNECTING;
     public readonly sent: string[] = [];
     private readonly listeners: Record<string, Listener[]> = {};
 
@@ -73,10 +90,12 @@ class MockWebSocket {
 
     close(): void {
         this.closed = true;
+        this.readyState = MockWebSocket.CLOSED;
     }
 
     // ---- server-side simulation helpers ----
     emitOpen(): void {
+        this.readyState = MockWebSocket.OPEN;
         this.dispatch("open", {});
     }
 
@@ -90,6 +109,7 @@ class MockWebSocket {
     }
 
     emitClose(): void {
+        this.readyState = MockWebSocket.CLOSED;
         this.dispatch("close", {});
     }
 
@@ -128,6 +148,12 @@ beforeEach(() => {
     };
     window.localStorage.setItem("token", JSON.stringify(TOKEN));
     (window as unknown as { taiga?: { sessionId?: string } }).taiga = { sessionId: SESSION_ID };
+
+    // Reset the module registry so the module-level shared singleton is recreated
+    // fresh (un-connected, no retained subscriptions) for each test — otherwise
+    // the singleton would leak socket / subscription state across tests.
+    jest.resetModules();
+    ({ createEventsClient } = require("./websocket") as typeof import("./websocket"));
 
     client = createEventsClient();
 });
@@ -478,43 +504,91 @@ describe("shared/events/websocket", () => {
         });
     });
 
-    describe("disconnect cleanup", () => {
-        it("closes the socket, stops the heartbeat, and never reconnects afterwards", () => {
+    describe("disconnect (per-board unmount) — shared session socket", () => {
+        // C-02: a board unmount must NOT close the shared socket. Closing it on
+        // navigation, while routing-key bindings are still live, is exactly what
+        // crashed the frozen taiga-events service (unhandled AMQP channel
+        // rejection, RestartPolicy=no). This mirrors AngularJS events.coffee,
+        // where a scope $destroy only unsubscribes and never closes the socket.
+        it("does NOT close the shared socket on unmount (leaves the session socket open)", () => {
             client.connect();
             const socket = MockWebSocket.latest;
             socket.emitOpen();
 
             client.disconnect();
 
-            expect(socket.closed).toBe(true);
-
-            const pingsAtDisconnect = socket.framesOfCmd("ping").length;
-            jest.advanceTimersByTime(HEARTBEAT_MS * 5);
-            // No new heartbeats and no reconnect after an explicit disconnect.
-            expect(socket.framesOfCmd("ping").length).toBe(pingsAtDisconnect);
+            expect(socket.closed).toBe(false);
+            expect(socket.readyState).toBe(MockWebSocket.OPEN);
             expect(MockWebSocket.instances).toHaveLength(1);
         });
 
-        it("does not reconnect when the socket closes after an explicit disconnect", () => {
+        it("keeps the heartbeat running after unmount (session-long socket, matching AngularJS)", () => {
             client.connect();
             const socket = MockWebSocket.latest;
             socket.emitOpen();
 
+            const pingsAtDisconnect = socket.framesOfCmd("ping").length;
             client.disconnect();
-            socket.emitClose(); // listeners already detached — must be inert
-            jest.advanceTimersByTime(20000);
+            jest.advanceTimersByTime(HEARTBEAT_MS * 2);
+
+            // The socket persists, so heartbeats continue and no reconnect churns
+            // a new socket.
+            expect(socket.framesOfCmd("ping").length).toBeGreaterThan(
+                pingsAtDisconnect,
+            );
+            expect(MockWebSocket.instances).toHaveLength(1);
+        });
+
+        it("reuses the SAME shared socket on a re-mount instead of opening a new one", () => {
+            client.connect();
+            const first = MockWebSocket.latest;
+            first.emitOpen();
+
+            // Unmount (disconnect) then re-mount (connect) — e.g. navigating away
+            // from and back to a board, or the other board mounting. The singleton
+            // must reuse the still-open socket, never tear it down and reopen.
+            client.disconnect();
+            client.connect();
 
             expect(MockWebSocket.instances).toHaveLength(1);
+            expect(MockWebSocket.latest).toBe(first);
+            expect(first.closed).toBe(false);
+        });
+
+        it("still delivers events to a retained subscription after a disconnect (socket persists)", () => {
+            client.connect();
+            const socket = MockWebSocket.latest;
+            socket.emitOpen();
+
+            const callback = jest.fn();
+            client.subscribe("changes.project.1.userstories", callback);
+
+            // A per-board disconnect that does NOT unsubscribe leaves the binding
+            // intact on the persistent shared socket (callers unsubscribe their own
+            // keys; disconnect alone never closes and never drops subscriptions).
+            client.disconnect();
+            socket.emitMessage({
+                routing_key: "changes.project.1.userstories",
+                data: { id: 7 },
+            });
+
+            expect(callback).toHaveBeenCalledWith({ id: 7 });
         });
     });
 
-    describe("factory", () => {
-        it("creates an events client exposing the documented surface", () => {
+    describe("shared singleton accessor", () => {
+        it("exposes the documented client surface", () => {
             const created = createEventsClient();
             expect(typeof created.connect).toBe("function");
             expect(typeof created.subscribe).toBe("function");
             expect(typeof created.unsubscribe).toBe("function");
             expect(typeof created.disconnect).toBe("function");
+        });
+
+        it("returns the SAME shared instance on every call (one socket per document — AAP §0.6.1, C-02)", () => {
+            const a = createEventsClient();
+            const b = createEventsClient();
+            expect(a).toBe(b);
         });
     });
 });

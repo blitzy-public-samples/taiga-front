@@ -75,6 +75,7 @@ import type { Project, UsStatus, Role, Point, Id, UserStory, Swimlane } from "./
 import { t } from "../shared/i18n/translate";
 import { Icon } from "../shared/ui/Icon";
 import type { UserStoryAttachment } from "../shared/api/attachments";
+import { isVersionConflict, HttpError } from "../shared/api/httpClient";
 import { dueDateColor, dueDateTitle } from "../shared/duedate/dueDate";
 import type { DueDateAppearance } from "../shared/duedate/dueDate";
 import { useDialogA11y } from "../shared/dialog/useDialogA11y";
@@ -213,6 +214,26 @@ const SUBJECT_TOO_LONG_TEMPLATE = "This value is too long. It should have %s cha
  * lightbox has one error slot rather than per-field checksley annotations.
  */
 const GENERIC_ERROR_MESSAGE = "The user story could not be saved. Please try again.";
+
+/**
+ * [N21] Actionable message for an optimistic-concurrency (version) conflict.
+ * The FROZEN backend rejects a stale write with HTTP 400 + a `version` body
+ * (see `isVersionConflict`). Rather than the opaque generic message, tell the
+ * user exactly what happened AND what to do — the lightbox has already refreshed
+ * to the latest version, so their preserved input can simply be saved again.
+ */
+const VERSION_CONFLICT_MESSAGE =
+    "This user story was updated by someone else. The latest version has been loaded — review your changes and save again.";
+
+/**
+ * [M26] Connectivity-specific message shown when a save fails with a network /
+ * offline error (a rejected `fetch` with no HTTP response). The lightbox stays
+ * open with the draft intact so the user can retry once the connection is back,
+ * instead of the whole screen collapsing to the global connection-lost page and
+ * stranding the draft.
+ */
+const OFFLINE_SAVE_MESSAGE =
+    "Unable to reach the server. Your changes are kept — check your connection and save again.";
 
 /* -------------------------------------------------------------------------- */
 /* Public props                                                               */
@@ -453,6 +474,11 @@ export function UserStoryEditLightbox(
     const fileInputRef = useRef<HTMLInputElement>(null);
     // Autofocus target for the add-tag input once the "Add tag +" button reveals it.
     const tagInputRef = useRef<HTMLInputElement>(null);
+    // [N21] Authoritative optimistic-concurrency version. Seeded from the row on
+    // open and REFRESHED in place after a version conflict, so the user's
+    // preserved input can be saved again on top of the latest server version
+    // without having to close and reopen the lightbox.
+    const versionRef = useRef<number | null>(null);
 
     /** `add_us` gates the add/delete-tag controls (`permissions="add_us"`). */
     const canAddTags = useMemo<boolean>(
@@ -467,6 +493,9 @@ export function UserStoryEditLightbox(
             return;
         }
         if (mode === "edit" && us) {
+            // [N21] Seed the authoritative version from the row; refreshed on a
+            // version conflict below.
+            versionRef.current = typeof us.version === "number" ? us.version : null;
             setSubject(us.subject);
             setStatusId(us.status);
             // Clone the points map so edits never mutate the row object in place.
@@ -557,10 +586,21 @@ export function UserStoryEditLightbox(
         if (!open || mode !== "edit" || !us?.id || !fetchAttachments) {
             return undefined;
         }
-        const alreadyLoaded = Array.isArray(us.attachments);
-        const total = us.total_attachments;
-        const hasAttachments = typeof total === "number" && total > 0;
-        if (alreadyLoaded || !hasAttachments) {
+        // M10 — the board LIST serializer returns an EMPTY `attachments` array
+        // ALONGSIDE a non-zero `total_attachments`, so the mere PRESENCE of the
+        // array must NOT be read as "already hydrated" (the previous
+        // `Array.isArray(us.attachments)` guard did exactly that and skipped the
+        // fetch, so a story with attachments showed a "0 Attachments" count). We
+        // genuinely hold the attachments only when the known array length
+        // matches the reported total (e.g. a zoomed-in `include_attachments`
+        // response); otherwise the list endpoint gave us a placeholder and we
+        // must fetch the real attachments so the count/list is correct.
+        const totalAttachments =
+            typeof us.total_attachments === "number" ? us.total_attachments : 0;
+        const knownCount = Array.isArray(us.attachments)
+            ? us.attachments.length
+            : 0;
+        if (totalAttachments === 0 || knownCount >= totalAttachments) {
             return undefined;
         }
         let alive = true;
@@ -984,7 +1024,15 @@ export function UserStoryEditLightbox(
             setSubmitting(true);
             try {
                 if (mode === "edit" && us) {
-                    await onEdit(us, {
+                    // [N21] Save against the authoritative version tracked in the
+                    // ref (refreshed after a prior conflict) rather than the
+                    // possibly-stale `us.version` snapshot, so a post-conflict
+                    // retry carries the latest version and succeeds.
+                    const editTarget: UserStory =
+                        versionRef.current != null
+                            ? { ...us, version: versionRef.current }
+                            : us;
+                    await onEdit(editTarget, {
                         subject: trimmed,
                         status: statusId,
                         points,
@@ -1026,10 +1074,39 @@ export function UserStoryEditLightbox(
                     });
                 }
                 onClose();
-            } catch {
-                // HttpError (or any request failure): surface the single inline
-                // error slot and KEEP the lightbox open so the user can retry.
-                setError(t("LIGHTBOX.CREATE_EDIT.SAVE_ERROR", GENERIC_ERROR_MESSAGE));
+            } catch (err) {
+                // [N21] An optimistic-concurrency conflict (HTTP 400 + `version`
+                // body from the FROZEN backend) is distinct from a generic
+                // failure: refresh the authoritative version IN PLACE — preserving
+                // the user's input — and surface a specific, actionable message so
+                // a second Save applies their edit on top of the latest version
+                // and clears the error. The parent has already reconciled the
+                // board list; this only re-reads the fresh version for the retry.
+                if (mode === "edit" && us && isVersionConflict(err)) {
+                    if (fetchDetail) {
+                        try {
+                            const fresh = await fetchDetail(us.id);
+                            if (typeof fresh.version === "number") {
+                                versionRef.current = fresh.version;
+                            }
+                        } catch {
+                            /* best-effort version refresh; retry may reconflict */
+                        }
+                    }
+                    setError(
+                        t("LIGHTBOX.CREATE_EDIT.VERSION_CONFLICT", VERSION_CONFLICT_MESSAGE),
+                    );
+                } else if (!(err instanceof HttpError)) {
+                    // [M26] A rejected `fetch` with no HTTP response is a
+                    // network/offline failure. Keep the lightbox open with the
+                    // draft intact and show a connectivity-specific, retryable
+                    // message instead of the generic save error.
+                    setError(t("COMMON.CONNECTION_ERROR", OFFLINE_SAVE_MESSAGE));
+                } else {
+                    // HttpError (any other non-2xx): surface the single inline
+                    // error slot and KEEP the lightbox open so the user can retry.
+                    setError(t("LIGHTBOX.CREATE_EDIT.SAVE_ERROR", GENERIC_ERROR_MESSAGE));
+                }
             } finally {
                 setSubmitting(false);
             }
@@ -1058,6 +1135,7 @@ export function UserStoryEditLightbox(
             onCreate,
             onEdit,
             onClose,
+            fetchDetail,
         ],
     );
 
@@ -1084,7 +1162,62 @@ export function UserStoryEditLightbox(
                 ✕
             </button>
 
-            <form onSubmit={handleSubmit} noValidate>
+            <form
+                onSubmit={handleSubmit}
+                noValidate
+                onKeyDown={(e) => {
+                    // M13 — nested-picker Escape isolation. When a status,
+                    // points, assignee, due-date, or swimlane picker popover is
+                    // open, Escape must close ONLY that popover — never the whole
+                    // story lightbox, which would silently discard the user's
+                    // in-progress edits. The assignee/due-date popovers already
+                    // stop Escape at their own focused <input>, but the status
+                    // and points popovers keep focus on their trigger (a
+                    // role="button" element with no Escape-aware input), so the
+                    // key would otherwise bubble to the shared document-level
+                    // dialog Escape listener (useDialogA11y) and dismiss the
+                    // modal. Catching Escape here — at the <form>, beneath that
+                    // document listener — and calling stopPropagation() keeps
+                    // the lightbox open regardless of which element inside a
+                    // popover holds focus. When no popover is open the key is
+                    // left to bubble, so Escape still closes the lightbox as
+                    // before (like-for-like with the AngularJS lightbox).
+                    if (e.key !== "Escape") {
+                        return;
+                    }
+                    if (statusOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setStatusOpen(false);
+                    } else if (pointsPopoverRoleId !== null) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setPointsPopoverRoleId(null);
+                    } else if (assigneePopoverOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setAssigneePopoverOpen(false);
+                    } else if (dueDatePopoverOpen) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDueDatePopoverOpen(false);
+                    } else if (displaySwimlaneSelector) {
+                        // The swimlane selector (`.swimlane-select`) exists only
+                        // on the Backlog lightbox (it is gated on
+                        // `is_kanban_activated && swimlanesList.size`; the Kanban
+                        // lightbox has no swimlane picker). Its trigger is a
+                        // role="button"/listbox <button> that keeps focus on a
+                        // non-input element, so — exactly like status/points —
+                        // Escape would otherwise bubble to the document-level
+                        // dialog listener and dismiss the whole story modal,
+                        // discarding edits. Catch it here so Escape closes ONLY
+                        // the swimlane dropdown.
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDisplaySwimlaneSelector(false);
+                    }
+                }}
+            >
                 <h2 className="title" id={titleId}>
                     {mode === "edit"
                         ? t("LIGHTBOX.CREATE_EDIT.EDIT_US", TITLE_EDIT)

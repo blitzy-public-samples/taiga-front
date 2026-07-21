@@ -633,6 +633,74 @@ test("Escape does nothing while the lightbox is closed", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* [M-13] Nested-picker Escape isolation                                       */
+/* -------------------------------------------------------------------------- */
+/* Escape while a nested status / points / assignee picker is open must close  */
+/* ONLY that picker, never the whole story lightbox (which would silently      */
+/* discard the user's in-progress edits). The form-level Escape guard          */
+/* stopPropagation()s so the key never reaches the shared document-level       */
+/* dialog Escape listener while a popover is open.                             */
+
+test("[M-13] Escape while the status picker is open closes ONLY the picker (lightbox stays open)", () => {
+    const { container, onClose } = renderLightbox({
+        mode: "create",
+        initialStatusId: 100,
+    });
+    const trigger = container.querySelector(".status-dropdown") as HTMLElement;
+    fireEvent.click(trigger);
+    expect(container.querySelector(".pop-status")).not.toBeNull();
+
+    // Escape originates from the picker trigger (which keeps focus).
+    fireEvent.keyDown(trigger, { key: "Escape" });
+
+    expect(container.querySelector(".pop-status")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+});
+
+test("[M-13] Escape while a points picker is open closes ONLY the picker (lightbox stays open)", () => {
+    const { container, onClose } = renderLightbox({ mode: "create" });
+    const row = container.querySelector(
+        ".ticket-role-points.clickable",
+    ) as HTMLElement;
+    fireEvent.click(row);
+    expect(container.querySelector(".pop-points-open")).not.toBeNull();
+
+    fireEvent.keyDown(row, { key: "Escape" });
+
+    expect(container.querySelector(".pop-points-open")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+});
+
+test("[M-13] Escape while the assignee picker is open closes ONLY the picker (lightbox stays open)", () => {
+    const { container, onClose } = renderLightbox({ mode: "create" });
+    fireEvent.click(
+        container.querySelector(
+            ".ticket-assigned-to .users-dropdown.user-assigned",
+        ) as HTMLElement,
+    );
+    const picker = container.querySelector(".pop-users.popover") as HTMLElement;
+    expect(picker).not.toBeNull();
+
+    // Escape from the picker's search input closes the picker only.
+    fireEvent.keyDown(picker.querySelector("input") as HTMLElement, {
+        key: "Escape",
+    });
+
+    expect(container.querySelector(".pop-users.popover")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+});
+
+test("[M-13] Escape with NO picker open still closes the lightbox (bubbles past the form guard)", () => {
+    const { container, onClose } = renderLightbox({ mode: "create" });
+    // No popover open: the form's Escape guard is a no-op, so the key bubbles to
+    // the shared dialog listener and closes the lightbox exactly as before.
+    fireEvent.keyDown(container.querySelector("form") as HTMLElement, {
+        key: "Escape",
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+/* -------------------------------------------------------------------------- */
 /* Failure keeps the lightbox open                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -837,4 +905,57 @@ test("[M-10] attachments: adding files lists them and edit deletion queues the i
     };
     expect(changes.attachmentsToDelete).toEqual([55]);
     expect(changes.attachmentsToAdd.map((f) => f.name)).toEqual(["diagram.png"]);
+});
+
+test("[M-10] edit-open HYDRATES attachments when the board row carries an EMPTY array but total_attachments > 0", async () => {
+    // Reproduces the board LIST serializer shape: an EMPTY `attachments` array
+    // together with a non-zero `total_attachments`. The lightbox must fetch the
+    // real attachments (the empty-array placeholder must NOT be treated as
+    // "already loaded", which previously produced a wrong "0 Attachments" count).
+    const fetchAttachments = jest.fn(() =>
+        Promise.resolve([
+            { id: 71, name: "one.pdf" },
+            { id: 72, name: "two.png" },
+        ]),
+    );
+    const us = makeUs({
+        attachments: [],
+        total_attachments: 2,
+    } as Partial<UserStoryModel>);
+    const { container } = renderLightbox({
+        mode: "edit",
+        us,
+        fetchAttachments:
+            fetchAttachments as unknown as UserStoryEditLightboxProps["fetchAttachments"],
+    });
+
+    // Hydration fetch is issued for this story.
+    await waitFor(() => expect(fetchAttachments).toHaveBeenCalledWith(us.id));
+
+    // Both existing attachments render — count/list correct, NOT zero.
+    await waitFor(() =>
+        expect(container.querySelectorAll(".single-attachment").length).toBe(2),
+    );
+    const names = Array.from(
+        container.querySelectorAll(".single-attachment .attachment-name span"),
+    ).map((n) => n.textContent);
+    expect(names).toEqual(["one.pdf", "two.png"]);
+});
+
+test("[M-10] edit-open does NOT re-fetch when the row already holds all attachments", () => {
+    // A zoomed-in row already carries the full attachments array
+    // (length === total_attachments), so no network hydration is needed.
+    const fetchAttachments = jest.fn(() => Promise.resolve([]));
+    const us = makeUs({
+        attachments: [{ id: 55, name: "spec.pdf" }],
+        total_attachments: 1,
+    } as Partial<UserStoryModel>);
+    const { container } = renderLightbox({
+        mode: "edit",
+        us,
+        fetchAttachments:
+            fetchAttachments as unknown as UserStoryEditLightboxProps["fetchAttachments"],
+    });
+    expect(fetchAttachments).not.toHaveBeenCalled();
+    expect(container.querySelectorAll(".single-attachment").length).toBe(1);
 });

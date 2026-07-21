@@ -1319,6 +1319,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const [swimlanes, setSwimlanes] = useState<Swimlane[]>([]);
     const [permissionDenied, setPermissionDenied] = useState<boolean>(false);
     const [loadError, setLoadError] = useState<string | null>(null);
+    // [M16] Board-fetch error surface. `loadProject` failing sets `loadError`
+    // (the whole screen cannot render). But when the PROJECT resolves and only
+    // the board (user-stories) fetch fails, `project` is non-null so the screen
+    // falls through to the normal board render, which — with zero stories —
+    // showed the misleading "The backlog is empty!" empty-state (QF-M16: a
+    // board-fetch 500 produced a blank/no-action state indistinguishable from a
+    // genuinely empty backlog). `boardLoadError` records that the initial
+    // (reset) board fetch failed so the board region renders an explicit error
+    // surface with a retry affordance instead. The AngularJS original kept its
+    // global `tgLoader` spinner up indefinitely on such a 500 (never calling
+    // `pageLoaded()`); this restores a non-blank, recoverable state.
+    const [boardLoadError, setBoardLoadError] = useState<boolean>(false);
     // [ERR-2] offline surface: set when a React `fetch` fails with no HTTP
     // response (network down). Mirrors the AngularJS offline interceptor branch
     // (`errorHandlingService.error()`, app.coffee L620-623) which renders a
@@ -1391,6 +1403,17 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     // `filterMode` dependency) always reads the live value.
     const filterModeRef = useRef<string>(filterMode);
     filterModeRef.current = filterMode;
+    // [M26] Whether ANY foreground modal (create/edit US, sprint, bulk, delete)
+    // is open. Read by the offline interceptor hook (set once with `[]` deps) to
+    // decide whether a network failure should replace the whole screen with the
+    // full-page connection overlay. When a modal is open the failing request is a
+    // user-initiated SUBMIT that the modal handles inline (showing a retryable
+    // error and PRESERVING the draft), so the overlay — which would unmount the
+    // modal and strand the draft — MUST be suppressed. Mirrored via a ref so the
+    // stable hook closure always reads the live value.
+    const anyModalOpenRef = useRef<boolean>(false);
+    anyModalOpenRef.current =
+        usLightbox.open || sprintLightbox.open || bulkLightbox.open || deleteConfirm.open;
 
     // Pagination cursor authority: the hook's `appendUserstories` increments its
     // own `page` on `hasNextPage` but does NOT reset it on a reset-load, so the
@@ -1399,6 +1422,13 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
 
     // WebSocket client (created lazily in `initializeSubscription`).
     const eventsRef = useRef<ReturnType<typeof createEventsClient> | null>(null);
+    // C-02: the exact routing keys this board has subscribed on the SHARED events
+    // singleton. They MUST be unsubscribed before the client is released on
+    // unmount / project change, so the shared socket is left with no live
+    // bindings for this board (closing a socket that still has live bindings is
+    // what crashes taiga-events). Kanban unsubscribes its keys explicitly;
+    // Backlog records them here because the subscribe id is resolved dynamically.
+    const subscribedKeysRef = useRef<string[]>([]);
 
     // Debounce timer for free-text search.
     const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1420,7 +1450,16 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     useEffect(() => {
         setInterceptorHooks({
             onOffline: () => {
-                setConnectionError(true);
+                // [M26] A foreground submit (a modal is open) handles its own
+                // offline failure INLINE — showing a retryable error and
+                // PRESERVING the draft — so do NOT replace the whole screen (an
+                // early-return that unmounts the modal and strands the draft).
+                // The full-page connection overlay is reserved for background /
+                // load failures, mirroring AngularJS whose form scope survived a
+                // connection error rather than being destroyed.
+                if (!anyModalOpenRef.current) {
+                    setConnectionError(true);
+                }
             },
             onBlocked: () => {
                 setPermissionDenied(true);
@@ -1631,6 +1670,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
             const projGen = loadGenRef.current;
             const usGen = ++userstoriesGenRef.current;
 
+            // [M16] A fresh reset fetch clears any prior board-error surface so a
+            // recovered load never stays wedged on the error state.
+            if (opts.reset) {
+                setBoardLoadError(false);
+            }
+
             setLoadingUserstories(true);
 
             const params: QueryParams = {
@@ -1681,6 +1726,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     return;
                 }
                 setLoadingUserstories(false);
+                // [M16] Only a RESET (initial / filter / search) fetch failing
+                // leaves the board with no rows to show, so only that surfaces
+                // the recoverable board-error state. A pagination ("load more")
+                // failure keeps the rows already on screen, so it stays a
+                // non-destructive toast exactly as before.
+                if (opts.reset) {
+                    setBoardLoadError(true);
+                }
                 reportError("loadUserstories failed", err);
             }
         },
@@ -1754,6 +1807,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     const loadBacklog = useCallback(async (): Promise<void> => {
         await Promise.all([loadProjectStats(), loadSprints(), loadUserstories({ reset: true })]);
     }, [loadProjectStats, loadSprints, loadUserstories]);
+
+    /**
+     * [M16] Retry the board data after a board-fetch failure. Clears the error
+     * surface and re-runs the same aggregate load the initial mount performs
+     * (stats + sprints + first user-story page). `loadUserstories({reset:true})`
+     * clears `boardLoadError` itself on entry and re-sets it if it fails again,
+     * so the surface reappears on a repeated failure and disappears on success.
+     */
+    const retryBoardLoad = useCallback((): void => {
+        setBoardLoadError(false);
+        void loadBacklog();
+    }, [loadBacklog]);
 
     /**
      * Refresh the authoritative project record and reconcile everything that
@@ -1866,6 +1931,14 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         // no longer fire. The mount effect also tears the socket down on a
         // projectId change; this guards any re-init ordering.
         if (eventsRef.current) {
+            // C-02: unsubscribe this board's routing keys FIRST so the shared
+            // socket is left with no live bindings for the previous project, THEN
+            // release the client handle. The socket is never closed with live
+            // bindings (that crashes taiga-events).
+            for (const key of subscribedKeysRef.current) {
+                eventsRef.current.unsubscribe(key);
+            }
+            subscribedKeysRef.current = [];
             eventsRef.current.disconnect();
             eventsRef.current = null;
             // Drop any trailing refresh still pending for the previous socket so
@@ -1878,13 +1951,20 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         eventsRef.current = client;
         client.connect();
 
-        client.subscribe(`changes.project.${id}.userstories`, () => {
+        const userstoriesKey = `changes.project.${id}.userstories`;
+        const milestonesKey = `changes.project.${id}.milestones`;
+        const projectsKey = `changes.project.${id}.projects`;
+        // C-02: remember exactly what we subscribed so unmount / project-change
+        // unsubscribes these same keys before releasing the shared client.
+        subscribedKeysRef.current = [userstoriesKey, milestonesKey, projectsKey];
+
+        client.subscribe(userstoriesKey, () => {
             // Issue 2: coalesce a burst into one trailing refresh.
             debouncedUserstoriesRef.current?.();
         });
 
         client.subscribe(
-            `changes.project.${id}.milestones`,
+            milestonesKey,
             () => {
                 debouncedMilestonesRef.current?.();
             },
@@ -1902,7 +1982,7 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         // — the Backlog has no swimlanes, so (unlike Kanban) it does not narrow
         // to swimlane/status match strings; any project-attribute change is
         // relevant to at least one Backlog gate or list.
-        client.subscribe(`changes.project.${id}.projects`, () => {
+        client.subscribe(projectsKey, () => {
             debouncedProjectsRef.current?.();
         });
         // NOTE: the debounced refs (stable useRef instances) invoke the latest
@@ -2038,6 +2118,35 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         let dropIndex: number;
 
         if (typeof overId === "string") {
+            // [N-12] Keyboard pick-up-and-drop-in-place no-op guard.
+            //
+            // A KEYBOARD drag (Space to lift, Space again to drop) with NO arrow
+            // press in between never moves the drag reference off the origin row.
+            // Because `rowPreferringCollisionDetection` EXCLUDES the active row's
+            // own droppable, the collision then falls back to the enclosing
+            // CONTAINER, and the branch below would append the untouched story at
+            // the END of its list (dropIndex = base.length) — a phantom write that
+            // slips past the downstream `shouldSkip` index check. This restores the
+            // legacy no-op invariant both boards enforced on drag-end
+            // (kanban `index == oldIndex && initialContainer == parentEl: return`;
+            // backlog `index == oldIndex && sameContainer: return`).
+            //
+            // Only KEYBOARD drops onto the ORIGIN container are suppressed. A real
+            // keyboard reorder always steps onto a ROW (numeric id) — the keyboard
+            // coordinate getter only ever targets rows — so `over` can equal the
+            // origin container ONLY for a genuine drop-in-place. A POINTER drop on
+            // the origin container is instead a deliberate "release in the empty
+            // space below the list → move to the end" gesture and must still move
+            // (a true pointer no-op there is already caught by `shouldSkip`). The
+            // activator event type distinguishes the two reliably and independently
+            // of layout/geometry (jsdom-safe: it never depends on a computed rect
+            // or drag delta).
+            const activator = event.event?.activatorEvent;
+            const isKeyboardDrag =
+                typeof KeyboardEvent !== "undefined" && activator instanceof KeyboardEvent;
+            if (isKeyboardDrag && overId === origin.containerKey) {
+                return null;
+            }
             // Dropped on a container itself → append at the end.
             targetKey = overId;
             const base = containerIds(targetKey, userstories, sprints, closedSprints).filter(
@@ -3079,19 +3188,54 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 return;
             }
             const bulkStories = ids.map((usId, index) => ({ us_id: usId, order: index }));
+
+            // [N-33] Immediate row update (parity with the legacy `moveUssToSprint`,
+            // main.coffee L779-805, which spliced the stories OUT of the backlog and
+            // INTO the sprint synchronously, BEFORE issuing the request). The prior
+            // React order (await the request, THEN `loadBacklog`) left the moved
+            // rows visibly lingering in the backlog for the whole round-trip — the
+            // "DOM initially stale" defect. Optimistically relocating the checked
+            // block up-front makes it vanish from the backlog and appear at the end
+            // of the target sprint INSTANTLY; the success path then reconciles the
+            // authoritative order/points from the server, and the failure path rolls
+            // the move back — recovering safely from a failure the AngularJS
+            // original never handled at all (it left the optimistic move stranded).
+            const prev: MovedCollections = {
+                userstories: s.userstories,
+                sprints: s.sprints,
+                closedSprints: s.closedSprints,
+            };
+            const targetKey = `${SPRINT_PREFIX}${targetSprint.id}`;
+            const optimistic = applyOptimisticMoveMulti(
+                prev,
+                ids,
+                targetKey,
+                targetSprint.user_stories.length,
+            );
+            if (optimistic) {
+                applyMovedUserstories(optimistic);
+            }
+            // The moved rows have left the backlog, so the checkbox selection that
+            // drove this action is now stale; clear it immediately so the
+            // "N selected" affordance and its move-to-sprint buttons disappear at
+            // once (they keyed off rows that no longer exist in the backlog).
+            clearSelection();
+
             try {
                 await userstoriesApi.bulkUpdateMilestone(resolvedId, targetSprint.id, bulkStories);
                 if (!aliveRef.current) {
                     return;
                 }
-                // [#4] The moved stories have left the backlog, so the checkbox
-                // selection that drove this action is now stale. Clear it BEFORE
-                // reloading so the "N selected" affordance (and its move-to-sprint
-                // buttons) disappears immediately; previously the checked refs
-                // lingered, leaving orphaned selection UI for rows that no longer
-                // existed in the backlog list.
-                clearSelection();
+                // Reconcile the authoritative order + points from the server,
+                // mirroring the legacy success path (`loadSprints` +
+                // `loadProjectStats`), now that the rows have already moved
+                // optimistically.
                 await loadBacklog();
+                if (!aliveRef.current) {
+                    return;
+                }
+                await loadSprints();
+                await loadProjectStats();
                 if (!aliveRef.current) {
                     return;
                 }
@@ -3099,6 +3243,11 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                     await loadClosedSprints();
                 }
             } catch (err) {
+                // Roll the optimistic relocation back so a failed move never strands
+                // the rows in the wrong list, then surface an actionable error.
+                if (optimistic && aliveRef.current) {
+                    applyMovedUserstories(prev);
+                }
                 reportError(
                     "moveSelectedToSprint failed",
                     err,
@@ -3106,7 +3255,15 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 );
             }
         },
-        [resolvedId, loadBacklog, loadClosedSprints, clearSelection],
+        [
+            resolvedId,
+            loadBacklog,
+            loadSprints,
+            loadProjectStats,
+            loadClosedSprints,
+            clearSelection,
+            applyMovedUserstories,
+        ],
     );
 
     /* ---------------------------------------------------------------------- */
@@ -3161,8 +3318,19 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 clearTimeout(searchTimerRef.current);
                 searchTimerRef.current = null;
             }
-            eventsRef.current?.disconnect();
-            eventsRef.current = null;
+            // C-02: unsubscribe this board's routing keys on the SHARED singleton
+            // BEFORE releasing the client, so the persistent shared socket is left
+            // with no live bindings for this board. The socket is NOT closed here
+            // (disconnect() no longer closes) — closing with live bindings is what
+            // crashed taiga-events.
+            if (eventsRef.current) {
+                for (const key of subscribedKeysRef.current) {
+                    eventsRef.current.unsubscribe(key);
+                }
+                subscribedKeysRef.current = [];
+                eventsRef.current.disconnect();
+                eventsRef.current = null;
+            }
             // Issue 2: cancel any pending trailing WebSocket refresh so it cannot
             // fire after unmount / project change.
             debouncedUserstoriesRef.current?.cancel();
@@ -3258,9 +3426,18 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                 <div className="permission-denied">
                     <h1>{t("ERROR.PERMISSION_DENIED", "Permission denied")}</h1>
                     <p>
+                        {/* [N31] Restore the BASELINE permission-denied copy. The
+                         * original AngularJS module-disabled/403/451 path rendered
+                         * `app/partials/error/permission-denied.jade`, whose body is
+                         * `ERROR.PERMISSION_DENIED_TEXT` ("You don't have permission
+                         * to access this page."). The React port had drifted to a
+                         * NON-EXISTENT locale key (`BACKLOG.PERMISSION_DENIED_HELP`)
+                         * with different wording, so the copy diverged from baseline
+                         * (QF-N31). Use the same key + English fallback the original
+                         * and the Kanban root use, restoring exact copy parity. */}
                         {t(
-                            "BACKLOG.PERMISSION_DENIED_HELP",
-                            "You don't have permission to see the backlog.",
+                            "ERROR.PERMISSION_DENIED_TEXT",
+                            "You don't have permission to access this page.",
                         )}
                     </p>
                 </div>
@@ -3273,11 +3450,31 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
         if (loadError) {
             return (
                 <main className="main scrum">
-                    <div className="error-load-data">{loadError}</div>
+                    <div className="error-load-data">
+                        <p>{loadError}</p>
+                        {/* [M16] The project-level load failed; offer a retry that
+                            re-runs the whole initial load rather than forcing a
+                            full browser reload. */}
+                        <button
+                            type="button"
+                            className="button button-green"
+                            onClick={() => void loadInitialData()}
+                        >
+                            {t("COMMON.RETRY", "Retry")}
+                        </button>
+                    </div>
                 </main>
             );
         }
-        return <main className="main scrum" />;
+        // [M16] Initial load still in flight. The AngularJS backlog showed the
+        // global `tgLoader` spinner here (hidden by `pageLoaded()` on success);
+        // render an equivalent in-board spinner rather than a blank screen so the
+        // screen never looks like an empty/broken board while it is still loading.
+        return (
+            <main className="main scrum">
+                <div className="loading-spinner" role="status" aria-live="polite" />
+            </main>
+        );
     }
 
     // From here `project` is non-null (TypeScript narrows the const binding),
@@ -3298,8 +3495,12 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
     // Empty-state visibility ports the jade `ng-class`. In React `userstories`
     // is ALWAYS an array (never `undefined`), so the `=== undefined` disjunct
     // collapses out.
-    const emptyBacklogHidden = hasStories || state.filterQ.length === 0;
-    const emptyLargeHidden = hasStories || state.filterQ.length > 0;
+    // [M16] When the board fetch failed there are no rows, but the failure must
+    // NOT be mistaken for a genuinely empty backlog: suppress BOTH empty-states
+    // and render the explicit board-error surface instead.
+    const emptyBacklogHidden = hasStories || state.filterQ.length === 0 || boardLoadError;
+    const emptyLargeHidden = hasStories || state.filterQ.length > 0 || boardLoadError;
+    const showBoardError = boardLoadError && !hasStories;
     const speed = state.stats?.speed ?? 0;
 
     return (
@@ -3626,6 +3827,29 @@ export function BacklogApp(props: BacklogAppProps): JSX.Element {
                                         </div>
                                     )}
                                 </section>
+
+                                {/* [M16] Board-fetch error surface. Shown when the
+                                    reset user-story fetch failed and there are no
+                                    rows to display, replacing the misleading
+                                    "backlog is empty" state with an explicit,
+                                    recoverable error + retry. */}
+                                {showBoardError && (
+                                    <div className="error-load-data" role="alert">
+                                        <p>
+                                            {t(
+                                                "BACKLOG.ERROR_LOADING_USERSTORIES",
+                                                "The backlog could not be loaded.",
+                                            )}
+                                        </p>
+                                        <button
+                                            type="button"
+                                            className="button button-green"
+                                            onClick={retryBoardLoad}
+                                        >
+                                            {t("COMMON.RETRY", "Retry")}
+                                        </button>
+                                    </div>
+                                )}
 
                                 <div
                                     className={`empty-backlog js-empty-backlog${

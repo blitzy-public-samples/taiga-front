@@ -750,6 +750,79 @@ test.describe('kanban', () => {
                 board(page).locator(COLUMNS).nth(0).locator(CARD_TITLE).filter({ hasText: edited }),
             ).toHaveCount(1, { timeout: 20_000 });
         });
+
+        /*
+         * [C-04] A subject-only edit must PRESERVE the existing description.
+         * -----------------------------------------------------------------
+         * REGRESSION GUARD for QA finding C-04. The Kanban board LIST payload
+         * omits each story's `description`, so the edit lightbox hydrates the
+         * full detail (`GET /userstories/{id}`) on open. When the user changes
+         * ONLY the subject and saves, the outgoing `PATCH` body must still carry
+         * the *unchanged* description verbatim — never `null`, never blanked —
+         * otherwise a subject tweak would silently wipe the story body.
+         *
+         * The test is self-seeding (does not depend on which sample story holds a
+         * description): it first SETS a known description (setup PATCH), reopens
+         * to confirm the textarea hydrated with it (proves detail hydration),
+         * then edits the subject alone and asserts (a) the captured PATCH REQUEST
+         * body preserves the description byte-for-byte, and (b) a GET readback of
+         * the persisted story confirms the description survived on the server.
+         * Editing never reorders the board, so `boxUss(0).first()` addresses the
+         * same card across the setup and the subject-only edit.
+         */
+        test('a subject-only edit preserves the existing description (C-04)', async ({ page }) => {
+            const card = boxUss(page, 0).first();
+
+            // --- setup: give the card a known, non-empty description ----------
+            const knownDesc = `C04 kanban description ${Date.now()} — survives a subject-only edit`;
+            let lb = await openEditLightbox(page, card);
+            await lb.locator(LB_EDIT_DESCRIPTION).fill(knownDesc);
+            const setupPersist = waitEditPersist(page);
+            await submitLightbox(page, lb);
+            await setupPersist;
+
+            // --- reopen: the description textarea is hydrated from detail -----
+            lb = await openEditLightbox(page, card);
+            await expect(lb.locator(LB_EDIT_DESCRIPTION)).toHaveValue(knownDesc, {
+                timeout: 15_000,
+            });
+
+            // --- edit ONLY the subject ---------------------------------------
+            const editedSubject = `C04-kanban-subject-${Date.now()}`;
+            await lb.locator(LB_EDIT_SUBJECT).fill(editedSubject);
+
+            // Capture the PATCH *request* body (not just the response) so the
+            // exact serialized payload can be asserted.
+            const patchReqP = page.waitForRequest(
+                (r) => /\/userstories\/\d+(\?|$)/.test(r.url()) && r.method() === 'PATCH',
+                { timeout: 20_000 },
+            );
+            await submitLightbox(page, lb);
+            const patchReq = await patchReqP;
+            const body = (patchReq.postDataJSON() ?? {}) as Record<string, unknown>;
+
+            // The crux of C-04: subject changed; description sent UNCHANGED and is
+            // neither dropped, null, nor blanked.
+            expect(body.subject).toBe(editedSubject);
+            expect(body.description).toBe(knownDesc);
+            expect(body.description).not.toBeNull();
+            expect(String(body.description ?? '')).not.toBe('');
+
+            // --- GET/DB readback: the persisted story keeps the description ---
+            const idMatch = /\/userstories\/(\d+)(?:\?|$)/.exec(patchReq.url());
+            expect(idMatch).not.toBeNull();
+            const storyId = Number(idMatch![1]);
+            const persistedDesc = await page.evaluate(async (id) => {
+                const raw = window.localStorage.getItem('token');
+                const token = raw ? JSON.parse(raw) : '';
+                const res = await fetch(`/api/v1/userstories/${id}`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                const json = await res.json();
+                return json.description as string;
+            }, storyId);
+            expect(persistedDesc).toBe(knownDesc);
+        });
     });
 
     /*

@@ -398,6 +398,36 @@ function dragEnd(activeId: number, overId: number | string | null): NormalizedDr
     return { activeId, overId, event: {} as unknown as DragEndEvent };
 }
 
+/**
+ * A drag-end whose activator is a real KeyboardEvent — models an accessible
+ * keyboard drag (Space to lift / drop). Used by the [N-12] no-op guard specs,
+ * which distinguish keyboard from pointer drops via `event.activatorEvent`.
+ */
+function keyboardDragEnd(activeId: number, overId: number | string | null): NormalizedDragEnd {
+    return {
+        activeId,
+        overId,
+        event: {
+            activatorEvent: new KeyboardEvent("keydown", { code: "Space" }),
+        } as unknown as DragEndEvent,
+    };
+}
+
+/**
+ * A drag-end whose activator is a real pointer (MouseEvent) — models a mouse/
+ * touch drag. `instanceof KeyboardEvent` is false, so the [N-12] guard treats it
+ * as a pointer gesture (a container drop = deliberate "move to end").
+ */
+function pointerDragEnd(activeId: number, overId: number | string | null): NormalizedDragEnd {
+    return {
+        activeId,
+        overId,
+        event: {
+            activatorEvent: new MouseEvent("mousedown"),
+        } as unknown as DragEndEvent,
+    };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Per-test wiring (mutable fixtures the http mock reads lazily)               */
 /* -------------------------------------------------------------------------- */
@@ -2025,6 +2055,77 @@ test("[#4] a successful move-to-sprint clears the checkbox selection", async () 
     expect(container.querySelector("#move-to-latest-sprint")).toHaveStyle({ display: "none" });
 });
 
+test("[N-33] move-to-sprint removes the checked rows from the backlog OPTIMISTICALLY (before the request resolves)", async () => {
+    const { container } = await renderApp();
+
+    // Default fixture: exactly one backlog story (id 1000, ref 1).
+    expect(mockCaptured.backlogTableProps?.userstories.map((u) => u.id)).toEqual([1000]);
+
+    // Select it so the move affordance reveals.
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(1, true, false);
+    });
+
+    // Make the move request HANG so we can observe the board state AFTER the click
+    // but BEFORE the round-trip completes — the exact window in which the legacy
+    // React code left the moved rows visibly stranded in the backlog (QF-N33
+    // "DOM initially stale").
+    let resolveMove: (value: unknown) => void = () => undefined;
+    const pending = new Promise((resolve) => {
+        resolveMove = resolve;
+    });
+    mockBulkUpdateMilestone.mockReturnValueOnce(pending as Promise<unknown>);
+
+    await act(async () => {
+        fireEvent.click(container.querySelector("#move-to-latest-sprint") as HTMLElement);
+        await Promise.resolve();
+    });
+
+    // The request has been issued but has NOT resolved ...
+    expect(mockBulkUpdateMilestone).toHaveBeenCalledTimes(1);
+    // ... yet the moved row has ALREADY left the backlog. The optimistic splice
+    // (parity with the legacy synchronous `moveUssToSprint`) makes the row vanish
+    // immediately instead of lingering for the whole request round-trip.
+    expect(mockCaptured.backlogTableProps?.userstories.map((u) => u.id)).toEqual([]);
+
+    // Release the request so the success path reconciles and no promise dangles.
+    await act(async () => {
+        resolveMove({ data: undefined, status: 204, headers: new Headers() });
+        await Promise.resolve();
+    });
+});
+
+test("[N-33] move-to-sprint rolls the optimistic removal back when the request FAILS", async () => {
+    // `reportError` logs the failure via console.error; suppress it so the
+    // console-error guard does not fail the test (the log itself is expected and
+    // is exercised by "move-to-sprint reports a failure without throwing").
+    const errSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    const { container } = await renderApp();
+
+    expect(mockCaptured.backlogTableProps?.userstories.map((u) => u.id)).toEqual([1000]);
+
+    await act(async () => {
+        mockCaptured.backlogTableProps?.onToggleSelection(1, true, false);
+    });
+
+    // The move request rejects (e.g. offline / 500). The optimistic removal must
+    // be reversed so a failed move never strands the row in the wrong list —
+    // strictly better than the AngularJS original, which left it stranded.
+    mockBulkUpdateMilestone.mockRejectedValueOnce(new Error("network down"));
+
+    await act(async () => {
+        fireEvent.click(container.querySelector("#move-to-latest-sprint") as HTMLElement);
+        await Promise.resolve();
+    });
+
+    await waitFor(() => expect(mockBulkUpdateMilestone).toHaveBeenCalledTimes(1));
+    // The row is restored to the backlog after the failure (rollback).
+    await waitFor(() =>
+        expect(mockCaptured.backlogTableProps?.userstories.map((u) => u.id)).toEqual([1000]),
+    );
+    errSpy.mockRestore();
+});
+
 test("move-to-sprint is a no-op when no rows are checked", async () => {
     const { container } = await renderApp();
 
@@ -2393,6 +2494,60 @@ test("[multi] dragging an UNCHECKED row ignores the selection (single-item move)
     // the unchecked row 1000 moves only 1000.
     const resolved = mockCaptured.dndProps?.resolveDrop(dragEnd(1000, 3000)) ?? null;
     expect(resolved?.draggedIds).toEqual([1000]);
+});
+
+// ---------------------------------------------------------------------------
+// [N-12] Keyboard pick-up-and-drop-in-place no-op guard.
+//
+// A keyboard drag (Space to lift, Space again to drop) with NO arrow press
+// never moves the drag reference off the origin row. Because the board's
+// `rowPreferringCollisionDetection` excludes the active row's OWN droppable,
+// `over` then falls back to the enclosing CONTAINER — and the container branch
+// of `resolveDrop` would append the untouched story at the END of its list,
+// silently reordering it (the reported quirk). The guard suppresses that write
+// for KEYBOARD drops onto the origin container only; the identical gesture via
+// POINTER remains a deliberate "release in the empty space below the list ->
+// move to end" and must still move. The two tests below share the SAME setup
+// and SAME overId and differ ONLY in the activator, isolating the fix exactly.
+// ---------------------------------------------------------------------------
+test("[N-12] a KEYBOARD drop on the origin container (pick-up-and-drop-in-place) writes NOTHING", async () => {
+    currentUserstories = [makeUs({ id: 1000, ref: 1 }), makeUs({ id: 2000, ref: 2 })];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "2" };
+    await renderApp();
+    const resolve = mockCaptured.dndProps?.resolveDrop;
+    expect(resolve).toBeTruthy();
+
+    // Keyboard pick-up of the FIRST backlog row, dropped with no arrow press:
+    // `over` resolves to the "backlog" container. Without the guard this would
+    // append row 1000 last ([2000, 1000]); the guard returns null so nothing is
+    // persisted — restoring the legacy same-position-writes-nothing invariant.
+    expect(resolve?.(keyboardDragEnd(1000, "backlog"))).toBeNull();
+});
+
+test("[N-12] a POINTER drop on the origin container still moves to the end (drop-in-empty-space preserved)", async () => {
+    currentUserstories = [makeUs({ id: 1000, ref: 1 }), makeUs({ id: 2000, ref: 2 })];
+    currentUsHeaders = { "Taiga-Info-Backlog-Total-Userstories": "2" };
+    await renderApp();
+    const resolve = mockCaptured.dndProps?.resolveDrop;
+
+    // Identical drop target, but via POINTER: this is a deliberate move-to-end
+    // gesture and must NOT be suppressed. Row 1000 is appended after row 2000.
+    const resolved = resolve?.(pointerDragEnd(1000, "backlog")) ?? null;
+    expect(resolved).not.toBeNull();
+    expect(resolved?.target.containerKey).toBe("backlog");
+    expect(resolved?.orderedIds).toEqual([2000, 1000]);
+});
+
+test("[N-12] a KEYBOARD drop onto a DIFFERENT container is a real move and is NOT suppressed", async () => {
+    await renderApp();
+    const resolve = mockCaptured.dndProps?.resolveDrop;
+
+    // Keyboard-dragging backlog story 1000 into sprint:10 changes containers, so
+    // the origin-container guard must NOT fire — the cross-list move persists.
+    const resolved = resolve?.(keyboardDragEnd(1000, "sprint:10")) ?? null;
+    expect(resolved).not.toBeNull();
+    expect(resolved?.origin.containerKey).toBe("backlog");
+    expect(resolved?.target.containerKey).toBe("sprint:10");
 });
 
 test("[multi] persist moves the whole selection into a sprint via ONE bulk call and clears the selection", async () => {

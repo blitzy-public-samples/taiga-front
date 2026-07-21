@@ -104,9 +104,39 @@ class EventsClientImpl implements EventsClient {
     private readonly subscriptions: Record<string, Subscription> = {};
     private pendingMessages: OutgoingMessage[] = [];
 
+    /**
+     * Number of currently-mounted React boards that have called {@link connect}
+     * without a matching {@link disconnect}. This is bookkeeping for the SHARED
+     * singleton socket only — the socket's lifetime is deliberately NOT tied to
+     * this reaching zero (see {@link disconnect}). It persists for the whole
+     * session exactly like the single AngularJS `EventsService` socket.
+     */
+    private mountCount = 0;
+
     connect(): void {
+        // Shared-singleton entry point. Every mounting board calls connect(); the
+        // FIRST call establishes the one shared socket and later calls (the other
+        // board, or a re-mount) simply reuse it. Establishing a fresh socket ONLY
+        // when none is usable is what makes the singleton safe for two coexisting
+        // boards: a second connect() must NEVER tear down the first board's live
+        // socket, because an abrupt close while AMQP routing-key bindings are
+        // still live is exactly what crashed the frozen taiga-events service
+        // (QA C02).
+        this.mountCount += 1;
         this.stopped = false;
-        this.setupConnection();
+
+        const usable =
+            this.ws !== null &&
+            (this.ws.readyState === WebSocket.OPEN ||
+                this.ws.readyState === WebSocket.CONNECTING);
+
+        if (!usable) {
+            // Fresh establish (first mount, or after a prior socket fully closed):
+            // reset the error budget so a re-mount recovers from an earlier
+            // permanent failure, then open the socket.
+            this.errors = 0;
+            this.setupConnection();
+        }
     }
 
     subscribe(
@@ -150,9 +180,23 @@ class EventsClientImpl implements EventsClient {
     }
 
     disconnect(): void {
-        this.stopped = true;
-        this.clearReconnectTimer();
-        this.stopExistingConnection();
+        // Per-board unmount. This mirrors AngularJS `events.coffee`, where a
+        // scope `$destroy` NEVER closes the shared socket — it only unsubscribes
+        // that scope's routing keys (callers do that immediately BEFORE calling
+        // disconnect). The socket here is a process-lifetime singleton shared by
+        // BOTH React boards and, like the single AngularJS `EventsService`
+        // socket, it persists for the whole session. Closing it on navigation —
+        // especially while routing-key bindings are still live — triggers an
+        // unhandled AMQP channel rejection that crashes the frozen taiga-events
+        // service and leaves it down (RestartPolicy=no) (QA C02). We therefore
+        // only decrement the mounted-board count and leave the transport
+        // untouched; the browser releases the socket when the document itself
+        // unloads (a transport drop that taiga-events already tolerates on every
+        // page reload). Auto-reconnection (heartbeat / error driven) stays armed
+        // for the session, matching the always-on AngularJS socket.
+        if (this.mountCount > 0) {
+            this.mountCount -= 1;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -429,14 +473,37 @@ class EventsClientImpl implements EventsClient {
 }
 
 /**
- * Create a React-agnostic real-time events client.
+ * The process-wide shared events client. Created lazily on first use and reused
+ * for the lifetime of the document.
+ */
+let sharedClient: EventsClientImpl | null = null;
+
+/**
+ * Obtain the React-agnostic real-time events client.
  *
- * The client reuses the SAME session as AngularJS — the JWT token from
- * `shared/session/auth`, the `X-Session-Id` value from
- * `shared/session/sessionId`, and the runtime config from `shared/config` —
- * so both frameworks share a single authenticated session and a single events
- * subscription identity.
+ * This returns a SHARED module-level singleton: every React board (Kanban and
+ * Backlog) receives the SAME instance, backed by ONE WebSocket for the whole
+ * document. This mirrors the AngularJS `EventsService`, which is a single
+ * shared service with a single socket for the entire app, and satisfies the
+ * "single events subscription identity" coexistence requirement (AAP §0.6.1):
+ * both frameworks — and both React boards — share one authenticated session
+ * (JWT from `shared/session/auth`, `X-Session-Id` from
+ * `shared/session/sessionId`) and one subscription identity, so the events
+ * backend can correctly suppress echoing a client's own optimistic changes.
+ *
+ * Because the socket is shared and session-scoped, a board unmount
+ * ({@link EventsClient.disconnect}) must NOT close it: callers unsubscribe
+ * their own routing keys on unmount and the socket persists, exactly like the
+ * AngularJS socket. This is what prevents the per-navigation socket close that
+ * crashed the frozen taiga-events service (QA C02).
+ *
+ * The `createEventsClient` name is retained for call-site compatibility; it is
+ * now an accessor for the singleton rather than a constructor of independent
+ * clients.
  */
 export function createEventsClient(): EventsClient {
-    return new EventsClientImpl();
+    if (sharedClient === null) {
+        sharedClient = new EventsClientImpl();
+    }
+    return sharedClient;
 }

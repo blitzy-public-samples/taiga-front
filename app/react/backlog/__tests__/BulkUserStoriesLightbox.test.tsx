@@ -348,6 +348,52 @@ describe("BulkUserStoriesLightbox", () => {
             expect(props.onClose).toHaveBeenCalledTimes(1);
         });
 
+        it("[M11] two submits in the SAME tick issue only ONE bulkCreate (synchronous latch)", async () => {
+            // The finding: a rapid double activation (double-click, or click+Enter)
+            // fires two submit events BEFORE React commits the `setSubmitting(true)`
+            // re-render, so a guard that reads the `submitting` STATE still observes
+            // the stale `false` in its closure on the second call and slips a
+            // duplicate `bulkCreate` through (QF-M11: "two POST 200s persisted
+            // duplicate ids155/156"). This test reproduces that exact race by
+            // dispatching TWO native submit events back-to-back inside a SINGLE
+            // `act()` — React does NOT re-render between them — and asserts the
+            // synchronous ref latch admits only one write. (The sibling test above
+            // exercises the SEQUENTIAL case, where fireEvent flushes a re-render
+            // between the two submits and the disabled button also guards.)
+            let resolveCreate: (() => void) | null = null;
+            bulkCreateMock.mockImplementation(
+                () =>
+                    new Promise<BulkCreateResult>((resolve) => {
+                        resolveCreate = () =>
+                            resolve({ data: [{ id: 1 }], status: 200, headers: new Headers() });
+                    }),
+            );
+            const props = makeProps();
+            const { container } = render(<BulkUserStoriesLightbox {...props} />);
+            fireEvent.change(screen.getByRole("textbox"), { target: { value: "Story" } });
+
+            const form = container.querySelector("form");
+            if (form === null) {
+                throw new Error("expected a <form> element to be rendered");
+            }
+
+            await act(async () => {
+                // Raw native dispatch (NOT fireEvent) so there is NO act flush /
+                // re-render between the two events — the true same-tick race.
+                form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+                form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+            });
+
+            // Exactly one logical write despite two same-tick submissions.
+            expect(bulkCreateMock).toHaveBeenCalledTimes(1);
+
+            await act(async () => {
+                resolveCreate?.();
+            });
+            expect(props.onCreated).toHaveBeenCalledTimes(1);
+            expect(props.onClose).toHaveBeenCalledTimes(1);
+        });
+
         it("surfaces a generic error when the request fails and keeps the lightbox open", async () => {
             bulkCreateMock.mockRejectedValue(new Error("HTTP 400 Bad Request"));
             const props = makeProps();

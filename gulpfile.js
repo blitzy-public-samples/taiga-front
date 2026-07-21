@@ -47,6 +47,37 @@ var gulp = require("gulp"),
 // Gulp itself is retained; this is purely additive (AAP §0.7.2).
 var esbuild = require("esbuild");
 
+// [C-01] Best-effort image optimization gate.
+// gulp-imagemin's default optimizers (optipng, mozjpeg) shell out to prebuilt
+// native binaries that are fetched by their npm *postinstall* scripts. The
+// hermetic Docker build stage installs dependencies with `npm ci --ignore-scripts`
+// (see docker/Dockerfile) precisely because one of those optional postinstalls
+// (gifsicle) stalls indefinitely and hangs `npm ci`. With `--ignore-scripts` the
+// optimizer binaries are never downloaded, so imagemin-optipng / imagemin-mozjpeg
+// throw `spawn .../vendor/optipng ENOENT` at deploy time and abort `npx gulp deploy`.
+// Image OPTIMIZATION is non-essential — images are still copied verbatim and the
+// served app is byte-identical — so we make it best-effort: run imagemin only when
+// its optimizer binaries are actually present on disk, otherwise pass the images
+// through untouched. `require('optipng-bin')` / `require('mozjpeg')` each resolve to
+// the vendored binary PATH, so an fs.existsSync check is the exact, reliable signal
+// for whether imagemin will be able to spawn them. This keeps `npx gulp deploy`
+// deterministic and green whether or not the optional binaries were installed, without
+// dropping gulp-imagemin or any dependency (AAP §0.5.1 "no dependency removal").
+var imageminBinariesAvailable = (function () {
+    try {
+        var optipngPath = require("optipng-bin");
+        var mozjpegPath = require("mozjpeg");
+        return typeof optipngPath === "string" && fs.existsSync(optipngPath) &&
+               typeof mozjpegPath === "string" && fs.existsSync(mozjpegPath);
+    } catch (e) {
+        return false;
+    }
+})();
+
+if (!imageminBinariesAvailable) {
+    console.log("[gulp] imagemin optimizer binaries not present; images will be copied unoptimized (best-effort, build continues).");
+}
+
 var argv = require('minimist')(process.argv.slice(2));
 
 var utils = require("./gulp-utils");
@@ -670,7 +701,7 @@ gulp.task("copy-theme-fonts", function() {
 
 gulp.task("copy-images", function() {
     return gulp.src([paths.app + "/images/**/*", paths.app + '/modules/compile-modules/**/images/*'])
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
+        .pipe(gulpif(isDeploy && imageminBinariesAvailable, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"));
 });
 
@@ -681,7 +712,7 @@ gulp.task("copy-emojis", function() {
 
 gulp.task("copy-theme-images", function() {
     return gulp.src(themes.current.path + "/images/**/*")
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
+        .pipe(gulpif(isDeploy && imageminBinariesAvailable, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"  + themes.current.name));
 });
 
