@@ -8,7 +8,6 @@
 
 var gulp = require("gulp"),
     fs = require('fs'),
-    imagemin = require("gulp-imagemin"),
     jade = require("gulp-jade"),
     coffee = require("gulp-coffee"),
     concat = require("gulp-concat"),
@@ -603,8 +602,12 @@ gulp.task("copy-theme-fonts", function() {
 });
 
 gulp.task("copy-images", function() {
+    // gulp-imagemin removed: its optional imagemin-* plugins pull prebuilt
+    // binaries from an external CDN at install time, which makes `npm ci`
+    // non-deterministic (and hangs in network-restricted builders). The pipe
+    // only ever optimised images written to the untracked dist/ output, so
+    // dropping it cannot change a single tracked byte.
     return gulp.src([paths.app + "/images/**/*", paths.app + '/modules/compile-modules/**/images/*'])
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"));
 });
 
@@ -614,8 +617,8 @@ gulp.task("copy-emojis", function() {
 });
 
 gulp.task("copy-theme-images", function() {
+    // See copy-images: gulp-imagemin removed (external binary CDN dependency).
     return gulp.src(themes.current.path + "/images/**/*")
-        .pipe(gulpif(isDeploy, imagemin({progressive: true})))
         .pipe(gulp.dest(paths.distVersion + "/images/"  + themes.current.name));
 });
 
