@@ -5,7 +5,10 @@
 # Copyright (c) 2021-present Kaleidos INC
 
 # ---- Build stage: compile the AngularJS app from source ----
-FROM node:16.19.1 AS build
+# Node pinned to 20.20.2 (matches .nvmrc): the platform's minimum supported
+# Node version. Node 22.x cannot build node-sass 8.0.0 (locked nan 2.17.0 fails
+# against V8 12.x), so 20.20.2 is the highest usable line for this toolchain.
+FROM node:20.20.2 AS build
 LABEL maintainer="support@taiga.io"
 
 WORKDIR /app
