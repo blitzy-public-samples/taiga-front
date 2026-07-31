@@ -8,6 +8,46 @@
 
 groupBy = @.taiga.groupBy
 
+#############################################################################
+## React migration seam: this service is RETAINED, not retired
+#############################################################################
+#
+# `tgKanbanUserstories` remains the AngularJS-side data-shaping layer for the
+# Kanban board. It owns the mutable raw collection (`userstoriesRaw`), the
+# `order` map, and the four derived Immutable projections `usByStatus`,
+# `usMap`, `usByStatusSwimlanes` and `swimlanesList`. `KanbanController`
+# publishes those four projections onto `$scope` at
+# `app/coffee/modules/kanban/main.coffee` L93-L103 through
+# `taiga.defineImmutableProperty`.
+#
+# The React board never receives Immutable structures: they are flattened
+# with `.toJS()` at the `app/coffee/modules/kanban/react-bridge.coffee` seam.
+# That mirrors the in-repo precedent for handing data to a Web Component at
+# `app/modules/components/project-menu/project-menu.controller.coffee` L28.
+#
+# The React successor for the derived-view logic is
+# `app/react/kanban/state/boardSelectors.ts` (together with `boardReducer.ts`
+# and `state/types.ts`), which rebuilds `usByStatus` / `usByStatusSwimlanes`
+# from normalised plain-object state using `immer`. The immer conversion
+# belongs there, not here.
+#
+# This service deliberately stays on Immutable (the `immutable` package).
+# `swimlanesList` is read through the Immutable `List` API (`.size`,
+# `.first()`) by code that this migration must not break:
+#   - `app/partials/kanban/kanban.jade` L17
+#   - `app/partials/includes/modules/kanban-table.jade` L14, L74, L177, L185
+#   - `app/partials/includes/modules/lightbox-us-bulk.jade` L57, L61
+#   - `app/partials/common/lightbox/lightbox-create-edit/lb-create-edit-us.jade` L8, L12
+#   - `app/coffee/modules/kanban/main.coffee` L154, L155, L320
+#   - `app/modules/components/card/card.controller.coffee` L31, which is
+#     rule-T4 protected and shared with the out-of-scope taskboard
+#     (`app/partials/includes/modules/taskboard-table.jade` L135, L186)
+#
+# A plain JavaScript array exposes `.length`, never `.size`, so converting
+# this service in place would make every one of those call sites silently
+# evaluate `undefined` -> falsy, with no error thrown anywhere.
+#############################################################################
+
 class KanbanUserstoriesService extends taiga.Service
     @.$inject = [
         "$translate"
@@ -50,6 +90,14 @@ class KanbanUserstoriesService extends taiga.Service
         @.refreshRawOrder()
         @.refresh()
 
+    # React seam: key-type normalisation the React selectors must reproduce.
+    # `usByStatus` is keyed by `String(usModel.status)` -- STRING keys, which
+    # is why `main.coffee` L178 and L213 both read it as
+    # `usByStatus.get(us.status.toString())`. By contrast `usMap` is keyed by
+    # NUMERIC user-story ids, and the inner maps of `usByStatusSwimlanes` are
+    # keyed by `Number(statusId)` (see `refreshSwimlanes` below). Mixing those
+    # key types up in `app/react/kanban/state/boardSelectors.ts` yields empty
+    # columns rather than an error.
     initUsByStatusList: (userstories) ->
         for key, usModel of userstories
             status = String(usModel.status)
@@ -181,6 +229,16 @@ class KanbanUserstoriesService extends taiga.Service
 
         @.refresh(false)
 
+        # React seam: this return value is the in-repo proof that the kanban
+        # write API is POSITION-RELATIVE, not index-based. `main.coffee`
+        # L618-L625 forwards `afterUserstoryId` / `beforeUserstoryId` into
+        # `@rs.userstories.bulkUpdateKanbanOrder(...)`, which serialises them
+        # as `after_userstory_id` / `before_userstory_id`
+        # (`app/coffee/modules/resources/userstories.coffee` L112-L129).
+        # `app/react/shared/dnd/useSortableList.ts` must therefore compute the
+        # same two neighbours from @dnd-kit collision data; an off-by-one
+        # there silently persists a wrong order with no error surface, and
+        # only becomes visible on the next page load.
         return {
             statusId: statusId,
             swimlaneId: swimlaneId,
@@ -189,6 +247,13 @@ class KanbanUserstoriesService extends taiga.Service
             bulkUserstories: usList,
         }
 
+    # React seam: `-1` is a SENTINEL order, not a real position. It tells the
+    # backend "append to the end of this status" instead of naming a
+    # neighbour, and it is written to both the local `order` map and the
+    # model's `kanban_order`. The return shape is `{"us_id": <id>, "order":
+    # -1}` -- snake_case, because it is API payload rather than view state.
+    # Any React reimplementation must keep the sentinel and the payload keys
+    # exactly; substituting a computed index changes the request semantics.
     moveToEnd: (id, statusId) ->
         us = @.getUsModel(id)
 
@@ -227,6 +292,14 @@ class KanbanUserstoriesService extends taiga.Service
 
     retrieveUserStoryData: (usModel) ->
         us = {}
+        # React seam: `getAttrs()` is the existing `$tgModel` -> plain-object
+        # boundary. It is also the in-repo precedent for immer pitfall
+        # P-IMMER-1: immer drafts do not tolerate class instances, and
+        # `$tgModel` instances carry dirty-tracking state. The React state
+        # layer must perform the equivalent flattening before handing a user
+        # story to `produce()`, just as this line does before the plain `us`
+        # object returned below is frozen with Immutable's `fromJS()` by the
+        # callers of this method.
         model = usModel.getAttrs()
 
         us.foldStatusChanged = @.foldStatusChanged[usModel.id]

@@ -19,6 +19,32 @@ generateHash = @.taiga.generateHash
 module = angular.module("taigaBacklog")
 
 #############################################################################
+## AngularJS / React coexistence seam (strangler-fig migration)
+##
+## This module is RETRIEVED, never re-declared. `angular.module("taigaBacklog")`
+## must NEVER gain a second argument: the declaration is owned by
+## `app/coffee/modules/backlog.coffee:9` (`angular.module("taigaBacklog", [])`)
+## and `app/coffee/modules/taskboard/sortable.coffee:17` retrieves the SAME
+## module *after* this folder in the Gulp `coffee_order`. Passing `[]` here would
+## reset the module and silently detach the out-of-scope taskboard's
+## `tgTaskboardSortable` at bootstrap.
+##
+## The seven view-layer directives this file used to register are retired below.
+## The backlog screen's markup is now rendered by the React tree under
+## `app/react/backlog/**`, mounted through the `tg-react-loader` custom element
+## and fed by `app/coffee/modules/backlog/react-bridge.coffee`. Each retired
+## factory function is deliberately LEFT IN PLACE as the authoritative
+## behavioural reference for its React successor -- only the registration call
+## itself is removed, so this file now registers a controller and no directives.
+## See the retirement comment at each site.
+##
+## `BacklogController` is RETAINED IN FULL, registration unchanged. It stays the
+## data, permission and drag-serialisation layer behind the React screen, and its
+## `ng-controller="BacklogController as ctrl"` host on
+## `app/partials/backlog/backlog.jade` survives the migration.
+#############################################################################
+
+#############################################################################
 ## Backlog Controller
 #############################################################################
 
@@ -79,6 +105,18 @@ class BacklogController extends mixOf(taiga.Controller, taiga.PageMixin, taiga.F
         @.disablePagination = false
         @.firstLoadComplete = false
         @.translationData = {q: @.filterQ}
+
+        # MIGRATION NOTE: the state block below is retained verbatim -- React reads
+        # it through the bridge instead of re-deriving it. `@.pendingDrag` is the
+        # drag serialisation queue documented at `moveUs` below. `swimlanesList`
+        # MUST stay an `Immutable.List`: `Immutable.List::push` returns a NEW list
+        # while `Array::push` returns the new LENGTH, so converting it would make
+        # `loadSwimlanes` silently assign a Number here. Its `.size` contract is
+        # also read by out-of-scope consumers (`app/modules/components/card/
+        # card.controller.coffee`, the bulk-US and create/edit-US lightbox
+        # partials), so it cannot change from this side. React receives a plain
+        # array because `react-bridge.coffee` flattens it with `.toJS()` at the
+        # seam, matching the house style of the existing Web Component hand-off.
         @scope.userstories = []
         @.totalUserStories = 0
         @.pendingDrag = []
@@ -220,6 +258,14 @@ class BacklogController extends mixOf(taiga.Controller, taiga.PageMixin, taiga.F
         @scope.$on("backlog:load-closed-sprints", @.loadClosedSprints)
         @scope.$on("backlog:unload-closed-sprints", @.unloadClosedSprints)
 
+    # MIGRATION NOTE: these are the ONLY two routing keys the backlog screen
+    # subscribes to, and they are the contract `app/react/backlog/hooks/
+    # useBacklogRealtime.ts` must reproduce exactly. Both subscriptions pass
+    # `@scope`, so `app/coffee/modules/events.coffee` auto-unsubscribes them on
+    # `$destroy`. React's `useRealtime` passes a NULL scope and therefore gets no
+    # auto-cleanup: its `unsubscribe(routingKey)` in the `useEffect` cleanup is
+    # mandatory, not defensive -- a leaked subscription is silent and surfaces
+    # only as duplicate refreshes after navigating away and back.
     initializeSubscription: ->
         routingKey1 = "changes.project.#{@scope.projectId}.userstories"
         @events.subscribe @scope, routingKey1, (message) =>
@@ -520,6 +566,37 @@ class BacklogController extends mixOf(taiga.Controller, taiga.PageMixin, taiga.F
 
         return Promise.resolve()
 
+    # MIGRATION NOTE: `moveUs` is the backlog's drag serialisation queue and is
+    # retained verbatim. `app/react/backlog/hooks/useStoryDrag.ts` -- backed by the
+    # reducer in `app/react/backlog/state/`, so the queue stays unit-testable
+    # without a browser -- must reproduce these semantics exactly:
+    #
+    #  * `ctx` is only ever tested for TRUTHINESS, never read as a value. It
+    #    arrives as an AngularJS event object (`$scope.$on "sprint:us:move"`), as
+    #    the literal string "sprint:us:move" from `moveUsToTopOfBacklog` and from
+    #    `sortable.coffee`, or as `null` from the queue-drain re-drive below.
+    #    React models it as a plain boolean `isUserInitiated`.
+    #  * RE-ENTRANCY GUARD: a user drag arriving while another request is in flight
+    #    is enqueued but NOT sent -- only the head of `pendingDrag` is ever on the
+    #    wire. The re-drive deliberately passes `ctx = null` so that it bypasses
+    #    both the enqueue and the guard.
+    #  * WHY THE GUARD IS LOAD-BEARING: `bulk-update-us-backlog-order` is
+    #    POSITION-RELATIVE -- `previousUs`/`nextUs` serialise to
+    #    `after_userstory_id`/`before_userstory_id`, not to absolute indices. With
+    #    two requests in flight the second computes its neighbours from a client
+    #    ordering the server has not yet acknowledged, so the persisted order
+    #    silently diverges from what the user sees: no error, no toast, no console
+    #    warning, visible only on the next page load. A single-drag test passes
+    #    against a completely broken implementation, which is why the Playwright
+    #    specs must drag twice in rapid succession.
+    #  * The success path reconciles the AUTHORITATIVE `milestone` and
+    #    `backlog_order` returned by the server back onto the local models before
+    #    shifting the queue -- and writes only those two fields, preserving
+    #    `$tgModel`'s changed-fields-only PATCH semantics.
+    #  * Both tail blocks -- the `events.connected` reload fallback and the
+    #    `backlog:load-closed-sprints` broadcast -- live in the queue-EMPTY branch
+    #    and therefore fire only once the queue has fully drained, never on an
+    #    intermediate iteration.
     moveUs: (ctx, usList, newUsIndex, newSprintId, previousUs, nextUs) ->
         oldSprintId = usList[0].milestone
         project = usList[0].project
@@ -597,6 +674,8 @@ class BacklogController extends mixOf(taiga.Controller, taiga.PageMixin, taiga.F
             @scope.visibleUserStories = _.map @scope.userstories, (it) ->
                 return it.ref
 
+        # Re-entrancy guard: a queued drag is not sent; only the head goes on the
+        # wire. See the MIGRATION NOTE above this method.
         if ctx && @.pendingDrag.length > 1
             return
 
@@ -617,6 +696,8 @@ class BacklogController extends mixOf(taiga.Controller, taiga.PageMixin, taiga.F
 
             @.pendingDrag.shift()
 
+            # Drain the queue. The literal `null` first argument is what bypasses
+            # both the enqueue above and the re-entrancy guard.
             if @.pendingDrag.length
                 @scope.$applyAsync () =>
                     @.moveUs(
@@ -957,7 +1038,16 @@ BacklogDirective = ($repo, $rootscope, $translate, $rs) ->
     return {link: link}
 
 
-module.directive("tgBacklog", ["$tgRepo", "$rootScope", "$translate", "$tgResources", BacklogDirective])
+## RETIRED (React coexistence migration): the `tgBacklog` directive registration
+## is removed. The backlog screen is rendered by `app/react/backlog/
+## BacklogScreen.tsx` together with the containers in
+## `app/react/backlog/hooks/**`. The `BacklogDirective` factory above is retained
+## as the authoritative behavioural reference for those components -- the doom
+## line, move-to-current-sprint, the tag show/hide contract and the filter
+## open/close contract are all specified there. The now-inert `tg-backlog`
+## attribute on `app/partials/backlog/backlog.jade` is simply ignored by
+## AngularJS; the `ng-controller="BacklogController as ctrl"` on the SAME element
+## is what still matters and is preserved by the controller registration above.
 
 #############################################################################
 ## User story edit directive
@@ -986,7 +1076,12 @@ UsEditSelector = ($rootscope, $tgTemplate, $compile, $translate) ->
 
     return {link: link}
 
-module.directive("tgUsEditSelector", ["$rootScope", "$tgTemplate", "$compile", "$translate", UsEditSelector])
+## RETIRED (React coexistence migration): the `tgUsEditSelector` directive
+## registration is removed. It is superseded by the row action popover in
+## `app/react/backlog/StoryRow.tsx`. The `UsEditSelector` factory above is
+## retained as the authoritative behavioural reference -- it defines the
+## `popover-open` class contract on `.js-popup-button` and the `first` variant
+## applied to `.us-option-popup` for the first row.
 
 #############################################################################
 ## User story points directive
@@ -1051,7 +1146,14 @@ UsRolePointsSelectorDirective = ($rootscope, $template, $compile, $translate) ->
 
     return {link: link}
 
-module.directive("tgUsRolePointsSelector", ["$rootScope", "$tgTemplate", "$compile", "$translate", UsRolePointsSelectorDirective])
+## RETIRED (React coexistence migration): the `tgUsRolePointsSelector` directive
+## registration is removed. It is superseded by the role-points popover in
+## `app/react/backlog/StoryRow.tsx`. The `UsRolePointsSelectorDirective` factory
+## above is retained as the authoritative behavioural reference -- it defines the
+## computable-roles gate (the arrow is dropped and `.header-points` becomes
+## `not-clickable` when a project has a single computable role), the
+## `uspoints:select` / `uspoints:clear-selection` broadcast contract, and the
+## `active-popover` class handling.
 
 
 UsPointsDirective = ($tgEstimationsService, $repo, $tgTemplate) ->
@@ -1157,7 +1259,13 @@ UsPointsDirective = ($tgEstimationsService, $repo, $tgTemplate) ->
 
     return {link: link}
 
-module.directive("tgBacklogUsPoints", ["$tgEstimationsService", "$tgRepo", "$tgTemplate", UsPointsDirective])
+## RETIRED (React coexistence migration): the `tgBacklogUsPoints` directive
+## registration is removed. It is superseded by the points cell in
+## `app/react/backlog/StoryRow.tsx`. The `UsPointsDirective` factory above is
+## retained as the authoritative behavioural reference for the estimation popover
+## and the per-role points write path, which must keep going through
+## `$tgRepo`/`$tgModel` so that `save()` PATCHes only the changed fields together
+## with the optimistic-concurrency `version` rather than the whole object.
 
 
 #############################################################################
@@ -1207,7 +1315,18 @@ ToggleBurndownVisibility = ($storage) ->
         link: link
     }
 
-module.directive("tgToggleBurndownVisibility", ["$tgStorage", ToggleBurndownVisibility])
+## RETIRED (React coexistence migration): the `tgToggleBurndownVisibility`
+## directive registration is removed. It is superseded by the graph toggle in
+## `app/react/backlog/SummaryBar.tsx`. The `ToggleBurndownVisibility` factory
+## above is retained as the authoritative behavioural reference and carries two
+## details React must copy exactly:
+##   * the persisted preference key is hashed from the MISSPELLED literal
+##     "is-burndown-grpahs-collapsed". Correcting the spelling would change the
+##     hash and silently orphan every existing user's saved preference, so the
+##     typo is intentional and must survive.
+##   * `show()` adds "shown" on the first load but "open" on every subsequent
+##     toggle, while `hide()` removes BOTH. The two classes are not
+##     interchangeable, and `showGraphPlaceholder` force-collapses the graph.
 
 
 #############################################################################
@@ -1335,7 +1454,24 @@ BurndownBacklogGraphDirective = ($translate) ->
 
     return {link: link}
 
-module.directive("tgBurndownBacklogGraph", ["$translate", BurndownBacklogGraphDirective])
+## RETIRED (React coexistence migration): the `tgBurndownBacklogGraph` directive
+## registration is removed. It is superseded by `app/react/backlog/
+## BurndownChart.tsx`, which KEEPS jQuery Flot and drives it from a `useEffect`
+## against a ref rather than substituting a React charting library -- a
+## substitution would change rendered pixels.
+##
+## The `BurndownBacklogGraphDirective` factory above is the AUTHORITATIVE Flot
+## configuration and is preserved verbatim: the `width / 6` height rule, the five
+## series in order (zero / optimal / evolution / client-increment /
+## team-increment) with their exact `lines.fillColor` values and the suppressed
+## points on the zero series, the `colors` array, the right-only grid border, the
+## empty x-axis `tickFormatter`, the 12 px Verdana canvas axis font, and the
+## `flotItem.seriesIndex` tooltip switch. Those values are canvas literals and
+## must NOT be tokenised into Sass variables, because canvas rendering cannot read
+## them. The `"resize"` handler being registered inside the `"stats"` watcher (so
+## handlers accumulate) is a pre-existing behaviour recorded in the Drift Register
+## and deliberately left as-is; a React `useEffect` registering once is
+## observably equivalent.
 
 
 #############################################################################
@@ -1382,4 +1518,10 @@ TgBacklogProgressBarDirective = ($template, $compile) ->
 
     return {link: link}
 
-module.directive("tgBacklogProgressBar", ["$tgTemplate", "$compile", TgBacklogProgressBarDirective])
+## RETIRED (React coexistence migration): the `tgBacklogProgressBar` directive
+## registration is removed. It is superseded by
+## `app/react/backlog/SprintProgressBar.tsx` and the progress fill inside
+## `app/react/backlog/SummaryBar.tsx`. The `TgBacklogProgressBarDirective` factory
+## above is retained as the authoritative behavioural reference for the percentage
+## arithmetic: the `defined_points > total_points` branch, the `- 3` visual inset,
+## and the clamp to 0...100 performed by `adjustPercentaje`.

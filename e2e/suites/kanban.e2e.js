@@ -5,6 +5,19 @@
  *
  * Copyright (c) 2021-present Kaleidos INC
  */
+// ---------------------------------------------------------------------------
+// RETIRED -- the Kanban screen was migrated from AngularJS to React 18.
+// End-to-end coverage for this screen now lives in the Playwright layer at
+// e2e-react/specs/kanban.spec.ts. This Protractor suite is retained for
+// reference only: its selectors and flows are the source material for
+// e2e-react/pages/KanbanPage.ts. It is no longer registered in conf.e2e.js,
+// where the `kanban: "e2e/suites/kanban.e2e.js"` suites entry has been removed.
+// The skip is applied to the top-level describe because Mocha runs none of a
+// skipped suite's hooks -- which suppresses the before() below that would
+// otherwise navigate to a board AngularJS no longer renders, along with every
+// nested describe/before/it and the shared filter cases bound in at the end.
+// Technology-specific change documented at the point of change (rule T9).
+// ---------------------------------------------------------------------------
 
 var utils = require('../utils');
 var kanbanHelper = require('../helpers').kanban;
@@ -19,7 +32,7 @@ var chaiAsPromised = require('chai-as-promised');
 chai.use(chaiAsPromised);
 var expect = chai.expect;
 
-describe('kanban', function() {
+describe.skip('kanban', function() {
     before(async function() {
         browser.get(browser.params.glob.host + 'project/project-0/kanban');
 

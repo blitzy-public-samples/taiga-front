@@ -5,6 +5,17 @@
  *
  * Copyright (c) 2021-present Kaleidos INC
  */
+// ---------------------------------------------------------------------------
+// RETIRED - the Backlog / sprint-planning screen was migrated from AngularJS
+// to React 18. End-to-end coverage for this screen now lives in the Playwright
+// layer at e2e-react/specs/backlog.spec.ts. This Protractor suite is retained
+// for reference only (its selectors and flows are the source for
+// e2e-react/pages/BacklogPage.ts) and is no longer registered in conf.e2e.js,
+// where the `backlog` suites entry has been removed.
+// Skipped at the top-level describe so that Mocha runs none of its hooks,
+// which would otherwise navigate to a screen AngularJS no longer renders.
+// Technology-specific change documented at the point of change (rule T9).
+// ---------------------------------------------------------------------------
 
 var utils = require('../utils');
 var backlogHelper = require('../helpers').backlog;
@@ -19,7 +30,7 @@ chai.use(chaiAsPromised);
 var expect = chai.expect;
 
 
-describe('backlog', function() {
+describe.skip('backlog', function() {
     before(async function() {
         browser.get(browser.params.glob.host + 'project/project-3/backlog');
         await utils.common.waitLoader();
