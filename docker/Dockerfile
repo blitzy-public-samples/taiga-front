@@ -18,6 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
+
+# Seven dependencies install straight from git, and package-lock.json resolves
+# four of them (bourbon, checksley, Flot, taiga-html-editor) over
+# "git+ssh://git@github.com/". A build container carries no SSH key and no
+# known_hosts entry, so those fetches abort with "Host key verification failed"
+# and `npm ci` fails outright. Rewriting the git transport to anonymous HTTPS is
+# the same workaround the repository's CI already applies
+# (.github/workflows/main.yml, step "Reconfigure git to use HTTP authentication")
+# and it must be replicated in every install path, this image included. bourbon
+# is the load-bearing one: app/styles/extras/dependencies.scss imports
+# node_modules/bourbon/core/bourbon, so without it no stylesheet compiles at all.
+RUN git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
+    && git config --global --add url."https://github.com/".insteadOf https://git@github.com/ \
+    && git config --global --add url."https://github.com/".insteadOf git@github.com:
+
 RUN npm ci
 
 COPY . .
