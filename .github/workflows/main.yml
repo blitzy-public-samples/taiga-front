@@ -92,6 +92,15 @@ jobs:
     - name: npm install
       run: npm ci
 
+    # Gates for the new React 18 + TypeScript layer under app/react/.
+    # Both are browserless and need no built dist/, so they run before the
+    # slower step below, which does gulp deploy + headless Chrome.
+    - name: type check
+      run: npm run typecheck
+
+    - name: pass react unit test
+      run: npm test
+
     - name: pass unit test
       run: npm run ci:test
 

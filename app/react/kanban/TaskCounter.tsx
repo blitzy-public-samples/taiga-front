@@ -101,7 +101,7 @@
  *    becomes a no-op once `nextUp`/`nextDown` have been cleared.
  *
  * 5. `useLayoutEffect` FOR THE STATE MACHINE. AngularJS runs both `$watch`
- *    listeners inside the first `$digest`, before the browser paints, so the
+ *    listeners inside the first digest, before the browser paints, so the
  *    badge never shows a transient `0`. A passive `useEffect` runs after paint
  *    and would flash `0` on every mount. `useLayoutEffect` is the React
  *    equivalent of "before paint" and preserves the existing behaviour exactly.

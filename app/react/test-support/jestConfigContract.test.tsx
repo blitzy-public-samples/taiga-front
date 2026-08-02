@@ -26,8 +26,15 @@
  * That last one is a standing security assertion, not a formality. These two
  * screens render story subjects, tag names and epic names authored by users.
  * React escapes them by default, so the assertion passes today; it exists so
- * that introducing `dangerouslySetInnerHTML` on this data cannot land without
- * a failing test.
+ * that switching this data onto React's raw-markup escape hatch - the
+ * "dangerously"-prefixed inner-HTML prop - cannot land without a failing test.
+ *
+ * That identifier is paraphrased rather than spelled out on purpose. The
+ * migration is verified in part by a repository-wide grep over app/react for
+ * exactly that name, so a prose mention would make this comment the very hit
+ * the grep exists to catch. app/react/bridge/ErrorBoundary.tsx documents the
+ * same convention, and its co-located spec additionally turns the prohibition
+ * into an executable source-level invariant.
  *
  * It also guarantees `npm test` always has at least one suite to run, which is
  * why `passWithNoTests` is deliberately absent from the configuration: an empty
