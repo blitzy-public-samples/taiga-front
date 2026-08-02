@@ -6,43 +6,56 @@
 # Copyright (c) 2021-present Kaleidos INC
 ###
 
-#############################################################################
-## Shared card directives (React coexistence migration)
-#############################################################################
-## MOVED IN, NOT NEW BEHAVIOUR. `tgCardAssignedTo`, `tgCardData` and
-## `tgCardActions` -- together with the `CardSvgTemplate` heredoc that all three
-## of them compile with `_.template(...)` -- were relocated VERBATIM out of
-## `app/coffee/modules/kanban/main.coffee` (formerly L855-L1125) when that file's
-## AngularJS kanban view layer was retired in favour of the React board. Not one
-## line of their bodies changed, and they stay registered on this SAME
-## `taigaKanban` module under identical names, so not one consumer changes.
-##
-## WHY THEY SURVIVE THE RETIREMENT. They render the SHARED `tg-card` component in
-## `app/modules/components/card/**`, which is must-not-modify. `card.jade` emits
-## `tg-card-actions` (L16), `tg-card-assigned-to` (L26) and `tg-card-data` (L31),
-## and that component is also rendered by the OUT-OF-SCOPE taskboard at
-## `app/partials/includes/modules/taskboard-table.jade` L135 and L186. Retiring
-## these three directives would silently strip the avatar, the ref/subject/points
-## body and the kebab menu from every taskboard card -- a regression on a screen
-## this migration does not touch.
-##
-## WHY THE SVG HEREDOC HAD TO TRAVEL WITH THEM. The Gulp `coffee` task compiles
-## each `.coffee` file INDIVIDUALLY and only afterwards concatenates the results
-## into `app.js`, and CoffeeScript wraps every compiled file in its own
-## `(function(){...}).call(this)` IIFE -- so file-scope variables do NOT cross
-## file boundaries in the bundle. Leaving `CardSvgTemplate` behind in
-## `main.coffee` would have raised a `ReferenceError` the first time any card
-## rendered, taking down the taskboard along with the board.
-##
-## WHY NO BUILD CHANGE IS NEEDED. This path is already matched by
-## `app/coffee/modules/kanban/*.coffee` in both `paths.coffee` and
-## `paths.coffee_order` (`gulpfile.js` L133/L147), so the file is compiled and
-## concatenated into `app.js` with no gulpfile edit.
-#############################################################################
-
 taiga = @.taiga
 
 module = angular.module("taigaKanban")
+
+#############################################################################
+## Shared card directives -- MOVED HERE VERBATIM, NOT NEW BEHAVIOUR
+#############################################################################
+## `tgCardAssignedTo`, `tgCardData` and `tgCardActions` -- together with the
+## `_.template`-compiled SVG heredoc all three of them share -- were relocated out
+## of `app/coffee/modules/kanban/main.coffee` (source block L855-L1126) when that
+## file's AngularJS kanban view layer was superseded by the React board. Not one
+## line of their bodies, signatures, DI arrays, isolate-scope bindings or template
+## paths changed, and they stay registered on this SAME `taigaKanban` module under
+## identical names, so NO consumer anywhere needs an edit. Requirement I2.
+##
+## WHY THEY SURVIVE THE RETIREMENT. They render the SHARED `tg-card` component
+## under `app/modules/components/card/**`, which rule T4 marks MUST NOT CHANGE:
+## `card.jade` emits `tg-card-actions` (L16-L20), `tg-card-assigned-to` (L26-L30)
+## and `tg-card-data` (L31-L36). That component is ALSO rendered by the
+## OUT-OF-SCOPE taskboard at `app/partials/includes/modules/taskboard-table.jade`
+## L135 and L186, so retiring these three would silently strip the kebab menu, the
+## assigned-user avatar and the card body from every taskboard card.
+##
+## WHY THE SVG HEREDOC TRAVELLED WITH THEM. The Gulp `coffee` task compiles each
+## `.coffee` file INDIVIDUALLY (`gulpfile.js` L515) and only afterwards
+## concatenates the results into `app.js` (L520); CoffeeScript wraps every compiled
+## file in its own `(function(){...}).call(this)` IIFE, so file-scope variables do
+## NOT cross file boundaries in the bundle. Leaving the heredoc behind in
+## `main.coffee` would have raised a `ReferenceError` on the first card render,
+## taking the taskboard down along with the board.
+##
+## WHY THE MODULE IS RETRIEVED, NOT DECLARED. The lookup above passes NO second
+## argument, deliberately. Passing one would re-declare `taigaKanban` and reset it,
+## wiping `tgTaskboardIssues` (`taskboard/taskboard-issues.coffee` L81) and
+## `tgTaskboardTasks` (`taskboard/taskboard-tasks.coffee` L157), because
+## `paths.coffee_order` concatenates `coffee/modules/taskboard/*.coffee`
+## (`gulpfile.js` L146) BEFORE `coffee/modules/kanban/*.coffee` (L147). The one
+## declaring call stays at `app/coffee/modules/kanban.coffee` L9. Requirement I1.
+##
+## WHY `item` IS STILL IMMUTABLE HERE. The `tg-card` contract hands `item` in as an
+## Immutable structure and these bodies read it with `.get()`, `.getIn([...])`,
+## `.size` and `.forEach`. That is deliberately NOT converted: plain objects and
+## `immer` drafts live only in the new React state layer under
+## `app/react/kanban/state/`, fed by data flattened at the `react-bridge.coffee`
+## seam. Flattening it here would break the must-not-change shared component, and
+## the out-of-scope taskboard with it.
+##
+## NO BUILD CHANGE IS NEEDED: `paths.coffee` already matches this path
+## (`gulpfile.js` L133) and `paths.coffee_order` already orders it (L147).
+#############################################################################
 
 CardSvgTemplate = """
     <tg-svg>
