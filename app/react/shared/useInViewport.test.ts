@@ -38,10 +38,20 @@
  *
  * `StubIntersectionObserver` below therefore stands in for the platform: it records the
  * options it was constructed with, the targets it was asked to watch and whether it was
- * disconnected, and it exposes `emit()` so a test can decide exactly what the platform
- * reports and when. It is installed on `window` in `beforeEach` and removed in `afterEach`,
- * and the hook picks it up because it constructs its observers through the global at call
- * time instead of capturing a reference when the module loads.
+ * disconnected, and it exposes `report()` and `emit()` so a test can decide exactly what the
+ * platform reports and when. It is installed on `window` in `beforeEach` and removed in
+ * `afterEach`, and the hook picks it up because it constructs its observers through the
+ * global at call time instead of capturing a reference when the module loads.
+ *
+ * The two reporting methods differ in one respect that matters. `report()` takes a per-target
+ * verdict, so a single callback invocation can carry a MIXED batch — which is what a real
+ * observer delivers when several cards cross the boundary in the same frame, and therefore
+ * the only shape that exercises the incumbent's map-then-filter pair. `emit()` is the
+ * shorthand for the common case where every target in the batch shares one verdict.
+ *
+ * Everything the suite needs is built here rather than installed: no observer polyfill is
+ * added to the project, because a controllable double is what the assertions require and a
+ * faithful one would have to be provoked anyway.
  */
 import { StrictMode, createElement, useCallback, useRef } from 'react';
 import type { ReactElement } from 'react';
@@ -65,6 +75,20 @@ const emptyRect: DOMRectReadOnly = {
     left: 0,
     toJSON: () => ({}),
 };
+
+/**
+ * One target together with the verdict the platform reports for it.
+ *
+ * A real observer batches: one callback invocation covers every target whose intersection
+ * changed since the last one, and each carries its own `isIntersecting`. The incumbent leans
+ * on exactly that shape — it maps the whole batch and only afterwards discards the entries
+ * that are not intersecting (`boards.js` L31-L39) — so the double has to be able to produce a
+ * batch in which the verdicts disagree.
+ */
+interface TargetReport {
+    readonly target: Element;
+    readonly isIntersecting: boolean;
+}
 
 /** Builds one platform report for one target. */
 function entryFor(target: Element, isIntersecting: boolean): IntersectionObserverEntry {
@@ -153,11 +177,19 @@ class StubIntersectionObserver implements IntersectionObserver {
     }
 
     /**
-     * Reports the given targets to the hook, as the platform would. Wrap calls in `act()`:
-     * a visible report can move React state.
+     * Delivers one batch to the hook, each target carrying its own verdict, as the platform
+     * would. Wrap calls in `act()`: a visible report can move React state.
      */
+    report(reports: readonly TargetReport[]): void {
+        this.callback(
+            reports.map(({ target, isIntersecting }) => entryFor(target, isIntersecting)),
+            this,
+        );
+    }
+
+    /** The common case: one batch in which every target shares the same verdict. */
     emit(targets: readonly Element[], isIntersecting: boolean): void {
-        this.callback(targets.map((target) => entryFor(target, isIntersecting)), this);
+        this.report(targets.map((target) => ({ target, isIntersecting })));
     }
 }
 
@@ -232,6 +264,21 @@ function latestObserver(): StubIntersectionObserver {
     expect(instances.length).toBeGreaterThan(0);
 
     return instances[instances.length - 1];
+}
+
+/**
+ * The one live observer rooted at a given column, located through the registry by element
+ * identity. This is how a test addresses "the observer for THAT column" when several columns
+ * are registered at once, without depending on construction order.
+ */
+function observerRootedAt(column: Element): StubIntersectionObserver {
+    const live = StubIntersectionObserver.instances.filter(
+        (observer) => observer.root === column && !observer.disconnected,
+    );
+
+    expect(live).toHaveLength(1);
+
+    return live[0];
 }
 
 describe('useInViewport observer construction', () => {
@@ -353,7 +400,37 @@ describe('useInViewport sticky latch', () => {
         expect(result.current.visibleIds).not.toBe(empty);
     });
 
-    it('mixes visible and invisible targets in one report and keeps only the visible', () => {
+    it('sifts a single mixed batch, keeping the visible target and dropping the other', () => {
+        const { result } = renderHook(() => useInViewport());
+        const column = columnElement(1, 5);
+        const visible = cardElement(101);
+        const hidden = cardElement(102);
+
+        result.current.registerColumn(column, 1, 5);
+        result.current.registerCard(visible, 1, 5);
+        result.current.registerCard(hidden, 1, 5);
+
+        // ONE callback invocation carrying both verdicts, which is what the platform delivers
+        // when two cards cross the boundary in the same frame. The incumbent maps the whole
+        // batch and only then discards what is not intersecting (`boards.js` L31-L39), so the
+        // sifting has to happen WITHIN a single batch — two consecutive single-target reports
+        // would leave that path unexercised.
+        act(() => onlyObserver().report([
+            { target: visible, isIntersecting: true },
+            { target: hidden, isIntersecting: false },
+        ]));
+
+        // 102 is ABSENT, not present-and-false. The state is a set of latched ids, so a card
+        // that has never been reported visible carries no key at all. That is what makes
+        // `visibleIds[usId]` a faithful stand-in for `in-view-port="usCardVisibility[usId]"`
+        // (kanban-table.jade L168 and L243), which in turn feeds `ng-if="vm.inViewPort"` on
+        // `.card-inner` (card.jade L9).
+        expect(Object.keys(result.current.visibleIds)).toEqual(['101']);
+        expect(Object.prototype.hasOwnProperty.call(result.current.visibleIds, 102)).toBe(false);
+        expect(result.current.visibleIds[101]).toBe(true);
+    });
+
+    it('keeps only the visible target across two consecutive single-target reports', () => {
         const { result } = renderHook(() => useInViewport());
         const column = columnElement(1, 5);
         const visible = cardElement(7);
@@ -373,6 +450,93 @@ describe('useInViewport sticky latch', () => {
         expect(result.current.visibleIds).toEqual({ 7: true });
     });
 
+    it('does nothing at all when the platform reports an empty batch', () => {
+        const { result } = renderHook(() => useInViewport());
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+
+        const before = result.current.visibleIds;
+
+        // An observer can invoke its callback with an empty list — every target whose
+        // intersection changed may already have been unobserved. The incumbent guards that
+        // with `if (entries.length)` at `boards.js` L41, and the subscriber guards it a second
+        // time with `if visibleEntries.length` at main.coffee L672. Neither writes anything,
+        // so the state object must come back untouched by reference.
+        act(() => onlyObserver().report([]));
+
+        expect(result.current.visibleIds).toBe(before);
+        expect(result.current.visibleIds).toEqual({});
+    });
+
+    it('holds an id latched across leaving and re-entering, without re-rendering', () => {
+        const { result } = renderHook(() => useInViewport());
+        const card = cardElement(101);
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+        result.current.registerCard(card, 1, 5);
+
+        const observer = onlyObserver();
+
+        // Enter.
+        act(() => observer.report([{ target: card, isIntersecting: true }]));
+
+        const latched = result.current.visibleIds;
+
+        expect(latched[101]).toBe(true);
+
+        // Leave — and nothing changes. `usCardVisibility` is created empty once at
+        // main.coffee L577, written `true` at L675, and repository-wide it is never written
+        // back to `false` and no key is ever deleted, so the latch has to survive the card
+        // scrolling away. A hook that un-latched here would unmount and remount `.card-inner`
+        // on every scroll, which is a behaviour change rule T10 forbids, and it would take the
+        // drop target away from every scrolled-away card — the R-DND-3 regression, since the
+        // new drag layer has no virtualisation of its own to compensate.
+        act(() => observer.report([{ target: card, isIntersecting: false }]));
+
+        expect(result.current.visibleIds).toBe(latched);
+        expect(result.current.visibleIds[101]).toBe(true);
+
+        // Re-enter: still latched, and still the very same object, so React does no work. The
+        // second dedupe at main.coffee L670 (`!$scope.usCardVisibility[entry.id]`) is what
+        // this reproduces.
+        act(() => observer.report([{ target: card, isIntersecting: true }]));
+
+        expect(result.current.visibleIds).toBe(latched);
+        expect(result.current.visibleIds[101]).toBe(true);
+    });
+
+    it('keys the latch by the NUMBER in data-id, not by the attribute text', () => {
+        const { result } = renderHook(() => useInViewport());
+        const plain = cardElement(101);
+        const padded = cardElement();
+
+        // An attribute whose text differs from its numeric form. `Number()` at `boards.js`
+        // L34 normalises it to 102; keying off `dataset.id` directly would store `'0102'`
+        // instead, and `visibleIds[102]` — the lookup each card performs with its own numeric
+        // `us.id` — would silently miss and the card would never show its content.
+        padded.dataset.id = '0102';
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+        result.current.registerCard(plain, 1, 5);
+        result.current.registerCard(padded, 1, 5);
+
+        act(() => onlyObserver().report([
+            { target: plain, isIntersecting: true },
+            { target: padded, isIntersecting: true },
+        ]));
+
+        const { visibleIds } = result.current;
+
+        expect(Object.keys(visibleIds)).toEqual(['101', '102']);
+        expect(Object.prototype.hasOwnProperty.call(visibleIds, '0102')).toBe(false);
+
+        // Numeric lookup, and the value is the boolean `true` rather than the entry object or
+        // the attribute text.
+        expect(visibleIds[101]).toBe(true);
+        expect(visibleIds[102]).toBe(true);
+        expect(typeof visibleIds[101]).toBe('boolean');
+    });
+
     it('resolves a card with no data-id to NaN, so it can never match a real id', () => {
         const { result } = renderHook(() => useInViewport());
         const column = columnElement(1, 5);
@@ -381,12 +545,25 @@ describe('useInViewport sticky latch', () => {
         result.current.registerColumn(column, 1, 5);
         result.current.registerCard(card, 1, 5);
 
-        act(() => onlyObserver().emit([card], true));
+        // The documented, deliberate failure mode. `Number(undefined)` is `NaN`, so a card
+        // element that lost its `data-id` simply never becomes visible, quietly, exactly as it
+        // does today. Reporting it must not throw.
+        expect(() => act(() => onlyObserver().emit([card], true))).not.toThrow();
 
-        // The documented, deliberate failure mode: the attribute is missing, so the id is
-        // NaN and the card simply never becomes visible. No guard hides that.
+        // The NaN key is PRESENT, not filtered out. Dropping non-finite ids here would be an
+        // improvement that hides the bug: the symptom would become "one card never renders"
+        // with nothing in the state to point at. Leaving the key visible is what makes the
+        // missing attribute diagnosable, and it is precisely why every card element has to
+        // carry `data-id="{{ usId }}"` — kanban-table.jade L151 in swimlane mode and L227 in
+        // flat mode.
         expect(Object.keys(result.current.visibleIds)).toEqual(['NaN']);
+        expect(result.current.visibleIds[Number.NaN]).toBe(true);
+
+        // And no real id was latched on its behalf. `Number(null)` would be `0`, which is why
+        // the hook reads `dataset.id` rather than `getAttribute('data-id')`: a missing
+        // attribute must not resolve to a value a genuine user story could hold.
         expect(result.current.visibleIds[7]).toBeUndefined();
+        expect(result.current.visibleIds[0]).toBeUndefined();
     });
 });
 
@@ -508,6 +685,79 @@ describe('useInViewport keying branches', () => {
         expect(result.current.visibleIds).toEqual({ 7: true });
     });
 
+    it('leaves the replaced swimlane observer with nothing left to report', () => {
+        const { result } = renderHook(() => useInViewport());
+        const card = cardElement(101);
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+        result.current.registerCard(card, 1, 5);
+
+        const [replaced] = StubIntersectionObserver.instances;
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+
+        // `disconnect()` empties the observed set, exactly as the platform does, so the retired
+        // observer can no longer report anything and cannot latch behind the replacement's
+        // back. The incumbent simply drops the reference at `boards.js` L51 and lets the old
+        // observer keep reporting; releasing it is a React lifecycle addition, and it is safe
+        // because the replacement inherited every target.
+        expect(replaced.disconnected).toBe(true);
+        expect(replaced.observed).toEqual([]);
+
+        act(() => replaced.report(replaced.observed.map((target) => ({
+            target,
+            isIntersecting: true,
+        }))));
+
+        expect(result.current.visibleIds).toEqual({});
+
+        // The live observer is the one that latches, and it does so exactly once.
+        act(() => latestObserver().report([{ target: card, isIntersecting: true }]));
+
+        expect(result.current.visibleIds).toEqual({ 101: true });
+    });
+
+    it('observes a card exactly once through the observer of its own column', () => {
+        const { result } = renderHook(() => useInViewport());
+        const card = cardElement(101);
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+        result.current.registerCard(card, 1, 5);
+
+        // The column is already registered, so `boards.js` L17-L23 hands the card straight to
+        // its observer: one `observe()` call, no buffering, no duplicate.
+        expect(onlyObserver().observeCalls).toEqual([card]);
+        expect(onlyObserver().observed).toEqual([card]);
+    });
+
+    it('routes each card to its own swimlane observer, never to a sibling column', () => {
+        const { result } = renderHook(() => useInViewport());
+        const upperColumn = columnElement(1, 5);
+        const lowerColumn = columnElement(1, 6);
+        const upperCard = cardElement(101);
+        const lowerCard = cardElement(102);
+
+        // The SAME status in two swimlanes: two columns, two observers, two roots. The markup
+        // keeps them apart with the pair the column element carries — `data-status` and
+        // `data-swimlane` at kanban-table.jade L119-L120 — and the hook keys its registry on
+        // exactly that pair.
+        result.current.registerColumn(upperColumn, 1, 5);
+        result.current.registerColumn(lowerColumn, 1, 6);
+        result.current.registerCard(upperCard, 1, 5);
+        result.current.registerCard(lowerCard, 1, 6);
+
+        expect(StubIntersectionObserver.instances).toHaveLength(2);
+        expect(observerRootedAt(upperColumn).observed).toEqual([upperCard]);
+        expect(observerRootedAt(lowerColumn).observed).toEqual([lowerCard]);
+
+        // And a report from one swimlane latches only its own card.
+        act(() => observerRootedAt(upperColumn).report([
+            { target: upperCard, isIntersecting: true },
+        ]));
+
+        expect(result.current.visibleIds).toEqual({ 101: true });
+    });
+
     it('builds the flat observer only if absent, leaving the first root in place', () => {
         const { result } = renderHook(() => useInViewport());
         const firstColumn = columnElement(1);
@@ -620,9 +870,35 @@ describe('useInViewport release', () => {
     it('ignores the release of a column or a card it never registered', () => {
         const { result } = renderHook(() => useInViewport());
 
+        // No observer exists for this key at all, so there is nothing to disconnect and
+        // nothing to unobserve. Neither call may throw: React unmounts a folded swimlane and
+        // its cards in one pass, and the order in which their ref callbacks fire is not
+        // something a component controls.
         expect(() => result.current.unregisterColumn(42, 5)).not.toThrow();
         expect(() => result.current.unregisterCard(cardElement(7), 42, 5)).not.toThrow();
         expect(StubIntersectionObserver.instances).toHaveLength(0);
+    });
+
+    it('ignores the release of a card its live column never observed', () => {
+        const { result } = renderHook(() => useInViewport());
+        const registered = cardElement(101);
+        const stranger = cardElement(102);
+
+        result.current.registerColumn(columnElement(1, 5), 1, 5);
+        result.current.registerCard(registered, 1, 5);
+
+        const observer = onlyObserver();
+
+        // Here the key DOES resolve to a live observer, but the element was never handed to
+        // it. The platform ignores `unobserve()` for a target it is not watching, so this has
+        // to be a no-op rather than an error — and it must leave the cards that ARE observed
+        // exactly where they were.
+        expect(() => result.current.unregisterCard(stranger, 1, 5)).not.toThrow();
+        expect(observer.observed).toEqual([registered]);
+
+        act(() => observer.report([{ target: registered, isIntersecting: true }]));
+
+        expect(result.current.visibleIds).toEqual({ 101: true });
     });
 
     it('disconnects every observer when the board unmounts', () => {

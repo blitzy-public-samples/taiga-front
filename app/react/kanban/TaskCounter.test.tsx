@@ -14,14 +14,24 @@
  * `dist/`.
  *
  * `TaskCounter` is the port of `tgAnimatedCounter`
- * (app/modules/components/kanban-board-zoom/animated-counter.directive.coffee),
- * which is by far the most stateful unit on the board: a four-branch value
- * machine, a deferred class promotion that makes the CSS transition run at all,
- * and a `transitionEnd` handler that promotes the scrolled-in row to the resting
- * row. None of that is visible in a screenshot, so it is asserted here.
+ * (app/modules/components/animated-counter/animated-counter.directive.coffee --
+ * every `:NNN` locator below refers to that file), which is by far the most
+ * stateful unit on the board: a four-branch value machine, a deferred class
+ * promotion that makes the CSS transition run at all, and a `transitionEnd`
+ * handler that promotes the scrolled-in row to the resting row. None of that is
+ * visible in a screenshot, so it is asserted here.
  *
  * What these specs hold, in the source's own terms:
  *
+ *  - the rendered shape: the `<tg-animated-counter>` HOST element as the
+ *    outermost node, then `.animated-counter-inner` > `.counter-translator` >
+ *    exactly three `.result` rows (:13-29). The host is not cosmetic --
+ *    animated-counter.directive.scss line 1 is literally
+ *    `tg-animated-counter {` and all 65 of its lines nest inside that element
+ *    selector, so dropping the wrapper would silently unstyle the badge with no
+ *    error and no build failure. That makes it the single most load-bearing
+ *    assertion in this file (transformation rule T1 extends to `tg-*` element
+ *    names, not only to class names);
  *  - the four branches of `renderData` (:60-86) in order, each reachable and
  *    each with the right effect on the baseline;
  *  - the remove-then-re-add direction sequence (:80-86) -- the class must be
@@ -93,7 +103,61 @@ function rowTexts(container: HTMLElement): string[] {
     );
 }
 
-/** The resting (middle) row -- the only one visible at rest. */
+/** The three `.result` rows themselves, in the source's row order. */
+function rows(container: HTMLElement): HTMLElement[] {
+    return Array.from(container.querySelectorAll<HTMLElement>('.result'));
+}
+
+/**
+ * The `<tg-animated-counter>` host as the container's OUTERMOST element, rather
+ * than as "some descendant that happens to match". Anything but the outermost
+ * node would mean the component had emitted a wrapper the directive never had.
+ */
+function outermost(container: HTMLElement): Element {
+    const element = container.firstElementChild;
+
+    if (element === null) {
+        throw new Error('Expected the counter to render an element.');
+    }
+
+    return element;
+}
+
+/**
+ * `element.children[index]`, narrowed. Used to walk the nesting chain one level
+ * at a time so a missing or reordered level names itself in the failure.
+ */
+function childAt(element: Element, index: number): Element {
+    const child = element.children[index];
+
+    if (child === undefined) {
+        throw new Error(`Expected a child at index ${index} of <${element.tagName}>.`);
+    }
+
+    return child;
+}
+
+/**
+ * The resting (middle) row -- the only one visible at rest.
+ *
+ * WHITESPACE, and why these assertions read `'1 / 4'` rather than the AngularJS
+ * string (T9 seam note, confirmed against the running application):
+ *
+ * The directive's template is a multi-line CoffeeScript string, so AngularJS
+ * emits indentation text nodes inside each `.result` and the live DOM reports
+ * `textContent === "\n            1 / 4\n        "` (measured on
+ * /project/project-3/kanban: 30 counters, every row shaped that way). React
+ * renders the same two spans with no text node between or around them, so
+ * `textContent === "1 / 4"`.
+ *
+ * That divergence is deliberate and is NOT a fidelity loss: the whitespace is an
+ * artefact of how the template literal was authored, it collapses to nothing in
+ * a block-level `.result` box, and reproducing it would mean emitting decorative
+ * text nodes React has no reason to emit. The space that DOES matter -- the one
+ * inside the suffix span, `" / 4"` -- is asserted by exact equality below,
+ * because that one is the visible separator between numerator and divider and it
+ * is confirmed byte-for-byte in the live DOM.
+ */
 function restingText(container: HTMLElement): string {
     return rowTexts(container)[1] ?? '';
 }
@@ -111,6 +175,22 @@ describe('TaskCounter', () => {
             expect(container.querySelectorAll('.result')).toHaveLength(3);
         });
 
+        it('makes the `<tg-animated-counter>` host the OUTERMOST node', () => {
+            // The directive declares no `replace`, so AngularJS kept the host
+            // element and rendered the template as its CONTENT (:104-111). The
+            // whole stylesheet nests inside `tg-animated-counter { … }`
+            // (animated-counter.directive.scss:1), so an extra wrapper above the
+            // host -- or the host being dropped for its inner div -- silently
+            // detaches all 65 lines of it. Asserted on `firstElementChild`, not
+            // with a selector, because a selector would also match a host buried
+            // under a wrapper this component must never introduce.
+            const { container } = render(<TaskCounter count={1} wip={4} />);
+
+            expect(outermost(container).tagName.toLowerCase()).toBe('tg-animated-counter');
+            // Exactly one root: no sibling node is emitted alongside the host.
+            expect(container.children).toHaveLength(1);
+        });
+
         it('nests the rows inside the translator inside the inner box', () => {
             const { container } = render(<TaskCounter count={1} wip={4} />);
             const rows = translator(container).children;
@@ -118,6 +198,54 @@ describe('TaskCounter', () => {
             expect(rows).toHaveLength(3);
             expect(mustFind(container, '.animated-counter-inner').children).toHaveLength(1);
             expect(host(container).children).toHaveLength(1);
+        });
+
+        it('reproduces the template nesting chain level by level, by tag and class', () => {
+            // Walks :13-29 top-down. The stylesheet's selectors are
+            // `tg-animated-counter .animated-counter-inner`,
+            // `… .counter-translator` and `… .result`, so both the tag names and
+            // the class names at each level are part of the contract -- and so is
+            // the fact that each level holds exactly one child until the rows.
+            const { container } = render(<TaskCounter count={1} wip={4} />);
+
+            const hostElement = outermost(container);
+            expect(hostElement.tagName.toLowerCase()).toBe('tg-animated-counter');
+            expect(hostElement.children).toHaveLength(1);
+
+            const inner = childAt(hostElement, 0);
+            expect(inner.tagName).toBe('DIV');
+            expect(inner.classList.contains('animated-counter-inner')).toBe(true);
+            expect(inner.children).toHaveLength(1);
+
+            const translatorElement = childAt(inner, 0);
+            expect(translatorElement.tagName).toBe('DIV');
+            expect(translatorElement.classList.contains('counter-translator')).toBe(true);
+            expect(translatorElement.children).toHaveLength(3);
+
+            // All three rows are `div.result`, in order and with nothing between
+            // them: the resting offset of one row height depends on it.
+            Array.from(translatorElement.children).forEach((row) => {
+                expect(row.tagName).toBe('DIV');
+                expect(row.classList.contains('result')).toBe(true);
+            });
+        });
+
+        it('opens every row with a `span.current`, not only the resting one', () => {
+            // `<span class="current">{{ X.current || 0 }}</span>` is the FIRST
+            // child of each of the three rows (:19, :22, :25). The suffix span,
+            // when present, is its next sibling -- never its parent or its
+            // predecessor.
+            const { container } = render(<TaskCounter count={1} wip={4} />);
+            const allRows = rows(container);
+
+            expect(allRows).toHaveLength(3);
+
+            allRows.forEach((row) => {
+                const first = childAt(row, 0);
+
+                expect(first.tagName).toBe('SPAN');
+                expect(first.getAttribute('class')).toBe('current');
+            });
         });
 
         it('renders the count in a `.current` span', () => {
@@ -157,6 +285,20 @@ describe('TaskCounter', () => {
             expect(container.querySelectorAll('.result')[1]?.children).toHaveLength(1);
         });
 
+        it('renders `0 / limit` for an empty status that has a WIP limit', () => {
+            // The `|| 0` fallback at :22 with a GENUINE zero rather than an absent
+            // snapshot: the count really is 0, so the suffix must still render.
+            // This is the empty-column state the board shows most often, and the
+            // Kanban frame (node 1:7) evidences it as "0 / 2".
+            const { container } = render(<TaskCounter count={0} wip={4} />);
+            const resting = childAt(translator(container), 1);
+
+            expect(restingText(container)).toBe('0 / 4');
+            expect(resting.children).toHaveLength(2);
+            expect(childAt(resting, 0).textContent).toBe('0');
+            expect(childAt(resting, 1).textContent).toBe(' / 4');
+        });
+
         it('renders `0` for a row that holds no snapshot', () => {
             // `{{ X.current || 0 }}` uses `||`, so an absent snapshot renders `0`
             // rather than nothing (animated-counter.directive.coffee:18-26).
@@ -180,6 +322,36 @@ describe('TaskCounter', () => {
 
             expect(host(container).hasAttribute('class')).toBe(false);
         });
+
+        it('puts the class on the HOST element, never on the inner box', () => {
+            // `&.vertical` is nested directly under `tg-animated-counter` in
+            // animated-counter.directive.scss:5-26, so the class has to sit on the
+            // host for `.vertical .animated-counter-inner`,
+            // `.vertical .counter-translator` and `.vertical .result` to match. The
+            // call site puts it there too: `tg-animated-counter(class="vertical" …)`
+            // at kanban-table.jade:133-136 and :209-212.
+            const { container } = render(<TaskCounter count={6} wip={null} vertical />);
+
+            expect(outermost(container).classList.contains('vertical')).toBe(true);
+            expect(innerClass(container)).not.toContain('vertical');
+            expect(translatorClass(container)).not.toContain('vertical');
+        });
+
+        it('renders the folded call-site shape, which passes no `disabled` binding at all', () => {
+            // Both folded call sites bind only `class` and `data`
+            // (kanban-table.jade:133-136 and :209-212) -- there is no
+            // `disabled="ctrl.renderInProgress"` on either, unlike their expanded
+            // counterparts at :126-129 and :202-205. `disabled` must therefore be
+            // optional and must default to "not disabled", or the vertical rail
+            // would render a permanent 0.
+            const { container } = render(<TaskCounter count={6} wip={2} vertical />);
+
+            expect(outermost(container).classList.contains('vertical')).toBe(true);
+            expect(restingText(container)).toBe('6 / 2');
+            expect(innerClass(container)).toBe(
+                'animated-counter-inner wip-amount limit-over',
+            );
+        });
     });
 
     describe('the template-derived classes', () => {
@@ -195,6 +367,32 @@ describe('TaskCounter', () => {
             expect(innerClass(container)).toBe('animated-counter-inner');
             // A zero limit also renders no ` / 0` suffix.
             expect(restingText(container)).toBe('0');
+        });
+
+        it('renders a bare count when wip_limit is 0, because the source tests `wip` for truthiness and not for null (Drift D13)', () => {
+            // THE quirk of this component, spelled out with a non-zero count so it
+            // cannot be confused with the empty-column case above. `data.wip` is
+            // read as a boolean in three places -- the `ng-class` at :15 and the
+            // `ng-if="X.wip"` guard on each of the three rows at :19, :22 and :25 --
+            // and `0` is falsy in all three. A status configured with a WIP limit of
+            // zero therefore renders EXACTLY like a status with no limit at all:
+            // a bare count, no `wip-amount` class, and no suffix ELEMENT (not merely
+            // an empty one). Preserved verbatim under T10; implementing this as
+            // `wip !== null` would print " / 0" in production.
+            const { container } = render(<TaskCounter count={2} wip={0} />);
+            const resting = childAt(translator(container), 1);
+
+            expect(innerClass(container)).not.toContain('wip-amount');
+            expect(restingText(container)).toBe('2');
+            // One child only: the suffix span is absent from the DOM, not blank.
+            expect(resting.children).toHaveLength(1);
+            expect(resting.childNodes).toHaveLength(1);
+            expect(childAt(resting, 0).getAttribute('class')).toBe('current');
+            // Not one row carries a suffix, since `getCounter` copies the same
+            // falsy limit onto every snapshot it builds (:51-55).
+            rows(container).forEach((row) => {
+                expect(row.children).toHaveLength(1);
+            });
         });
 
         it('omits `limit-over` when the count merely equals its limit (Drift D14)', () => {
@@ -405,6 +603,30 @@ describe('TaskCounter', () => {
             expect(translatorClass(container)).toBe('counter-translator dec');
         });
 
+        it('copies the limit onto every snapshot it builds, so both live rows carry the suffix', () => {
+            // `getCounter` returns `{current: num, wip: data.wip}` (:51-55) -- the
+            // limit is copied onto EVERY counter object, not held once on the
+            // resting one. That is why each of the three rows has its own
+            // `ng-if="X.wip"` suffix guard rather than sharing a single one, and it
+            // is what makes the rolling digits read "1 / 4" -> "2 / 4" instead of
+            // the limit vanishing mid-roll.
+            const { container, rerender } = render(<TaskCounter count={1} wip={4} />);
+
+            rerender(<TaskCounter count={2} wip={4} />);
+
+            const [up, resting, down] = rowTexts(container);
+
+            // Both rows that now hold a snapshot render the suffix...
+            expect(up).toBe('2 / 4');
+            expect(resting).toBe('1 / 4');
+            expect(childAt(translator(container), 0).children).toHaveLength(2);
+            expect(childAt(translator(container), 1).children).toHaveLength(2);
+            // ...and the one that holds none renders the bare `|| 0` fallback,
+            // because an absent snapshot has no `wip` to be truthy.
+            expect(down).toBe('0');
+            expect(childAt(translator(container), 2).children).toHaveLength(1);
+        });
+
         it('captures the CURRENT limit in the staged snapshot, not the previous one', () => {
             const { container, rerender } = render(<TaskCounter count={1} wip={4} />);
 
@@ -429,6 +651,46 @@ describe('TaskCounter', () => {
 
             expect(translatorClass(container)).toBe('counter-translator dec');
             expect(rowTexts(container)[2]).toBe('1 / 4');
+        });
+
+        it('never carries `inc` and `dec` together when a reversal lands before the roll completes', () => {
+            // The source removes BOTH classes before re-adding either
+            // (`counter.removeClass('inc dec')` at :80, then the `$evalAsync` at
+            // :82-86 adds exactly one), so the two are mutually exclusive by
+            // construction. Here the reversal arrives while the first roll is still
+            // only SCHEDULED, which is the case that exercises the deferred
+            // promotion's cleanup: the queued `inc` must be cancelled rather than
+            // applied alongside the `dec` that superseded it. In the source this is
+            // the same guarantee, expressed there as a queued `$evalAsync` callback
+            // finding `nextUp` already cleared.
+            const { container, rerender } = render(<TaskCounter count={5} wip={4} />);
+
+            rerender(<TaskCounter count={7} wip={4} />);
+            // The `inc` is queued but not yet applied.
+            expect(translatorClass(container)).toBe('counter-translator');
+            expect(jest.getTimerCount()).toBe(1);
+
+            rerender(<TaskCounter count={6} wip={4} />);
+
+            // Still nothing applied, and still exactly one timer: the `inc` one was
+            // cleared and replaced rather than left to fire as well.
+            expect(translatorClass(container)).toBe('counter-translator');
+            expect(jest.getTimerCount()).toBe(1);
+
+            act(() => {
+                jest.advanceTimersByTime(1);
+            });
+
+            // Exactly one direction survives, and it is the later one.
+            const applied = translatorClass(container);
+            expect(applied).toBe('counter-translator dec');
+            expect(applied).not.toContain('inc');
+            // The reversal is measured from the SUPERSEDED value (7), not from the
+            // last resting value (5), because branch 4 advanced the baseline before
+            // its class was ever applied.
+            expect(rowTexts(container)).toEqual(['0', '5 / 4', '6 / 4']);
+            // Nothing is left queued behind it.
+            expect(jest.getTimerCount()).toBe(0);
         });
 
         it('clears the pending timer on unmount, scheduling nothing after teardown', () => {
@@ -527,11 +789,20 @@ describe('TaskCounter', () => {
             const { container, rerender } = render(<TaskCounter count={1} wip={4} />);
 
             expect(restingText(container)).toBe('1 / 4');
+            expect(translatorClass(container)).toBe('counter-translator');
 
             rerender(<TaskCounter count={9} wip={4} disabled />);
 
+            // Both `$watch` listeners return before `renderData` (:88-98), so a
+            // count change arriving while `ctrl.renderInProgress` is true neither
+            // moves the number nor stages a roll.
             expect(restingText(container)).toBe('1 / 4');
             expect(rowTexts(container)[0]).toBe('0');
+            // No direction class is applied, and none is scheduled either: an
+            // eight-step jump must not roll once the board re-enables.
+            expect(translatorClass(container)).toBe('counter-translator');
+            expect(translatorClass(container)).not.toContain('inc');
+            expect(translatorClass(container)).not.toContain('dec');
         });
 
         it('lands the pending value once re-enabled', () => {
