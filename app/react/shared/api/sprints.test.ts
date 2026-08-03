@@ -76,12 +76,14 @@ import {
     listSprints,
     moveUserStoriesToMilestone,
 } from './sprints';
+import type { SprintStatsResponse } from './sprints';
 import type {
     AngularHttpResponse,
     AngularPromise,
     ResourceParams,
     TaigaModel,
 } from '../../bridge/useAngularService';
+import type { NestedSprintUserStory, Sprint } from '../types/sprint';
 
 /* ==========================================================================
  * FIXTURES AND DOUBLES
@@ -359,22 +361,27 @@ class ModelDouble<TAttrs extends object> implements TaigaModel<TAttrs> {
 }
 
 /**
- * The statistics body shape, mirrored locally.
+ * The statistics body shape.
  *
- * The facade's own payload type is intentionally NOT exported -- it describes a raw
- * response rather than a domain model -- so the spec mirrors it structurally and
- * passes it explicitly. Mirroring it here also means a drift in the real shape
- * shows up as a compile error in this spec.
+ * ⛔ THE FACADE'S OWN TYPE IS USED, NOT A LOCAL MIRROR. A mirror was declared here
+ * before, and it is what let the two point members be described wrongly for as long
+ * as they were: a mirror agrees with whatever the spec author believed, so the
+ * production declaration was never on trial. Aliasing the exported type means a
+ * drift in either direction is a compile error right here.
  *
- * ⭐ The two point fields are MAPS keyed by role, and the four DERIVED fields the
- * incumbent consumer computes onto its own view state are deliberately absent.
+ * ⛔ `total_points` is a role-keyed MAP and `completed_points` is an ARRAY. The
+ * view builds them differently -- `milestone.total_points` versus
+ * `milestone.closed_points.values()` -- so the role keys survive on one and are
+ * discarded on the other. The incumbent consumer is agnostic because it reads both
+ * through `_.values(...)` (`taskboard/main.coffee:418-419`), which is exactly why
+ * the wrong declaration was never observed to be wrong.
+ *
+ * ⭐ The four DERIVED fields that consumer computes onto its own view state --
+ * the point sums, the remaining counts and the completion percentage
+ * (`taskboard/main.coffee:422-431`) -- are deliberately absent: they are not wire
+ * fields, and the facade neither declares nor computes them.
  */
-type StatsFixture = {
-    readonly total_points: Readonly<Record<string, number>>;
-    readonly completed_points: Readonly<Record<string, number>>;
-    readonly total_tasks: number;
-    readonly completed_tasks: number;
-};
+type StatsFixture = SprintStatsResponse;
 
 /** The story attributes the nested story models wrap. */
 type StoryFixtureAttrs = {
@@ -633,10 +640,23 @@ describe('getSprintStats', () => {
      * they are not wire fields, and the facade neither declares nor computes them.
      */
     const statsPayload: StatsFixture = {
-        total_points: { UX: 20, Design: 15.5, Front: 66 },
-        completed_points: { UX: 10, Design: 5.5, Front: 5.5 },
+        name: 'Sprint 2026-5-15',
+        estimated_start: '2026-05-15',
+        estimated_finish: '2026-05-30',
+        // Role-KEYED, because the view sends `milestone.total_points` whole.
+        total_points: { '1': 20, '2': 15.5, '3': 66 },
+        // ⛔ An ARRAY, because the view sends `closed_points.values()`: the role
+        // keys are discarded before serialisation.
+        completed_points: [10, 5.5, 5.5],
+        total_userstories: 11,
+        completed_userstories: 3,
         total_tasks: 108,
         completed_tasks: 21,
+        iocaine_doses: 2,
+        days: [
+            { day: '2026-05-15', name: 15, open_points: 101.5, optimal_points: 101.5 },
+            { day: '2026-05-16', name: 16, open_points: 96.5, optimal_points: 94.7 },
+        ],
     };
 
     it('forwards the project id and the sprint id positionally, in that order', async () => {
@@ -663,9 +683,11 @@ describe('getSprintStats', () => {
         expect(resolved).toBe(statsPayload);
         expect(typeof (resolved as { getAttrs?: unknown }).getAttrs).toBe('undefined');
 
-        // The point fields stay MAPS -- not pre-summed. Summing is the caller's.
-        expect(resolved.total_points).toEqual({ UX: 20, Design: 15.5, Front: 66 });
-        expect(resolved.completed_points).toEqual({ UX: 10, Design: 5.5, Front: 5.5 });
+        // Neither point field is pre-summed -- summing is the caller's -- but they are
+        // not the same KIND of value, and that asymmetry is the point.
+        expect(resolved.total_points).toEqual({ '1': 20, '2': 15.5, '3': 66 });
+        expect(Array.isArray(resolved.completed_points)).toBe(true);
+        expect(resolved.completed_points).toEqual([10, 5.5, 5.5]);
         expect(resolved.total_tasks).toBe(108);
         expect(resolved.completed_tasks).toBe(21);
     });
@@ -676,13 +698,24 @@ describe('getSprintStats', () => {
         const resolved = await getSprintStats<StatsFixture>(service, PROJECT_ID, SPRINT_ID);
 
         // Deriving these here would relocate controller behaviour into the resource
-        // layer, which T10 forbids.
+        // layer, which T10 forbids. The key set is the view's own, in full: the four
+        // derived members the taskboard computes are absent, and so is any addition of
+        // this facade's.
         expect(Object.keys(resolved).sort()).toEqual([
             'completed_points',
             'completed_tasks',
+            'completed_userstories',
+            'days',
+            'estimated_finish',
+            'estimated_start',
+            'iocaine_doses',
+            'name',
             'total_points',
             'total_tasks',
+            'total_userstories',
         ]);
+        expect(resolved).not.toHaveProperty('totalPointsSum');
+        expect(resolved).not.toHaveProperty('completedPercentage');
     });
 
     it('rejects with the reason unchanged', async () => {
@@ -985,23 +1018,53 @@ describe('moveUserStoriesToMilestone', () => {
         expect(asPayload<readonly MoveEntry[]>(forwarded)[0]).toBe(entries[0]);
     });
 
-    it('accepts a null destination without adding a guard of its own', async () => {
+    it('\u26d4 cannot be called with a null destination, because the endpoint rejects one', () => {
+        // `move_userstories_to_sprint` validates through `UpdateMilestoneBulkValidator`,
+        // whose `milestone_id` is a mandatory `IntegerField()`, and the view then does
+        // `get_object_or_error(Milestone, pk=data["milestone_id"])` unconditionally. A
+        // null destination is an HTTP 400 -- it does NOT mean "unassign" -- so the
+        // signature refuses it and the mistake is unrepresentable rather than merely
+        // discouraged.
+        //
+        // The GATE still lives in the UI, exactly as it does today: the incumbent
+        // lightbox initialises its selection to nothing
+        // (`move-to-sprint-lb.controller.coffee:36`) and gates its submit control on
+        // the value being set (`move-to-sprint-lb.jade:79`). This facade adds no
+        // run-time check of its own (T10); it simply requires the caller to have
+        // passed its own gate before the call can be expressed.
+        //
+        // Asserted at the TYPE level, since a compile error cannot be caught at run
+        // time. `@ts-expect-error` fails the build if the error ever stops occurring,
+        // so this is an executable assertion rather than a comment.
+        const callWithNullDestination = (): unknown =>
+            moveUserStoriesToMilestone(
+                sprintsDouble({ move: { kind: 'fulfil', value: response } }).service,
+                SOURCE_SPRINT_ID,
+                PROJECT_ID,
+                // @ts-expect-error - a null destination is an HTTP 400, not an unassign
+                null,
+                entries,
+            );
+
+        expect(typeof callWithNullDestination).toBe('function');
+    });
+
+    it('forwards a real destination id in the third position, where the body reads it', async () => {
         const { service, log } = sprintsDouble({ move: { kind: 'fulfil', value: response } });
 
-        // The incumbent lightbox initialises its selection to nothing
-        // (`move-to-sprint-lb.controller.coffee:36`) and gates its submit control on
-        // the value being set (`move-to-sprint-lb.jade:79`), so the gate lives in the
-        // UI. Validating here would be behaviour the incumbent does not have (T10).
         await moveUserStoriesToMilestone(
             service,
             SOURCE_SPRINT_ID,
             PROJECT_ID,
-            null,
+            DESTINATION_SPRINT_ID,
             entries,
         );
 
+        // Position three, not one: the FIRST id is the source and lands in the URL
+        // path, so a transposition moves the stories to the wrong sprint under an
+        // HTTP 200, with no error anywhere.
         expect(log.moveUserStoriesMilestone).toEqual([
-            [SOURCE_SPRINT_ID, PROJECT_ID, null, entries],
+            [SOURCE_SPRINT_ID, PROJECT_ID, DESTINATION_SPRINT_ID, entries],
         ]);
     });
 
@@ -1107,6 +1170,118 @@ describe('moveUserStoriesToMilestone', () => {
 /* ==========================================================================
  * THE MODULE SURFACE
  * ========================================================================== */
+
+/* ==========================================================================
+ * THE SPRINT DOMAIN SHAPE -- what a milestone response does and does not carry
+ * ========================================================================== */
+
+describe('the Sprint domain type matches MilestoneSerializer, member for member', () => {
+    /**
+     * Exact type equality, in the standard conditional-inference form.
+     *
+     * Mutual assignability is not enough: a type with an EXTRA member stays
+     * assignable in one direction, so a re-added phantom field would still satisfy an
+     * assignability check.
+     */
+    type Equals<A, B> =
+        (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+
+    it('\u26d4 declares NO `version`, because no milestone response carries one', () => {
+        // A `version` was declared and does not exist in any milestone payload:
+        // `MilestoneSerializer` declares id, name, slug, owner, project,
+        // estimated_start, estimated_finish, created_date, modified_date, closed,
+        // disponibility, order, user_stories, total_points, closed_points -- and
+        // `project_extra_info` from its mixin. A sprint round-tripped through a write
+        // would therefore have carried `undefined` as its optimistic-concurrency
+        // token, which is either a rejected write or a silently overwritten
+        // concurrent edit.
+        const hasNoVersion: Equals<Extract<keyof Sprint, 'version'>, never> = true;
+
+        expect(hasNoVersion).toBe(true);
+    });
+
+    it('\u2b50 the NESTED stories DO carry a version, which is why the confusion arose', () => {
+        // `UserStoryNestedSerializer` declares `version`; `MilestoneSerializer` does
+        // not. Asserting both halves is what keeps the distinction from collapsing
+        // again in either direction.
+        const nestedHasVersion: Equals<NestedSprintUserStory['version'], number> = true;
+
+        expect(nestedHasVersion).toBe(true);
+    });
+
+    it('\u26d4 nested stories are NOT full list stories -- nineteen members are absent', () => {
+        // A sprint's stories come from `UserStoryNestedSerializer`, the backlog's rows
+        // from `UserStoryListSerializer`. Declaring the nested ones as full stories
+        // promised every member below; a component reading `story.tags` off a sprint
+        // row gets `undefined`, and `story.tags.map(...)` throws.
+        type AbsentFromNested =
+            | 'tags'
+            | 'assigned_users'
+            | 'owner'
+            | 'tasks'
+            | 'swimlane'
+            | 'total_attachments'
+            | 'total_comments'
+            | 'attachments'
+            | 'watchers';
+
+        const noneOfThemPresent: Equals<
+            Extract<keyof NestedSprintUserStory, AbsentFromNested>,
+            never
+        > = true;
+
+        expect(noneOfThemPresent).toBe(true);
+    });
+
+    it('\u2b50 a sprint\u2019s point members are SCALAR SUMS, not role-keyed maps', () => {
+        // `total_points_attr` / `closed_points_attr` are `SUM(projects_points.value)`
+        // sub-selects, null when the sprint's stories carry no role points. The
+        // identically-named members of the `/stats` response are a role-keyed map and
+        // an array respectively -- three different value kinds behind two names.
+        const totalIsNullableNumber: Equals<Sprint['total_points'], number | null> = true;
+        const closedIsNullableNumber: Equals<Sprint['closed_points'], number | null> = true;
+        const statsTotalIsAMap: Equals<
+            SprintStatsResponse['total_points'],
+            Readonly<Record<string, number>>
+        > = true;
+        const statsCompletedIsAnArray: Equals<
+            SprintStatsResponse['completed_points'],
+            readonly number[]
+        > = true;
+
+        expect([
+            totalIsNullableNumber,
+            closedIsNullableNumber,
+            statsTotalIsAMap,
+            statsCompletedIsAnArray,
+        ]).toEqual([true, true, true, true]);
+    });
+
+    it('a sprint that satisfies the domain type needs no invented member', () => {
+        // The run-time half: a fixture built from the serializer's fields alone
+        // type-checks, which it could not do if a phantom member were still required.
+        const sprint: Sprint = {
+            id: 8,
+            name: 'Sprint 2026-5-15',
+            slug: 'sprint-2026-5-15',
+            owner: 6,
+            project: 3,
+            closed: false,
+            disponibility: null,
+            order: 1,
+            created_date: '2026-05-01T10:00:00+0000',
+            modified_date: '2026-05-02T10:00:00+0000',
+            closed_points: 21,
+            total_points: 101.5,
+            estimated_start: '2026-05-15',
+            estimated_finish: '2026-05-30',
+            user_stories: [],
+        };
+
+        expect(Object.keys(sprint)).not.toContain('version');
+        expect(sprint.user_stories).toEqual([]);
+    });
+});
 
 describe('the sprints facade module', () => {
     it('exports exactly four functions and nothing else', async () => {

@@ -39,7 +39,22 @@ export interface UserStory {
 
     readonly is_closed: boolean;
 
-    readonly is_iocaine: boolean;
+    // ⛔ THERE IS NO STORY-LEVEL `is_iocaine`, and one was declared here. No
+    // user-story serializer emits it: the flag lives on a TASK
+    // (`taiga/projects/tasks/models.py`), which is why the sprint-stats endpoint
+    // counts it as `iocaine_doses` over `milestone.tasks`.
+    //
+    // The confusion is worth recording, because the shared card component makes it
+    // look real: `card-assigned-to.jade:10` and `card-data.jade:34` both read
+    // `vm.item.getIn(['model', 'is_iocaine'])`. That component renders TASKS on the
+    // out-of-scope taskboard as well as stories on the board, so the lookup is
+    // generic on purpose and resolves to `undefined` for every story -- which is
+    // exactly why a required boolean here was never observed to be missing.
+    //
+    // Declaring it meant a story fixture had to invent a value the API never sends,
+    // and any code that came to depend on it would have been reading a constant.
+    // A per-story iocaine indicator would have to be DERIVED from `tasks`, and that
+    // derivation does not exist, so the honest declaration is no member at all.
 
     readonly due_date: string | null;
 

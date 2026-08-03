@@ -104,11 +104,75 @@ createImmutableSnapshotCache = () ->
 # `createImmutableSnapshotCache` for why that is sound for this branch alone. The
 # conversion itself is unchanged: the same `.toJS()`, the same deep copy and the
 # same `$$`-stripping, on the same values.
+#
+# ⭐ THE MODEL AND PLAIN BRANCHES ARE RECURSIVE, AND THAT IS A CORRECTNESS FIX
+# RATHER THAN THOROUGHNESS. `getAttrs()` is `_.extend({}, @._attrs,
+# @._modifiedAttrs)` (`base/model.coffee:48-54`), which is ONE LEVEL DEEP: every
+# nested array and every nested object -- including nested `$tgModel` instances,
+# which is what a milestone's `user_stories` holds -- survives the copy BY
+# REFERENCE. A single-level flatten therefore hands React live, AngularJS-owned
+# structures wearing a plain wrapper, and both consequences are silent:
+#
+#   * a nested model reaches React carrying its dirty-tracking state, so a
+#     reducer sees `_attrs`/`_modifiedAttrs` bookkeeping instead of story fields,
+#     and `immer` cannot proxy a class instance at all (`P-IMMER-1`); and
+#   * with `autoFreeze` on (`P-IMMER-4`), anything React puts in state is FROZEN,
+#     so the next in-place AngularJS mutation of that very object throws from
+#     inside the retained controller -- a fault reported from a line that names
+#     neither this file nor React.
+#
+# `stripAngularPrivates` already deep-copies through `angular.toJson`, so a plain
+# value with no model and no persistent collection anywhere inside it is detached
+# in one step. The recursion exists for the MIXED case: a plain array or object
+# whose members are models or collections, which JSON cannot unwrap because a
+# model serialises its private slots rather than its attributes. Every branch
+# ends in a copy, so NOTHING mutable crosses by identity except a memoised
+# persistent snapshot, whose source can never be mutated in place.
 toPlain = (snapshotOf, value) ->
     return value if not value?
     return snapshotOf(value) if angular.isFunction(value.toJS)
-    return stripAngularPrivates(value.getAttrs()) if angular.isFunction(value.getAttrs)
-    return stripAngularPrivates(value)
+    return toPlainDeep(snapshotOf, value.getAttrs()) if angular.isFunction(value.getAttrs)
+    return toPlainDeep(snapshotOf, value)
+
+# Deep-convert a value that is already plain at its top level but whose members
+# may not be. Arrays and plain objects are rebuilt member by member through
+# `toPlain`, so a nested model or collection is unwrapped at whatever depth it
+# sits; anything else -- a scalar, a `Date`, a `RegExp` -- goes to
+# `stripAngularPrivates`, which copies it and drops AngularJS's `$$` bookkeeping.
+#
+# `angular.isObject` is FALSE for a function and TRUE for an array, so the array
+# test has to come first. A `Date` is deliberately left to
+# `stripAngularPrivates`: `angular.toJson` renders it as its ISO string, which is
+# exactly what the wire carries and what React should hold.
+toPlainDeep = (snapshotOf, value) ->
+    return value if not value?
+
+    if angular.isArray(value)
+        return (toPlain(snapshotOf, item) for item in value)
+
+    return stripAngularPrivates(value) if not isPlainConvertibleObject(value)
+
+    converted = {}
+    for own key, member of value
+        continue if key.charAt(0) == '$'
+        converted[key] = toPlain(snapshotOf, member)
+    return converted
+
+# Whether `toPlainDeep` should walk this object's own members rather than hand it
+# to `angular.toJson`. Only a plain object qualifies: a `Date`, a `RegExp`, a
+# `File` and every other exotic host object must keep going through
+# `stripAngularPrivates`, which has one well-defined rendering for each of them.
+#
+# `Object.getPrototypeOf` rather than `constructor`, because an object built by
+# `angular.fromJson` or by an object literal has `Object.prototype`, while a
+# `$tgModel` -- already handled by the caller -- and every other class instance
+# does not. A null prototype qualifies too: `Object.create(null)` is as plain as
+# a literal.
+isPlainConvertibleObject = (value) ->
+    return false if not angular.isObject(value) or angular.isArray(value)
+    return false if angular.isDate(value) or angular.isElement(value)
+    prototype = Object.getPrototypeOf(value)
+    return prototype == null or prototype == Object.prototype
 
 # Flatten a plain AngularJS array whose members may be models. Anything that is
 # not an array -- most often a collection the async load chain has not populated
@@ -156,6 +220,16 @@ toStoryAttrs = (card) ->
 # Register a React handler for an AngularJS event on the CONTROLLER'S scope and
 # hand back AngularJS's own deregistration function.
 #
+# ⭐ `snapshotOf` IS A REQUIRED FIRST PARAMETER, NOT AN OPTIONAL EXTRA. `toPlain`
+# takes `(snapshotOf, value)`, so calling it with the payload alone would bind the
+# payload to `snapshotOf` and leave `value` undefined -- and `toPlain` answers
+# `undefined` for an absent value, which means EVERY broadcast would reach React
+# with an undefined payload. Nothing would throw: the handler would simply be
+# handed nothing, on every event, for the life of the screen. The per-screen cache
+# is created inside `build(ctrl)`, so it is threaded down to here rather than
+# reached through a module-level variable, which also keeps two screens from ever
+# sharing one cache.
+#
 # ⭐ THE WRAPPER IS THE POINT, NOT CEREMONY. `$scope.$on` invokes its listener as
 # `(event, payloadArgs...)`, so passing a React handler straight through would (a)
 # hand React AngularJS's event object -- which carries `targetScope` and
@@ -164,6 +238,11 @@ toStoryAttrs = (card) ->
 # argument by one position, silently. The wrapper drops the event object and
 # forwards only the payload, flattened by the seam's single `toPlain` helper so no
 # persistent collection and no `$tgModel` can cross either.
+#
+# ⭐ THE PAYLOAD ARRIVES AT THE REACT HANDLER AS ARGUMENT 1. A React consumer must
+# therefore be written `(payload) -> …`, never `(event, payload) -> …`; the
+# registrar types in `app/react/kanban/hooks/useKanbanRealtime.ts` and
+# `app/react/backlog/hooks/useBacklogRealtime.ts` spell that out for the compiler.
 #
 # Returning the deregistration function is equally load-bearing: React MUST call
 # it from its `useEffect` cleanup, and a leak here is silent -- it surfaces only as
@@ -182,11 +261,11 @@ toStoryAttrs = (card) ->
 # `$emit` would NOT be observable here, which is exactly why
 # `app/react/bridge/useTranslate.ts` reaches the root scope through its own named
 # accessor instead of through this channel.
-registerAngularEvent = ($scope, eventName, handler) ->
+registerAngularEvent = (snapshotOf, $scope, eventName, handler) ->
     return angular.noop if not angular.isFunction(handler)
 
     deregister = $scope.$on eventName, (event, args...) ->
-        handler.apply(null, (toPlain(arg) for arg in args))
+        handler.apply(null, (toPlain(snapshotOf, arg) for arg in args))
 
     return deregister
 
@@ -343,18 +422,119 @@ KanbanReactBridgeFactory = (projectService) ->
                 return null
             return id
 
-        # Every id in a list, or null if ANY of them fails. All-or-nothing on
-        # purpose: a partially validated list would still be written, and the write
-        # is position-relative, so persisting a subset of a multi-card move
-        # reorders the board in a way the user never asked for.
-        canonicalUsIds = (action, usList) ->
-            return null if not angular.isArray(usList) or usList.length == 0
-            ids = []
-            for us in usList
-                id = canonicalUsId(action, us)
-                return null if not id?
-                ids.push(id)
-            return ids
+        # ⭐⭐ RE-HYDRATE A VALIDATED ID TO THE STORY ATTRIBUTES THE CONTROLLER READS.
+        #
+        # WHY VALIDATING THE ID IS NOT ENOUGH. React holds NUMERIC ids -- that is
+        # what `app/react/shared/dnd/useSortableList.ts` produces and what the board's
+        # own action shape carries -- but the retained controller does NOT read a
+        # number. `moveUs` opens with
+        #
+        #     usList = _.map usList, (us) => @kanbanUserstoriesService.getUsModel(us.id)
+        #
+        # (`main.coffee:653-655`), and `getUsModel` is
+        # `_.find(userstoriesRaw, (us) -> us.id == id)`
+        # (`kanban-usertories.coffee:237-238`). Hand it a number and `us.id` is
+        # `undefined`, the lookup misses for every entry, and the very next line --
+        # `usList.map((it) => it.id)` (`:667`) -- dies on `undefined`. The drag write
+        # never reaches the wire. `moveUsToTop` fails one frame earlier still: it
+        # reads `us.id`, `us.status` AND `us.swimlane` (`main.coffee:175-199`) to pick
+        # the destination column before it delegates.
+        #
+        # WHAT IS HANDED OVER INSTEAD, AND WHY IT IS THE SAME VALUE THE INCUMBENT USED.
+        # `usMap` holds one CARD per story and each card's `model` member is the story
+        # attributes: `retrieveUserStoryData` writes `us.model = usModel.getAttrs()`
+        # (`kanban-usertories.coffee:245-257`). Those attributes carry `id`, `status`
+        # and `swimlane`, which is exactly what both retained methods read -- and
+        # exactly what the retained `moveToTopDropdown` already forwards, since
+        # `us.toJS().model` (`main.coffee:172-173`) resolves to the same member. So
+        # this is the incumbent's own value, not an approximation of it.
+        #
+        # WHY NOT THE LIVE MODEL. `moveUs` re-resolves every live `$tgModel` by id
+        # itself, so a model here would be immediately discarded and re-looked-up;
+        # plain attributes are sufficient and keep no AngularJS-owned object in the
+        # argument list. The backlog seam is deliberately ASYMMETRIC on this point --
+        # its queue splices and reconciles live models, so it re-hydrates to the model.
+        #
+        # Flattened through the seam's own converter, so the value handed to the
+        # controller is detached like every other value that crosses here.
+        toControllerStory = (action, usId) ->
+            id = canonicalUsId(action, usId)
+            return null if not id?
+
+            card = $scope.usMap.get(id)
+            model = card?.get?('model')
+
+            if not model?
+                # Only reachable if `usMap` holds a card with no `model` member, which
+                # `retrieveUserStoryData` never produces. Refused rather than
+                # forwarded, because a story without `status` would send the board's
+                # ordering arithmetic somewhere unreadable.
+                denied(action, "that user story has no attributes on this board")
+                return null
+
+            return toPlain(snapshotOf, model)
+
+        # Every entry in a list re-hydrated, or NULL IF ANY ONE OF THEM FAILS.
+        # All-or-nothing on purpose: a partially validated list would still be
+        # written, and the write is POSITION-RELATIVE, so persisting a subset of a
+        # multi-card move reorders the board in a way the user never asked for -- and
+        # the endpoint reports no error for it. A single value is accepted as well as
+        # an array, because `moveUsToTop` is legitimately called with one story.
+        toControllerStories = (action, usList) ->
+            list = if angular.isArray(usList) then usList else [usList]
+            return null if list.length == 0
+
+            stories = []
+            for us in list
+                story = toControllerStory(action, us)
+                return null if not story?
+                stories.push(story)
+            return stories
+
+        # ⭐ CANONICALISE AND VALIDATE A DESTINATION SWIMLANE.
+        #
+        # WHY THIS IS A WRITE-PATH CHECK AND NOT A FORMALITY. `moveUs` mutates local
+        # board state OPTIMISTICALLY -- `kanbanUserstoriesService.move(...)` reassigns
+        # each story's `swimlane` and re-derives the projections (`main.coffee:665`,
+        # `kanban-usertories.coffee:182-187`) -- and only then issues the write. There
+        # is no rollback. So a swimlane id that the backend will reject still moves
+        # every dragged card on screen first, and the board stays wrong until the next
+        # full reload.
+        #
+        # THE THREE LEGITIMATE VALUES, taken from the controller and the service
+        # rather than invented here:
+        #   * NULLISH -- flat mode, no swimlanes on this project. Forwarded as `null`.
+        #   * `-1` -- the SYNTHETIC "unclassified" swimlane the service inserts when
+        #     some stories have no swimlane (`kanban-usertories.coffee:315-321`), and
+        #     for which the controller registers a statuses entry
+        #     (`main.coffee:615`). `moveUs` maps it to `null` for the API itself
+        #     (`main.coffee:659-661`), so it is forwarded UNCHANGED -- rewriting it
+        #     here would lose the distinction the local mutation still needs.
+        #   * a real swimlane id present in `$scope.swimlanes`, which is what
+        #     `loadSwimlanes` stores (`main.coffee:608-609`).
+        # Everything else -- a malformed value, a stale id, an id belonging to another
+        # project -- is refused before delegation.
+        canonicalSwimlaneId = (action, swimlaneId) ->
+            return {ok: true, value: null} if not swimlaneId?
+
+            id = Number(swimlaneId)
+            if not _.isFinite(id)
+                denied(action, "the swimlane id is not a number")
+                return {ok: false}
+
+            # The unclassified swimlane, forwarded verbatim.
+            return {ok: true, value: id} if id == -1
+
+            swimlanes = $scope.swimlanes
+            if not angular.isArray(swimlanes)
+                denied(action, "the board has no swimlanes yet")
+                return {ok: false}
+
+            if not _.some(swimlanes, (swimlane) -> swimlane? and Number(swimlane.id) == id)
+                denied(action, "that swimlane does not belong to this project")
+                return {ok: false}
+
+            return {ok: true, value: id}
 
         # Whether a status id may be used. A NULLISH id is accepted and left
         # untouched: `addNewUs` is legitimately called with no status from the
@@ -417,14 +597,24 @@ KanbanReactBridgeFactory = (projectService) ->
                 # hands React exactly the shape the server round-trips.
                 foldedSwimlane: toPlain(snapshotOf, ctrl.foldedSwimlane)
 
-                zoom: ctrl.zoom
+                # `zoom` is an ARRAY of card-feature names, not a scalar: the shared
+                # zoom component reduces its four tiers into one list and hands it
+                # over (`kanban-board-zoom.directive.coffee:31-39`). It is therefore
+                # detached like every other array at this seam. `zoomLevel` beside it
+                # is a number and needs nothing.
+                zoom: toPlainList(snapshotOf, ctrl.zoom)
                 zoomLevel: ctrl.zoomLevel
 
                 filterQ: ctrl.filterQ
                 openFilter: ctrl.openFilter
                 filters: toPlain(snapshotOf, ctrl.filters)
-                selectedFilters: ctrl.selectedFilters or []
-                customFilters: ctrl.customFilters or []
+                # Detached for the same reason the matching accessors are: the
+                # retained filter mixin replaces and splices these arrays in place,
+                # and `params` is what React seeds its state from, so a live array
+                # here is the shortest path to a frozen-then-mutated AngularJS
+                # object.
+                selectedFilters: toPlainList(snapshotOf, ctrl.selectedFilters)
+                customFilters: toPlainList(snapshotOf, ctrl.customFilters)
             }
 
             # Stable function references, so the payload keeps one identity for the
@@ -449,39 +639,81 @@ KanbanReactBridgeFactory = (projectService) ->
                 getSwimlanesStatuses: => toPlain(snapshotOf, $scope.swimlanesStatuses)
                 getFoldedSwimlane: => toPlain(snapshotOf, ctrl.foldedSwimlane)
 
-                getUsCardVisibility: => $scope.usCardVisibility or {}
-                getZoom: => ctrl.zoom
+                # ⭐ EVERY MUTABLE READ IS DETACHED, and the four below are the ones
+                # that used to cross BY REFERENCE. `usCardVisibility` is a plain
+                # object AngularJS keys per card (`main.coffee:757`), `movedUs` is
+                # an array the controller pushes into and empties on a timer
+                # (`main.coffee:183`-`:186`), `selectedUss` is a map the selection
+                # toggle mutates in place, and the two filter arrays are replaced
+                # and spliced by the retained filter mixin. Handing any of them
+                # over unconverted put a LIVE, AngularJS-OWNED object into React
+                # state, which fails in both directions: React would observe
+                # mutations it never rendered for, and `immer`'s `autoFreeze`
+                # (`P-IMMER-4`) would freeze the object the controller is still
+                # about to mutate, throwing from inside AngularJS.
+                #
+                # `toPlain` on a plain object now deep-copies (see `toPlainDeep`),
+                # so each call hands back a fresh detached value. That is a NEW
+                # object per read by construction, which is correct rather than
+                # wasteful here: these are exactly the values that change, so a
+                # stable identity would be a lie. The four persistent projections
+                # above keep their memoised identity, which is where `React.memo`
+                # gets its purchase.
+                getUsCardVisibility: => toPlain(snapshotOf, $scope.usCardVisibility) or {}
+                # An array of card-feature names; see the `params.zoom` note above.
+                getZoom: => toPlainList(snapshotOf, ctrl.zoom)
                 getZoomLevel: => ctrl.zoomLevel
                 getZoomLoading: => ctrl.zoomLoading
                 getInitialLoad: => ctrl.initialLoad
                 getRenderInProgress: => ctrl.renderInProgress
                 getNotFoundUserstories: => ctrl.notFoundUserstories
-                getMovedUs: => ctrl.movedUs or []
-                getSelectedUss: => ctrl.selectedUss or {}
+                getMovedUs: => toPlainList(snapshotOf, ctrl.movedUs)
+                getSelectedUss: => toPlain(snapshotOf, ctrl.selectedUss) or {}
 
                 getFilterQ: => ctrl.filterQ
                 getFilters: => toPlain(snapshotOf, ctrl.filters)
-                getSelectedFilters: => ctrl.selectedFilters or []
-                getCustomFilters: => ctrl.customFilters or []
+                getSelectedFilters: => toPlainList(snapshotOf, ctrl.selectedFilters)
+                getCustomFilters: => toPlainList(snapshotOf, ctrl.customFilters)
                 getOpenFilter: => ctrl.openFilter
 
-                # `moveUs` keeps the controller's signature verbatim, including the
+                # `moveUs` keeps the controller's ARGUMENT ORDER verbatim, including the
                 # leading `ctx` -- the event object when it is driven from the event
-                # bus, `null` when it is called directly. Its write is
+                # bus, `null` when it is called directly, and forwarded untouched
+                # because the drag serialisation keys on its truthiness. Its write is
                 # position-relative: the two neighbour ids become
                 # `after_userstory_id` / `before_userstory_id`, so an off-by-one in
                 # the caller persists a wrong order with no error surface.
+                #
+                # ⭐ THE STORY LIST IS RE-HYDRATED, NOT MERELY VALIDATED. React passes
+                # numeric ids and the controller reads `us.id`, so forwarding the
+                # caller's own list would abort every drag write inside AngularJS --
+                # see `toControllerStory` above for the full trace. The two anchors
+                # stay as IDS, because that is what the ordering arithmetic and the
+                # request body take (`main.coffee:668-680`).
+                #
+                # ⭐ THE DESTINATION SWIMLANE IS VALIDATED BEFORE DELEGATION, because
+                # `moveUs` mutates the board optimistically and has no rollback.
                 moveUs: (ctx, usList, newStatusId, newSwimlaneId, index, previousCard, nextCard) =>
                     return if not allowed("moveUs", "modify_us")
-                    return if not canonicalUsIds("moveUs", usList)?
+                    stories = toControllerStories("moveUs", usList)
+                    return if not stories?
                     return if not isCanonicalStatusId("moveUs", newStatusId)
+                    swimlane = canonicalSwimlaneId("moveUs", newSwimlaneId)
+                    return if not swimlane.ok
                     return if not isCanonicalAnchor("moveUs", previousCard)
                     return if not isCanonicalAnchor("moveUs", nextCard)
-                    ctrl.moveUs(ctx, usList, newStatusId, newSwimlaneId, index, previousCard, nextCard)
+                    ctrl.moveUs(
+                        ctx, stories, newStatusId, swimlane.value, index, previousCard, nextCard)
+                # Re-hydrated for the same reason, and it matters one step sooner here:
+                # `moveUsToTop` reads `us.status` and `us.swimlane` to choose the
+                # destination column before it ever reaches `moveUs`
+                # (`main.coffee:175-199`). It normalises a single value to an array
+                # itself, so the shape the caller used is preserved.
                 moveUsToTop: (uss) =>
                     return if not allowed("moveUsToTop", "modify_us")
-                    return if not canonicalUsIds("moveUsToTop", uss)?
-                    ctrl.moveUsToTop(uss)
+                    stories = toControllerStories("moveUsToTop", uss)
+                    return if not stories?
+                    ctrl.moveUsToTop(if angular.isArray(uss) then stories else stories[0])
 
                 # NOT a verbatim delegation, and `toStoryAttrs` above documents why in
                 # full: the retained `moveToTopDropdown` unwraps an IMMUTABLE card with
@@ -503,9 +735,15 @@ KanbanReactBridgeFactory = (projectService) ->
                             "tgKanbanReactBridge: moveToTopDropdown needs the flattened card " +
                             "or its story attributes, carrying `id` and `status`")
 
-                    return if not canonicalUsId("moveToTopDropdown", story)?
+                    # Resolved through the SAME re-hydration every other write path
+                    # uses, so the controller receives the board's own attributes
+                    # rather than whatever the caller happened to hold -- which also
+                    # means a stale `status` on a card React has kept around cannot
+                    # send the story to the wrong column.
+                    resolved = toControllerStory("moveToTopDropdown", story)
+                    return if not resolved?
 
-                    ctrl.moveUsToTop(story)
+                    ctrl.moveUsToTop(resolved)
 
                 setZoom: (zoomLevel, zoom) => ctrl.setZoom(zoomLevel, zoom)
 
@@ -599,7 +837,7 @@ KanbanReactBridgeFactory = (projectService) ->
                 # `filters:update`. A React handler must never call
                 # `$rootScope.$apply()`: these handlers already run inside a digest.
                 onAngularEvent: (eventName, handler) =>
-                    registerAngularEvent($scope, eventName, handler)
+                    registerAngularEvent(snapshotOf, $scope, eventName, handler)
             }
         }
 

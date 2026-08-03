@@ -346,9 +346,23 @@ export type KanbanRealtimeEventDeregistrar = () => void;
  * `events.onAngularEvent`, which is a direct `$scope.$on` on the retained
  * controller's scope; a spec satisfies it with a stub that records the handler.
  *
- * The listener signature carries BOTH AngularJS arguments in AngularJS's order —
- * the event object first, the payload second — because reading the payload out
- * of the wrong position is the classic way to get a `$scope.$on` consumer wrong.
+ * ⭐ THE LISTENER IS PAYLOAD-ONLY, AND THAT IS THE BRIDGE'S CONTRACT RATHER THAN
+ * A SIMPLIFICATION OF IT. `$scope.$on` does invoke its own listener as
+ * `(event, payloadArgs…)`, but the bridge does not hand a React handler to
+ * `$scope.$on` directly — it wraps it, DROPS the AngularJS event object and
+ * forwards only the payload arguments
+ * (`app/coffee/modules/kanban/react-bridge.coffee`, `registerAngularEvent`).
+ * Dropping the event object is deliberate and load-bearing: that object carries
+ * `targetScope` and `currentScope`, so forwarding it would put a live `$scope`
+ * on the React side of the seam.
+ *
+ * The payload therefore arrives as ARGUMENT 1. Declaring `(event, message)` here
+ * would be a two-position lie: a handler written against it would read the
+ * payload out of argument 2 and find `undefined` on every message — no error, no
+ * warning, just a refresh that never happens. The type is spelled payload-only so
+ * the compiler makes that mistake unexpressible, and
+ * `app/react/bridge/reactBridgeContract.test.ts` pins it end to end against the
+ * real compiled bridge.
  *
  * It SHOULD be referentially stable (wrap it in `useCallback`, or take it
  * straight from the bridge payload, whose function identities never change),
@@ -358,7 +372,7 @@ export type KanbanRealtimeEventDeregistrar = () => void;
  */
 export type KanbanRealtimeEventRegistrar = (
     eventName: KanbanRealtimeEventName,
-    handler: (event: unknown, message: unknown) => void,
+    handler: (message: unknown) => void,
 ) => KanbanRealtimeEventDeregistrar;
 
 /**
@@ -612,23 +626,26 @@ export function useKanbanRealtime(options: UseKanbanRealtimeOptions): void {
     // both by construction: a project change destroys the controller and its
     // debounced closures with it.
     //
-    // The listener signature takes AngularJS's event object first and the
-    // payload second. The event object is never read — `main.coffee` never reads
-    // one either — but it must be declared, because the payload is the SECOND
-    // argument and there is no other way to reach it.
+    // ⭐ THE LISTENERS TAKE THE PAYLOAD AS THEIR FIRST AND ONLY ARGUMENT. The
+    // bridge strips AngularJS's event object before calling back
+    // (`app/coffee/modules/kanban/react-bridge.coffee`, `registerAngularEvent`),
+    // so the payload IS argument 1. Declaring an unread leading parameter here
+    // would silently shift both reads onto `undefined` and stop every realtime
+    // refresh without raising anything; the cross-language contract spec at
+    // `app/react/bridge/reactBridgeContract.test.ts` pins this end to end.
     useEffect(() => {
         disposedRef.current = false;
 
         const deregisterUserStories = registerAngularEvent(
             KANBAN_REALTIME_USERSTORIES_EVENT,
-            (_event: unknown, message: unknown) => {
+            (message: unknown) => {
                 handleUserStoriesMessage(message);
             },
         );
 
         const deregisterProject = registerAngularEvent(
             KANBAN_REALTIME_PROJECT_EVENT,
-            (_event: unknown, message: unknown) => {
+            (message: unknown) => {
                 handleProjectMessage(message);
             },
         );

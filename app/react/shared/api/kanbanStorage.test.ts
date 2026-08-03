@@ -81,11 +81,32 @@ describe('kanbanStorage', () => {
             expect(kanban.getStatusColumnModes).toHaveBeenCalledWith(PROJECT_ID);
         });
 
-        it('returns the stored value by reference, without copying or rebuilding it', () => {
+        it('returns every stored entry unchanged when the stored map is already boolean', () => {
             const stored = { '11': true, '12': false };
             const kanban = createKanbanDouble(stored);
 
-            expect(getStatusColumnModes(kanban, PROJECT_ID)).toBe(stored);
+            expect(getStatusColumnModes(kanban, PROJECT_ID)).toEqual({
+                '11': true,
+                '12': false,
+            });
+        });
+
+        it('hands back a detached copy, so React state never aliases the stored map', () => {
+            // The reader normalises into a fresh object. That is not incidental:
+            // it is what stops an Angular-owned value from being retained in
+            // React state, where `immer`'s auto-freeze would freeze it (AAP
+            // §0.8.7 P-IMMER-4, and the same concern as F6 at the bridge seam).
+            const stored: Record<string, unknown> = { '11': true };
+            const kanban = createKanbanDouble(stored);
+
+            const result = getStatusColumnModes(kanban, PROJECT_ID);
+
+            expect(result).not.toBe(stored);
+
+            (result as Record<string, boolean>)['12'] = true;
+
+            expect(stored).toEqual({ '11': true });
+            expect(Object.keys(stored)).toEqual(['11']);
         });
 
         it('surfaces the empty default unchanged, and never null or undefined', () => {
@@ -126,11 +147,154 @@ describe('kanbanStorage', () => {
             expect(kanban.getStatusColumnModes).toHaveBeenCalledWith(0);
         });
 
-        it('passes a non-boolean stored value straight through, without coercing it', () => {
-            const stored = { '11': 1, '12': 'folded' };
-            const kanban = createKanbanDouble(stored);
+    });
 
-            expect(getStatusColumnModes(kanban, PROJECT_ID)).toBe(stored);
+    /**
+     * `$tgStorage.get` is `JSON.parse(localStorage.getItem(key))`
+     * [app/coffee/modules/base/storage.coffee:L17-L25] and the resource returns
+     * `$storage.get(hash) or {}`
+     * [app/coffee/modules/resources/kanban.coffee:L24-L27], so the readers'
+     * input is arbitrary JSON written by this build, an older build, or by hand.
+     * The declared `Readonly<Record<string, boolean>>` is only true because the
+     * facade normalises; these are the tests that hold it true.
+     *
+     * Several fixtures below store a value the DOUBLE's type forbids. The cast
+     * is the point: it models exactly the case the declared resource type cannot
+     * express but `localStorage` can produce.
+     */
+    describe('normalising what localStorage actually hands back', () => {
+        function storing(raw: unknown): KanbanDouble {
+            return createKanbanDouble(raw as Record<string, unknown>, raw as Record<string, unknown>);
+        }
+
+        it('declares every value a boolean, and every value IS a boolean', () => {
+            const kanban = storing({ '11': 1, '12': 'folded', '13': 0, '14': null });
+
+            for (const result of [
+                getStatusColumnModes(kanban, PROJECT_ID),
+                getSwimlanesModes(kanban, PROJECT_ID),
+            ]) {
+                expect(Object.values(result)).toHaveLength(4);
+
+                for (const value of Object.values(result)) {
+                    expect(typeof value).toBe('boolean');
+                }
+            }
+        });
+
+        it('reads a truthy non-boolean as folded, matching how the AngularJS board reads it', () => {
+            // `!!!$scope.folds[status.id]` [kanban/main.coffee:L840] and
+            // `!@.foldedSwimlane.get(id)` [:L384] both consume these by
+            // truthiness, so a persisted `1` already means folded. Coercing
+            // preserves that; dropping the entry would silently unfold it.
+            const kanban = storing({ '11': 1, '12': 'folded', '13': [] });
+
+            expect(getStatusColumnModes(kanban, PROJECT_ID)).toEqual({
+                '11': true,
+                '12': true,
+                '13': true,
+            });
+            expect(getSwimlanesModes(kanban, PROJECT_ID)).toEqual({
+                '11': true,
+                '12': true,
+                '13': true,
+            });
+        });
+
+        it('reads a falsy non-boolean as unfolded, for the same reason', () => {
+            const kanban = storing({ '11': 0, '12': '', '13': null, '14': false });
+
+            expect(getStatusColumnModes(kanban, PROJECT_ID)).toEqual({
+                '11': false,
+                '12': false,
+                '13': false,
+                '14': false,
+            });
+        });
+
+        it('keeps every persisted key, including ids the board is not showing right now', () => {
+            // Filtering keys to the visible board would discard the fold state
+            // of a status or swimlane that is merely filtered out at the moment.
+            const kanban = storing({ '11': true, '99999': true, 'not-an-id': true });
+
+            expect(Object.keys(getStatusColumnModes(kanban, PROJECT_ID)).sort()).toEqual([
+                '11',
+                '99999',
+                'not-an-id',
+            ]);
+        });
+
+        it('yields an empty map, and never throws, when storage holds no object at all', () => {
+            // `or {}` only rules out the falsy cases, so a non-empty string, a
+            // non-zero number and `true` all escape the resource intact.
+            for (const hostile of ['folded', 42, true, 'null']) {
+                const kanban = storing(hostile);
+
+                expect(getStatusColumnModes(kanban, PROJECT_ID)).toEqual({});
+                expect(getSwimlanesModes(kanban, PROJECT_ID)).toEqual({});
+            }
+        });
+
+        it('treats a stored array as an index-keyed map, preserving the AngularJS lookup', () => {
+            // `arr[5]` and `{'5': …}['5']` are the same lookup once JS
+            // stringifies the index, so index keys keep the incumbent semantics.
+            const kanban = storing([true, 0, 'folded']);
+
+            expect(getSwimlanesModes(kanban, PROJECT_ID)).toEqual({
+                '0': true,
+                '1': false,
+                '2': true,
+            });
+        });
+
+        it('keeps a persisted __proto__ key as an ordinary entry, polluting nothing', () => {
+            // Built by parsing, exactly as `$tgStorage.get` builds it — an
+            // object LITERAL with this key would set the prototype instead of
+            // creating an own property, so the fixture would not be faithful.
+            const kanban = storing(JSON.parse('{"__proto__": 1, "11": true}'));
+
+            const result = getStatusColumnModes(kanban, PROJECT_ID);
+
+            expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(true);
+            expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+            expect(result['11']).toBe(true);
+            expect({}).not.toHaveProperty('11');
+        });
+
+        it('surfaces the empty default as an own empty map, not as a shared constant', () => {
+            const kanban = createKanbanDouble();
+
+            const first = getStatusColumnModes(kanban, PROJECT_ID);
+            const second = getSwimlanesModes(kanban, PROJECT_ID);
+
+            expect(first).toEqual({});
+            expect(second).toEqual({});
+            expect(first).not.toBe(second);
+        });
+
+        it('declares the readers as boolean maps, not as unknown-valued ones', () => {
+            // The review offered two remedies: normalise at the boundary, or
+            // widen the return to unknown values and narrow in the consumer.
+            // Nothing consumes these facades yet, so widening would have
+            // deferred the work; this pins the choice that was made, so the
+            // contract cannot quietly become the other one.
+            type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends <
+                T,
+            >() => T extends B ? 1 : 2
+                ? true
+                : false;
+
+            const columnsAreBooleanMaps: Equals<
+                ReturnType<typeof getStatusColumnModes>,
+                Readonly<Record<string, boolean>>
+            > = true;
+            const swimlanesAreBooleanMaps: Equals<
+                ReturnType<typeof getSwimlanesModes>,
+                Readonly<Record<string, boolean>>
+            > = true;
+
+            expect(columnsAreBooleanMaps).toBe(true);
+            expect(swimlanesAreBooleanMaps).toBe(true);
         });
     });
 
@@ -196,13 +360,21 @@ describe('kanbanStorage', () => {
             expect(kanban.getSwimlanesModes).toHaveBeenCalledWith(PROJECT_ID);
         });
 
-        it('returns the stored value by reference and surfaces the empty default', () => {
+        it('returns every stored entry unchanged and surfaces the empty default', () => {
             const stored = { '5': true, '6': false };
 
-            expect(getSwimlanesModes(createKanbanDouble({}, stored), PROJECT_ID)).toBe(
-                stored,
+            expect(getSwimlanesModes(createKanbanDouble({}, stored), PROJECT_ID)).toEqual(
+                { '5': true, '6': false },
             );
             expect(getSwimlanesModes(createKanbanDouble(), PROJECT_ID)).toEqual({});
+        });
+
+        it('hands back a detached copy of the swimlane map too', () => {
+            const stored: Record<string, unknown> = { '5': true };
+
+            expect(getSwimlanesModes(createKanbanDouble({}, stored), PROJECT_ID)).not.toBe(
+                stored,
+            );
         });
 
         it('returns a plain value rather than a thenable', () => {

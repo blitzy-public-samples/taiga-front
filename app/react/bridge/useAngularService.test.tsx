@@ -803,6 +803,38 @@ describe('useAngularService', () => {
             expect(mocks.$tgResources.getSwimlanesModes).toHaveBeenCalledWith(7);
             expect(screen.getByTestId('typed-member-probe')).toHaveTextContent('0');
         });
+
+        it('⛔ requires an INTEGER milestone on both milestone-write members', () => {
+            // The two milestone writes validate through `UpdateMilestoneBulkValidator`,
+            // whose `milestone_id` is a mandatory `IntegerField()`, so a null is an
+            // HTTP 400 rather than an "unassign". Asserting the parameter type exactly
+            // is what stops it widening back to `number | null` later.
+            const bulkMilestoneIsRequired: Equals<
+                Parameters<TaigaResources['userstories']['bulkUpdateMilestone']>[1],
+                number
+            > = true;
+            const moveDestinationIsRequired: Equals<
+                Parameters<TaigaResources['sprints']['moveUserStoriesMilestone']>[2],
+                number
+            > = true;
+
+            expect(bulkMilestoneIsRequired).toBe(true);
+            expect(moveDestinationIsRequired).toBe(true);
+        });
+
+        it('⭐ still allows a NULL milestone on the backlog-ORDER write, which is optional', () => {
+            // The distinction the previous assertion protects: this endpoint's
+            // validator declares `milestone_id = IntegerField(required=False)` and the
+            // resource OMITS the key when the value is falsy, which is how "move to the
+            // backlog" is expressed. Conflating the two contracts would either break
+            // backlog drags or bless a 400.
+            const backlogMilestoneIsNullable: Equals<
+                Parameters<TaigaResources['userstories']['bulkUpdateBacklogOrder']>[1],
+                number | null
+            > = true;
+
+            expect(backlogMilestoneIsNullable).toBe(true);
+        });
     });
 
     describe('no digest surface', () => {

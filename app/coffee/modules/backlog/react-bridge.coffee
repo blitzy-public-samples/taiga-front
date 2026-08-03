@@ -32,25 +32,98 @@ module = angular.module("taigaBacklog")
 # colour; status, tag and epic colours are per-project data and are never handed
 # over as literals.
 
+# A copy with AngularJS's private `$$` bookkeeping removed, which is mandatory
+# rather than cosmetic: `ng-repeat` without a `track by` stamps `$$hashKey` onto
+# every object it iterates, and anything React freezes would then make the next
+# repeat pass throw. `angular.toJson` is reused because it already drops `$$` keys
+# at every depth and substitutes a sentinel for a window, a document or a scope,
+# which makes passing one of those across the seam structurally impossible. It is
+# also a DEEP copy, which is what detaches the value from AngularJS entirely.
+stripAngularPrivates = (value) ->
+    return value if not angular.isObject(value)
+    json = angular.toJson(value)
+    return value if not json?
+    return angular.fromJson(json)
+
+# Whether `toPlainDeep` should walk this object's own members rather than hand it
+# to `angular.toJson`. Only a plain object qualifies: a `Date`, a DOM element and
+# every other exotic host object must keep going through `stripAngularPrivates`,
+# which has one well-defined rendering for each of them.
+#
+# `Object.getPrototypeOf` rather than `constructor`, because an object built by
+# `angular.fromJson` or by an object literal has `Object.prototype`, while a
+# `$tgModel` -- already handled by the caller -- and every other class instance
+# does not. A null prototype qualifies too: `Object.create(null)` is as plain as
+# a literal.
+isPlainConvertibleObject = (value) ->
+    return false if not angular.isObject(value) or angular.isArray(value)
+    return false if angular.isDate(value) or angular.isElement(value)
+    prototype = Object.getPrototypeOf(value)
+    return prototype == null or prototype == Object.prototype
+
 # Flatten at the boundary: persistent collections through `toJS`, models through
-# `getAttrs`, and anything already plain by identity -- returning the same reference
-# for a plain value keeps React's reference equality intact, so wrapping a
-# known-plain getter costs nothing.
+# `getAttrs`, everything else deep-copied and detached.
+#
+# ⭐⭐ NOTHING MUTABLE MAY CROSS BY IDENTITY, AND THIS IS A CORRECTNESS RULE
+# RATHER THAN A STYLE ONE. Returning a plain value by reference looks free -- it
+# preserves React's reference equality -- but the values reaching this seam are
+# AngularJS-OWNED and mutated IN PLACE: `$scope.stats` is reassigned and read
+# through, `$ctrl.filters` is spliced by the retained filter mixin,
+# `$ctrl.translationData` is rebuilt per digest, and every milestone's
+# `user_stories` array is mutated by the drag queue (`main.coffee:601-602`,
+# `:643`, `:648-649`, `:670`, `:689-695`). Handing one over unconverted fails in
+# both directions, silently:
+#
+#   * React observes mutations it never rendered for, so its state and the DOM
+#     disagree with no update ever scheduled; and
+#   * `immer`'s `autoFreeze` (`P-IMMER-4`) freezes anything that enters React
+#     state, so the controller's NEXT in-place mutation of that same object throws
+#     -- from inside AngularJS, at a line that names neither this file nor React.
+#
+# `getAttrs()` is `_.extend({}, @._attrs, @._modifiedAttrs)`
+# (`base/model.coffee:48-54`), i.e. ONE LEVEL DEEP, so a model's nested arrays and
+# nested models survive the copy by reference. That is why the model branch feeds
+# its result back through the deep walk rather than returning it: a milestone's
+# `user_stories` holds `$tgModel` instances (`resources/sprints.coffee:18-20`,
+# `:33-36`), and `immer` cannot proxy a class instance at all (`P-IMMER-1`).
 toPlain = (value) ->
     return value if not value?
-    return value.toJS() if angular.isFunction(value.toJS)
-    return value.getAttrs() if angular.isFunction(value.getAttrs)
-    return value
+    return stripAngularPrivates(value.toJS()) if angular.isFunction(value.toJS)
+    return toPlainDeep(value.getAttrs()) if angular.isFunction(value.getAttrs)
+    return toPlainDeep(value)
+
+# Deep-convert a value that is already plain at its top level but whose members may
+# not be. Arrays and plain objects are rebuilt member by member through `toPlain`,
+# so a nested model or collection is unwrapped at whatever depth it sits; anything
+# else -- a scalar, a `Date` -- goes to `stripAngularPrivates`, which copies it and
+# drops AngularJS's `$$` bookkeeping.
+#
+# `angular.isObject` is FALSE for a function and TRUE for an array, so the array
+# test has to come first.
+toPlainDeep = (value) ->
+    return value if not value?
+
+    return _.map(value, toPlain) if angular.isArray(value)
+
+    return stripAngularPrivates(value) if not isPlainConvertibleObject(value)
+
+    converted = {}
+    for own key, member of value
+        continue if key.charAt(0) == '$'
+        converted[key] = toPlain(member)
+    return converted
 
 toPlainList = (list) -> _.map(list or [], toPlain)
 
-# Sprints are the one nested case at this seam: a milestone model's `user_stories`
-# are themselves models and `getAttrs` is shallow, so without this step the nested
-# stories would still cross as class instances.
+# Sprints reach React through `toPlain` like everything else -- the deep walk above
+# already unwraps a milestone model's nested story models, which is the one nested
+# case at this seam. This wrapper is kept as the NAMED entry point for a sprint so
+# every sprint-shaped read says so at the call site, and it normalises a missing
+# sprint to `null` rather than `undefined` so React's optional-sprint checks have a
+# single shape to test.
 toPlainSprint = (sprint) ->
-    plain = toPlain(sprint)
-    return plain if not plain? or not _.isArray(plain.user_stories)
-    return _.assign({}, plain, {user_stories: toPlainList(plain.user_stories)})
+    return null if not sprint?
+    return toPlain(sprint)
 
 toPlainSprintList = (sprints) -> _.map(sprints or [], toPlainSprint)
 
@@ -75,6 +148,11 @@ toPlainSprintMap = (sprintsById) -> _.mapValues(sprintsById or {}, toPlainSprint
 # A non-function handler yields `angular.noop` rather than letting AngularJS accept it
 # and throw later, at broadcast time, from a line that names neither this file nor the
 # React caller.
+#
+# ⭐ THE PAYLOAD ARRIVES AT THE REACT HANDLER AS ARGUMENT 1. A React consumer must
+# therefore be written `(payload) -> …`, never `(event, payload) -> …`; the registrar
+# type in `app/react/backlog/hooks/useBacklogRealtime.ts` spells that out for the
+# compiler so a future payload consumer cannot read argument 2 and find nothing.
 registerAngularEvent = ($scope, eventName, handler) ->
     return angular.noop if not angular.isFunction(handler)
 
@@ -144,17 +222,16 @@ BacklogReactBridgeDirective = ($rootScope, projectService) ->
         # when the id is unknown would let a value React composed reach a queue that
         # mutates, splices and reconciles live `$tgModel`s (`main.coffee:601-602`,
         # `:643`, `:648-649`, `:670`, `:689-695`), so an unknown id is a refusal.
+        # `userStoryModelLists` already enumerates the backlog, every open sprint,
+        # every closed sprint and both `sprintsById` maps, so ONE pass over its
+        # lists is exhaustive. An earlier revision followed this loop with a second,
+        # narrower sprint search; it sat after an unconditional `return null` and was
+        # therefore unreachable, so it has been removed rather than left to imply
+        # coverage this function does not get from it.
         findUserStoryById = (id) ->
             for list in userStoryModelLists()
                 found = _.find(list, (it) -> it? and it.id == id)
                 return found if found?
-
-            return null
-
-            for sprint in ($scope.sprints or []).concat($scope.closedSprints or [])
-                continue if not sprint or not _.isArray(sprint.user_stories)
-                found = _.find(sprint.user_stories, (it) -> it? and it.id == id)
-                return found if found
 
             return null
 
@@ -280,14 +357,25 @@ BacklogReactBridgeDirective = ($rootScope, projectService) ->
                     pointsById: toPlain($scope.pointsById)
                     usStatusById: toPlain($scope.usStatusById)
                     usStatusList: toPlainList($scope.usStatusList)
-                    closedMilestones: $scope.closedMilestones
+                    # `closedMilestones` is a plain count/flag the controller
+                    # reassigns per load; routed through `toPlain` for the same
+                    # reason every other member is -- so nothing AngularJS still
+                    # owns can be frozen by React.
+                    closedMilestones: toPlain($scope.closedMilestones)
                     swimlanesList: toPlain($scope.swimlanesList)
                 }
 
+                # ⭐ EVERY READ GOES THROUGH THE SEAM'S OWN CONVERSION, WITH NO
+                # EXCEPTION FOR A VALUE THAT IS "ALREADY PLAIN". The values marked
+                # below used to be returned by identity on exactly that reasoning,
+                # and every one of them is mutated in place by the retained
+                # controller or the drag queue -- which is what makes handing over
+                # the live object a defect rather than an optimisation. See the
+                # `toPlain` header for the two silent failure modes.
                 events: {
                     getProject: => toPlain($scope.project)
                     getUserStories: => toPlainList($scope.userstories)
-                    getVisibleUserStories: => $scope.visibleUserStories
+                    getVisibleUserStories: => toPlain($scope.visibleUserStories)
                     getSprints: => toPlainSprintList($scope.sprints)
                     getClosedSprints: => toPlainSprintList($scope.closedSprints)
                     getSprintsById: => toPlainSprintMap($scope.sprintsById)
@@ -295,14 +383,14 @@ BacklogReactBridgeDirective = ($rootScope, projectService) ->
                     getStats: => toPlain($scope.stats)
                     getShowGraphPlaceholder: => $scope.showGraphPlaceholder
                     getSwimlanes: => toPlain($scope.swimlanesList)
-                    getNoSwimlaneUserStories: => $scope.noSwimlaneUserStories
+                    getNoSwimlaneUserStories: => toPlain($scope.noSwimlaneUserStories)
                     getTotalUserStories: => $ctrl.totalUserStories
                     getFilterQ: => $ctrl.filterQ
                     getTranslationData: => toPlain($ctrl.translationData)
-                    getActiveFilters: => $ctrl.activeFilters
-                    getSelectedFilters: => $ctrl.selectedFilters
+                    getActiveFilters: => toPlain($ctrl.activeFilters)
+                    getSelectedFilters: => toPlain($ctrl.selectedFilters)
                     getFilters: => toPlain($ctrl.filters)
-                    getCustomFilters: => $ctrl.customFilters
+                    getCustomFilters: => toPlain($ctrl.customFilters)
                     getShowTags: => $ctrl.showTags
                     getDisplayVelocity: => $ctrl.displayVelocity
                     getForecastedStories: => toPlainList($ctrl.forecastedStories)

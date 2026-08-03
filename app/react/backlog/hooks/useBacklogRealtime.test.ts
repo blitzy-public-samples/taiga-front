@@ -74,12 +74,24 @@ import type {
  * Test doubles
  * -------------------------------------------------------------------------- */
 
-/** The listener shape AngularJS invokes: event object first, payload second. */
-type ScopeListener = (event: unknown, payload: unknown) => void;
+/**
+ * The listener shape THE BRIDGE invokes: the payload, and nothing before it.
+ *
+ * ⭐ NOT `$scope.$on`'s own `(event, payload)` shape, deliberately. The bridge
+ * does not hand a React handler to `$scope.$on`; it wraps it, DROPS AngularJS's
+ * event object -- which carries `targetScope`/`currentScope` and would put a live
+ * `$scope` on the React side of the seam -- and forwards only the payload
+ * (`registerAngularEvent` in the matching `react-bridge.coffee`). A double that
+ * invoked `(event, payload)` would be testing a producer that does not exist, and
+ * would pass while the real hook read `undefined` on every message. The
+ * cross-language spec at `app/react/bridge/reactBridgeContract.test.ts` pins this
+ * shape against the real compiled bridge rather than against a double.
+ */
+type BridgeListener = (payload: unknown) => void;
 
 interface RegistrarDouble {
     /** The registrar itself, shaped exactly like `events.onAngularEvent`. */
-    readonly register: jest.Mock<() => void, [BacklogRealtimeEventName, ScopeListener]>;
+    readonly register: jest.Mock<() => void, [BacklogRealtimeEventName, BridgeListener]>;
 
     /** Every event name the hook registered for, in registration order. */
     registeredNames(): BacklogRealtimeEventName[];
@@ -102,11 +114,11 @@ interface RegistrarDouble {
 
 function makeRegistrarDouble(): RegistrarDouble {
     // An array per name, like a real scope: registering never displaces.
-    const live = new Map<BacklogRealtimeEventName, ScopeListener[]>();
-    const everRegistered = new Map<BacklogRealtimeEventName, ScopeListener[]>();
+    const live = new Map<BacklogRealtimeEventName, BridgeListener[]>();
+    const everRegistered = new Map<BacklogRealtimeEventName, BridgeListener[]>();
     const deregistrations: jest.Mock<void, []>[] = [];
 
-    const register = jest.fn<() => void, [BacklogRealtimeEventName, ScopeListener]>(
+    const register = jest.fn<() => void, [BacklogRealtimeEventName, BridgeListener]>(
         (eventName, listener) => {
             const liveForName = live.get(eventName) ?? [];
             liveForName.push(listener);
@@ -131,9 +143,9 @@ function makeRegistrarDouble(): RegistrarDouble {
         },
     );
 
-    function invoke(listeners: ScopeListener[], payload: unknown): void {
+    function invoke(listeners: BridgeListener[], payload: unknown): void {
         for (const listener of listeners) {
-            listener({ name: 'angular-event-object' }, payload);
+            listener(payload);
         }
     }
 

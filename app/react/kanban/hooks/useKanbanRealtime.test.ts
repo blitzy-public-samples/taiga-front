@@ -73,11 +73,23 @@ import type {
  * Test doubles
  * -------------------------------------------------------------------------- */
 
-/** The listener shape AngularJS invokes: event object first, payload second. */
-type ScopeListener = (event: unknown, payload: unknown) => void;
+/**
+ * The listener shape THE BRIDGE invokes: the payload, and nothing before it.
+ *
+ * ⭐ NOT `$scope.$on`'s own `(event, payload)` shape, deliberately. The bridge
+ * does not hand a React handler to `$scope.$on`; it wraps it, DROPS AngularJS's
+ * event object -- which carries `targetScope`/`currentScope` and would put a live
+ * `$scope` on the React side of the seam -- and forwards only the payload
+ * (`registerAngularEvent` in the matching `react-bridge.coffee`). A double that
+ * invoked `(event, payload)` would be testing a producer that does not exist, and
+ * would pass while the real hook read `undefined` on every message. The
+ * cross-language spec at `app/react/bridge/reactBridgeContract.test.ts` pins this
+ * shape against the real compiled bridge rather than against a double.
+ */
+type BridgeListener = (payload: unknown) => void;
 
 interface RegistrarDouble {
-    readonly register: jest.Mock<() => void, [KanbanRealtimeEventName, ScopeListener]>;
+    readonly register: jest.Mock<() => void, [KanbanRealtimeEventName, BridgeListener]>;
     registeredNames(): KanbanRealtimeEventName[];
     liveListenerCount(eventName: KanbanRealtimeEventName): number;
     readonly deregistrations: jest.Mock<void, []>[];
@@ -94,11 +106,11 @@ interface RegistrarDouble {
  * delivery that was already in flight when teardown ran.
  */
 function makeRegistrarDouble(): RegistrarDouble {
-    const live = new Map<KanbanRealtimeEventName, ScopeListener[]>();
-    const everRegistered = new Map<KanbanRealtimeEventName, ScopeListener[]>();
+    const live = new Map<KanbanRealtimeEventName, BridgeListener[]>();
+    const everRegistered = new Map<KanbanRealtimeEventName, BridgeListener[]>();
     const deregistrations: jest.Mock<void, []>[] = [];
 
-    const register = jest.fn<() => void, [KanbanRealtimeEventName, ScopeListener]>(
+    const register = jest.fn<() => void, [KanbanRealtimeEventName, BridgeListener]>(
         (eventName, listener) => {
             const liveForName = live.get(eventName) ?? [];
             liveForName.push(listener);
@@ -123,9 +135,9 @@ function makeRegistrarDouble(): RegistrarDouble {
         },
     );
 
-    function invoke(listeners: ScopeListener[], payload: unknown): void {
+    function invoke(listeners: BridgeListener[], payload: unknown): void {
         for (const listener of listeners) {
-            listener({ name: 'angular-event-object' }, payload);
+            listener(payload);
         }
     }
 

@@ -46,9 +46,26 @@ export interface ProjectPoint {
 
 export type PointsById = Readonly<Record<number, ProjectPoint | undefined>>;
 
+/**
+ * One entry of a `bulk-update-us-milestone` / `move_userstories_to_sprint` body.
+ *
+ * ⛔ BOTH MEMBERS ARE REQUIRED INTEGERS, because the backend validator says so:
+ * `_UserStoryMilestoneBulkValidator` declares `us_id = IntegerField()` and
+ * `order = IntegerField()`, neither with `required=False`, so an absent or
+ * `undefined` order is an HTTP 400 for the whole request rather than a defaulted
+ * value.
+ *
+ * ⭐ The incumbent CAN emit `{us_id, order: undefined}` --
+ * `app/coffee/modules/backlog/main.coffee:513` reads a dynamic order member and
+ * `:831` reads `us.sprint_order`, which a story outside every sprint does not
+ * have -- and `angular.toJson` then drops the key, producing exactly the request
+ * the validator rejects. That is a latent defect in the incumbent, not a contract
+ * to reproduce: typing `order` as optional would let the compiler bless a call
+ * that cannot succeed. Producers compute or narrow the order first.
+ */
 export interface BulkMilestoneItem {
     readonly us_id: number;
-    readonly order: number | undefined;
+    readonly order: number;
 }
 
 export type SelectedRoleId = string | number | null;

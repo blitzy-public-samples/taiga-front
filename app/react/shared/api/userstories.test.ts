@@ -25,14 +25,33 @@ import {
     storeUserstoriesQueryParams,
 } from './userstories';
 import type {
+    BacklogOrSprintOrderedUserStoryRow,
+    BacklogOrderedUserStoryRow,
+    KanbanOrderedUserStoryRow,
+    SprintOrderedUserStoryRow,
+    UserstoriesFiltersData,
+} from './userstories';
+import type {
     AngularPromise,
     HttpHeadersGetter,
     ResourceParams,
     TaigaModel,
 } from '../../bridge/useAngularService';
+import type { BulkMilestoneItem } from '../../backlog/state/types';
 import type { Epic } from '../types/epic';
 import type { Tag } from '../types/tag';
 import type { UserStory } from '../types/userStory';
+
+/**
+ * Exact type equality, in the standard conditional-inference form.
+ *
+ * Mutual assignability is not enough for these assertions: `readonly Row[]` and a
+ * wider row type are assignable in one direction, so a widened declaration would
+ * still satisfy an assignability check while breaking every caller that reads the
+ * narrow member. Exactness is what makes the assertion mean something.
+ */
+type Equals<A, B> =
+    (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
 function deferredThenable<T>(value: T): AngularPromise<T> {
     return {
@@ -325,7 +344,6 @@ const SAMPLE_STORY: UserStory = {
     is_blocked: true,
     blocked_note: '<b>bold</b> blocking note & "quoted"',
     is_closed: false,
-    is_iocaine: false,
     due_date: null,
     total_points: 8,
     points: { '1': 5, '2': null },
@@ -1262,7 +1280,7 @@ describe('bulkUpdateMilestone', () => {
         expect(body).not.toHaveProperty('bulk_userstories');
     });
 
-    it('sends milestone_id UNCONDITIONALLY, including when it is null', async () => {
+    it('sends milestone_id UNCONDITIONALLY, never omitting the key', async () => {
         const bodies: FrozenBulkMilestoneBody[] = [];
         const bulkUpdateMilestoneMember = jest.fn(
             (projectId: number, milestoneId: number | null, data: ResourceParams[]) => {
@@ -1275,13 +1293,38 @@ describe('bulkUpdateMilestone', () => {
         await bulkUpdateMilestone(
             { bulkUpdateMilestone: bulkUpdateMilestoneMember },
             PROJECT_ID,
-            null,
+            MILESTONE_ID,
             [{ us_id: 701, order: 0 }],
         );
 
+        // Unlike `bulkUpdateBacklogOrder`, which OMITS `milestone_id` to mean "the
+        // backlog", this endpoint's validator declares it mandatory, so the key is
+        // always present and always an integer.
         const body = bodyOf(bodies);
         expect(body).toHaveProperty('milestone_id');
-        expect(body.milestone_id).toBeNull();
+        expect(body.milestone_id).toBe(MILESTONE_ID);
+    });
+
+    it('\u26d4 cannot be called with a null milestone, because the validator rejects one', () => {
+        // `UpdateMilestoneBulkValidator.milestone_id` is a mandatory `IntegerField()`
+        // and `UserStoryViewSet.bulk_update_milestone` resolves it with
+        // `get_object_or_error(Milestone, pk=data["milestone_id"])` unconditionally, so
+        // a null is an HTTP 400 rather than an "unassign". Contrast
+        // `UpdateUserStoriesBacklogOrderBulkValidator`, whose `milestone_id` really is
+        // `required=False` -- the two must not be conflated.
+        //
+        // Asserted at the TYPE level with `@ts-expect-error`, which fails the build if
+        // the error ever stops occurring, so this is executable rather than prose.
+        const callWithNullMilestone = (): unknown =>
+            bulkUpdateMilestone(
+                { bulkUpdateMilestone: jest.fn(() => deferredThenable(WRITE_RESPONSE)) },
+                PROJECT_ID,
+                // @ts-expect-error - a null milestone is an HTTP 400, not an unassign
+                null,
+                [{ us_id: 701, order: 0 }],
+            );
+
+        expect(typeof callWithNullMilestone).toBe('function');
     });
 
     it('copies the entry list rather than aliasing frozen React state', async () => {
@@ -1300,31 +1343,91 @@ describe('bulkUpdateMilestone', () => {
         expect(forwarded).not.toBe(frozenEntries);
     });
 
-    it('⭐ carries an UNDEFINED order through as a PRESENT key, never dropping it', async () => {
+    it('\u26d4 REFUSES an undefined order, which the validator rejects and JSON drops', async () => {
         const bulkUpdateMilestoneMember = jest.fn(() => deferredThenable(WRITE_RESPONSE));
 
-        // Both incumbent construction sites read a member that may be absent --
-        // `backlog/main.coffee:505` reads a dynamic order member defaulting to the
-        // backlog position, and `:797` reads `us.sprint_order`, which a story outside
-        // every sprint does not have -- yet BOTH ALWAYS EMIT THE KEY. The entry type
-        // therefore declares `number | undefined` as a UNION rather than an optional
-        // member: a producer must state the absence, because a body that dropped the key
-        // would no longer be the body the incumbent sends (G2). It also matches the
-        // canonical `BulkMilestoneItem` of `app/react/backlog/state/types.ts` member for
-        // member, so the screen's own payload type needs no adaptation at this seam.
+        // Each entry is validated by `_UserStoryMilestoneBulkValidator`, whose `order`
+        // is a plain `IntegerField()` with no `required=False`, so an absent order is
+        // an HTTP 400 for the WHOLE request. It is doubly unusable because
+        // `angular.toJson` DROPS an undefined-valued key outright, so the key the
+        // entry object appears to carry never reaches the wire at all.
+        //
+        // The incumbent can build exactly that body -- `backlog/main.coffee:513` reads
+        // a dynamic order member and `:831` reads `us.sprint_order`, which a story
+        // outside every sprint does not have -- which makes this a latent defect in
+        // the incumbent rather than a contract to preserve. A facade that accepted it
+        // would let the compiler bless a call that cannot succeed.
+        //
+        // `@ts-expect-error` makes the refusal executable: the build fails if the
+        // error ever stops occurring.
+        const callWithUndefinedOrder = (): unknown =>
+            bulkUpdateMilestone(
+                { bulkUpdateMilestone: bulkUpdateMilestoneMember },
+                PROJECT_ID,
+                MILESTONE_ID,
+                // @ts-expect-error - `order` is a required integer on the validator
+                [{ us_id: 701, order: undefined }],
+            );
+
+        expect(typeof callWithUndefinedOrder).toBe('function');
+        expect(bulkUpdateMilestoneMember).not.toHaveBeenCalled();
+    });
+
+    it("\u2b50 accepts the SCREEN'S OWN entry type with no adaptation at the seam", async () => {
+        const bulkUpdateMilestoneMember = jest.fn(() => deferredThenable(WRITE_RESPONSE));
+
+        // ⭐ THIS IS AN EXECUTABLE CROSS-TYPE CONTRACT, not a redundant call. The
+        // backlog screen composes its payload as `BulkMilestoneItem[]`
+        // (`app/react/backlog/state/types.ts`) and hands it straight to this facade,
+        // whose own `BulkMilestoneEntry` is deliberately unexported. The claim that no
+        // adaptation is needed at that seam only holds while the two agree member for
+        // member -- so it is asserted by ACTUALLY passing the screen's type here.
+        //
+        // It is also the only guard on `BulkMilestoneItem.order` being a REQUIRED
+        // integer, since nothing else consumes that type yet: widening it back to
+        // `number | undefined` breaks this call and nothing else would notice.
+        const screenEntries: readonly BulkMilestoneItem[] = [
+            { us_id: 701, order: 0 },
+            { us_id: 702, order: 1 },
+        ];
+
         await bulkUpdateMilestone(
             { bulkUpdateMilestone: bulkUpdateMilestoneMember },
             PROJECT_ID,
             MILESTONE_ID,
-            [{ us_id: 701, order: undefined }],
+            screenEntries,
+        );
+
+        expect(argsOf(bulkUpdateMilestoneMember)[2]).toEqual([
+            { us_id: 701, order: 0 },
+            { us_id: 702, order: 1 },
+        ]);
+    });
+
+    it('forwards a valid integer order untouched, including the falsy zero', async () => {
+        const bulkUpdateMilestoneMember = jest.fn(() => deferredThenable(WRITE_RESPONSE));
+
+        await bulkUpdateMilestone(
+            { bulkUpdateMilestone: bulkUpdateMilestoneMember },
+            PROJECT_ID,
+            MILESTONE_ID,
+            [
+                { us_id: 701, order: 0 },
+                { us_id: 702, order: 7 },
+            ],
         );
 
         const forwarded = argsOf(bulkUpdateMilestoneMember)[2];
-        expect(forwarded).toEqual([{ us_id: 701, order: undefined }]);
-        // The KEY is what matters, and `toEqual` alone does not see its absence:
-        // `{us_id: 701}` and `{us_id: 701, order: undefined}` are `toEqual`-equal, so the
-        // key set is asserted directly. Narrowed by run-time checks rather than by a cast,
-        // because this file admits no assertion on a value it is inspecting.
+
+        expect(forwarded).toEqual([
+            { us_id: 701, order: 0 },
+            { us_id: 702, order: 7 },
+        ]);
+
+        // The KEY set is asserted directly, because `toEqual` cannot see a missing
+        // key: `{us_id: 701}` and `{us_id: 701, order: undefined}` are `toEqual`-equal.
+        // Narrowed by run-time checks rather than by a cast, because this file admits
+        // no assertion on a value it is inspecting.
         const entries: readonly unknown[] = Array.isArray(forwarded) ? forwarded : [];
         const firstEntry: unknown = entries[0];
 
@@ -1820,6 +1923,476 @@ describe('getUserstoriesFiltersData', () => {
     });
 });
 
+/* ==========================================================================
+ * THE THREE ORDER-WRITE RESPONSE SHAPES
+ *
+ * ⛔⛔ The two order endpoints answer with THREE different row shapes, and which
+ * one arrives depends on the REQUEST rather than on the endpoint alone. These
+ * specs drive each facade WITHOUT an explicit `TResult`, so the DEFAULT result
+ * type is what gets exercised: reading a member the default does not declare is a
+ * compile error, and reading one it declares wrongly is a run-time failure.
+ * Passing an explicit `TResult` would override the default and assert nothing
+ * about it, which is exactly how one incorrect row type covered all three.
+ * ========================================================================== */
+
+describe('the order writes resolve THREE distinct response shapes', () => {
+    /**
+     * Builds a member that answers with a caller-chosen response body.
+     *
+     * `TData` is supplied EXPLICITLY at each call site rather than inferred from the
+     * literal, because the facade infers its own `TResult` from this double: an
+     * inferred literal type would make every read trivially valid and the spec would
+     * assert nothing about the row shapes.
+     */
+    function memberAnswering<TData>(data: TData) {
+        return jest.fn(() =>
+            deferredThenable({ data, status: 200, headers: makeHeadersGetter({}) }),
+        );
+    }
+
+    it('⛔ the three row types are DISTINCT and none satisfies another', () => {
+        // ⭐ THE ASSERTION THAT MATTERS MOST. Sharing one row type across three
+        // responses is exactly the defect these types replace, so their mutual
+        // NON-interchangeability is asserted rather than assumed. Exact equality, not
+        // assignability: a widened row stays assignable in one direction while
+        // breaking every caller that reads the narrow member.
+        const backlogIsNotSprint: Equals<
+            BacklogOrderedUserStoryRow,
+            SprintOrderedUserStoryRow
+        > = false;
+        const backlogIsNotKanban: Equals<
+            BacklogOrderedUserStoryRow,
+            KanbanOrderedUserStoryRow
+        > = false;
+        const sprintIsNotKanban: Equals<
+            SprintOrderedUserStoryRow,
+            KanbanOrderedUserStoryRow
+        > = false;
+        const unionIsExactlyTheTwo: Equals<
+            BacklogOrSprintOrderedUserStoryRow,
+            BacklogOrderedUserStoryRow | SprintOrderedUserStoryRow
+        > = true;
+
+        expect([backlogIsNotSprint, backlogIsNotKanban, sprintIsNotKanban]).toEqual([
+            false,
+            false,
+            false,
+        ]);
+        expect(unionIsExactlyTheTwo).toBe(true);
+    });
+
+    it('⭐ the row types are EXPORTED, because the frozen member defeats the default', () => {
+        // The frozen resource member is itself generic with `TResult = unknown`, so
+        // passing the LIVE namespace makes TypeScript infer `unknown` and the facade's
+        // own default result type is never reached. A caller therefore has to NAME the
+        // shape it expects -- and if the only correct names were private, it would
+        // write its own, which is how three responses came to share one description.
+        // This spec importing them by name IS the assertion that they are reachable.
+        const rows: readonly BacklogOrSprintOrderedUserStoryRow[] = [
+            { id: 4021, milestone: null, backlog_order: 1 },
+            { id: 4022, milestone: 8, sprint_order: 2 },
+        ];
+        const kanbanRows: readonly KanbanOrderedUserStoryRow[] = [
+            { id: 4021, swimlane: null, status: 12, kanban_order: 1 },
+        ];
+
+        expect(rows).toHaveLength(2);
+        expect(kanbanRows).toHaveLength(1);
+    });
+
+    it('⛔ BACKLOG reorder: {id, milestone: null, backlog_order}', async () => {
+        // `update_userstories_backlog_or_sprint_order_in_bulk` with no milestone
+        // leaves `order_param` as "backlog_order" and reports `milestone` as null.
+        const member = memberAnswering<readonly BacklogOrSprintOrderedUserStoryRow[]>([
+            { id: 4021, milestone: null, backlog_order: 1 },
+            { id: 4022, milestone: null, backlog_order: 2 },
+        ]);
+
+        const response = await bulkUpdateBacklogOrder(
+            { bulkUpdateBacklogOrder: member },
+            PROJECT_ID,
+            null,
+            null,
+            null,
+            [4021, 4022],
+        );
+
+        // Narrowed on `milestone`, which is what makes the union usable: the
+        // backlog branch has `backlog_order` and the sprint branch does not.
+        const orders = response.data.map((row) =>
+            row.milestone === null ? row.backlog_order : row.sprint_order,
+        );
+
+        expect(orders).toEqual([1, 2]);
+        expect(response.data[0]).not.toHaveProperty('sprint_order');
+        expect(response.data[0]).not.toHaveProperty('kanban_order');
+        expect(response.data[0]).not.toHaveProperty('status');
+    });
+
+    it('⛔ SPRINT reorder: {id, milestone, sprint_order} — NO backlog_order at all', async () => {
+        // The SAME function WITH a milestone switches `order_param` to
+        // "sprint_order", so a caller promised `backlog_order` reads `undefined`
+        // behind an HTTP 200 — no error, no rejection, and an ordering computed
+        // from nothing.
+        const member = memberAnswering<readonly BacklogOrSprintOrderedUserStoryRow[]>([
+            { id: 4021, milestone: MILESTONE_ID, sprint_order: 5 },
+            { id: 4022, milestone: MILESTONE_ID, sprint_order: 6 },
+        ]);
+
+        const response = await bulkUpdateBacklogOrder(
+            { bulkUpdateBacklogOrder: member },
+            PROJECT_ID,
+            MILESTONE_ID,
+            null,
+            null,
+            [4021, 4022],
+        );
+
+        const orders = response.data.map((row) =>
+            row.milestone === null ? row.backlog_order : row.sprint_order,
+        );
+
+        expect(orders).toEqual([5, 6]);
+        expect(response.data[0]).toHaveProperty('sprint_order');
+        expect(response.data[0]).not.toHaveProperty('backlog_order');
+    });
+
+    it('⛔ KANBAN reorder: {id, swimlane, status, kanban_order} — a third shape', async () => {
+        // `update_userstories_kanban_order_in_bulk` reports the destination the
+        // server settled on, which is what makes the row worth reading rather than
+        // discarding: no `milestone`, no `backlog_order`, plus `status` and
+        // `swimlane`.
+        const member = memberAnswering<readonly KanbanOrderedUserStoryRow[]>([
+            { id: 4021, swimlane: 7, status: 12, kanban_order: 1 },
+            { id: 4022, swimlane: null, status: 12, kanban_order: 2 },
+        ]);
+
+        const response = await bulkUpdateKanbanOrder(
+            { bulkUpdateKanbanOrder: member },
+            PROJECT_ID,
+            12,
+            7,
+            null,
+            null,
+            [4021, 4022],
+        );
+
+        const destinations = response.data.map((row) => ({
+            id: row.id,
+            status: row.status,
+            swimlane: row.swimlane,
+            order: row.kanban_order,
+        }));
+
+        expect(destinations).toEqual([
+            { id: 4021, status: 12, swimlane: 7, order: 1 },
+            { id: 4022, status: 12, swimlane: null, order: 2 },
+        ]);
+        expect(response.data[0]).not.toHaveProperty('milestone');
+        expect(response.data[0]).not.toHaveProperty('backlog_order');
+    });
+
+    it('⛔ a Kanban row does NOT type-check as carrying backlog_order or milestone', async () => {
+        const member = memberAnswering<readonly KanbanOrderedUserStoryRow[]>([
+            { id: 4021, swimlane: null, status: 12, kanban_order: 1 },
+        ]);
+
+        const response = await bulkUpdateKanbanOrder(
+            { bulkUpdateKanbanOrder: member },
+            PROJECT_ID,
+            12,
+            null,
+            null,
+            null,
+            [4021],
+        );
+
+        const row = response.data[0];
+
+        if (row === undefined) {
+            throw new Error('the Kanban order write resolved no rows');
+        }
+
+        // `@ts-expect-error` fails the build if the error ever STOPS occurring, so
+        // the separation of the three row types is asserted rather than described.
+        // @ts-expect-error - a Kanban row has no `backlog_order`
+        expect(row.backlog_order).toBeUndefined();
+        // @ts-expect-error - a Kanban row has no `milestone`
+        expect(row.milestone).toBeUndefined();
+    });
+
+    it('⛔ a backlog/sprint row does NOT type-check as carrying status or swimlane', async () => {
+        const member = memberAnswering<readonly BacklogOrSprintOrderedUserStoryRow[]>([
+            { id: 4021, milestone: null, backlog_order: 1 },
+        ]);
+
+        const response = await bulkUpdateBacklogOrder(
+            { bulkUpdateBacklogOrder: member },
+            PROJECT_ID,
+            null,
+            null,
+            null,
+            [4021],
+        );
+
+        const row = response.data[0];
+
+        if (row === undefined) {
+            throw new Error('the backlog order write resolved no rows');
+        }
+
+        // @ts-expect-error - a backlog/sprint row has no `status`
+        expect(row.status).toBeUndefined();
+        // @ts-expect-error - a backlog/sprint row has no `swimlane`
+        expect(row.swimlane).toBeUndefined();
+    });
+
+    it('⛔ reading an order member WITHOUT narrowing on milestone is a type error', async () => {
+        const member = memberAnswering<readonly BacklogOrSprintOrderedUserStoryRow[]>([
+            { id: 4021, milestone: null, backlog_order: 1 },
+        ]);
+
+        const response = await bulkUpdateBacklogOrder(
+            { bulkUpdateBacklogOrder: member },
+            PROJECT_ID,
+            null,
+            null,
+            null,
+            [4021],
+        );
+
+        const row = response.data[0];
+
+        if (row === undefined) {
+            throw new Error('the backlog order write resolved no rows');
+        }
+
+        // The whole value of the discriminated union: an un-narrowed read is
+        // refused, so the caller cannot forget that the shape depends on the
+        // request it just made.
+        // @ts-expect-error - `backlog_order` is absent from the sprint branch
+        expect(row.backlog_order).toBe(1);
+    });
+});
+
+/* ==========================================================================
+ * THE SEVEN FILTER CATEGORIES
+ *
+ * ⛔ Each category has its own row shape. Driven through the DEFAULT `TFilters`,
+ * so the declared shape is what is under test. Three of the differences are
+ * load-bearing: `tags` has no `id`, `epics` carries a synthetic all-null row, and
+ * `roles` always sends `color: null`.
+ * ========================================================================== */
+
+describe('userstories-filters is typed per category, not by one shared row', () => {
+    /**
+     * The full seven-category payload, exactly as the endpoint assembles it.
+     *
+     * ⭐ ANNOTATED WITH THE DECLARED TYPE, WHICH IS HALF THE ASSERTION. A bare
+     * literal would be inferred, the facade would infer `TFilters` from it, and every
+     * read below would be trivially valid against the fixture's own shape while saying
+     * nothing about the declaration. Annotating it means a declaration that CANNOT
+     * represent the real payload -- a non-nullable epic `subject`, a `string` role
+     * colour -- fails right here.
+     */
+    const EXACT_FILTERS_PAYLOAD: UserstoriesFiltersData = {
+        statuses: [
+            { id: 12, name: 'New', color: '#70728F', order: 1, count: 4 },
+            { id: 13, name: 'Ready', color: '#E44057', order: 2, count: 2 },
+        ],
+        assigned_to: [
+            {
+                id: 6,
+                full_name: 'Ada Lovelace',
+                count: 3,
+                photo: '/media/a.png',
+                big_photo: '/media/a-big.png',
+                gravatar_id: 'abc',
+            },
+            // The unassigned row, appended when the query did not produce one.
+            { id: null, full_name: '', count: 0, photo: null, big_photo: null, gravatar_id: null },
+        ],
+        assigned_users: [
+            {
+                id: 6,
+                full_name: 'Ada Lovelace',
+                count: 3,
+                photo: null,
+                big_photo: null,
+                gravatar_id: null,
+            },
+        ],
+        owners: [
+            {
+                id: 6,
+                full_name: 'Ada Lovelace',
+                count: 3,
+                photo: null,
+                big_photo: null,
+                gravatar_id: null,
+            },
+        ],
+        tags: [
+            { name: 'urgent', color: '#111111', count: 3 },
+            { name: 'untagged', color: null, count: 1 },
+        ],
+        epics: [
+            // The synthetic "no epic" row: id, ref AND subject are all null.
+            { id: null, ref: null, subject: null, order: 0, count: 2 },
+            { id: 31, ref: 9, subject: 'Checkout', order: 1, count: 5 },
+        ],
+        roles: [{ id: 4, name: 'Design', color: null, order: 1, count: 2 }],
+    };
+
+    async function resolveExactFilters(): Promise<UserstoriesFiltersData> {
+        const filtersData = jest.fn(() => deferredThenable(EXACT_FILTERS_PAYLOAD));
+
+        // `TFilters` is supplied EXPLICITLY, and that is the other half of the
+        // assertion. The frozen `filtersData` member is generic with
+        // `TFilters = unknown`, so a caller must name the shape it expects; naming it
+        // here means every read below goes through the DECLARED type rather than
+        // through the fixture's inferred literal, which is what makes a wrong
+        // optionality or a wrong nullability a compile error.
+        return getUserstoriesFiltersData<UserstoriesFiltersData>(
+            { filtersData },
+            { project: PROJECT_ID },
+        );
+    }
+
+    it('declares all seven categories', async () => {
+        const resolved = await resolveExactFilters();
+
+        expect(Object.keys(resolved).sort()).toEqual([
+            'assigned_to',
+            'assigned_users',
+            'epics',
+            'owners',
+            'roles',
+            'statuses',
+            'tags',
+        ]);
+    });
+
+    it('statuses carry a NON-optional name, colour and order', async () => {
+        const resolved = await resolveExactFilters();
+        const status = resolved.statuses[0];
+
+        if (status === undefined) {
+            throw new Error('no status rows resolved');
+        }
+
+        // `color` is `NOT NULL DEFAULT '#999999'` on the model, so it is a string
+        // rather than a nullable one.
+        const name: string = status.name;
+        const color: string = status.color;
+        const order: number = status.order;
+        const id: number = status.id;
+
+        expect([id, name, color, order]).toEqual([12, 'New', '#70728F', 1]);
+    });
+
+    it('⛔ tags carry NO id — they are keyed by name', async () => {
+        const resolved = await resolveExactFilters();
+        const tag = resolved.tags[0];
+
+        if (tag === undefined) {
+            throw new Error('no tag rows resolved');
+        }
+
+        const name: string = tag.name;
+
+        expect(name).toBe('urgent');
+        // Keying a list on `tag.id` would give every tag the same `undefined` key,
+        // which is why the member must not be declared at all.
+        // @ts-expect-error - a tag row has no `id`
+        expect(tag.id).toBeUndefined();
+        // @ts-expect-error - a tag row has no `order`
+        expect(tag.order).toBeUndefined();
+    });
+
+    it('tag colour is NULLABLE, because an untagged row carries none', async () => {
+        const resolved = await resolveExactFilters();
+
+        const colors: Array<string | null> = resolved.tags.map((tag) => tag.color);
+
+        expect(colors).toEqual(['#111111', null]);
+    });
+
+    it('⛔ the synthetic no-epic row has a null id, ref AND subject', async () => {
+        const resolved = await resolveExactFilters();
+        const noEpic = resolved.epics[0];
+        const realEpic = resolved.epics[1];
+
+        if (noEpic === undefined || realEpic === undefined) {
+            throw new Error('the epic rows did not resolve');
+        }
+
+        // A caller that assumed `subject` was a string would render "undefined" in
+        // the filter list for the "stories with no epic" option.
+        const subject: string | null = noEpic.subject;
+        const ref: number | null = noEpic.ref;
+        const id: number | null = noEpic.id;
+
+        expect([id, ref, subject]).toEqual([null, null, null]);
+        expect([realEpic.id, realEpic.ref, realEpic.subject]).toEqual([31, 9, 'Checkout']);
+    });
+
+    it('⛔ roles always send colour as null, present rather than omitted', async () => {
+        const resolved = await resolveExactFilters();
+        const role = resolved.roles[0];
+
+        if (role === undefined) {
+            throw new Error('no role rows resolved');
+        }
+
+        const color: null = role.color;
+
+        expect(color).toBeNull();
+        expect(role).toHaveProperty('color');
+    });
+
+    it('the three USER categories share one shape whose id is nullable', async () => {
+        const resolved = await resolveExactFilters();
+
+        for (const category of [
+            resolved.assigned_to,
+            resolved.assigned_users,
+            resolved.owners,
+        ]) {
+            const row = category[0];
+
+            if (row === undefined) {
+                throw new Error('a user filter category resolved no rows');
+            }
+
+            // `full_name` is `full_name or username or ""`, so it is always a string
+            // and is `""` for the unassigned row — never null and never absent.
+            const fullName: string = row.full_name;
+            const id: number | null = row.id;
+            const photo: string | null = row.photo;
+
+            expect(typeof fullName).toBe('string');
+            expect(id).toBe(6);
+            expect(photo === null || typeof photo === 'string').toBe(true);
+        }
+
+        // `assigned_to` ALWAYS includes the unassigned row; the other two include
+        // only non-zero counts, so they may omit it.
+        const unassigned = resolved.assigned_to[1];
+
+        expect(unassigned?.id).toBeNull();
+        expect(unassigned?.full_name).toBe('');
+    });
+
+    it('resolves the payload by identity, transforming nothing', async () => {
+        const filtersData = jest.fn(() => deferredThenable(EXACT_FILTERS_PAYLOAD));
+
+        const resolved = await getUserstoriesFiltersData({ filtersData }, { project: PROJECT_ID });
+
+        expect(resolved).toBe(EXACT_FILTERS_PAYLOAD);
+    });
+});
+
 describe('listUserstoryValues', () => {
     it('forwards the project and the requested collection name verbatim', async () => {
         const listValues = jest.fn(() => deferredThenable([makeModel({ id: 3, order: 30 })]));
@@ -2015,6 +2588,66 @@ describe('getShowTags', () => {
         expect(asIdiom(getShowTags({ getShowTags: jest.fn(() => null) }, PROJECT_ID))).toBe(
             'untouched',
         );
+    });
+});
+
+/* ==========================================================================
+ * THE USER-STORY DOMAIN SHAPE -- no member the serializers do not send
+ * ========================================================================== */
+
+describe('the UserStory domain type carries no field the API never sends', () => {
+    it('\u26d4 declares NO story-level `is_iocaine`, because no serializer emits one', () => {
+        // The flag lives on a TASK, which is why the sprint-stats endpoint counts it
+        // as `iocaine_doses` over `milestone.tasks` and no user-story serializer
+        // declares it at all.
+        //
+        // The shared card component makes it LOOK real -- `card-assigned-to.jade:10`
+        // and `card-data.jade:34` both read `vm.item.getIn(['model', 'is_iocaine'])` --
+        // but that component renders tasks on the out-of-scope taskboard as well as
+        // stories on the board, so the lookup is generic on purpose and resolves to
+        // `undefined` for every story. That is exactly why a required boolean here was
+        // never observed to be missing: nothing ever read it expecting a value.
+        const hasNoIocaine: Equals<Extract<keyof UserStory, 'is_iocaine'>, never> = true;
+
+        expect(hasNoIocaine).toBe(true);
+        expect(Object.keys(SAMPLE_STORY)).not.toContain('is_iocaine');
+    });
+
+    it('\u2b50 still declares the members the list serializer DOES send', () => {
+        // The counterpart assertion, so "remove the phantom" cannot drift into
+        // "remove whatever is inconvenient". Each of these is a real field of
+        // `UserStoryListSerializer`.
+        const declared: readonly (keyof UserStory)[] = [
+            'id',
+            'ref',
+            'subject',
+            'status',
+            'swimlane',
+            'milestone',
+            'project',
+            'is_blocked',
+            'blocked_note',
+            'is_closed',
+            'due_date',
+            'total_points',
+            'points',
+            'tags',
+            'epics',
+            'assigned_users',
+            'assigned_to',
+            'kanban_order',
+            'backlog_order',
+            'total_attachments',
+            'total_comments',
+            'attachments',
+            'tasks',
+            'watchers',
+            'version',
+        ];
+
+        for (const member of declared) {
+            expect(SAMPLE_STORY).toHaveProperty(member);
+        }
     });
 });
 

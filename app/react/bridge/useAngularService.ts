@@ -266,9 +266,30 @@ interface UserStoriesResource {
         bulkUserstories: number[],
     ): AngularPromise<AngularHttpResponse<TResult>>;
 
+    /**
+     * `:107-110`. Reassigns a set of stories to ONE sprint, in one request.
+     *
+     * ⛔⛔ THE DESTINATION MILESTONE IS REQUIRED AND MUST BE AN INTEGER. The
+     * endpoint's validator is `UpdateMilestoneBulkValidator`, whose `milestone_id`
+     * is a plain `IntegerField()` with no `required=False`, and the view then does
+     * `get_object_or_error(Milestone, pk=data["milestone_id"])` unconditionally. A
+     * `null` therefore does not mean "unassign" — it is a validation error, HTTP
+     * 400, every time. Declaring `number | null` here promised a call the backend
+     * has never accepted, so the narrowing belongs at the UI gate that chooses the
+     * sprint, not in this signature.
+     *
+     * This is deliberately NARROWER than `bulkUpdateBacklogOrder`'s
+     * `milestoneId`, which really is optional: that endpoint's validator declares
+     * `milestone_id = IntegerField(required=False)` and treats its absence as "the
+     * backlog". The two must not be conflated.
+     *
+     * `data` entries are `{us_id, order}` and BOTH are required integers, for the
+     * same reason — see `BulkMilestoneItem` in
+     * `app/react/backlog/state/types.ts`, which is the canonical entry type.
+     */
     bulkUpdateMilestone<TResult = unknown>(
         projectId: number,
-        milestoneId: number | null,
+        milestoneId: number,
         data: ResourceParams[],
     ): AngularPromise<AngularHttpResponse<TResult>>;
 
@@ -373,11 +394,19 @@ interface SprintsResource {
      * while the THIRD is the DESTINATION and lands in the request body as
      * `milestone_id` (`:46`). `data` becomes `bulk_stories` on the same line --
      * NOT `bulk_userstories`, which belongs to the two order endpoints.
+     *
+     * ⛔ BOTH SPRINT IDS ARE REQUIRED INTEGERS. This endpoint validates through the
+     * very same `UpdateMilestoneBulkValidator` as `bulkUpdateMilestone`, so the
+     * destination `milestone_id` is a mandatory `IntegerField()` and the view
+     * resolves it with `get_object_or_error` unconditionally. A `null` destination
+     * is an HTTP 400, not an unassign, so it is not expressible here; the incumbent
+     * lightbox already gates its submit control on a destination being chosen,
+     * which is where that check belongs.
      */
     moveUserStoriesMilestone<TResult = unknown>(
         currentMilestoneId: number,
         projectId: number,
-        milestoneId: number | null,
+        milestoneId: number,
         data: ResourceParams[],
     ): AngularPromise<AngularHttpResponse<TResult>>;
 }

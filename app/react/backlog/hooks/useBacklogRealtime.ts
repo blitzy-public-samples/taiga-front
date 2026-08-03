@@ -402,15 +402,26 @@ export type BacklogRealtimeEventDeregistrar = () => void;
  * `events.onAngularEvent`, which is a direct `$scope.$on` on the retained
  * controller's scope; a spec satisfies it with a stub that records the handler.
  *
- * The listener signature carries BOTH AngularJS arguments in AngularJS's order
- * -- the event object first, the payload second -- because reading the payload
- * out of the wrong position is the classic way to get a `$scope.$on` consumer
- * wrong. Neither deliverer in this file reads either argument (section 3), and
- * declaring them both keeps that a visible decision rather than an accident.
+ * ⭐ THE LISTENER IS PAYLOAD-ONLY, AND THAT IS THE BRIDGE'S CONTRACT RATHER THAN
+ * A SIMPLIFICATION OF IT. `$scope.$on` does invoke its own listener as
+ * `(event, payloadArgs…)`, but the bridge does not hand a React handler to
+ * `$scope.$on` directly -- it wraps it, DROPS the AngularJS event object and
+ * forwards only the payload arguments
+ * (`app/coffee/modules/backlog/react-bridge.coffee`, `registerAngularEvent`).
+ * Dropping the event object is deliberate and load-bearing: that object carries
+ * `targetScope` and `currentScope`, so forwarding it would put a live `$scope` on
+ * the React side of the seam.
+ *
+ * The payload therefore arrives as ARGUMENT 1. Declaring `(event, message)` here
+ * would be a two-position lie, and a costly one PRECISELY BECAUSE neither
+ * deliverer in this file reads an argument today (section 3): nothing would break
+ * now, and the contract would quietly direct the first consumer that DOES need a
+ * payload to read argument 2 and find `undefined` on every message. The type is
+ * spelled payload-only so the compiler makes that mistake unexpressible.
  */
 export type BacklogRealtimeEventRegistrar = (
     eventName: BacklogRealtimeEventName,
-    handler: (event: unknown, message: unknown) => void,
+    handler: (message: unknown) => void,
 ) => BacklogRealtimeEventDeregistrar;
 
 /**
@@ -574,10 +585,10 @@ export function useBacklogRealtime(
     //
     // Neither listener DECLARES an argument, because neither deliverer consults
     // one (see above) and a zero-argument function satisfies the registrar's
-    // two-argument listener type. The type still spells both arguments out, in
-    // AngularJS's order -- event object first, payload second -- so that a future
-    // listener which does need the payload cannot read it out of the first
-    // position, which is the classic way to get a `$scope.$on` consumer wrong.
+    // one-argument listener type. The type itself spells that one argument out as
+    // the PAYLOAD, because the bridge strips AngularJS's event object before
+    // calling back, so a future listener which does need the payload reads it from
+    // the first position and gets the real thing.
     // ------------------------------------------------------------------
     useEffect(() => {
         const deregisterUserStories = registerAngularEvent(

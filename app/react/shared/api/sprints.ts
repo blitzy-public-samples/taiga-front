@@ -14,8 +14,7 @@ import type {
     ResourceParams,
     TaigaModel,
 } from '../../bridge/useAngularService';
-import type { Sprint } from '../types/sprint';
-import type { UserStory } from '../types/userStory';
+import type { NestedSprintUserStory, Sprint } from '../types/sprint';
 
 /* ==========================================================================
  * THE SERVICE SURFACE
@@ -52,11 +51,17 @@ type SprintsResource = AngularServices['$tgResources']['sprints'];
  * so at every call site: a caller that treats an element as a plain story gets a
  * type error instead of a structure the state library cannot proxy.
  *
+ * ⛔ THE MODELS WRAP `NestedSprintUserStory`, NOT `UserStory`. A sprint's stories
+ * come from `UserStoryNestedSerializer`, which omits nineteen members that
+ * `UserStoryListSerializer` sends -- `tags`, `assigned_users`, `owner`, `tasks`,
+ * `swimlane`, `total_attachments` and the rest. Declaring them as full stories
+ * promised every one of those; `../types/sprint` documents the full omission list.
+ *
  * Everything else is the frozen domain shape, `../types/sprint` unchanged --
  * including the two `"YYYY-MM-DD"` date STRINGS, which stay strings.
  */
 type SprintModelAttrs = Omit<Sprint, 'user_stories'> & {
-    readonly user_stories: ReadonlyArray<TaigaModel<UserStory>>;
+    readonly user_stories: ReadonlyArray<TaigaModel<NestedSprintUserStory>>;
 };
 
 interface SprintListEnvelope<TAttrs> {
@@ -67,16 +72,76 @@ interface SprintListEnvelope<TAttrs> {
     readonly open: number;
 }
 
-interface SprintStatsResponse {
+/**
+ * The `/milestones/{id}/stats` body.
+ *
+ * ⛔⛔ THE TWO POINT MEMBERS ARE DIFFERENT KINDS OF VALUE, which is the defect this
+ * type replaces. The view builds them from two different expressions:
+ *
+ *     'total_points':     milestone.total_points            -> a role-keyed DICT
+ *     'completed_points': milestone.closed_points.values()  -> an ARRAY of numbers
+ *
+ * `closed_points` is a dict too, but `.values()` is taken before serialisation, so
+ * the ROLE KEYS ARE DISCARDED and what arrives is a bare list of per-role sums.
+ * Declaring it as a record promised keys that do not exist: `stats.completed_points[
+ * roleId]` reads `undefined` for every role, `Object.entries(...)` yields the array
+ * INDICES as keys, and a "points completed by role" readout silently renders
+ * nothing. Being wrong about the SHAPE rather than the values is what made it
+ * invisible -- both are truthy objects, so every guard passed.
+ *
+ * ⭐ EXPORTED, because the frozen `stats` member is generic with `TStats = unknown`:
+ * passing the live namespace makes TypeScript infer `unknown`, so a caller has to
+ * name the shape it expects and the right name must be reachable.
+ *
+ * ⭐ EVERY member the view sends is declared, in its own order, rather than the
+ * four that were guessed at. `days` is the burndown series the taskboard's sprint
+ * chart consumes; `iocaine_doses` counts TASKS flagged as iocaine, which is the
+ * only place that flag exists (it is not a user-story field).
+ *
+ * ⚠ NOT the same thing as `Sprint.total_points` / `Sprint.closed_points`, which are
+ * scalar `SUM()` sub-selects on the milestone LIST payload. Identical names, three
+ * different value kinds across the two endpoints.
+ */
+export interface SprintStatsResponse {
+    readonly name: string;
+
+    readonly estimated_start: string;
+
+    readonly estimated_finish: string;
+
+    /** Role-keyed: `{ "<roleId>": points }`. */
     readonly total_points: Readonly<Record<string, number>>;
 
-    readonly completed_points: Readonly<Record<string, number>>;
+    /** ⛔ An ARRAY, because the view serialises `closed_points.values()`. */
+    readonly completed_points: readonly number[];
+
+    readonly total_userstories: number;
+
+    readonly completed_userstories: number;
 
     readonly total_tasks: number;
 
     readonly completed_tasks: number;
+
+    /** A count of TASKS flagged iocaine; stories carry no such flag. */
+    readonly iocaine_doses: number;
+
+    readonly days: ReadonlyArray<{
+        readonly day: string;
+        readonly name: number;
+        readonly open_points: number;
+        readonly optimal_points: number;
+    }>;
 }
 
+/**
+ * One story to move, with its order in the destination sprint.
+ *
+ * ⛔ BOTH MEMBERS ARE REQUIRED INTEGERS: the endpoint validates each entry with
+ * `_UserStoryMilestoneBulkValidator`, whose `us_id` and `order` are both plain
+ * `IntegerField()`s. Same entry contract as `bulkUpdateMilestone`'s, because both
+ * endpoints share the one validator.
+ */
 type MoveUserStoriesEntry = {
     readonly us_id: number;
 
@@ -170,11 +235,21 @@ export async function listSprints<TAttrs = SprintModelAttrs>(
  * user-story variant is faceted here. Needing one of the others would be a
  * reviewed edit, not an accident.
  *
- * ⭐ T9 -- the destination is typed as nullable because the incumbent lightbox
- * initialises it to nothing (`move-to-sprint-lb.controller.coffee:36`) and gates
- * its submit control on the value being set (`move-to-sprint-lb.jade:79`), so the
- * gate lives in the UI. This facade adds NO validation of its own: guarding here
- * would be behaviour the incumbent does not have (T10).
+ * ⛔⛔ T9 -- THE DESTINATION IS REQUIRED AND NON-NULL. This endpoint validates
+ * through `UpdateMilestoneBulkValidator`, whose `milestone_id` is a mandatory
+ * `IntegerField()`, and `MilestoneViewSet.move_userstories_to_sprint` then resolves
+ * it with `get_object_or_error(Milestone, pk=data["milestone_id"])`
+ * unconditionally. A `null` destination is therefore an HTTP 400 -- it does NOT
+ * mean "unassign" -- so accepting one here would have let the compiler bless a
+ * call that cannot succeed.
+ *
+ * ⭐ AND THE GATE STILL LIVES IN THE UI, exactly as it does today. The incumbent
+ * lightbox initialises its selection to nothing
+ * (`move-to-sprint-lb.controller.coffee:36`) and gates its submit control on the
+ * value being set (`move-to-sprint-lb.jade:79`). Requiring a number in this
+ * signature does not move that gate or add a run-time check of its own (T10): it
+ * simply means a caller must have PASSED its own gate before it can express the
+ * call at all, which is the same behaviour with the mistake made unrepresentable.
  *
  * ⭐ T10 -- STATELESS, deliberately. Rapid consecutive drags are serialised by the
  * backlog's own queue and re-entrancy guard, not here; section 7 of the file header
@@ -190,6 +265,7 @@ export async function listSprints<TAttrs = SprintModelAttrs>(
  * @param sourceMilestoneId - the sprint being moved OUT OF; lands in the URL path.
  * @param projectId - owning project.
  * @param destinationMilestoneId - the sprint being moved INTO; lands in the body.
+ *   Required and non-null, per the validator note above.
  * @param userStories - the stories to move, each an id plus its sprint order.
  * @returns the full response, whose `data` holds the server's reply.
  */
@@ -197,7 +273,7 @@ export async function moveUserStoriesToMilestone<TResult = unknown>(
     sprints: { readonly moveUserStoriesMilestone: MoveUserStoriesMilestoneMember<TResult> },
     sourceMilestoneId: number,
     projectId: number,
-    destinationMilestoneId: number | null,
+    destinationMilestoneId: number,
     userStories: readonly MoveUserStoriesEntry[],
 ): Promise<AngularHttpResponse<TResult>> {
     return toNativePromise<AngularHttpResponse<TResult>>(
