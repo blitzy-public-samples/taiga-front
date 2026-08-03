@@ -26,7 +26,8 @@
  *      (goal G2).
  *   3. **Pass-through fidelity, in both settlement branches.** The value is a bare array of
  *      live dirty-tracking model instances, and the rejection value is how the AngularJS
- *      interceptor chain reports a version conflict, a blocked project and connection loss.
+ *      interceptor pipeline reports a version conflict, a blocked project and connection
+ *      loss.
  *      Copying, flattening, sorting, filtering, re-keying or swallowing would each be a
  *      regression, so the assertions here are deliberately IDENTITY assertions (`toBe`,
  *      i.e. `Object.is`): a structurally equal copy is already a failure, because a copy
@@ -161,6 +162,20 @@ class ModelDouble<TAttrs extends object> implements TaigaModel<TAttrs> {
  * A swimlane payload shaped like the endpoint's, including two fields the shared domain
  * type deliberately omits (`order` and `project`), so the spec also demonstrates that a
  * wider server payload survives the facade untouched.
+ *
+ * A PLAIN OBJECT LITERAL, DELIBERATELY (rule T9). The incumbent spec builds its fixtures
+ * with the persistent-collection library the AngularJS controllers hold internally --
+ * `move-to-sprint.controller.spec.coffee:25`, `:81-85` and `:95-98` all construct one from
+ * a plain object. That library stays installed, because 124 files outside these two screens
+ * still depend on it (requirement I5), but it is never imported under this tree and never
+ * appears in a fixture here. Two reasons, and the second is the load-bearing one:
+ *
+ *   a. React is never handed one of those structures. The custom-element hand-off flattens
+ *      to plain JavaScript AT THE BOUNDARY, so a persistent collection cannot reach a React
+ *      component and a fixture built from one would be testing a shape that does not occur.
+ *   b. Board state is produced by a structural-sharing library that wants plain objects and
+ *      misbehaves on foreign wrappers, so a fixture shaped like real server JSON is the only
+ *      one that exercises the path the application actually takes.
  */
 function swimlanePayload(id: number, name: string, statusIds: readonly number[]): Swimlane {
     return {
@@ -177,6 +192,19 @@ function swimlanePayload(id: number, name: string, statusIds: readonly number[])
             is_archived: statusId === 9,
         })),
     };
+}
+
+/**
+ * A swimlane payload with NO `statuses` KEY AT ALL -- not an empty array, genuinely absent.
+ *
+ * The member is optional on the shared domain type for a reason that is easy to mistake for
+ * an oversight: a swimlane record really can arrive without its status columns, and the
+ * board's own synthetic band omits the key outright rather than sending it empty. An empty
+ * array and an absent key are different values, and code that reads `swimlane.statuses`
+ * without guarding sees `undefined` only in the second case, so both are exercised.
+ */
+function swimlanePayloadWithoutStatuses(id: number, name: string): Swimlane {
+    return { id, name };
 }
 
 /** One model instance wrapping a swimlane payload, as the repository layer produces. */
@@ -256,7 +284,29 @@ function rejectedThenable(reason: unknown): {
     };
 }
 
-/** Builds the service double the facade is called with. */
+/**
+ * Builds the service double the facade is called with.
+ *
+ * THE TECHNOLOGY-SPECIFIC CHANGE AT THIS SEAM (rule T9). The incumbent spec this file is
+ * modelled on registers each of its doubles INTO THE ANGULARJS INJECTOR -- a
+ * `module ($provide) ->` block calling `provide.value "tgProjectService", ...`
+ * (`move-to-sprint.controller.spec.coffee:21` and `:30`), which means the framework, its
+ * mocking add-on and the application's own module graph all have to be loaded before the
+ * first assertion can run.
+ *
+ * Nothing of the sort happens here, and the rule is absolute for every spec under this
+ * tree: MOCK THE INJECTOR, NEVER LOAD ANGULARJS. This file imports no framework, registers
+ * no module, opens no injector and assigns no framework global; the object below is a plain
+ * TypeScript literal, and it is enough because the facade takes the sub-resource service as
+ * its FIRST PARAMETER instead of looking one up (requirement I9). A bridge-level injector
+ * double exists for the hooks that genuinely need one; a plain function needs only a plain
+ * object, so reaching for it here would add a collaborator without adding cover.
+ *
+ * The literal is annotated with the service type derived from the bridge's own map rather
+ * than left to inference, which is what makes the double structurally checked against the
+ * real namespace: a member the namespace does not declare cannot be added to it, and a
+ * signature change upstream breaks this file at compile time.
+ */
 function serviceDouble(list: jest.Mock): { service: SwimlanesService; list: jest.Mock } {
     const service: SwimlanesService = { list };
 
@@ -283,6 +333,36 @@ describe('listSwimlanes', () => {
             // no barrel module, so there is no second place for surface to accumulate.
             expect(Object.keys(moduleUnderTest)).toEqual(['listSwimlanes']);
             expect(typeof moduleUnderTest.listSwimlanes).toBe('function');
+        });
+
+        it('exposes none of the five out-of-scope admin mutators', async () => {
+            const moduleUnderTest = await import('./swimlanes');
+            const exported = Object.keys(moduleUnderTest);
+
+            // The exclusion, named member by member rather than implied by the export list
+            // above, because a name is what a future reader recognises. The AngularJS
+            // namespace exposes six methods; these five are mutators, and every one of them
+            // is reached only from the ADMIN project-values screen --
+            // `create` at `resources/swimlanes.coffee:20`, `edit` at `:31`,
+            // `bulkUpdateOrder` at `:39`, `wipLimitUpdate` at `:48` and `delete` at `:56`.
+            // That screen stays on AngularJS and keeps calling the namespace directly, and
+            // the plan places it out of scope in as many words: "Every screen other than
+            // Kanban and Backlog ... admin ...".
+            //
+            // Facading one here would add public surface with no consumer, which the Minimal
+            // Change Clause forbids ("Do not enhance or optimize beyond the stated
+            // requirements"). Nothing in the type system objects to a new export, and a
+            // cross-folder note about where those request shapes "belong" reads, out of
+            // context, like an invitation to add them. This assertion is the guard that
+            // keeps them out: when an admin migration genuinely needs them, they arrive
+            // together with specs that exercise them, and this list is updated deliberately.
+            (['create', 'edit', 'bulkUpdateOrder', 'wipLimitUpdate', 'delete'] as const).forEach(
+                (mutator) => {
+                    expect(exported).not.toContain(mutator);
+                },
+            );
+
+            expect(exported).toHaveLength(1);
         });
 
         it('declares the service first and the project identifier second', () => {
@@ -334,6 +414,48 @@ describe('listSwimlanes', () => {
 
             expect(list).toHaveBeenCalledTimes(1);
             expect(list).toHaveBeenCalledWith(42);
+        });
+
+        it('forwards the bare identifier and composes no query bag of its own', async () => {
+            // ⭐ THE HIGHEST-VALUE GUARD IN THIS FILE.
+            //
+            // The incumbent read is three lines long, and its middle line is the whole
+            // request contract: `params = {project: projectId}` at
+            // `app/coffee/modules/resources/swimlanes.coffee:17`. The key is `project` --
+            // SINGULAR -- and that bag is composed ON THE ANGULARJS SIDE of the seam, one
+            // layer below this facade, which forwards the identifier alone.
+            //
+            // Why this is asserted rather than trusted: a wrong key does not fail. The
+            // endpoint ignores a parameter it does not recognise and answers HTTP 200 with a
+            // body -- the wrong body, or an empty one -- so a plural or snake_case spelling
+            // would surface as a board that silently renders no swimlanes, with no error, no
+            // rejection and nothing in the console. Goal G2 freezes the request shape for
+            // exactly this reason, and the cheapest place to hold the line is here.
+            //
+            // The argument is therefore captured and checked to be the PRIMITIVE identifier,
+            // and each spelling a well-meaning refactor might reach for is named and excluded
+            // so that composing the bag a second time up here cannot pass unnoticed.
+            const forwarded: unknown[] = [];
+            const list: jest.Mock = jest.fn((...args: unknown[]) => {
+                forwarded.push(...args);
+
+                return settledThenable([swimlaneModel(1, 'totam')]);
+            });
+            const { service } = serviceDouble(list);
+
+            await listSwimlanes(service, 42);
+
+            expect(forwarded).toEqual([42]);
+            expect(typeof forwarded[0]).toBe('number');
+
+            [
+                { project: 42 },
+                { projects: 42 },
+                { project_id: 42 },
+                { projectId: 42 },
+            ].forEach((queryBag) => {
+                expect(forwarded[0]).not.toEqual(queryBag);
+            });
         });
 
         it('passes exactly one argument, so the frozen request cannot drift', async () => {
@@ -467,6 +589,33 @@ describe('listSwimlanes', () => {
             expect(flattened?.statuses?.map((status) => status.id)).toEqual([3, 4]);
         });
 
+        it('passes a swimlane whose statuses key is absent through without inventing one', async () => {
+            const bare = new ModelDouble<Swimlane>(
+                'swimlanes',
+                swimlanePayloadWithoutStatuses(1, 'totam'),
+            );
+            const withStatuses = swimlaneModel(2, 'animi', [1, 2]);
+            const list = jest.fn(() => settledThenable([bare, withStatuses]));
+            const { service } = serviceDouble(list);
+
+            const result = await listSwimlanes(service, 3);
+            const bareAttrs = result[0]?.getAttrs();
+
+            // Both shapes in one response, because the optional member is optional in
+            // practice and not merely in the type. The absent key must stay ABSENT: an empty
+            // array would be a defaulted value, and defaulting is a transformation the
+            // incumbent does not perform (rule T10). Downstream code distinguishes the two --
+            // "no columns were sent" is not "this band has zero columns" -- so the facade
+            // normalising them together would erase information rather than tidy it.
+            expect(bareAttrs).toEqual({ id: 1, name: 'totam' });
+            expect(bareAttrs && 'statuses' in bareAttrs).toBe(false);
+            expect(bareAttrs?.statuses).toBeUndefined();
+
+            // The sibling in the same response keeps its columns, proving the two shapes are
+            // carried independently rather than reconciled to whichever arrived first.
+            expect(result[1]?.getAttrs().statuses?.map((status) => status.id)).toEqual([1, 2]);
+        });
+
         it('leaves the caller to flatten, because a shallow spread is not equivalent', async () => {
             const model = swimlaneModel(1, 'totam');
             const list = jest.fn(() => settledThenable([model]));
@@ -568,7 +717,7 @@ describe('listSwimlanes', () => {
     describe('rejection pass-through', () => {
         it('rejects with the identical reason the service rejected with', async () => {
             // Shaped like the AngularJS response object a version conflict rejects with: a
-            // 400 carrying a `version` field, which the interceptor chain surfaces as the
+            // 400 carrying a `version` field, which the interceptor pipeline surfaces as the
             // VERSION_ERROR toast. Swallowing or re-wrapping it here would hide an
             // optimistic-concurrency conflict from the caller whose job is to surface it.
             const reason = { status: 400, data: { version: ['conflict'] } };

@@ -19,20 +19,28 @@
  * separate the correct rule from its plausible neighbour:
  *
  *   - the FIRST-position and LAST-position cases, which are the two the
- *     previous-wins rule treats asymmetrically;
- *   - the CROSS-CONTAINER cases, which are the ones the guard must NOT absorb;
- *   - fixtures with TWO candidates on the same side, which is the only way to
- *     tell nearest-first from document-order-first apart;
+ *     previous-wins rule treats asymmetrically — asserted both within one
+ *     container and, by name, at the head and the tail of a DESTINATION;
+ *   - the CROSS-CONTAINER cases, which are the ones the guard must NOT absorb,
+ *     including three drops whose index is UNCHANGED and whose container is not;
+ *   - fixtures with TWO candidates on the same side, and one with THREE, which is
+ *     the only way to tell nearest-first from document-order-first apart;
  *   - the three index semantics measured over the SAME element, so conflating
  *     them fails loudly here instead of quietly in production;
- *   - and an equivalence group that asserts the projected-order path agrees with
- *     the DOM path, which is the specification, on every fixture.
+ *   - an equivalence group that asserts the projected-order path agrees with
+ *     the DOM path, which is the specification, on every fixture;
+ *   - the two deliberately inconsistent swimlane readings of KANBAN:140 and
+ *     KANBAN:146, proving this layer neither adds nor removes their fallback;
+ *   - and a group asserting the layer WRITES NOTHING: no DOM mutation, no
+ *     dispatched event, no surface beyond the four operations and one origin.
  *
  * Browserless by construction: it runs in the jsdom environment configured by
  * `jest.config.js` and needs no browser binary, no built bundle and no network.
  * jsdom implements no layout engine, which does not matter here — nothing in the
  * unit under test measures geometry, and nothing in it may filter by visibility
- * (R-DND-3), which the hidden-original case below asserts directly.
+ * (R-DND-3). That is not left to inspection: the hidden-original case asserts it
+ * directly, and the R-DND-3 group installs a TRIPWIRE that throws on any layout,
+ * rectangle or viewport read and then drives a whole gesture through it.
  */
 import { StrictMode } from 'react';
 import { renderHook } from '@testing-library/react';
@@ -49,6 +57,7 @@ import {
     useSortableList,
 } from './useSortableList';
 import type {
+    SortableDropResult,
     SortableNeighbours,
     UseSortableListConfig,
 } from './useSortableList';
@@ -194,6 +203,82 @@ function buildSprintTable(
     return { table, rows: appendItems(table, 'div', ['row', 'milestone-us-item-row'], specs) };
 }
 
+/**
+ * BOTH empty-backlog blocks, because there are exactly two of them in the real
+ * markup — `backlog.jade` L174 renders `.empty-backlog.js-empty-backlog` and L178
+ * renders `.empty-large.js-empty-backlog` — and that is precisely why BACKLOG:34
+ * collects the class and BACKLOG:39 registers `emptyBacklog[0]` AND
+ * `emptyBacklog[1]` as drop containers. Their children are reproduced too
+ * (L175-L176 and L179-L181), so the unfiltered sibling index has something to
+ * count and the fixture cannot accidentally flatter the measurement.
+ */
+function buildEmptyBacklogBlocks(): readonly [HTMLElement, HTMLElement] {
+    const noMatch = createElementIn('div', ['empty-backlog', 'js-empty-backlog']);
+    const large = createElementIn('div', ['empty-large', 'js-empty-backlog']);
+
+    noMatch.appendChild(createElementIn('p', ['no-match']));
+    noMatch.appendChild(createElementIn('p', ['no-match-help']));
+    large.appendChild(createElementIn('p', ['title']));
+    large.appendChild(createElementIn('button', ['btn-small']));
+
+    document.body.appendChild(noMatch);
+    document.body.appendChild(large);
+
+    return [noMatch, large];
+}
+
+/**
+ * Adds the inner wrapper of `app/modules/components/card/card.jade` L8-L13 to a
+ * card, which is where the viewport guard lives. Leaving it off is how a card
+ * that is currently scrolled away renders: the OUTER custom element, and the
+ * positional attribute it carries, are emitted either way because the card
+ * directive declares no element replacement (R-DND-3).
+ */
+function addCardInner(card: HTMLElement): void {
+    card.appendChild(createElementIn('div', ['card-inner']));
+}
+
+/**
+ * Replaces every layout, rectangle and viewport accessor on an element with a
+ * getter that THROWS, so one geometry read anywhere inside the unit under test
+ * fails the case by name instead of passing quietly.
+ *
+ * This is a tripwire rather than an assertion on purpose. jsdom implements no
+ * layout engine, so every metric it reports is 0 and every rectangle is empty —
+ * which means a geometry-dependent implementation would look perfectly correct
+ * here for entirely the wrong reason, and would then fail in a browser the moment
+ * a card scrolled out of view (R-DND-3).
+ */
+function forbidLayoutReads(element: HTMLElement): void {
+    const forbidden: readonly string[] = [
+        'offsetParent',
+        'offsetHeight',
+        'offsetWidth',
+        'offsetTop',
+        'offsetLeft',
+        'clientHeight',
+        'clientWidth',
+        'getBoundingClientRect',
+        'getClientRects',
+        // Not a DOM property at all — the virtualisation flag the board binds on
+        // its cards. Named here so the tripwire also covers an implementation
+        // that reached for it directly.
+        'inViewPort',
+    ];
+
+    for (const name of forbidden) {
+        Object.defineProperty(element, name, {
+            configurable: true,
+            get(): never {
+                throw new Error(
+                    `useSortableList read "${name}", which R-DND-3 forbids: ordering must ` +
+                        'never depend on visibility or geometry.',
+                );
+            },
+        });
+    }
+}
+
 function specsFor(ids: readonly number[]): readonly ItemSpec[] {
     return ids.map((id) => ({ id: String(id) }));
 }
@@ -252,6 +337,11 @@ describe('computeNeighbours', () => {
     });
 
     it('reports neither anchor for the only item in a container', () => {
+        // Both anchors null is a MEANINGFUL answer rather than a missing one: the
+        // write layer builds its order payload with an exclusive chain
+        // (`resources/userstories.coffee` L99-L103 for the backlog, L120-L124 for
+        // the board), so a pair of nulls sends NEITHER `after_userstory_id` NOR
+        // `before_userstory_id` and the server places the story by index alone.
         const { cards } = buildColumn(specsFor([10]));
 
         expect(computeNeighbours(cards[0], CARD_SELECTOR)).toEqual({
@@ -286,6 +376,40 @@ describe('computeNeighbours', () => {
             const { cards } = buildColumn(specsFor([10, 20, 30]));
 
             expect(computeNeighbours(cards[0], CARD_SELECTOR).nextId).toBe(20);
+        });
+
+        it('chooses the THIRD of FIVE items when the FOURTH is dragged, never the first', () => {
+            // The five-item fixture, because three items only separate "nearest"
+            // from "furthest" — with three matches ahead of the dragged one the
+            // three plausible implementations answer differently, and only the
+            // incumbent's answer is correct:
+            //
+            //   nearest-first (correct, upstream)      -> 30
+            //   document-order-first (the classic slip) -> 10
+            //   "whatever the query returned last"      -> 10
+            //
+            // Upstream reads `prevAll(sel)[0]`, and that collection arrives in
+            // REVERSE document order, so index 0 is the IMMEDIATELY preceding
+            // match. Rebuilding the same scan with a document-order query and
+            // taking `[0]` is an off-by-MANY that persists silently (R-DND-2).
+            const { cards } = buildColumn(specsFor([10, 20, 30, 40, 50]));
+
+            expect(computeNeighbours(cards[3], CARD_SELECTOR)).toEqual({
+                previousId: 30,
+                nextId: null,
+            });
+        });
+
+        it('chooses the SECOND of FIVE items when the FIRST is dragged, never the last', () => {
+            // The symmetric half: `nextAll(sel)[0]` is the IMMEDIATELY following
+            // match, so with four matches behind it the answer is the nearest one
+            // and not the tail of the column.
+            const { cards } = buildColumn(specsFor([10, 20, 30, 40, 50]));
+
+            expect(computeNeighbours(cards[0], CARD_SELECTOR)).toEqual({
+                previousId: null,
+                nextId: 20,
+            });
         });
 
         it('steps over siblings the item selector does not match', () => {
@@ -428,6 +552,24 @@ describe('computeNeighbours', () => {
             const { rows } = buildBacklogBody(specsFor([101, 102, 103]));
 
             expect(computeNeighbours(rows[1], ROW_SELECTOR)).toEqual({
+                previousId: 101,
+                nextId: null,
+            });
+        });
+
+        it('steps over a backlog sibling the row selector does not match', () => {
+            // The selector-filtering rule again, on the LIST's selector, because
+            // the table body is not a homogeneous run of rows: `backlog-table.jade`
+            // L27-L28 renders a loading block among them and it carries no row
+            // class, so the scan has to continue past it instead of stopping and
+            // reporting no neighbour.
+            const { rows } = buildBacklogBody([
+                { id: '101' },
+                { decoy: true, tag: 'div', classNames: ['loading'] },
+                { id: '102' },
+            ]);
+
+            expect(computeNeighbours(rows[2], ROW_SELECTOR)).toEqual({
                 previousId: 101,
                 nextId: null,
             });
@@ -1137,6 +1279,567 @@ describe('useSortableList — list configuration (document-scoped index)', () =>
     });
 });
 
+/* ==========================================================================
+ * CROSS-CONTAINER DROPS — THE CASES THE GUARD MUST NOT ABSORB
+ * ==========================================================================
+ * A cross-container drop is the half of the arithmetic that a same-container
+ * suite cannot reach, and it is where the silent corruption of R-DND-2 hides for
+ * two compounding reasons.
+ *
+ * FIRST, the guard compares an index against an index. Position 1 of one column
+ * is a completely different place from position 1 of another, so a guard that
+ * ignored the container would discard a real move and report success — the user
+ * sees the card in its new column, the server never hears about it, and the next
+ * page load puts it back. Every case below that pairs an UNCHANGED index with a
+ * CHANGED container exists to pin that down.
+ *
+ * SECOND, the anchors are read from the DESTINATION, which the dragged element
+ * has already joined. So the head of the destination and its tail are the two
+ * positions whose anchors come out asymmetrically, and they are asserted here by
+ * name.
+ * ========================================================================== */
+
+describe('useSortableList — CROSS-CONTAINER drops on the board', () => {
+    it('resolves a CROSS-CONTAINER drop between two COLUMNS of the same swimlane', () => {
+        // KANBAN:121-L122 reads the pair fresh from the destination's attributes,
+        // and KANBAN:147 compares both halves, so a status change alone is enough
+        // to make the containers differ.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201, 202]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+
+        expect(result.current.origin).toEqual({ status: 7, swimlane: 3 });
+
+        relocate(origin.cards[0], destination.column, 1);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toEqual({
+            previousId: 201,
+            nextId: null,
+            index: 1,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [101],
+        });
+    });
+
+    it('reads the destination identity from the DESTINATION container’s own attributes', () => {
+        // The identity is a function of the container's attributes and of NOTHING
+        // else — not of element identity, not of anything captured at drag start.
+        // Two DIFFERENT columns carrying the SAME pair therefore resolve alike,
+        // which is exactly the behaviour of KANBAN:121-L122 reading
+        // `parentEl.dataset` afresh on every drop. Recording the resolutions also
+        // proves the destination is resolved from the container the drop is
+        // reported against, not from the dragged element's own ancestry.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const twin = buildColumn([], { status: '7', swimlane: '3' });
+        const resolved: ColumnIdentity[] = [];
+        const recordingConfig: UseSortableListConfig<ColumnIdentity> = {
+            ...boardConfig,
+            resolveContainer: (container) => {
+                const identity = boardConfig.resolveContainer(container);
+
+                resolved.push(identity);
+
+                return identity;
+            },
+        };
+        const { result } = renderHook(() => useSortableList(recordingConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], twin.column, 0);
+
+        // Same pair, different element, same index: indistinguishable from a
+        // no-op reorder, so the guard fires.
+        expect(result.current.endDrag(origin.cards[0], [], twin.column)).toBeNull();
+        expect(resolved).toEqual([
+            { status: 7, swimlane: 3 },
+            { status: 7, swimlane: 3 },
+        ]);
+    });
+
+    it('resolves a CROSS-CONTAINER drop between two SWIMLANES of the same status', () => {
+        // The other half of KANBAN:147. A card can move down the board without
+        // changing status at all, and the swimlane half of the pair is the only
+        // thing that says so.
+        const origin = buildColumn(specsFor([101]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '7', swimlane: '5' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 1);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toEqual({
+            previousId: 201,
+            nextId: null,
+            index: 1,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [101],
+        });
+    });
+
+    it('carries the -1 swimlane sentinel through untouched, never null, 0 or not-a-number', () => {
+        // `-1` IS A LEGITIMATE IDENTITY VALUE, not an error code. KANBAN:146 reads
+        // `item.getIn(['model','swimlane']) || -1`, and `../types/swimlane.ts`
+        // documents the same `-1` as the client-side "unclassified" swimlane that
+        // holds the stories whose own `swimlane` attribute is null
+        // (`kanban-usertories.coffee` L295-L300 and L312-L313). Nothing in this
+        // layer may substitute anything else for it.
+        //
+        // The case is also a second index-equals-old-index cross-container drop:
+        // position 1 in the origin and position 1 in the destination, which the
+        // guard must NOT absorb.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '-1' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '-1' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[1], []);
+
+        expect(result.current.origin).toEqual({ status: 7, swimlane: -1 });
+        expect(result.current.origin?.swimlane).not.toBeNull();
+        expect(result.current.origin?.swimlane).not.toBeNaN();
+        expect(result.current.origin?.swimlane).not.toBe(0);
+
+        relocate(origin.cards[1], destination.column, 1);
+        result.current.recordNeighbours(origin.cards[1]);
+
+        expect(result.current.endDrag(origin.cards[1], [], destination.column)).toEqual({
+            previousId: 201,
+            nextId: null,
+            index: 1,
+            oldIndex: 1,
+            unchanged: false,
+            ids: [102],
+        });
+    });
+
+    it('recognises the -1 sentinel as an identity that COMPARES EQUAL to itself', () => {
+        // The contrast that gives the sentinel its meaning: `-1` equals `-1`, so
+        // two unclassified columns of one status ARE the same container and the
+        // guard fires there. The absent flat-mode attribute below behaves the
+        // opposite way, and the difference is deliberate.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '-1' });
+        const twin = buildColumn(specsFor([201]), { status: '7', swimlane: '-1' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[1], []);
+        relocate(origin.cards[1], twin.column, 1);
+        result.current.recordNeighbours(origin.cards[1]);
+
+        expect(result.current.endDrag(origin.cards[1], [], twin.column)).toBeNull();
+    });
+
+    it('emits an id of 0 as 0, dropping nothing and coercing nothing', () => {
+        // Which key eventually reaches the wire is the api layer's decision, not
+        // this layer's: `resources/userstories.coffee` adds `milestone_id` (L96)
+        // and `swimlane_id` (L126) only when truthy while `status_id` is ALWAYS
+        // sent. So every id has to arrive up here exactly as the attribute spelled
+        // it, with no filtering of falsy values on the way.
+        const origin = buildColumn([{ id: '0' }, { id: '102' }], {
+            status: '7',
+            swimlane: '3',
+        });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        const dropped = result.current.endDrag(origin.cards[0], [], destination.column);
+
+        expect(dropped?.ids).toEqual([0]);
+        expect(dropped?.ids[0]).toBe(0);
+        expect(dropped?.nextId).toBe(201);
+    });
+
+    it('anchors on the destination’s FIRST id when a cross-container drop lands at the HEAD', () => {
+        // The mandated combination: cross-container AND head of list. This is
+        // where an off-by-one most often hides, because the head is the one
+        // position with no preceding sibling to fall back on, so it is the only
+        // position whose anchor is the FOLLOWING id — the `before_userstory_id`
+        // half of the write contract.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201, 202]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[1], []);
+        relocate(origin.cards[1], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[1]);
+
+        expect(result.current.endDrag(origin.cards[1], [], destination.column)).toEqual({
+            previousId: null,
+            nextId: 201,
+            index: 0,
+            oldIndex: 1,
+            unchanged: false,
+            ids: [102],
+        });
+    });
+
+    it('anchors on the destination’s LAST id when a cross-container drop lands at the TAIL', () => {
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201, 202]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 2);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toEqual({
+            previousId: 202,
+            nextId: null,
+            index: 2,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [101],
+        });
+    });
+
+    it('reports neither anchor and index 0 for a drop into an EMPTY container', () => {
+        // An empty column is a normal board state, not an edge case — every
+        // status starts empty. Both anchors null and index 0 is the answer that
+        // sends neither order key and lets the server place the story.
+        const origin = buildColumn(specsFor([101]), { status: '7', swimlane: '3' });
+        const destination = buildColumn([], { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toEqual({
+            previousId: null,
+            nextId: null,
+            index: 0,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [101],
+        });
+    });
+});
+
+describe('useSortableList — CROSS-CONTAINER drops between the backlog and the sprints', () => {
+    it('resolves a CROSS-CONTAINER drop from the BACKLOG into a SPRINT', () => {
+        // BACKLOG:101-L102: when EITHER side is the backlog the comparison is
+        // backlog-versus-backlog, so this drop is a container change however the
+        // sprint is identified. Note the index: 1 in the backlog and 1 in the
+        // sprint, which the guard must not read as "nothing happened".
+        const backlog = buildBacklogBody(specsFor([101, 102]));
+        const sprint = buildSprintTable(specsFor([201]));
+
+        sprint.table.setAttribute('data-sprint', '9');
+
+        const { result } = renderHook(() => useSortableList(buildListConfig(true)));
+
+        result.current.beginDrag(backlog.rows[1], []);
+        relocate(backlog.rows[1], sprint.table, 1);
+        result.current.recordNeighbours(backlog.rows[1]);
+
+        expect(result.current.endDrag(backlog.rows[1], [], sprint.table)).toEqual({
+            previousId: 201,
+            nextId: null,
+            // BACKLOG:117 — outside the table body the row is measured against
+            // its own siblings.
+            index: 1,
+            // BACKLOG:87 — inside it, against every row of every table body.
+            oldIndex: 1,
+            unchanged: false,
+            ids: [102],
+        });
+    });
+
+    it('resolves a CROSS-CONTAINER drop from a SPRINT back into the BACKLOG', () => {
+        const sprint = buildSprintTable(specsFor([201, 202]));
+
+        sprint.table.setAttribute('data-sprint', '9');
+
+        const backlog = buildBacklogBody(specsFor([101]));
+        const { result } = renderHook(() => useSortableList(buildListConfig(true)));
+
+        result.current.beginDrag(sprint.rows[0], []);
+        relocate(sprint.rows[0], backlog.body, 1);
+        result.current.recordNeighbours(sprint.rows[0]);
+
+        expect(result.current.endDrag(sprint.rows[0], [], backlog.body)).toEqual({
+            previousId: 101,
+            nextId: null,
+            index: 1,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [201],
+        });
+    });
+
+    it('fires the guard for a reorder that changed nothing WITHIN ONE sprint', () => {
+        // The second branch of BACKLOG:101-L104: with neither side the backlog the
+        // sprint ids are compared, and two references to the SAME sprint are the
+        // same container — so an unmoved row is absorbed exactly as it is in the
+        // backlog. The companion case, two DIFFERENT sprints at the same
+        // position, is asserted above and must stay distinguishable from this one.
+        const sprint = buildSprintTable(specsFor([201, 202]));
+
+        sprint.table.setAttribute('data-sprint', '9');
+
+        const { result } = renderHook(() => useSortableList(buildListConfig(true)));
+
+        result.current.beginDrag(sprint.rows[1], []);
+        result.current.recordNeighbours(sprint.rows[1]);
+
+        expect(result.current.endDrag(sprint.rows[1], [], sprint.table)).toBeNull();
+    });
+
+    it('treats the FIRST empty-backlog block as the backlog itself', () => {
+        // BACKLOG:99 — `.backlog-table-body` OR `.js-empty-backlog`. Dropping the
+        // only visible row into the no-match block has not left the backlog, so
+        // with the position unchanged the guard fires and nothing is persisted.
+        const backlog = buildBacklogBody(specsFor([101, 102]));
+        const [noMatchBlock] = buildEmptyBacklogBlocks();
+        const { result } = renderHook(() => useSortableList(buildListConfig(true)));
+
+        result.current.beginDrag(backlog.rows[0], []);
+        relocate(backlog.rows[0], noMatchBlock, 0);
+        result.current.recordNeighbours(backlog.rows[0]);
+
+        expect(noMatchBlock.classList.contains('js-empty-backlog')).toBe(true);
+        expect(result.current.endDrag(backlog.rows[0], [], noMatchBlock)).toBeNull();
+    });
+
+    it('treats the SECOND empty-backlog block identically, which is why BOTH are registered', () => {
+        // `backlog.jade` L178 renders the second block, BACKLOG:39 registers it as
+        // `emptyBacklog[1]`, and BACKLOG:99 matches it on the same class. A
+        // fixture that rendered only the first block would let an implementation
+        // that recognised only `emptyBacklog[0]` pass.
+        const backlog = buildBacklogBody(specsFor([101, 102]));
+        const [, emptyLargeBlock] = buildEmptyBacklogBlocks();
+        const { result } = renderHook(() => useSortableList(buildListConfig(true)));
+
+        result.current.beginDrag(backlog.rows[0], []);
+        relocate(backlog.rows[0], emptyLargeBlock, 0);
+        result.current.recordNeighbours(backlog.rows[0]);
+
+        expect(emptyLargeBlock.classList.contains('js-empty-backlog')).toBe(true);
+        expect(result.current.endDrag(backlog.rows[0], [], emptyLargeBlock)).toBeNull();
+    });
+});
+
+/* ==========================================================================
+ * THE TWO SWIMLANE READINGS, DELIBERATELY INCONSISTENT UPSTREAM
+ * ==========================================================================
+ * KANBAN:140 builds the value it REPORTS with `item.getIn(['model','swimlane'])`
+ * and no fallback at all, while KANBAN:146 builds the value it COMPARES with
+ * `item.getIn(['model','swimlane']) || -1`. Six lines apart, two different
+ * readings of one attribute.
+ *
+ * That is incumbent behaviour and T10 forbids harmonising it ("No functional or
+ * feature change of any kind"). What this group asserts is that the unit under
+ * test is AGNOSTIC: it neither adds the fallback where upstream omits it nor
+ * strips it where upstream applies it. The reading belongs to the screen's
+ * configuration, and the two readings produce two different — and both correct —
+ * outcomes for the very same gesture.
+ * ========================================================================== */
+
+describe('useSortableList — the raw and the fallback swimlane readings', () => {
+    /** The `-1` of KANBAN:146, named so the substitution below is unmistakable. */
+    const UNCLASSIFIED_SWIMLANE = -1;
+
+    /**
+     * KANBAN:146 semantics: the compared value carries the `|| -1` fallback, so an
+     * absent attribute becomes the unclassified sentinel BEFORE the comparison.
+     */
+    const fallbackConfig: UseSortableListConfig<ColumnIdentity> = {
+        itemSelector: CARD_SELECTOR,
+        resolveContainer: (container) => {
+            const raw = Number(container.dataset.swimlane);
+
+            return {
+                status: Number(container.dataset.status),
+                swimlane: Number.isNaN(raw) ? UNCLASSIFIED_SWIMLANE : raw,
+            };
+        },
+        isSameContainer: (from, to) => from.status === to.status && from.swimlane === to.swimlane,
+    };
+
+    it('reports a flat-mode no-op reorder as a CHANGE under the raw reading', () => {
+        // `kanban-table.jade` L189-L197 renders no swimlane attribute in flat
+        // mode. Read raw, the identity holds a not-a-number swimlane, which
+        // compares equal to nothing — not even to itself — so the flat-mode board
+        // never reports sameness and the guard never fires there.
+        const { column, cards } = buildColumn(specsFor([10, 20]), { status: '5' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(cards[1], []);
+
+        const dropped = result.current.endDrag(cards[1], [], column);
+
+        expect(dropped).not.toBeNull();
+        expect(dropped?.index).toBe(1);
+        expect(dropped?.oldIndex).toBe(1);
+    });
+
+    it('reports the SAME flat-mode reorder as UNCHANGED under the fallback reading', () => {
+        // The same gesture, the same unit, the other reading. The fallback turns
+        // the absent attribute into `-1`, `-1` equals `-1`, and the guard fires.
+        // Both outcomes are upstream behaviour; which one a screen gets is the
+        // screen's decision, taken in its own `resolveContainer`.
+        const { column, cards } = buildColumn(specsFor([10, 20]), { status: '5' });
+        const { result } = renderHook(() => useSortableList(fallbackConfig));
+
+        result.current.beginDrag(cards[1], []);
+
+        expect(result.current.origin).toEqual({ status: 5, swimlane: UNCLASSIFIED_SWIMLANE });
+        expect(result.current.endDrag(cards[1], [], column)).toBeNull();
+    });
+
+    it('substitutes nothing of its own for the absent flat-mode attribute', () => {
+        // The unit stores and reports whatever the configuration resolved, so the
+        // captured origin still holds the raw not-a-number value: NOT -1, NOT 0
+        // and NOT null. Coercing it here would silently hand flat mode the
+        // swimlane-mode guard.
+        const { column, cards } = buildColumn(specsFor([10, 20]), { status: '5' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(cards[1], []);
+
+        const origin = result.current.origin;
+
+        expect(origin).not.toBeNull();
+        expect(origin?.swimlane).toBeNaN();
+        expect(origin?.swimlane).not.toBe(UNCLASSIFIED_SWIMLANE);
+        expect(origin?.swimlane).not.toBe(0);
+        expect(origin?.swimlane).not.toBeNull();
+        // And the observable consequence, asserted rather than inferred: the
+        // position is identical on both sides and the drop is STILL resolved.
+        expect(result.current.endDrag(cards[1], [], column)).not.toBeNull();
+    });
+});
+
+/* ==========================================================================
+ * R-DND-3 — ORDERING NEVER DEPENDS ON VISIBILITY OR GEOMETRY
+ * ==========================================================================
+ * The adopted drag library brings no virtual-list support of its own, and the
+ * board virtualises its cards. Two structural facts keep that safe:
+ *
+ *   - `app/modules/components/card/card.jade` L8-L13 puts the viewport guard on
+ *     `.card-inner`, INSIDE the outer custom element, and the card directive
+ *     declares no element replacement — so the outer element carrying `data-id`
+ *     is emitted whether the card is on screen or not. A card that is scrolled
+ *     away is an EMPTY outer element, not an absent one.
+ *   - `../useInViewport` latches visibility MONOTONICALLY: an id marked visible
+ *     is never marked invisible again (`kanban/main.coffee` L577 and L666-L677).
+ *     There is no "left the viewport" transition to react to, so there is nothing
+ *     for this layer to react to even in principle.
+ *
+ * Filter on visibility here and a drag toward a scrolled-away region finds no
+ * drop target — one more failure with no error surface.
+ * ========================================================================== */
+
+describe('useSortableList — R-DND-3: no dependence on visibility or geometry', () => {
+    /**
+     * Three cards of which the MIDDLE one is currently virtualised out: it has no
+     * inner wrapper, exactly as `ng-if="vm.inViewPort"` leaves it.
+     */
+    function buildVirtualisedColumn(): {
+        readonly column: HTMLElement;
+        readonly cards: HTMLElement[];
+    } {
+        const built = buildColumn(specsFor([10, 20, 30]), { status: '7', swimlane: '3' });
+
+        addCardInner(built.cards[0]);
+        addCardInner(built.cards[2]);
+
+        return built;
+    }
+
+    it('keeps a VIRTUALISED-OUT card in the neighbour scan', () => {
+        const { cards } = buildVirtualisedColumn();
+
+        // The fixture's premise: the middle card renders nothing inside itself.
+        expect(cards[1].children).toHaveLength(0);
+
+        expect(computeNeighbours(cards[2], CARD_SELECTOR).previousId).toBe(20);
+        expect(computeNeighbours(cards[0], CARD_SELECTOR).nextId).toBe(20);
+    });
+
+    it('keeps a VIRTUALISED-OUT card in all three index measurements', () => {
+        const { column, cards } = buildVirtualisedColumn();
+
+        expect(indexWithinContainer(column, CARD_SELECTOR, cards[1])).toBe(1);
+        expect(indexWithinSelector(cards[1], CARD_SELECTOR)).toBe(1);
+        expect(indexAmongSiblings(cards[1])).toBe(1);
+
+        // And the cards after it still score correctly, which is the failure a
+        // visibility filter would cause: an off-by-one for every card below the
+        // fold.
+        expect(indexWithinContainer(column, CARD_SELECTOR, cards[2])).toBe(2);
+        expect(indexWithinSelector(cards[2], CARD_SELECTOR)).toBe(2);
+        expect(indexAmongSiblings(cards[2])).toBe(2);
+    });
+
+    it('does not exclude a card whose display is suppressed', () => {
+        const { column, cards } = buildColumn(specsFor([10, 20, 30]), {
+            status: '7',
+            swimlane: '3',
+        });
+
+        cards[1].style.display = 'none';
+
+        expect(computeNeighbours(cards[2], CARD_SELECTOR).previousId).toBe(20);
+        expect(indexWithinContainer(column, CARD_SELECTOR, cards[2])).toBe(2);
+    });
+
+    it('reads no layout metric and no viewport flag during a whole gesture', () => {
+        // The tripwire: every geometry accessor on the fixture throws, so a single
+        // read fails this case by name. Asserting on the metrics instead would
+        // prove nothing, because jsdom reports 0 for all of them.
+        const { column, cards } = buildVirtualisedColumn();
+
+        forbidLayoutReads(column);
+
+        for (const card of cards) {
+            forbidLayoutReads(card);
+        }
+
+        const { result } = renderHook(() => useSortableList(boardConfig));
+        const outcome: { dropped: SortableDropResult | null } = { dropped: null };
+
+        expect(() => {
+            result.current.beginDrag(cards[2], []);
+            relocate(cards[2], column, 0);
+            result.current.recordNeighbours(cards[2]);
+            outcome.dropped = result.current.endDrag(cards[2], [], column);
+        }).not.toThrow();
+
+        expect(outcome.dropped).toEqual({
+            previousId: null,
+            nextId: 10,
+            index: 0,
+            oldIndex: 2,
+            unchanged: false,
+            ids: [30],
+        });
+    });
+
+    it('would be indistinguishable from a geometry-dependent implementation without that tripwire', () => {
+        // Recorded so the tripwire above is understood as necessary rather than
+        // decorative: under jsdom every metric is 0 and every rectangle is empty,
+        // so an implementation that ranked cards by their vertical offset would
+        // agree with the correct one on every fixture in this file and disagree
+        // with it in a browser.
+        const { cards } = buildColumn(specsFor([10, 20]));
+
+        expect(cards[0].offsetHeight).toBe(0);
+        expect(cards[1].offsetTop).toBe(0);
+        expect(cards[0].getBoundingClientRect().height).toBe(0);
+
+        expect(computeNeighbours(cards[1], CARD_SELECTOR).previousId).toBe(10);
+    });
+});
+
 describe('useSortableList — the anchor protocol and cleanup', () => {
     it('resets and recomputes the anchors on every recordNeighbours call', () => {
         const { column, cards } = buildColumn(specsFor([10, 20, 30]), {
@@ -1202,6 +1905,86 @@ describe('useSortableList — the anchor protocol and cleanup', () => {
     });
 });
 
+/* ==========================================================================
+ * THIS LAYER COMPUTES AND REPORTS, AND DOES NOTHING ELSE
+ * ==========================================================================
+ * Everything the incumbent handlers did BESIDES the arithmetic belongs to the
+ * screens, and the specification's scope split says so explicitly. The class
+ * toggle and its `animationend` removal (KANBAN:128-L131), the per-item element
+ * deletion (KANBAN:149-L151, BACKLOG:123-L134), the doom-line removal
+ * (BACKLOG:95), the `drag-active` body class (BACKLOG:73 and L108), the
+ * serialised drag queue with its re-entrancy guard, and both hand-offs — the
+ * root-scope broadcast at KANBAN:153 and `ctrl.moveUs(...)` at BACKLOG:143 — are
+ * all somebody else's job.
+ *
+ * A drift here would not fail loudly either: a hook that quietly mutated the DOM
+ * or dispatched an event would work in one screen and double-apply in the other.
+ * ========================================================================== */
+
+describe('useSortableList — performs no write of any kind', () => {
+    it('leaves the document untouched and dispatches nothing across a whole gesture', () => {
+        const { column, cards } = buildColumn(specsFor([10, 20, 30]), {
+            status: '7',
+            swimlane: '3',
+        });
+        // The two configured collaborators, wrapped so the case can assert they
+        // are the ONLY collaboration and that both are read-only: one is asked for
+        // an identity, the other for a comparison. Neither is handed a way to
+        // write anything.
+        const resolveContainer = jest.fn(boardConfig.resolveContainer);
+        const isSameContainer = jest.fn(boardConfig.isSameContainer);
+        const { result } = renderHook(() =>
+            useSortableList({ itemSelector: CARD_SELECTOR, resolveContainer, isSameContainer }),
+        );
+
+        const beforeBeginDrag = document.body.innerHTML;
+
+        result.current.beginDrag(cards[2], []);
+
+        expect(document.body.innerHTML).toBe(beforeBeginDrag);
+
+        // The move itself is the drag library's, not the hook's — upstream the
+        // node was already in its new place before the `drop` handler ran.
+        relocate(cards[2], column, 0);
+
+        const dispatchEvent = jest.spyOn(EventTarget.prototype, 'dispatchEvent');
+        const afterRelocate = document.body.innerHTML;
+
+        result.current.recordNeighbours(cards[2]);
+
+        const dropped = result.current.endDrag(cards[2], [], column);
+
+        result.current.cancelDrag();
+
+        expect(document.body.innerHTML).toBe(afterRelocate);
+        expect(dispatchEvent).not.toHaveBeenCalled();
+        expect(resolveContainer).toHaveBeenCalled();
+        expect(isSameContainer).toHaveBeenCalled();
+
+        // The drop is reported as plain data: no callable travels with it, so a
+        // consumer cannot be handed a hidden write disguised as a result.
+        expect(dropped).not.toBeNull();
+        expect(Object.values(dropped ?? {}).every((value) => typeof value !== 'function')).toBe(
+            true,
+        );
+    });
+
+    it('publishes exactly four operations and one origin, and nothing that persists', () => {
+        // The whole surface, enumerated. A `save`, `commit`, `dispatch` or
+        // `persist` member appearing here later would mean the write moved into
+        // the wrong layer.
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        expect(Object.keys(result.current).sort()).toEqual([
+            'beginDrag',
+            'cancelDrag',
+            'endDrag',
+            'origin',
+            'recordNeighbours',
+        ]);
+    });
+});
+
 describe('useSortableList — stability and configuration freshness', () => {
     it('keeps one stable object and four stable callbacks across renders', () => {
         const { result, rerender } = renderHook(
@@ -1214,6 +1997,18 @@ describe('useSortableList — stability and configuration freshness', () => {
         // A freshly-built configuration object on every render is the normal case
         // for a consumer, and it must not tear the gesture handlers down.
         rerender({ ...boardConfig });
+
+        expect(result.current).toBe(first);
+        expect(result.current.beginDrag).toBe(first.beginDrag);
+        expect(result.current.recordNeighbours).toBe(first.recordNeighbours);
+        expect(result.current.endDrag).toBe(first.endDrag);
+        expect(result.current.cancelDrag).toBe(first.cancelDrag);
+
+        // A SECOND re-render, because identity has to hold across the whole life
+        // of the gesture rather than for one render only: a handler registered on
+        // a pointer event at drag start is still the handler that has to run at
+        // drop, however many times the screen re-rendered in between.
+        rerender({ ...boardConfig, itemSelector: CARD_SELECTOR });
 
         expect(result.current).toBe(first);
         expect(result.current.beginDrag).toBe(first.beginDrag);

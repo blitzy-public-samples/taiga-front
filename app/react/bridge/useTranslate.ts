@@ -205,9 +205,9 @@
  * `useUntypedAngularService` provides an explicit, greppable, `unknown`-typed
  * escape for exactly this case". Adding a sixteenth key to `AngularServices`
  * instead was ruled out on measured grounds as well as stylistic ones: its
- * co-located spec pins the map exhaustively -- `useAngularService.test.tsx:132`
- * (`satisfies readonly (keyof AngularServices)[]`), `:182`
- * (`Exclude<keyof AngularServices, …>` must be `never`) and `:186`
+ * co-located spec pins the map exhaustively -- `useAngularService.test.tsx:703`
+ * (`satisfies readonly (keyof AngularServices)[]`), `:1188`
+ * (`Exclude<keyof AngularServices, …>` must be `never`) and `:1195`
  * (`toHaveLength(15)`) -- so a new key would break both the type gate and a
  * passing spec of a file this one is only allowed to consume.
  *
@@ -584,7 +584,7 @@ function useTranslate(): TranslateFn {
     // sixteenth key to that file's service map, both because the root scope is
     // excluded from that map on correctness grounds (its section 6) and because
     // its co-located spec pins the map to exactly fifteen keys
-    // (`./useAngularService.test.tsx:182`, `:186`). Section 6 of this file's
+    // (`./useAngularService.test.tsx:1188`, `:1195`). Section 6 of this file's
     // header carries the full argument, including the measured evidence that
     // the `events.onAngularEvent` bridge callback cannot observe this
     // particular event because angular-translate `$emit`s it on the root.

@@ -25,6 +25,10 @@
  *     here. The key layout in browser local storage is frozen (see section 4 of
  *     the unit's header) and deriving it in the React tree would orphan every
  *     saved fold state.
+ *   - the ORDER of the two forwarded arguments. Both writers take
+ *     `(projectId, params)`, and a transposition still produces a valid-looking
+ *     storage key -- just a different one from every key already written. See the
+ *     dedicated `argument order at the seam` block.
  *   - reference pass-through of the stored value, with no copy, no default, no
  *     validation and no coercion. Rule T10 requires the facade to hand back
  *     exactly what the incumbent hands back.
@@ -138,7 +142,8 @@ describe('kanbanStorage', () => {
         it('publishes them as plain functions, not hooks or objects', () => {
             // Plain functions are what let a reducer, a selector or an event
             // handler call these (header section 7). A hook could not be called
-            // from any of the three.
+            // from a single one of those three, because the rules of hooks confine
+            // it to a component or another hook.
             expect(typeof getStatusColumnModes).toBe('function');
             expect(typeof storeStatusColumnModes).toBe('function');
             expect(typeof getSwimlanesModes).toBe('function');
@@ -179,17 +184,59 @@ describe('kanbanStorage', () => {
         });
 
         it('returns a plain value rather than a thenable', () => {
-            // The synchrony guarantee, made executable. Were this ever marked as
-            // deferred, `Immutable.fromJS` at `kanban/main.coffee:584` would wrap
-            // the promise object instead of the fold map and every swimlane would
-            // render expanded, with nothing thrown and nothing logged.
+            // ============================================================
+            // THE SYNCHRONY GUARD -- the single most valuable assertion in
+            // this file, and the reason it is spelled out at this length.
+            // ============================================================
+            // Rule T9 applies here more sharply than anywhere else in the spec,
+            // because this is the AngularJS/React seam: an AngularJS 1.5.10
+            // service below, React above, and a storage layer underneath that
+            // never signals failure.
+            //
+            // All three incumbent read sites consume these facades WITHOUT
+            // `.then()`, and each one was measured:
+            //
+            //   `app/coffee/modules/kanban/main.coffee:584`
+            //       the returned map is handed straight to the persistent-
+            //       structure factory that builds the board's fold state;
+            //   `app/coffee/modules/kanban/main.coffee:780`
+            //   `app/coffee/modules/kanban/main.coffee:797`
+            //       the returned map is assigned to `$scope.folds`, which is
+            //       then indexed by numeric status id at `:783` and `:803`.
+            //
+            // Marking a facade `async` would break all three WITHOUT THROWING
+            // AND WITHOUT LOGGING. At `:584` the pending promise object itself
+            // would be wrapped as though it were the fold map. At `:780` and
+            // `:797` a promise would land in `$scope.folds`; a promise is always
+            // truthy, so no guard fires, and indexing it by a status id simply
+            // yields `undefined`. Every column and every swimlane would render
+            // expanded and every fold the user had saved would look forgotten.
+            // No type catches that, and no runtime error announces it -- which is
+            // why a test is the only thing that can.
+            //
+            // The name of that structure factory is deliberately NOT written out
+            // anywhere in this file, exactly as section 4 of the unit's own
+            // header withholds the key-derivation helper's name. Keeping both
+            // identifiers unspoken means a plain text search across
+            // `app/react/**` proves mechanically that the React tree neither
+            // derives storage keys nor depends on the legacy persistent-
+            // structure library (requirement I5 keeps that library installed for
+            // its 124 out-of-scope consumers, and nothing here imports it).
             const result = getStatusColumnModes(
                 createKanbanDouble({ '11': true }),
                 PROJECT_ID,
             );
 
+            // Three complementary forms, because each fails on a different
+            // mistake: a hand-rolled thenable, a real promise, and an object
+            // carrying an inherited `then`.
+            expect(typeof (result as { then?: unknown }).then).toBe('undefined');
             expect(result).not.toHaveProperty('then');
             expect(result).not.toBeInstanceOf(Promise);
+
+            // And the value is usable immediately, with no microtask flushed in
+            // between -- the property the three call sites above actually rely on.
+            expect(result['11']).toBe(true);
         });
 
         it('does not touch the swimlane members', () => {
@@ -305,13 +352,21 @@ describe('kanbanStorage', () => {
         });
 
         it('returns a plain value rather than a thenable', () => {
+            // The swimlane reader is the more consequential half of the synchrony
+            // guard documented in the `getStatusColumnModes` block above: its one
+            // incumbent consumer, `kanban/main.coffee:584`, feeds the returned map
+            // directly into the board's persistent-structure factory with no
+            // `.then()`, so a deferred value would be wrapped in place of the fold
+            // map and every swimlane would render expanded in silence.
             const result = getSwimlanesModes(
                 createKanbanDouble({}, { '5': true }),
                 PROJECT_ID,
             );
 
+            expect(typeof (result as { then?: unknown }).then).toBe('undefined');
             expect(result).not.toHaveProperty('then');
             expect(result).not.toBeInstanceOf(Promise);
+            expect(result['5']).toBe(true);
         });
 
         it('reads back a map keyed by stringified swimlane ids', () => {
@@ -381,6 +436,117 @@ describe('kanbanStorage', () => {
             expect(kanban.storeStatusColumnModes).not.toHaveBeenCalled();
             expect(kanban.getStatusColumnModes).not.toHaveBeenCalled();
             expect(kanban.getSwimlanesModes).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('argument order at the seam', () => {
+        // ================================================================
+        // THE ARGUMENT-ORDER REGRESSION GUARD
+        // ================================================================
+        // Both writers take `(projectId, params)`, in that order
+        // (`app/coffee/modules/resources/kanban.coffee:19` and `:29`), and the
+        // facades forward the pair positionally. Transposing them is the single
+        // most likely refactor slip in a four-line delegation module, and it is
+        // one the type system CANNOT catch once a caller's map happens to be
+        // indexable: the incumbent's key derivation interpolates the project id
+        // into a string (`:20`, `:30`) and hashes a two-element pair (`:21`,
+        // `:31`), so a transposed call still produces a perfectly valid-looking
+        // key -- just a different one from every key already in browser storage.
+        //
+        // The whole failure is silent. Nothing throws, the write succeeds, and
+        // the only symptom is that a user's saved board layout never comes back.
+        // The assertions below therefore pin the ORDER, not merely the presence,
+        // of both arguments.
+        //
+        // Rule T9: the fixtures use STRING keys throughout this file because the
+        // incumbent's keys are stringified ids. The writer builds them with
+        // `id.toString()` (`kanban/main.coffee:329`) and the board template reads
+        // them back the same way -- `ctrl.foldedSwimlane.get(swimlane.id.toString())`
+        // at `app/partials/includes/modules/kanban-table.jade:108` (and `:82`,
+        // `:86`, `:90`). A numeric-key fixture would compile and would encode the
+        // wrong contract.
+        const COLUMN_MODES: Readonly<Record<string, boolean>> = {
+            '11': true,
+            '12': false,
+        };
+        const SWIMLANE_MODES: Readonly<Record<string, boolean>> = {
+            '5': true,
+            '-1': false,
+        };
+
+        it('gives storeStatusColumnModes the project id first and the map second', () => {
+            const kanban = createKanbanDouble();
+
+            storeStatusColumnModes(kanban, PROJECT_ID, COLUMN_MODES);
+
+            // Positional, not just present: index 0 is the id and index 1 is the
+            // map. Reading the recorded call directly is what distinguishes this
+            // from a matcher that would also accept the transposed pair.
+            const call = kanban.storeStatusColumnModes.mock.calls[0];
+
+            expect(call).toHaveLength(2);
+            expect(call?.[0]).toBe(PROJECT_ID);
+            expect(call?.[1]).toBe(COLUMN_MODES);
+            expect(typeof call?.[0]).toBe('number');
+            expect(typeof call?.[1]).toBe('object');
+
+            // The transposed form must not match, stated explicitly so the intent
+            // survives a future edit to the assertions above.
+            expect(kanban.storeStatusColumnModes).not.toHaveBeenCalledWith(
+                COLUMN_MODES,
+                PROJECT_ID,
+            );
+        });
+
+        it('gives storeSwimlanesModes the project id first and the map second', () => {
+            const kanban = createKanbanDouble();
+
+            storeSwimlanesModes(kanban, PROJECT_ID, SWIMLANE_MODES);
+
+            const call = kanban.storeSwimlanesModes.mock.calls[0];
+
+            expect(call).toHaveLength(2);
+            expect(call?.[0]).toBe(PROJECT_ID);
+            expect(call?.[1]).toBe(SWIMLANE_MODES);
+            expect(typeof call?.[0]).toBe('number');
+            expect(typeof call?.[1]).toBe('object');
+
+            expect(kanban.storeSwimlanesModes).not.toHaveBeenCalledWith(
+                SWIMLANE_MODES,
+                PROJECT_ID,
+            );
+        });
+
+        it('gives both readers the project id as their only argument', () => {
+            // The readers take one argument (`resources/kanban.coffee:24`, `:34`).
+            // Forwarding a second -- the map, out of symmetry with the writers --
+            // would be ignored by the service today and would become a live bug
+            // the moment its signature grew.
+            const kanban = createKanbanDouble(COLUMN_MODES, SWIMLANE_MODES);
+
+            getStatusColumnModes(kanban, PROJECT_ID);
+            getSwimlanesModes(kanban, PROJECT_ID);
+
+            expect(kanban.getStatusColumnModes.mock.calls[0]).toHaveLength(1);
+            expect(kanban.getStatusColumnModes.mock.calls[0]?.[0]).toBe(PROJECT_ID);
+            expect(kanban.getSwimlanesModes.mock.calls[0]).toHaveLength(1);
+            expect(kanban.getSwimlanesModes.mock.calls[0]?.[0]).toBe(PROJECT_ID);
+        });
+
+        it('preserves the stringified keys of the forwarded map exactly', () => {
+            // The map crosses the seam untouched: no key is re-derived, coerced to
+            // a number, re-ordered or dropped. The negative id is included on
+            // purpose -- it is the unclassified swimlane
+            // (`kanban-table.jade:82`), and it is the key most likely to be lost
+            // by a well-meaning numeric normalisation.
+            const kanban = createKanbanDouble();
+
+            storeSwimlanesModes(kanban, PROJECT_ID, SWIMLANE_MODES);
+
+            const forwarded = kanban.storeSwimlanesModes.mock.calls[0]?.[1];
+
+            expect(Object.keys(forwarded ?? {})).toEqual(['5', '-1']);
+            expect(forwarded).toEqual({ '5': true, '-1': false });
         });
     });
 
