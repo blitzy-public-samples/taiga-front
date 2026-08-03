@@ -68,6 +68,45 @@
  * depends on no build output. Every collaborator is a local structural double,
  * and the doubles are deliberately NOT native promises -- the incumbent resolves
  * AngularJS promises, and converting one is precisely the seam under test.
+ *
+ * ==========================================================================
+ * FOUR CONVENTIONS, AND THE REASON FOR EACH (rule T9)
+ * ==========================================================================
+ *
+ * 1. ⭐⭐ THE INJECTOR IS MOCKED; THE FRAMEWORK IS NEVER LOADED. The incumbent
+ *    CoffeeScript specs register a real module and substitute collaborators
+ *    through the injector's provider, which requires the whole framework plus its
+ *    mocking add-on in the page. Nothing of that kind happens here, and it is a
+ *    hard constraint rather than a preference: this runner has no browser, and the
+ *    bridge's own governing rule for every spec under this tree is to mock the
+ *    injector rather than load the framework.
+ *
+ *    In this file the seam is even simpler than a mocked injector, and the simpler
+ *    form is preferred: all four facades take the resource namespace AS THEIR FIRST
+ *    PARAMETER, so a plain typed object satisfies them outright. The bridge does
+ *    ship an injector double for the units that genuinely need one -- the hooks and
+ *    the components -- and it is deliberately not reached for here, because a
+ *    facade that never resolves a service has no injector to mock.
+ *
+ * 2. THE DOUBLES RESOLVE A BARE THENABLE, NOT A NATIVE PROMISE. See
+ *    {@link thenableFor}: handing the facade a native promise would make the
+ *    marshalling assertions vacuous, since the value would already be what they
+ *    claim it becomes.
+ *
+ * 3. NO MOCK IS RESET BY HAND. The runner is configured with both `clearMocks` and
+ *    `restoreMocks` enabled, so every recorded call and every replaced
+ *    implementation is discarded between specs automatically. A hand-written
+ *    `beforeEach` reset would be redundant, and worse, it would imply the
+ *    configuration cannot be relied on.
+ *
+ * 4. EVERY FIXTURE IS A PLAIN OBJECT OR A PLAIN ARRAY. No persistent-collection
+ *    value is constructed anywhere in this file. That library remains installed for
+ *    the 124 out-of-scope files that still depend on it (requirement I5), and it is
+ *    exactly what the migrated modules are moving away from -- so a fixture built
+ *    from it would assert the shape being retired rather than the one being
+ *    adopted, and would additionally be unusable as a state draft (P-IMMER-1).
+ *    Dates are likewise plain `"YYYY-MM-DD"` strings, never parsed into date
+ *    objects, because no layer on this path parses them.
  */
 
 import {
@@ -80,6 +119,7 @@ import type { SprintStatsResponse } from './sprints';
 import type {
     AngularHttpResponse,
     AngularPromise,
+    HttpHeadersGetter,
     ResourceParams,
     TaigaModel,
 } from '../../bridge/useAngularService';
@@ -269,11 +309,11 @@ function sprintsDouble(outcomes: Outcomes = {}): {
  *
  * A CLASS, not an object literal, and that choice is load-bearing rather than
  * stylistic. The real model is a CoffeeScript class
- * (`app/coffee/modules/base/model.coffee:9-127`), so its members live on a
- * PROTOTYPE and are therefore NOT copied by a spread. A literal would put them on
- * the instance as own enumerable properties, quietly making the pitfall assertions
- * below pass for the wrong reason and making a spread look survivable when against
- * the real class it is not.
+ * (`modules/base/model.coffee:9-127`), so its members live on a PROTOTYPE and are
+ * therefore NOT copied by a spread. A literal would put them on the instance as own
+ * enumerable properties, quietly making the pitfall assertions below pass for the
+ * wrong reason and making a spread look survivable when against the real class it is
+ * not.
  *
  * Everything else mirrors the original too:
  *
@@ -395,8 +435,8 @@ type StoryFixtureAttrs = {
  *
  * ⭐ `user_stories` holds MODEL instances, not plain stories: the incumbent
  * re-wraps every nested story and writes the result into the private attribute
- * slot (`app/coffee/modules/resources/sprints.coffee:18-20` for a single sprint,
- * `:33-36` once per milestone). That is the second level of the nesting hazard.
+ * slot (`modules/resources/sprints.coffee:18-20` for a single sprint, `:33-36`
+ * once per milestone). That is the second level of the nesting hazard.
  *
  * ⭐ The two dates are `"YYYY-MM-DD"` STRINGS, never date objects, and `closed` is
  * a BOOLEAN here -- to be read against the envelope's `closed`, which is a COUNT.
@@ -452,6 +492,14 @@ describe('getSprint', () => {
         // sprint, so both values are asserted, in order. Exactly two arguments: no
         // params bag, no options object, and above all no composed path -- the
         // repository builds that at `base/repository.coffee:165` (rule T5).
+        //
+        // ⭐ WHY THE FACADE SPELLS IT `_projectId`. The leading underscore is there
+        // purely to satisfy `noUnusedParameters: true`, which the project enables and
+        // which would otherwise reject a parameter the function forwards but never
+        // inspects. It is a compiler convention, NOT a hint that the argument is
+        // optional or ignorable: it is forwarded verbatim, and this assertion is what
+        // stops a future reader from "cleaning up" an apparently unused parameter and
+        // silently shifting every argument one slot to the left.
         expect(log.get).toEqual([[PROJECT_ID, SPRINT_ID]]);
     });
 
@@ -508,19 +556,42 @@ describe('getSprint', () => {
 
         const spread: Record<string, unknown> = { ...resolved };
 
-        // A spread copies own enumerable properties only, so the prototype methods
-        // are LOST -- the value is no longer a model and can no longer be saved.
-        expect(typeof spread['getAttrs']).toBe('undefined');
+        // ⚠⚠ A CORRECTION WORTH RECORDING, because the plan states the opposite and
+        // the opposite would be a comforting bug. The attribute accessors are
+        // installed as ENUMERABLE (`modules/base/model.coffee:94-101`, with
+        // `enumerable: true` at `:98`), so a spread does NOT "capture nothing": it
+        // reads every getter and copies the resulting VALUES. Asserting emptiness here
+        // would have been a test that passes only against a double built wrongly, so
+        // what is asserted is what the real class actually does.
+        expect(Object.keys(spread)).toContain('name');
+        expect(Object.keys(spread)).toContain('user_stories');
+        expect(spread['name']).toBe(`Sprint ${String(SPRINT_ID)}`);
 
-        // It also LEAKS the private bookkeeping fields, which are own and
-        // enumerable on the real class too (`model.coffee:11-13`, `:58-61`).
+        // ⛔ WHICH MAKES THE TRAP WORSE RATHER THAN BETTER: the spread LOOKS like a
+        // flattened sprint, so nothing draws attention to the two things it broke.
+        //
+        // First, the prototype methods are LOST -- the value is no longer a model and
+        // can no longer be handed to the repository's write path.
+        expect(typeof spread['getAttrs']).toBe('undefined');
+        expect(typeof spread['setAttr']).toBe('undefined');
+
+        // Second, it LEAKS the private bookkeeping fields, which are own and
+        // enumerable on the real class too (`model.coffee:11-13`, `:58-61`), so the
+        // dirty-tracking state travels onward as ordinary data.
         expect(spread).toHaveProperty('_attrs');
         expect(spread).toHaveProperty('_modifiedAttrs');
+        expect(spread).toHaveProperty('_isModified');
 
         // And it still does not solve level two: the stories remain models.
+        expect(typeof asPayload<SprintFixtureAttrs>(spread).user_stories[0]?.getAttrs).toBe(
+            'function',
+        );
+
+        // The sanctioned flatten leaks nothing -- and still leaves level two to do.
         const sanctioned = resolved.getAttrs();
 
         expect(Object.keys(sanctioned)).not.toContain('_attrs');
+        expect(Object.keys(sanctioned)).not.toContain('_modifiedAttrs');
         expect(typeof sanctioned.user_stories[0]?.getAttrs).toBe('function');
     });
 
@@ -550,7 +621,7 @@ describe('getSprint', () => {
         expect(typeof resolved.getAttrs().closed).toBe('boolean');
     });
 
-    it('rejects with the reason unchanged, so the interceptor chain stays visible', async () => {
+    it('rejects with the reason unchanged, so the interceptor pipeline stays visible', async () => {
         // The AngularJS interceptors surface the version conflict, the blocked
         // project and connection loss through the REJECTION value, so swallowing or
         // rewrapping it here would hide all of them.
@@ -621,6 +692,121 @@ describe('getSprint', () => {
         expect(typeof resolved.getAttrs).toBe('function');
         expect(resolved.getName()).toBe('milestones');
     });
+
+    it('resolves a NATIVE promise, not the AngularJS thenable it was handed', async () => {
+        const sprint = sprintModel(SPRINT_ID, false);
+        const { service } = sprintsDouble({ get: { kind: 'fulfil', value: sprint } });
+
+        const result = getSprint<SprintFixtureAttrs>(service, PROJECT_ID, SPRINT_ID);
+
+        expect(result).toBeInstanceOf(Promise);
+        expect(typeof result.catch).toBe('function');
+        expect(thenableFor<TaigaModel<SprintFixtureAttrs>>(NEVER)).not.toBeInstanceOf(Promise);
+
+        await expect(result).resolves.toBe(sprint);
+    });
+
+    it('resolves `user_stories` as a PLAIN array, not a persistent collection', async () => {
+        const sprint = sprintModel(SPRINT_ID, false);
+        const { service } = sprintsDouble({ get: { kind: 'fulfil', value: sprint } });
+
+        const resolved = await getSprint<SprintFixtureAttrs>(service, PROJECT_ID, SPRINT_ID);
+        const stories = resolved.getAttrs().user_stories;
+
+        // ⛔ THE NESTED STORIES ARE A JAVASCRIPT ARRAY. The incumbent builds it with a
+        // plain map (`modules/resources/sprints.coffee:19`), so it is indexed and has a
+        // `length` -- it is NOT one of the persistent collections the 124 out-of-scope
+        // files still use, and nothing under this tree may construct one (requirement
+        // I5). A reader reaching for `.size` or `.get(0)` gets nothing at all.
+        expect(Array.isArray(stories)).toBe(true);
+        expect(stories.length).toBe(2);
+
+        const asCollection = asPayload<{ readonly size?: unknown; readonly get?: unknown }>(
+            stories,
+        );
+
+        expect(asCollection.size).toBeUndefined();
+        expect(asCollection.get).toBeUndefined();
+
+        // Indexed access is the sanctioned read, and each element is still a model.
+        expect(stories[0]?.getAttrs().subject).toBe('story 1');
+        expect(stories[1]?.getAttrs().subject).toBe('story 2');
+    });
+
+    it('⭐⭐ hands back a value that is plain only after BOTH levels are flattened', async () => {
+        // ⭐⭐ P-IMMER-1, VERBATIM: "immer dislikes class instances. `$tgModel` returns
+        // model classes carrying dirty-tracking state; passing one into a draft
+        // produces undefined behaviour. Convert to plain objects at the boundary."
+        //
+        // ⭐ THE BOUNDARY IS THE CALLER'S, NOT THIS FACADE'S. The facade must NOT
+        // flatten: a flattened sprint can no longer be handed to the repository's write
+        // path, which needs the dirty tracking to issue a changed-fields-only write
+        // carrying the optimistic-concurrency token (requirement I7). So the facade
+        // resolves the model and the caller converts -- and the conversion is TWO
+        // LEVELS DEEP, because the incumbent re-wrapped every nested story
+        // (`modules/resources/sprints.coffee:18-20`). One flatten leaves models inside
+        // `user_stories`, and a draft built from that value still holds class
+        // instances, which is precisely the failure P-IMMER-1 names.
+        //
+        // The house precedent for flattening AT the boundary is the project-menu
+        // controller, which reads its persistent structure at
+        // `app/modules/components/project-menu/project-menu.controller.coffee:21` and
+        // flattens on the way out at `:27`. (The plan cites ":28"; that line is the
+        // closing brace, so the call itself is at `:27`.)
+        const sprint = sprintModel(SPRINT_ID, false);
+        const { service } = sprintsDouble({ get: { kind: 'fulfil', value: sprint } });
+
+        const resolved = await getSprint<SprintFixtureAttrs>(service, PROJECT_ID, SPRINT_ID);
+
+        // Level 0 -- what the facade resolved is a model, deliberately.
+        expect(typeof resolved.getAttrs).toBe('function');
+        expect(resolved.isModified()).toBe(false);
+
+        // Level 1 -- one flatten. The sprint's own fields are plain now...
+        const levelOne = resolved.getAttrs();
+
+        expect(typeof asPayload<{ readonly getAttrs?: unknown }>(levelOne).getAttrs).toBe(
+            'undefined',
+        );
+        // ...but the stories inside it are STILL models. A one-level flatten is not
+        // enough, and this is the only executable proof of that.
+        expect(typeof levelOne.user_stories[0]?.getAttrs).toBe('function');
+        expect(typeof levelOne.user_stories[1]?.getAttrs).toBe('function');
+
+        // Level 2 -- the second flatten. Only now is every value plain data.
+        const levelTwo = levelOne.user_stories.map((story) => story.getAttrs());
+
+        for (const story of levelTwo) {
+            const probe = asPayload<{ readonly getAttrs?: unknown; readonly _attrs?: unknown }>(
+                story,
+            );
+
+            expect(typeof probe.getAttrs).toBe('undefined');
+            expect(probe._attrs).toBeUndefined();
+        }
+
+        expect(levelTwo).toEqual([
+            { id: 1, subject: 'story 1', sprint_order: 1 },
+            { id: 2, subject: 'story 2', sprint_order: 2 },
+        ]);
+    });
+
+    it('is resolved UNFLATTENED, so the flattening discipline stays the caller\u2019s', async () => {
+        const sprint = sprintModel(SPRINT_ID, false);
+        const { service } = sprintsDouble({ get: { kind: 'fulfil', value: sprint } });
+
+        const resolved = await getSprint<SprintFixtureAttrs>(service, PROJECT_ID, SPRINT_ID);
+
+        // Identity with the value the incumbent produced: nothing was converted,
+        // copied or normalised on the way through (T10).
+        expect(resolved).toBe(sprint);
+        expect(resolved.getName()).toBe('milestones');
+
+        // Still carrying its dirty-tracking bookkeeping, which is what makes it
+        // writable. The bridge's model type does not DECLARE that field -- it is
+        // private to the implementation -- so it is probed rather than read.
+        expect(asPayload<{ readonly _attrs?: unknown }>(resolved)._attrs).toBeDefined();
+    });
 });
 
 /* ==========================================================================
@@ -633,7 +819,7 @@ describe('getSprintStats', () => {
      *
      * The two point fields are MAPS keyed by role, which is how the only existing
      * consumer reads them -- it enumerates their values and sums them
-     * (`app/coffee/modules/taskboard/main.coffee:418-419`).
+     * (`modules/taskboard/main.coffee:418-419`).
      *
      * Note what is ABSENT: the point sums, the remaining counts and the completion
      * percentage. That consumer DERIVES those onto its own view state at `:422-431`;
@@ -665,7 +851,8 @@ describe('getSprintStats', () => {
         await getSprintStats(service, PROJECT_ID, SPRINT_ID);
 
         // ⭐ Same accepted-but-unused project id as the single-sprint read
-        // (`sprints.coffee:23`), and the same reason it must still be forwarded.
+        // (`sprints.coffee:23`), the same `_projectId` underscore spelling for the same
+        // `noUnusedParameters` reason, and the same reason it must still be forwarded.
         // The `stats` sub-path is composed INSIDE the incumbent method at `:24`, so
         // nothing here interpolates an id into a string (rule T5).
         expect(log.stats).toEqual([[PROJECT_ID, SPRINT_ID]]);
@@ -699,8 +886,8 @@ describe('getSprintStats', () => {
 
         // Deriving these here would relocate controller behaviour into the resource
         // layer, which T10 forbids. The key set is the view's own, in full: the four
-        // derived members the taskboard computes are absent, and so is any addition of
-        // this facade's.
+        // derived members the taskboard computes are absent, and so is every field
+        // this facade could have contributed itself.
         expect(Object.keys(resolved).sort()).toEqual([
             'completed_points',
             'completed_tasks',
@@ -734,7 +921,242 @@ describe('getSprintStats', () => {
         expect(log.list).toEqual([]);
         expect(log.moveUserStoriesMilestone).toEqual([]);
     });
+
+    it('resolves a NATIVE promise, not the AngularJS thenable it was handed', async () => {
+        const { service } = sprintsDouble({ stats: { kind: 'fulfil', value: statsPayload } });
+
+        const result = getSprintStats<StatsFixture>(service, PROJECT_ID, SPRINT_ID);
+
+        expect(result).toBeInstanceOf(Promise);
+        expect(typeof result.catch).toBe('function');
+        expect(thenableFor<StatsFixture>(NEVER)).not.toBeInstanceOf(Promise);
+
+        await expect(result).resolves.toBe(statsPayload);
+    });
+
+    it('⭐ resolves a SPREADABLE payload, which is the asymmetry with the sprint read', async () => {
+        const { service } = sprintsDouble({ stats: { kind: 'fulfil', value: statsPayload } });
+
+        const resolved = await getSprintStats<StatsFixture>(service, PROJECT_ID, SPRINT_ID);
+
+        // ⭐ THE EXECUTABLE COUNTERPART TO THE MODEL TESTS ABOVE. The incumbent reads
+        // this endpoint through the repository's RAW query, which resolves the parsed
+        // body itself (`modules/base/repository.coffee:180`) rather than wrapping it.
+        // So there is no model here, no accessor pair, no dirty tracking and NOTHING
+        // TO FLATTEN: spreading the value captures the whole payload and loses nothing,
+        // which is exactly what spreading a sprint model does not do.
+        //
+        // Keeping both halves asserted in one file is what stops the two reads from
+        // being treated as interchangeable -- one needs a two-level flatten before it
+        // can enter React state, the other is already plain.
+        const spread = { ...resolved };
+
+        expect(spread).toEqual(statsPayload);
+        expect(Object.keys(spread).sort()).toEqual(Object.keys(statsPayload).sort());
+        expect(typeof asPayload<{ readonly getAttrs?: unknown }>(spread).getAttrs).toBe(
+            'undefined',
+        );
+        expect(spread).not.toHaveProperty('_attrs');
+
+        // Safe to place in state as-is: a draft built from it holds no class instance,
+        // which is the whole of P-IMMER-1's requirement met for free on this path.
+        expect(JSON.parse(JSON.stringify(spread))).toEqual(statsPayload);
+    });
+
+    it('⭐ passes a NULL point value through as null, not zero and not undefined', async () => {
+        // ⭐ A ROLE WITH NO ESTIMATE IS A REAL STATE, not a missing value. The domain
+        // types record it as such -- a nested story's `points` is declared
+        // `Record<string, number | null>`, and a sprint's own point sums are
+        // `number | null` because they are database aggregate sub-selects that are null
+        // when nothing carries points.
+        //
+        // ⛔ SUBSTITUTING ZERO WOULD BE A BEHAVIOUR CHANGE (T10) AND A WRONG ANSWER:
+        // "this role has not been estimated" and "this role was estimated at zero" are
+        // different facts, and a summary bar that renders the first as the second
+        // reports a complete estimate where none exists. Substituting `undefined` is no
+        // better -- it makes the key vanish from every enumeration.
+        //
+        // Asserted through an explicit type argument, which is what the facade's
+        // generic parameter is FOR: the caller names the shape it expects, and the
+        // facade neither inspects nor rewrites it.
+        type NullablePointStats = {
+            readonly total_points: Readonly<Record<string, number | null>>;
+            readonly completed_points: ReadonlyArray<number | null>;
+        };
+
+        const payload: NullablePointStats = {
+            total_points: { '1': 20, '2': null, '3': 0 },
+            completed_points: [10, null, 0],
+        };
+        const { service } = sprintsDouble({ stats: { kind: 'fulfil', value: payload } });
+
+        const resolved = await getSprintStats<NullablePointStats>(service, PROJECT_ID, SPRINT_ID);
+
+        expect(resolved.total_points['2']).toBeNull();
+        expect(resolved.total_points['2']).not.toBe(0);
+        expect(resolved.total_points['2']).not.toBeUndefined();
+
+        // The neighbouring real zero is untouched too, so null and 0 stay distinguishable.
+        expect(resolved.total_points['3']).toBe(0);
+        expect(resolved.completed_points).toEqual([10, null, 0]);
+
+        // The key survives enumeration rather than being dropped.
+        expect(Object.keys(resolved.total_points)).toEqual(['1', '2', '3']);
+    });
 });
+
+/* ==========================================================================
+ * THE INCUMBENT `list` METHOD, TRANSCRIBED
+ *
+ * ⭐⭐ WHY A TRANSCRIPTION EXISTS AT ALL, stated plainly so nobody mistakes it for
+ * a second implementation. The facade DELEGATES: `listSprints` hands its two
+ * arguments to `sprints.list` and marshals the result, and that is the whole of
+ * it. The query bag, the two custom response headers and the radix-10 parse all
+ * live in the CoffeeScript method it delegates to
+ * (`modules/resources/sprints.coffee:26-42`), which cannot be loaded here -- it is
+ * CoffeeScript, it is outside the runner's `roots`, and reaching for it would drag
+ * the AngularJS injector into a browserless suite that is required never to load
+ * it.
+ *
+ * So the frozen post-processing step is TRANSCRIBED, once, in the two functions
+ * below, and the transcription is TYPED AGAINST THE FACADE'S OWN DECLARED
+ * ENVELOPE. That last detail is what makes these specs load-bearing rather than
+ * self-congratulatory: rename `open` to `opened` in the facade, or retype either
+ * count as a string, and the object literal in {@link incumbentEnvelope} stops
+ * compiling. The contract is therefore pinned in the type system, while the two
+ * header SPELLINGS and the radix are pinned by the executable assertions that
+ * follow.
+ *
+ * What a transcription cannot do is notice an edit to the CoffeeScript itself, and
+ * pretending otherwise would be worse than saying so: goal G2 freezes that file,
+ * requirement T10 forbids changing it, and this suite records what it does today so
+ * that the React side cannot drift from it unnoticed.
+ * ========================================================================== */
+
+/**
+ * The response header carrying the CLOSED milestone count.
+ *
+ * ⭐⭐ SPELLED EXACTLY, and a typo here is the first of the four silent-failure
+ * modes: an unrecognised header name makes the getter return nothing, the parse
+ * yields not-a-number, and the screen renders an empty count under a perfectly
+ * successful HTTP 200 -- no error, no toast, no console warning. Frozen at
+ * `modules/resources/sprints.coffee:40`.
+ */
+const CLOSED_MILESTONES_HEADER = 'Taiga-Info-Total-Closed-Milestones';
+
+/**
+ * The response header carrying the OPEN milestone count.
+ *
+ * ⚠⚠ THE HEADER SAYS "Opened" WHILE THE ENVELOPE FIELD SAYS `open`. That
+ * disagreement is deliberate on the server's part and frozen on ours: writing
+ * `Taiga-Info-Total-Open-Milestones` to match the field name is the exact typo the
+ * assertions below exist to catch. Frozen at
+ * `modules/resources/sprints.coffee:41`.
+ */
+const OPENED_MILESTONES_HEADER = 'Taiga-Info-Total-Opened-Milestones';
+
+/**
+ * The header ACCESSOR, narrowed to the one form the incumbent uses.
+ *
+ * ⭐ A FUNCTION, NOT A DICTIONARY, and the distinction is the point of assertion D
+ * below. The repository asks its transport for headers and forwards the accessor
+ * untouched -- `queryMany` returns `[result, data.headers]`, and it does so only
+ * because it was called with its fourth argument set
+ * (`modules/base/repository.coffee:145-146`, reached from
+ * `modules/resources/sprints.coffee:29`). Indexing that value as an object yields
+ * nothing at all, so a reader who treats it as a bag of keys gets two absent counts
+ * and no error.
+ *
+ * The return type is taken FROM the bridge's own accessor declaration rather than
+ * restated, so a widening there moves this with it. Only the by-name form is
+ * modelled because only the by-name form is called.
+ */
+type MilestoneListHeaders = (name: string) => ReturnType<HttpHeadersGetter>;
+
+/**
+ * The tuple `queryMany` resolves when asked for headers.
+ *
+ * Element 0 is the milestone models, element 1 the header accessor -- the shape
+ * destructured at `modules/resources/sprints.coffee:30-31`.
+ */
+type MilestoneListTuple<TAttrs> = readonly [
+    ReadonlyArray<TaigaModel<TAttrs>>,
+    MilestoneListHeaders,
+];
+
+/**
+ * The envelope shape as the FACADE declares it, read back off the facade itself.
+ *
+ * The facade does not export its envelope type -- it is an implementation detail of
+ * that module -- so it is recovered from the resolved return type instead of being
+ * restated. Restating it would let this spec and the facade disagree in silence,
+ * which is the failure this whole file exists to prevent.
+ */
+type FacadeEnvelope<TAttrs> = Awaited<ReturnType<typeof listSprints<TAttrs>>>;
+
+/**
+ * The query bag, transcribed from `modules/resources/sprints.coffee:27-28`.
+ *
+ * ⭐ THE KEY IS `project`, SINGULAR. The incumbent seeds the bag with that one key
+ * and merges the caller's filters OVER it, so a filter may legitimately override it
+ * and nothing else is added. Spelling it `projects` or `project_id` is the second
+ * silent-failure mode: the endpoint ignores the unknown parameter, returns HTTP 200
+ * and hands back EVERY milestone the requester can see rather than the one
+ * project's.
+ *
+ * `_.extend({}, params, filters or {})` is reproduced exactly, including the
+ * coalescing of an absent filter argument to an empty bag.
+ */
+function incumbentParams(projectId: number, filters?: ResourceParams): ResourceParams {
+    const params: ResourceParams = { project: projectId };
+
+    return { ...params, ...(filters ?? {}) };
+}
+
+/**
+ * The envelope, transcribed from `modules/resources/sprints.coffee:38-42`.
+ *
+ * ⭐⭐ BOTH COUNTS ARE PARSED WITH AN EXPLICIT RADIX OF 10, and that argument is not
+ * decoration. Without it a value such as `"08"` is at the mercy of the host's
+ * legacy octal handling; with it the string is read as decimal 8 every time. The
+ * assertions below feed a leading-zero string precisely to prove the radix is
+ * honoured rather than merely written.
+ *
+ * `parseInt` receives the accessor's result through `String(...)` for one reason
+ * only: the accessor is declared as possibly returning nothing, and `parseInt`
+ * already performs exactly that conversion internally, so this is the same
+ * operation made expressible under a strict compiler rather than a change of
+ * behaviour. A missing header still stringifies to something non-numeric and still
+ * yields not-a-number, exactly as it does today.
+ */
+function incumbentEnvelope<TAttrs>(tuple: MilestoneListTuple<TAttrs>): FacadeEnvelope<TAttrs> {
+    const milestones = tuple[0];
+    const headers = tuple[1];
+
+    return {
+        milestones,
+        closed: parseInt(String(headers(CLOSED_MILESTONES_HEADER)), 10),
+        open: parseInt(String(headers(OPENED_MILESTONES_HEADER)), 10),
+    };
+}
+
+/**
+ * A header accessor double that answers from a fixed table.
+ *
+ * A `jest.fn()`, so the specs can assert WHICH NAMES were asked for -- which is the
+ * only way to pin the two spellings from outside the CoffeeScript. A name that is
+ * absent from the table answers `null`, exactly as the transport's accessor does
+ * for a header the response did not carry.
+ *
+ * ⚠ No manual reset accompanies it: the runner is configured with `clearMocks` and
+ * `restoreMocks` both enabled, so every mock is cleared between specs already and a
+ * hand-written reset would be redundant noise.
+ */
+function headersDouble(
+    table: Readonly<Record<string, string | null>>,
+): jest.Mock<string | null, [string]> {
+    return jest.fn((name: string): string | null => table[name] ?? null);
+}
 
 /* ==========================================================================
  * listSprints -- the envelope, the two frozen headers, and the `closed` collision
@@ -758,7 +1180,7 @@ describe('listSprints', () => {
         const { service, log } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
 
         // The open-sprints call, exactly as the backlog makes it at
-        // `app/coffee/modules/backlog/main.coffee:305-306`.
+        // `modules/backlog/main.coffee:305-306`.
         await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, { closed: false });
 
         // ⭐ The parameter bag is built INSIDE the incumbent -- it seeds the SINGULAR
@@ -924,6 +1346,254 @@ describe('listSprints', () => {
         expect(log.get).toEqual([]);
         expect(log.stats).toEqual([]);
         expect(log.moveUserStoriesMilestone).toEqual([]);
+    });
+
+    it('resolves a NATIVE promise, not the AngularJS thenable it was handed', async () => {
+        const envelope = envelopeFor(2, 3);
+        const { service } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+        const result = listSprints<SprintFixtureAttrs>(service, PROJECT_ID, { closed: false });
+
+        // ⭐ THE MARSHALLING SEAM. Awaiting a bare thenable appears to work, which is
+        // exactly why this needs asserting on the OBJECT rather than on the awaited
+        // value: only a real promise carries `catch`, `finally` and the rejection
+        // semantics the callers depend on.
+        expect(result).toBeInstanceOf(Promise);
+        expect(typeof result.catch).toBe('function');
+        expect(typeof result.finally).toBe('function');
+
+        // And the control half, without which the assertion above proves nothing:
+        // what the facade was GIVEN is genuinely not a promise.
+        expect(thenableFor<ListEnvelope<SprintFixtureAttrs>>(NEVER)).not.toBeInstanceOf(Promise);
+
+        await expect(result).resolves.toBe(envelope);
+    });
+
+    /* ----------------------------------------------------------------------
+     * The frozen query bag
+     * -------------------------------------------------------------------- */
+
+    describe('the query bag the incumbent builds from what it is handed', () => {
+        it('names the project with the SINGULAR key `project`', async () => {
+            const envelope = envelopeFor(2, 3);
+            const { service, log } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+            await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, { closed: false });
+
+            // The frozen bag-building step is driven with EXACTLY what the facade
+            // forwarded, so this asserts the bag the server would really receive
+            // rather than a bag composed for the occasion.
+            const call = log.list[0];
+            const bag = incumbentParams(
+                asPayload<number>(call?.[0]),
+                asPayload<ResourceParams | undefined>(call?.[1]),
+            );
+
+            expect(bag).toEqual({ project: PROJECT_ID, closed: false });
+            expect(Object.keys(bag).sort()).toEqual(['closed', 'project']);
+
+            // ⭐ The three near-misses, each of which the endpoint would ACCEPT while
+            // ignoring: an unrecognised query parameter is silently dropped, so the
+            // response is HTTP 200 carrying every visible milestone instead of the one
+            // project's. Naming them keeps the singular spelling from being "fixed".
+            expect(bag).not.toHaveProperty('projects');
+            expect(bag).not.toHaveProperty('project_id');
+            expect(bag).not.toHaveProperty('projectId');
+        });
+
+        it('lets a caller filter override the seeded key, because the merge is in that order', () => {
+            // `_.extend({}, params, filters or {})` seeds `project` FIRST and merges the
+            // filters over it, so a filter of the same name wins. Reversing the merge
+            // would make the seed unoverridable -- a behaviour change (T10), even though
+            // no caller relies on it today.
+            const bag = incumbentParams(PROJECT_ID, { project: 99, closed: true });
+
+            expect(bag).toEqual({ project: 99, closed: true });
+        });
+
+        it('adds nothing of its own when the caller supplies no filters', () => {
+            // The incumbent coalesces an absent filter argument to an empty bag, so the
+            // result is the seed alone: no page size, no ordering, no default filter.
+            expect(incumbentParams(PROJECT_ID)).toEqual({ project: PROJECT_ID });
+            expect(incumbentParams(PROJECT_ID, {})).toEqual({ project: PROJECT_ID });
+        });
+    });
+
+    /* ----------------------------------------------------------------------
+     * The two frozen response headers, and the radix that reads them
+     * -------------------------------------------------------------------- */
+
+    describe('the two frozen response headers and the radix-10 parse', () => {
+        /** Two milestones, the first OPEN and the second CLOSED. */
+        function twoMilestones(): ReadonlyArray<TaigaModel<SprintFixtureAttrs>> {
+            return [sprintModel(101, false), sprintModel(102, true)];
+        }
+
+        it('⭐⭐ reads both counts from their EXACTLY spelled header names', async () => {
+            const headers = headersDouble({
+                [CLOSED_MILESTONES_HEADER]: '3',
+                [OPENED_MILESTONES_HEADER]: '7',
+            });
+            const milestones = twoMilestones();
+            const envelope = incumbentEnvelope<SprintFixtureAttrs>([milestones, headers]);
+            const { service } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+            const resolved = await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, {
+                closed: false,
+            });
+
+            // ⭐⭐ THE NAMES, ASSERTED AS LITERALS RATHER THAN THROUGH THE CONSTANTS, so
+            // that a typo introduced in the constants themselves is still caught here.
+            // Note "Opened" on the wire against `open` on the envelope.
+            expect(headers.mock.calls.map((call) => call[0])).toEqual([
+                'Taiga-Info-Total-Closed-Milestones',
+                'Taiga-Info-Total-Opened-Milestones',
+            ]);
+            expect(headers).toHaveBeenCalledTimes(2);
+
+            // Counts, as NUMBERS -- the accessor answered with strings.
+            expect(resolved.closed).toBe(3);
+            expect(resolved.open).toBe(7);
+            expect(typeof resolved.closed).toBe('number');
+            expect(typeof resolved.open).toBe('number');
+
+            // The milestones travel through untouched, by identity.
+            expect(resolved.milestones).toBe(milestones);
+        });
+
+        it('⭐⭐ honours the explicit radix, so a LEADING ZERO is still read as decimal', async () => {
+            // ⭐⭐ THE EXECUTABLE PROOF OF THE `, 10`. `"08"` is the value that separates a
+            // radix-10 parse from a host-dependent one: with the radix it is decimal 8,
+            // and a reading of 0 would under-report the closed sprints on a board while
+            // looking like a perfectly ordinary zero.
+            const headers = headersDouble({
+                [CLOSED_MILESTONES_HEADER]: '08',
+                [OPENED_MILESTONES_HEADER]: '011',
+            });
+            const envelope = incumbentEnvelope<SprintFixtureAttrs>([twoMilestones(), headers]);
+            const { service } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+            const resolved = await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, {
+                closed: false,
+            });
+
+            expect(resolved.closed).toBe(8);
+            expect(resolved.open).toBe(11);
+
+            // Spelled out, because "8, not 0" is the whole assertion.
+            expect(resolved.closed).not.toBe(0);
+            expect(resolved.open).not.toBe(9);
+        });
+
+        it('⭐⭐ PROPAGATES not-a-number for an ABSENT header instead of coercing it to zero', async () => {
+            // ⭐⭐ THE FIRST SILENT-FAILURE MODE, reproduced at its real origin rather
+            // than injected pre-parsed: the response simply does not carry the closed
+            // count, the accessor answers with nothing, and the frozen parse yields
+            // not-a-number under a successful HTTP 200.
+            //
+            // ⛔ COERCING IT TO ZERO -- or to a default, or to the array length -- WOULD
+            // BE A BEHAVIOUR CHANGE (T10). Zero is a count the server never sent, and
+            // substituting one converts a visible "no number here" into a confident,
+            // wrong "none", which is strictly harder to notice.
+            const headers = headersDouble({ [OPENED_MILESTONES_HEADER]: '7' });
+            const envelope = incumbentEnvelope<SprintFixtureAttrs>([twoMilestones(), headers]);
+            const { service } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+            const resolved = await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, {
+                closed: false,
+            });
+
+            expect(headers).toHaveBeenCalledWith(CLOSED_MILESTONES_HEADER);
+            expect(Number.isNaN(resolved.closed)).toBe(true);
+            expect(resolved.closed).not.toBe(0);
+            expect(resolved.closed).not.toBeUndefined();
+            expect(resolved.closed).not.toBeNull();
+
+            // The header that WAS present is unaffected: one absent count does not
+            // invalidate the other, and neither is recomputed from the array.
+            expect(resolved.open).toBe(7);
+            expect(resolved.milestones).toHaveLength(2);
+        });
+
+        it('reads the accessor BY CALLING it, because headers are a FUNCTION not a dictionary', async () => {
+            // ⭐ `queryMany` resolves `[result, data.headers]` -- and only because it was
+            // called with its fourth argument set (`modules/base/repository.coffee:145-146`,
+            // reached from `modules/resources/sprints.coffee:29`). Element 1 is therefore
+            // the transport's ACCESSOR, forwarded untouched.
+            //
+            // Indexing it as a bag of keys is the mistake this pins: it yields nothing,
+            // both counts become not-a-number, and nothing anywhere reports a problem.
+            const headers = headersDouble({
+                [CLOSED_MILESTONES_HEADER]: '3',
+                [OPENED_MILESTONES_HEADER]: '7',
+            });
+
+            expect(typeof headers).toBe('function');
+
+            const asBag = asPayload<Readonly<Record<string, unknown>>>(headers);
+
+            expect(asBag[CLOSED_MILESTONES_HEADER]).toBeUndefined();
+            expect(asBag[OPENED_MILESTONES_HEADER]).toBeUndefined();
+            expect(Object.keys(headers)).not.toContain(CLOSED_MILESTONES_HEADER);
+            expect(Object.keys(headers)).not.toContain(OPENED_MILESTONES_HEADER);
+
+            // Read the sanctioned way, the same two values arrive.
+            const envelope = incumbentEnvelope<SprintFixtureAttrs>([twoMilestones(), headers]);
+            const { service } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+            const resolved = await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, {
+                closed: false,
+            });
+
+            expect([resolved.closed, resolved.open]).toEqual([3, 7]);
+        });
+
+        it('⭐⭐ keeps the envelope COUNT `closed` distinct from a sprint\u2019s BOOLEAN `closed`', async () => {
+            // ⭐⭐ THE SECOND SILENT-FAILURE MODE, and the single easiest mistake in this
+            // module: `closed` means THREE different things on one call, and every one of
+            // them type-checks in the wrong place.
+            //
+            //   - the FILTER `closed` is a boolean predicate -- "give me the open ones";
+            //   - the ENVELOPE's `closed` is a COUNT parsed from a response header;
+            //   - each SPRINT's `closed` is a boolean domain field on the milestone.
+            //
+            // Reading the count where the flag belongs makes a non-empty board look
+            // closed, because 3 is truthy; reading the flag where the count belongs
+            // renders "false sprints closed". Both compile, and both lie. Asserted here
+            // TOGETHER, in one test, so the three cannot be conflated one at a time.
+            const headers = headersDouble({
+                [CLOSED_MILESTONES_HEADER]: '3',
+                [OPENED_MILESTONES_HEADER]: '7',
+            });
+
+            // The first milestone is OPEN -- `closed: false` -- inside an envelope whose
+            // own `closed` is the count 3. The two therefore disagree on purpose.
+            const envelope = incumbentEnvelope<SprintFixtureAttrs>([twoMilestones(), headers]);
+            const { service, log } = sprintsDouble({ list: { kind: 'fulfil', value: envelope } });
+
+            const resolved = await listSprints<SprintFixtureAttrs>(service, PROJECT_ID, {
+                closed: false,
+            });
+
+            // 1. The envelope count.
+            expect(resolved.closed).toBe(3);
+            expect(typeof resolved.closed).toBe('number');
+
+            // 2. The domain flag, per milestone, independently.
+            const first = resolved.milestones[0];
+            const second = resolved.milestones[1];
+
+            expect(first?.getAttrs().closed).toBe(false);
+            expect(typeof first?.getAttrs().closed).toBe('boolean');
+            expect(second?.getAttrs().closed).toBe(true);
+            expect(typeof second?.getAttrs().closed).toBe('boolean');
+
+            // 3. The filter predicate, exactly as it was forwarded.
+            expect(log.list[0]?.[1]).toEqual({ closed: false });
+
+            // And the three are genuinely not interchangeable.
+            expect(resolved.closed).not.toBe(first?.getAttrs().closed);
+            expect(first?.getAttrs().closed).not.toBe(second?.getAttrs().closed);
+        });
     });
 });
 
@@ -1121,10 +1791,20 @@ describe('moveUserStoriesToMilestone', () => {
     it('is STATELESS: consecutive calls each delegate immediately, in order', async () => {
         const { service, log } = sprintsDouble({ move: { kind: 'fulfil', value: response } });
 
-        // ⭐ Rapid consecutive moves are serialised by the BACKLOG's own queue and
-        // its re-entrancy guard (`backlog/main.coffee:84`, `:539-546`, `:600-601`),
-        // never here. A facade that queued, de-duplicated or deferred would
-        // double-implement that guard and change behaviour (T10).
+        // ⭐⭐ THE SERIALISATION LIVES SOMEWHERE ELSE, ON PURPOSE. Rapid consecutive
+        // drags are serialised by the BACKLOG's own first-in-first-out queue and its
+        // context-keyed re-entrancy guard -- `backlog/main.coffee:84` initialises the
+        // queue, `:539-546` enqueues a real user drag, `:600-601` is the guard that
+        // holds a second drag back while one is in flight, `:603-618` sends the head
+        // and reconciles the server's answer, and `:620-629` re-drives the queue with a
+        // null context so the re-drive neither enqueues nor trips the guard.
+        //
+        // That behaviour is being reimplemented in `../../backlog/state/backlogReducer.ts`
+        // and `../../backlog/hooks/useStoryDrag.ts`, which are owned elsewhere and are
+        // deliberately NOT this facade's concern. A facade that queued, de-duplicated,
+        // deferred or coalesced would double-implement the guard -- two queues in series
+        // reorder differently from one, so it would be a behaviour change (T10) and not
+        // merely a redundant one.
         const first = moveUserStoriesToMilestone(
             service,
             SOURCE_SPRINT_ID,
@@ -1165,6 +1845,100 @@ describe('moveUserStoriesToMilestone', () => {
         expect(log.stats).toEqual([]);
         expect(log.list).toEqual([]);
     });
+
+    it('resolves a NATIVE promise, not the AngularJS thenable it was handed', async () => {
+        const { service } = sprintsDouble({ move: { kind: 'fulfil', value: response } });
+
+        const result = moveUserStoriesToMilestone<{ readonly moved: number }>(
+            service,
+            SOURCE_SPRINT_ID,
+            PROJECT_ID,
+            DESTINATION_SPRINT_ID,
+            entries,
+        );
+
+        expect(result).toBeInstanceOf(Promise);
+        expect(typeof result.catch).toBe('function');
+        expect(typeof result.finally).toBe('function');
+        expect(
+            thenableFor<AngularHttpResponse<{ readonly moved: number }>>(NEVER),
+        ).not.toBeInstanceOf(Promise);
+
+        await expect(result).resolves.toBe(response);
+    });
+
+    it('⛔ does NOT retry a rejected move, because a second send would move twice', async () => {
+        // ⛔⛔ THIS IS A WRITE, AND IT IS NOT IDEMPOTENT IN THE WAY A RETRY WOULD NEED.
+        // The endpoint is reached with a POST, so a silent retry after a failure risks
+        // applying the same move twice -- and the failure that most invites a retry is
+        // the very one where the first attempt may already have landed. The incumbent
+        // retries nothing; adding a retry here would be a new feature (T10) with a
+        // data-integrity cost.
+        const reason = { status: 500, data: 'server error' };
+        const { service, log } = sprintsDouble({ move: { kind: 'reject', reason } });
+
+        await expect(
+            moveUserStoriesToMilestone(
+                service,
+                SOURCE_SPRINT_ID,
+                PROJECT_ID,
+                DESTINATION_SPRINT_ID,
+                entries,
+            ),
+        ).rejects.toBe(reason);
+
+        // Exactly ONE delegation: no retry, no backoff, no second attempt.
+        expect(log.moveUserStoriesMilestone).toHaveLength(1);
+
+        // Give a retry every opportunity to appear before concluding it did not.
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(log.moveUserStoriesMilestone).toHaveLength(1);
+    });
+
+    it('⛔ carries the stories as the fourth ARGUMENT, which the incumbent sends as `bulk_stories`', async () => {
+        // ⛔⛔ THE BODY KEY IS `bulk_stories`, AND IT IS NOT `bulk_userstories`.
+        //
+        // The facade never spells a body key: it forwards positional arguments, and the
+        // incumbent builds `{project_id, milestone_id, bulk_stories: data}` from them at
+        // `modules/resources/sprints.coffee:46`. So the key is pinned HERE at the
+        // argument level -- the story list must arrive in slot FOUR, which is the slot
+        // that becomes `bulk_stories`.
+        //
+        // ⚠ THE DISTINCTION, RECORDED SO IT IS NEVER GUESSED AT:
+        //   - `bulk_stories`      -- this move, plus the bulk create and the bulk
+        //                            milestone update. The sibling task and issue moves
+        //                            use `bulk_tasks` and `bulk_issues` respectively
+        //                            (`sprints.coffee:51`, `:56`).
+        //   - `bulk_userstories`  -- the TWO STORY-ORDERING endpoints ONLY, faceted in
+        //                            the sibling user-story module, never here.
+        // Conflating them is a silent HTTP 400: the validator finds no field it
+        // recognises, so nothing is moved and the failure surfaces only as a rejected
+        // write with a field-name error nobody expects.
+        const { service, log } = sprintsDouble({ move: { kind: 'fulfil', value: response } });
+
+        await moveUserStoriesToMilestone(
+            service,
+            SOURCE_SPRINT_ID,
+            PROJECT_ID,
+            DESTINATION_SPRINT_ID,
+            entries,
+        );
+
+        const call = log.moveUserStoriesMilestone[0];
+
+        // Slot four, and it is the story list -- not the project id, not a sprint id.
+        expect(call).toHaveLength(4);
+        expect(Array.isArray(call?.[3])).toBe(true);
+        expect(call?.[3]).toEqual(entries);
+
+        // The facade contributes NO body object of its own, so no key it could have
+        // misspelled exists: every argument it forwards is a number or the story array.
+        expect(typeof call?.[0]).toBe('number');
+        expect(typeof call?.[1]).toBe('number');
+        expect(typeof call?.[2]).toBe('number');
+    });
 });
 
 /* ==========================================================================
@@ -1187,7 +1961,7 @@ describe('the Sprint domain type matches MilestoneSerializer, member for member'
         (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
     it('\u26d4 declares NO `version`, because no milestone response carries one', () => {
-        // A `version` was declared and does not exist in any milestone payload:
+        // A `version` was declared and exists in no milestone payload at all:
         // `MilestoneSerializer` declares id, name, slug, owner, project,
         // estimated_start, estimated_finish, created_date, modified_date, closed,
         // disponibility, order, user_stories, total_points, closed_points -- and
@@ -1300,6 +2074,39 @@ describe('the sprints facade module', () => {
             'listSprints',
             'moveUserStoriesToMilestone',
         ]);
+
+        // Exactly four, so a fifth cannot hide behind a passing list assertion.
+        expect(exported).toHaveLength(4);
+    });
+
+    it('⭐ faces NEITHER the task move NOR the issue move, which belong to other screens', async () => {
+        const facade: Record<string, unknown> = await import('./sprints');
+
+        // ⭐⭐ THE PERMANENT SCOPE-CREEP GUARD. The same incumbent provider exposes two
+        // further move members immediately below the user-story one --
+        // `moveTasksMilestone` at `modules/resources/sprints.coffee:49-52` and
+        // `moveIssuesMilestone` at `:54-57` -- differing from it only in their body key
+        // (`bulk_tasks` and `bulk_issues` against `bulk_stories`).
+        //
+        // They are NOT faceted, and that is a scope decision rather than an omission:
+        // tasks belong to the taskboard and issues to the issues screen, both of which
+        // this migration leaves as AngularJS. Their near-identical shape is exactly what
+        // makes adding one feel harmless, so the absence is asserted BY NAME. Needing
+        // either of them is a reviewed change to the scope, not a convenience edit.
+        expect(facade['moveTasksMilestone']).toBeUndefined();
+        expect(facade['moveIssuesMilestone']).toBeUndefined();
+        expect(Object.keys(facade)).not.toContain('moveTasksMilestone');
+        expect(Object.keys(facade)).not.toContain('moveIssuesMilestone');
+
+        // Nor under a renamed React-side spelling of the same thing.
+        for (const alias of [
+            'moveTasksToMilestone',
+            'moveIssuesToMilestone',
+            'moveTasks',
+            'moveIssues',
+        ]) {
+            expect(facade[alias]).toBeUndefined();
+        }
     });
 
     it('exposes no permission helper, no token accessor and no storage helper', async () => {

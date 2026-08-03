@@ -108,22 +108,58 @@ function UnmemoizedArchivedColumn({
 function UnmemoizedArchivedColumnIntro({
     status,
     onIntroShown,
-}: ArchivedColumnIntroProps): ReactElement {
+}: ArchivedColumnIntroProps): ReactElement | null {
     // The notification is once per status, so the callback is held in a ref and the
-    // firing effect depends only on the status id. Depending on the callback directly
-    // would re-announce the same status every time a parent re-rendered with a fresh
-    // closure, while capturing it once would call a stale one.
+    // firing effect depends only on the status identity. Depending on the callback
+    // directly would re-announce the same status every time a parent re-rendered with a
+    // fresh closure, while capturing it once would call a stale one.
     const onIntroShownRef = useRef<ArchivedColumnIntroProps['onIntroShown']>(onIntroShown);
 
     useEffect((): void => {
         onIntroShownRef.current = onIntroShown;
     }, [onIntroShown]);
 
-    useEffect((): void => {
-        onIntroShownRef.current?.(status.id);
-    }, [status.id]);
+    /*
+     * ⭐ THE ARCHIVED GATE, OWNED HERE RATHER THAN LEFT TO THE CALLER (rules T9, T10).
+     *
+     * The source element is `div.kanban-column-intro(ng-if="s.is_archived", ...)` --
+     * `kanban-table.jade` L172-L175 -- so for an ORDINARY status the element does not
+     * exist and `KanbanArchivedStatusIntroDirective` (`main.coffee` L754-L770) was
+     * therefore never linked and registered no listener. Both halves of that are
+     * reproduced: nothing renders, AND nothing is announced.
+     *
+     * Reproducing the gate INSIDE the component rather than relying on a caller to
+     * mount it conditionally is what makes the fidelity unconditional: the intro sits
+     * inside the per-status column repeat, so the most literal transliteration of the
+     * template mounts it for every status and lets this flag decide -- exactly as
+     * `ng-if` did. A caller that gates as well is harmless, because the two conditions
+     * are the same condition.
+     *
+     * Note the contrast with the collapsed rail above, whose source gate is
+     * `ng-if='folds[s.id]'` -- A FOLD TEST, not an archived test. That one is genuinely
+     * the caller's decision and is deliberately NOT reproduced here.
+     *
+     * The guard sits inside the effect because React forbids a conditional hook, and
+     * `is_archived` joins the dependency list so that a status which becomes archived
+     * announces itself then -- matching an `ng-if` element being created and its
+     * directive linked at that moment.
+     *
+     * ⛔ This gate is on `is_archived` ALONE. It must never grow a folded condition:
+     * `.vfold .kanban-column-intro { display: none }` at `kanban-table.scss` L107-L109
+     * already hides the intro of a folded archived column through CSS, and duplicating
+     * that here would remove an element the stylesheet only means to hide.
+     */
+    const isArchived: boolean = status.is_archived;
 
-    return <div className="kanban-column-intro" />;
+    useEffect((): void => {
+        if (!isArchived) {
+            return;
+        }
+
+        onIntroShownRef.current?.(status.id);
+    }, [status.id, isArchived]);
+
+    return isArchived ? <div className="kanban-column-intro" /> : null;
 }
 
 const ArchivedColumn = memo(UnmemoizedArchivedColumn);

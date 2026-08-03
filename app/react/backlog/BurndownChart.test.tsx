@@ -50,6 +50,47 @@
  * the real hook that hands back a NEW lookup identity when the language
  * changes. A module mock returning a stable function would make the assertion
  * pass for the wrong reason.
+ *
+ * ==========================================================================
+ * THREE PLACES WHERE THIS SPEC DELIBERATELY DIFFERS FROM THE PLAN THAT
+ * COMMISSIONED IT, AND THE MEASUREMENT BEHIND EACH
+ * ==========================================================================
+ *
+ * The plan for this spec was written against an EARLIER shape of the component.
+ * Three of its instructions cannot be followed literally without asserting
+ * something untrue, so each is reproduced in intent and recorded here. None is
+ * a relaxation: in every case the substitute assertion is the stricter one.
+ *
+ * 1. NO INJECTOR AND NO PROVIDER, because the translator is a PROP.
+ *    The plan has this spec stand the component inside a bridge provider
+ *    carrying a mock injector, and prove by the injector's throw-on-unsupplied
+ *    behaviour that the component asks for the translation service and nothing
+ *    else. The component no longer asks for ANY service -- its owner passes the
+ *    lookup down -- so the provider would be dead scaffolding and the injector
+ *    import would not even compile under `noUnusedLocals`. The equivalent proof
+ *    is stronger and needs no double at all: every case here renders the
+ *    component BARE, and a component that still reached the bridge would throw,
+ *    because the context's default value is null. See the final block.
+ *
+ * 2. THE HOST IS ONE VISIBLE ELEMENT, NOT THE ONLY ELEMENT.
+ *    The plan expects a single `div.burndown` carrying nothing but a class. The
+ *    component now also renders a `hidden` SIBLING holding the chart's textual
+ *    equivalent, and gives the host the ARIA attributes that point at it. So
+ *    "exactly one element carrying exactly one attribute" is replaced by two
+ *    assertions that are together tighter: exactly one element occupies space,
+ *    and the host's attribute set is enumerated EXHAUSTIVELY -- which is what
+ *    actually protects the stylesheet contract, since an `id`, a `style` or a
+ *    `data-` attribute appearing later would be caught.
+ *
+ * 3. THE PREDICTED FLOATING-POINT ARTEFACT DOES NOT OCCUR FOR THE PREDICTED
+ *    VALUE. The plan names 8.2 as the value whose caption acquires a decimal
+ *    tail, expecting 8.200000000000001. MEASURED IN THIS ENGINE, `8.2 * 10` is
+ *    exactly 82, so 8.2 round-trips cleanly and an assertion for the predicted
+ *    tail would fail. Asserting it "to be faithful to the plan" would have
+ *    frozen a fiction. The real tail-bearing values were found by sweeping one-
+ *    and two-decimal inputs, and the caption block below both pins those AND
+ *    records the predicted value explicitly as one that is NOT produced, so the
+ *    discrepancy is documented at the point where someone would look for it.
  * ========================================================================== */
 
 import { render } from '@testing-library/react';
@@ -375,6 +416,64 @@ const TWO_SPRINTS: readonly BurndownMilestone[] = [
     milestone('Sprint 2', 196.25, 371.5, 4, 6),
 ];
 
+/**
+ * FOUR sprints with the gap in the SECOND position and three distinct
+ * measurements either side of it: 10, absent, 30, 40.
+ *
+ * Deliberately distinct, round and non-monotonic-looking values, because this
+ * is the fixture that makes the compaction VISIBLE rather than merely short: a
+ * reader can see that 30 -- which belongs at axis position 2 -- is drawn at
+ * position 1, that 40 slides from 3 to 2, and that position 3 is left without a
+ * value. Two sprints could not show a shift of more than one place, and equal
+ * values could not show a shift at all.
+ */
+const GAPPED_SPRINTS: readonly BurndownMilestone[] = [
+    milestone('Sprint 1', 100, 10, 1, 1),
+    milestone('Sprint 2', 75, null, 2, 2),
+    milestone('Sprint 3', 50, 30, 3, 3),
+    milestone('Sprint 4', 25, 40, 4, 4),
+];
+
+/**
+ * A single sprint carrying the increments the commissioning plan names -- three
+ * from the team and five from the client -- so the two derived series come out
+ * at distinguishable magnitudes (-3 and -8) instead of coinciding.
+ */
+const INCREMENT_PROBE: readonly BurndownMilestone[] = [
+    milestone('Sprint 1', 200, 200, 3, 5),
+];
+
+/**
+ * ⭐ HOW A MEASUREMENT BECOMES `undefined` WITHOUT A SINGLE CAST.
+ *
+ * The component filters the measured series on BOTH `null` and `undefined`, and
+ * the domain type admits only `number | null` -- so the `undefined` half of that
+ * guard looks unreachable and invites deletion. It is not unreachable. The
+ * compiler is not configured to add `undefined` to the result of an index
+ * lookup, so reading a MISSING KEY out of a record of measurements yields the
+ * static type `number | null` and the runtime value `undefined`. That is a
+ * shape real code produces: a lookup table keyed by sprint name simply has no
+ * entry for a sprint nobody has measured yet.
+ *
+ * This is the same property of the configuration that lets the component index
+ * its sprint list with an out-of-range axis value and throw rather than fail to
+ * compile -- asserted at the end of the no-sprints block.
+ */
+const MEASUREMENTS_BY_SPRINT: Readonly<Record<string, number | null>> = {
+    'Sprint 1': 10,
+    'Sprint 3': 30,
+};
+
+/**
+ * Reads a measurement for a sprint out of the table above.
+ *
+ * For `'Sprint 2'` there is no entry, so this returns `undefined` at runtime
+ * while typing as `number | null` -- exactly the value the guard exists for.
+ */
+function measurementFor(sprintName: string): number | null {
+    return MEASUREMENTS_BY_SPRINT[sprintName];
+}
+
 /* --------------------------------------------------------------------------
  * 5. HARNESS
  * -------------------------------------------------------------------------- */
@@ -397,7 +496,7 @@ interface Harness {
 }
 
 /**
- * Renders the chart with a translator PROP and no provider of any kind.
+ * Renders the chart with a translator PROP and no provider whatsoever.
  *
  * `translate` is wrapped in a fresh arrow on every render so its identity is
  * unstable — the pessimistic case. That is deliberate: it is what proves the
@@ -488,7 +587,7 @@ describe('the rendered host', () => {
         expect(host.childElementCount).toBe(0);
 
         // The one sibling is that description, and it is `hidden`, so the host remains
-        // the only element that occupies any space.
+        // the only element that occupies space.
         const visible = Array.from(container.children).filter(
             (child) => !child.hasAttribute('hidden'),
         );
@@ -502,11 +601,47 @@ describe('the rendered host', () => {
         expect(hostOf(container).shadowRoot).toBeNull();
     });
 
-    it('renders the host even before the statistics have arrived', () => {
-        const { container } = mountChart({ stats: undefined });
+    it('carries an EXHAUSTIVELY enumerated attribute set, and nothing more', () => {
+        // The stylesheet contract is what rule T1 rests on -- zero stylesheet edits
+        // only hold while the markup keeps its side of the bargain -- so the host's
+        // attributes are pinned as a SET rather than checked one at a time. Anything
+        // added later fails here, which is the point: an `id` would collide with the
+        // shell's own document, a `style` would defeat the stylesheet, and a `data-`
+        // attribute would smuggle state into the DOM that React already holds.
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+        const host = hostOf(container);
 
-        expect(hostOf(container).className).toBe('burndown');
+        expect(
+            Array.from(host.attributes)
+                .map((attribute: Attr): string => attribute.name)
+                .sort(),
+        ).toEqual(['aria-describedby', 'aria-label', 'class', 'role']);
+
+        // Spelled out individually as well, because the three that matter most are
+        // absences and a reader should not have to infer them from the list above.
+        expect(host.hasAttribute('id')).toBe(false);
+        expect(host.hasAttribute('style')).toBe(false);
+        expect(
+            Array.from(host.attributes).some((attribute: Attr): boolean =>
+                attribute.name.startsWith('data-'),
+            ),
+        ).toBe(false);
     });
+
+    it.each([
+        ['not set at all', undefined],
+        ['explicitly empty', null],
+    ] as ReadonlyArray<[string, undefined | null]>)(
+        'renders the host before the statistics have arrived, when they are %s',
+        (_label: string, absent: undefined | null) => {
+            // BOTH absent forms, because the incumbent's guard was a single
+            // existential test that excluded each of them, and the host sat in the
+            // document from the moment the screen was compiled either way.
+            const { container } = mountChart({ stats: absent });
+
+            expect(hostOf(container).className).toBe('burndown');
+        },
+    );
 
     it('renders no placeholder and no wrapper of its own', () => {
         // The collapsible container and the empty-state panel belong to the screen
@@ -804,6 +939,45 @@ describe('sizing', () => {
         );
     });
 
+    it('applies the same ratio to a narrower panel', () => {
+        // 600 / 6 is 100. A second width, because a single measurement is consistent
+        // with a hardcoded height as well as with a ratio.
+        const stub = createFlotStub(600);
+
+        mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(stub.heights).toEqual([100]);
+    });
+
+    it('does NOT round the quotient', () => {
+        // Every width used above divides by six exactly, which would also be true of
+        // a rounded implementation. 1000 does not: the ratio must reach the plugin as
+        // the full repeating fraction, because rounding it would shift the canvas by
+        // a fraction of a pixel against the axis labels the plugin positions from the
+        // same number.
+        const stub = createFlotStub(1000);
+
+        mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(stub.heights).toEqual([1000 / 6]);
+        expect(stub.heights[0]).toBe(166.66666666666666);
+        expect(Number.isInteger(stub.heights[0])).toBe(false);
+    });
+
+    it('still draws when the element measures zero, adding no guard of its own', () => {
+        // ⭐ THE BROWSERLESS RUNNER'S REAL MEASUREMENT. jsdom performs no layout, so
+        // a live element genuinely reports a width of zero here. The incumbent sized
+        // and drew unconditionally, and so does this: a guard would be a behaviour
+        // change, and in a real browser a zero width only ever means the container is
+        // collapsed -- which the next resize corrects.
+        const stub = createFlotStub(0);
+
+        mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(stub.heights).toEqual([0]);
+        expect(stub.draws).toHaveLength(1);
+    });
+
     it('clears the host before drawing into it, so a redraw replaces rather than stacks', () => {
         const stub = createFlotStub(1254);
 
@@ -812,6 +986,27 @@ describe('sizing', () => {
         expect(stub.journal.indexOf('empty')).toBeLessThan(
             stub.journal.indexOf('plot'),
         );
+    });
+
+    it('measures, sizes, clears and draws exactly once each, in that order', () => {
+        // The whole sequence in one assertion, so the ORDER and the COUNTS are pinned
+        // together. A second `empty` would mean the host was cleared after being
+        // drawn into -- a blank chart -- and a missing one would mean canvases stack
+        // on every resize until the panel grows without bound.
+        const stub = createFlotStub(1254);
+
+        mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(stub.journal).toEqual([
+            'width',
+            'height:209',
+            'empty',
+            'plot',
+            'data:plot',
+        ]);
+        expect(
+            stub.journal.filter((entry: string): boolean => entry === 'empty'),
+        ).toHaveLength(1);
     });
 
     it('asks the plot for its stored handle and discards it', () => {
@@ -916,6 +1111,37 @@ describe('the series handed to the plot', () => {
         ]);
     });
 
+    it('distinguishes the two increment series, which one negation would merge', () => {
+        // ⭐ THE DOUBLE NEGATION, isolated. The client series carries
+        // `-team - client` and the team series carries `-team`, so with a team
+        // increment of three and a client increment of five they read -8 and -3. Drop
+        // either minus sign, or fold the team increment out of the client series, and
+        // the two lines coincide -- which is exactly the kind of change that looks
+        // like a simplification and silently erases one of the five series.
+        const series = drawWith(INCREMENT_PROBE);
+
+        expect(series[3]?.data).toEqual([[0, -8]]);
+        expect(series[4]?.data).toEqual([[0, -3]]);
+        expect(series[3]?.data[0]?.[1]).not.toBe(series[4]?.data[0]?.[1]);
+    });
+
+    it('indexes every series by ascending axis position, not by array position', () => {
+        // The x coordinates come from a generated range that is zipped against each
+        // value list, so they ascend from zero independently of how each list was
+        // built. Asserted across ALL FIVE series -- including the compacted one, whose
+        // VALUES are re-indexed while its POSITIONS are not, which is the whole
+        // mechanism of the defect two blocks down.
+        const series = drawWith(GAPPED_SPRINTS);
+        const expected = [0, 1, 2, 3];
+
+        expect(series).toHaveLength(5);
+        series.forEach((entry: RecordedSeries): void => {
+            expect(
+                entry.data.map((point: SeriesPoint): number | undefined => point[0]),
+            ).toEqual(expected);
+        });
+    });
+
     it('keeps a genuine zero measurement rather than treating it as absent', () => {
         const series = drawWith([
             milestone('Sprint 1', 100, 0),
@@ -949,6 +1175,107 @@ describe('the compacted measurement series (a preserved defect)', () => {
 
         return series;
     }
+
+    /* ----------------------------------------------------------------------
+     * ⛔ PRESERVED DEFECT -- DO NOT "FIX" ANY OF THE FOUR CASES BELOW.
+     *
+     * `coffee/modules/backlog/main.coffee:1257` filters the measured values
+     * before pairing them with the axis:
+     *
+     *     evolution_line = _.filter(_.map(dataToDraw.milestones,
+     *                                    (ml) -> ml.evolution),
+     *                               (evolution) -> evolution?)
+     *
+     * The filter REMOVES the unmeasured entries instead of leaving holes, so
+     * every surviving value slides down to fill the gap and is drawn against
+     * the WRONG sprint. The pairing helper then pads the freed trailing
+     * positions, because it spans the longer of the two lists (`:1259`).
+     *
+     * This is a genuine data-shifting defect in the shipped product, and it is
+     * reproduced deliberately: replacing the filter with a hole-preserving map,
+     * or substituting a zero or a not-a-number for the absent samples, would
+     * each change the line the user sees. Rule T10 -- no functional change
+     * whatsoever -- puts that out of bounds, so these cases exist to fail loudly
+     * if anyone tidies it.
+     * ---------------------------------------------------------------------- */
+
+    it('⛔ shifts EVERY later measurement down by the number of gaps before it', () => {
+        // Four sprints measured 10, absent, 30, 40. The gap at position 1 pulls 30
+        // from position 2 to position 1 and 40 from position 3 to position 2, and
+        // position 3 is left without a value at all -- so the line stops one sprint
+        // early AND misreports the two sprints it does draw.
+        expect(measuredSeries(GAPPED_SPRINTS).data).toEqual([
+            [0, 10],
+            [1, 30],
+            [2, 40],
+            [3, undefined],
+        ]);
+    });
+
+    it('⛔ spans the AXIS length rather than the surviving-measurement length', () => {
+        // Three values survive, yet four points are handed over: the pairing helper
+        // pads to the longer list instead of truncating to the shorter one. Truncating
+        // would be the more obvious implementation and would draw the same visible
+        // line, which is why the length is pinned explicitly rather than inferred.
+        const data = measuredSeries(GAPPED_SPRINTS).data;
+
+        const surviving = GAPPED_SPRINTS.filter(
+            (sample: BurndownMilestone): boolean => sample.evolution !== null,
+        ).length;
+
+        expect(surviving).toBe(3);
+        expect(data).toHaveLength(GAPPED_SPRINTS.length);
+        expect(data).toHaveLength(4);
+    });
+
+    it('⛔ leaves the other four series aligned across the SAME four sprints', () => {
+        // The defect is confined to the measured series. The other four keep one value
+        // per sprint, which is precisely what makes the misalignment visible on
+        // screen: the real-progress line drifts away from the ideal ramp beside it.
+        const stub = createFlotStub(1254);
+
+        mountChart({ stats: statsWith(GAPPED_SPRINTS) });
+
+        [0, 1, 3, 4].forEach((ordinal: number): void => {
+            const series = stub.draws[0]?.series[ordinal];
+
+            expect(series?.data).toHaveLength(4);
+            series?.data.forEach((point: SeriesPoint): void => {
+                expect(point[1]).not.toBeUndefined();
+            });
+        });
+    });
+
+    it('⛔ drops an ABSENT measurement exactly as it drops an empty one', () => {
+        /*
+         * The incumbent's existential test excluded both forms of absence at once,
+         * and the port's guard names them both. `undefined` looks impossible here --
+         * the domain type admits only a number or an empty measurement -- which is
+         * why this case exists: the compiler is not configured to widen an index
+         * lookup, so a missing entry in a table of measurements types as
+         * `number | null` and arrives as `undefined`. See MEASUREMENTS_BY_SPRINT.
+         *
+         * Deleting the `undefined` half of the guard would let that value through to
+         * the plot, where it becomes a point at an undefined height rather than an
+         * omitted one.
+         */
+        const fromLookup: readonly BurndownMilestone[] = [
+            milestone('Sprint 1', 100, measurementFor('Sprint 1')),
+            milestone('Sprint 2', 75, measurementFor('Sprint 2')),
+            milestone('Sprint 3', 50, measurementFor('Sprint 3')),
+        ];
+
+        // The middle sprint really is absent rather than empty, which is what makes
+        // this a test of the second half of the guard and not a repeat of the first.
+        expect(fromLookup[1]?.evolution).toBeUndefined();
+        expect(fromLookup[1]?.evolution).not.toBeNull();
+
+        expect(measuredSeries(fromLookup).data).toEqual([
+            [0, 10],
+            [1, 30],
+            [2, undefined],
+        ]);
+    });
 
     it('shifts a later measurement onto an earlier axis position', () => {
         // Sprint 2 has no measurement, so sprint 3's value of 300.25 -- which
@@ -1053,6 +1380,43 @@ describe('with no sprints at all (a preserved defect)', () => {
         expect((): Harness => mountChart({ stats: statsWith([]) })).not.toThrow();
         expect(stub.journal).toContain('plot');
     });
+
+    it('⛔ THROWS if the caption is asked about the negative axis position', () => {
+        /*
+         * ⛔ PRESERVED, AND DELIBERATELY UNGUARDED.
+         *
+         * The degenerate axis above contains position -1, and the caption names its
+         * sprint by indexing the sprint list with the axis value
+         * (`coffee/modules/backlog/main.coffee:1335`). On an empty list that lookup
+         * yields nothing and reading a name off it throws -- in the incumbent
+         * identically, since CoffeeScript compiled the same index expression.
+         *
+         * NO GUARD WAS ADDED, for two reasons. It is unreachable in practice: the
+         * plugin only calls the caption for a point the pointer is actually over, and
+         * a chart with no sprints has no drawn points to hover. And adding one would
+         * be a behaviour change under rule T10, in a component whose entire purpose
+         * is transcription. The compiler permits the expression because it is not
+         * configured to widen index lookups -- the same property the absent-
+         * measurement case above relies on -- so this is a runtime fact that the type
+         * checker cannot see, which is exactly why it is asserted here.
+         */
+        const stub = createFlotStub(1254);
+
+        mountChart({ stats: statsWith([]) });
+
+        const content = stub.draws[0]?.options.tooltipOpts.content;
+
+        if (content === undefined) {
+            throw new Error('no tooltip callback was handed over');
+        }
+
+        expect((): string => content('', -1, 0, { seriesIndex: 1 })).toThrow();
+
+        // Position 0 is no better off: the list is empty, so both positions of the
+        // degenerate axis are out of range. Asserted so the case cannot be misread as
+        // being about negative numbers specifically.
+        expect((): string => content('', 0, 0, { seriesIndex: 1 })).toThrow();
+    });
 });
 
 /* ==========================================================================
@@ -1088,6 +1452,21 @@ describe('the options handed to the plot', () => {
         expect(grid.margin).toEqual({ top: 0, right: 20, left: 5, bottom: 0 });
     });
 
+    it('hands over the WHOLE grid object, with no member beyond these five', () => {
+        // The members are asserted individually either side of this case; this one
+        // pins the object as a WHOLE, so a sixth member -- a background, a tick
+        // colour, a click handler -- cannot be introduced unnoticed. Every value is
+        // a canvas literal rather than a stylesheet value, because canvas paint
+        // cannot read a variable: this is the design system's sanctioned exception.
+        expect(optionsFor().grid).toEqual({
+            borderWidth: { top: 0, right: 1, left: 0, bottom: 0 },
+            borderColor: '#D8DEE9',
+            color: '#D8DEE9',
+            hoverable: true,
+            margin: { top: 0, right: 20, left: 5, bottom: 0 },
+        });
+    });
+
     it('gives the border and the gridlines one shared colour, and enables hovering', () => {
         const { grid } = optionsFor();
 
@@ -1109,7 +1488,23 @@ describe('the options handed to the plot', () => {
     it('formats every horizontal tick as the empty string', () => {
         // Deliberate: the axis shows tick positions and never a caption, which
         // is exactly what the committed design reference shows.
-        expect(optionsFor().xaxis.tickFormatter()).toBe('');
+        const { tickFormatter } = optionsFor().xaxis;
+
+        expect(typeof tickFormatter).toBe('function');
+        expect(tickFormatter()).toBe('');
+
+        // The plugin calls the formatter WITH the tick value and the axis object. The
+        // port declares it as taking nothing, which is sound only because it ignores
+        // both -- so it is invoked here the way the plugin really invokes it, through
+        // a reference typed as the plugin's own two-parameter contract, to prove the
+        // arguments cannot influence the result.
+        const asPluginCallsIt: (
+            value: number,
+            axis: Readonly<Record<string, unknown>>,
+        ) => string = tickFormatter;
+
+        expect(asPluginCallsIt(3, {})).toBe('');
+        expect(asPluginCallsIt(0, { min: 0, max: 3 })).toBe('');
     });
 
     it('gives the vertical axis NO tick formatter', () => {
@@ -1154,6 +1549,18 @@ describe('the options handed to the plot', () => {
             fill: true,
             radius: 4,
             lineWidth: 2,
+        });
+    });
+
+    it('hands over the WHOLE per-series default object, and nothing else', () => {
+        // As with the grid: the three members are checked individually above, and
+        // pinned as a whole here so nothing can be added silently. A shadow of zero
+        // matters visually -- the plugin's default is a soft drop shadow under every
+        // line, which the design reference does not show.
+        expect(optionsFor().series).toEqual({
+            shadowSize: 0,
+            lines: { show: true, fill: true },
+            points: { show: true, fill: true, radius: 4, lineWidth: 2 },
         });
     });
 
@@ -1321,6 +1728,54 @@ describe('the tooltip caption', () => {
         );
     });
 
+    it('⛔ reports the three values the plan named, as this engine really computes them', () => {
+        /*
+         * ⛔ PRESERVED DEFECT, AND A CORRECTION TO THE PLAN THAT COMMISSIONED IT.
+         *
+         * `coffee/modules/backlog/main.coffee:1326` (and the three sibling branches
+         * at `:1329`, `:1332` and `:1335`) compute the displayed figure as
+         *
+         *     value: Math.abs(yval * 10) / 10
+         *
+         * That is NOT a rounding step. It multiplies and divides back, which is the
+         * identity for most values and leaks a decimal tail for some -- so it is
+         * transcribed verbatim rather than simplified to a magnitude or replaced with
+         * a rounding call, either of which would change user-visible caption text and
+         * violate rule T10.
+         *
+         * ⚠ THE PLAN PREDICTED THE WRONG VALUE. It names 8.2 as the tail-bearing
+         * case, expecting a caption of 8.200000000000001. MEASURED HERE: this engine
+         * computes `8.2 * 10` as exactly 82, so 8.2 round-trips cleanly and the
+         * predicted caption is never produced. The prediction is recorded as a
+         * negative assertion below rather than quietly dropped, so that anyone
+         * checking this spec against the plan finds the discrepancy resolved at the
+         * point they look for it. The values that DO carry a tail are pinned in the
+         * case above, and were found by sweeping one- and two-decimal inputs.
+         */
+        const content = contentFor();
+
+        // The arithmetic itself, measured before it is asserted through the caption.
+        expect(8.2 * 10).toBe(82);
+        expect(Math.abs(8.2 * 10) / 10).toBe(8.2);
+        expect(Math.abs(8.2 * 10) / 10).not.toBe(8.200000000000001);
+
+        // 8.2 -- the plan's prediction of 8.200000000000001 does not occur.
+        expect(content('', 0, 8.2, { seriesIndex: 1 })).toBe(
+            'en:BACKLOG.CHART.OPTIMAL{sprintName=Sprint 1|value=8.2}',
+        );
+
+        // -12.5 -- the magnitude, exactly, because halves are representable.
+        expect(content('', 0, -12.5, { seriesIndex: 3 })).toBe(
+            'en:BACKLOG.CHART.INCREMENT_CLIENT{sprintName=Sprint 1|value=12.5}',
+        );
+
+        // 0.123 -- three decimals kept, which is the clearest single proof that the
+        // expression is not rounding to one decimal place.
+        expect(content('', 0, 0.123, { seriesIndex: 2 })).toBe(
+            'en:BACKLOG.CHART.REAL{sprintName=Sprint 1|value=0.123}',
+        );
+    });
+
     it('round-trips the tidier values cleanly, as the shipped captions show', () => {
         // Recorded so the two behaviours are not confused: most real point
         // totals are halves, and every one of those is exact.
@@ -1457,6 +1912,71 @@ describe('redraw triggers', () => {
         );
         expect(stub.draws).toHaveLength(2);
     });
+
+    it('stops drawing again, and stops listening, when the statistics go away', () => {
+        // The round trip, because the arrival direction is covered above and the
+        // DEPARTURE direction is where a stale closure would show: an effect that
+        // failed to tear down would keep redrawing from the statistics it captured,
+        // drawing a chart for data the screen no longer has.
+        const stub = createFlotStub(1254);
+        const { rerenderWith } = mountChart({ stats: null });
+
+        expect(stub.draws).toHaveLength(0);
+
+        rerenderWith({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(stub.draws).toHaveLength(1);
+
+        rerenderWith({ stats: null });
+
+        // No farewell draw, and no listener left behind.
+        expect(stub.draws).toHaveLength(1);
+
+        fireWindowResize();
+
+        expect(stub.draws).toHaveLength(1);
+    });
+
+    it('resolves the axis captions eagerly and the hover captions only on demand', () => {
+        // The asymmetry is in the source and is preserved: the two axis captions are
+        // resolved while the option object is being built, whereas the four hover
+        // captions live inside a callback the plugin invokes on hover. Resolving them
+        // eagerly would mean four lookups per draw for text nobody has asked for --
+        // and, worse, would freeze the caption wording at draw time in a way the
+        // language-change cases above would no longer detect.
+        const stub = createFlotStub(1254);
+        const { translate } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        const keysUsed = (): readonly string[] =>
+            translate.instant.mock.calls.map(
+                (call: readonly [string, ...unknown[]]): string => call[0],
+            );
+
+        expect(keysUsed()).toContain('BACKLOG.CHART.XAXIS_LABEL');
+        expect(keysUsed()).toContain('BACKLOG.CHART.YAXIS_LABEL');
+
+        // The four hover keys are absent -- with one qualification worth stating,
+        // because it would otherwise look like a contradiction: the textual
+        // alternative rendered beside the host uses the SAME four keys, so they are
+        // resolved during render even though the tooltip has not been invoked. What
+        // this case pins is that the DRAW does not resolve them, which is asserted by
+        // counting: the description accounts for every occurrence, and the tooltip
+        // adds one more the moment it is invoked.
+        const beforeHover = translate.instant.mock.calls.length;
+
+        const content = stub.draws[0]?.options.tooltipOpts.content;
+
+        if (content === undefined) {
+            throw new Error('no tooltip callback was handed over');
+        }
+
+        expect(translate.instant.mock.calls.length).toBe(beforeHover);
+
+        content('', 0, 1, { seriesIndex: 1 });
+
+        expect(translate.instant.mock.calls.length).toBe(beforeHover + 1);
+        expect(keysUsed()[keysUsed().length - 1]).toBe('BACKLOG.CHART.OPTIMAL');
+    });
 });
 
 /* ==========================================================================
@@ -1476,15 +1996,25 @@ describe('teardown', () => {
         expect(stub.draws).toHaveLength(1);
     });
 
-    it('detaches the handlers the plugin bound to the host', () => {
+    it('detaches the handlers the plugin bound to the host, exactly once', () => {
+        // The count matters, not just the presence. The incumbent detached once, on
+        // scope destruction (`coffee/modules/backlog/main.coffee:1354`); detaching on
+        // every redraw instead would strip the handlers the plugin itself binds for
+        // hovering, and the tooltip would stop appearing after the first resize.
         const stub = createFlotStub(1254);
         const { unmount } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        fireWindowResize();
 
         expect(stub.journal).not.toContain('off');
 
         unmount();
 
-        expect(stub.journal).toContain('off');
+        expect(
+            stub.journal.filter((entry: string): boolean => entry === 'off'),
+        ).toHaveLength(1);
+        // On the host itself, not on some other element the component reached for.
+        expect(stub.wrapped[stub.wrapped.length - 1]).toBe(stub.wrapped[0]);
     });
 
     it('tears down without throwing when the vendor bundle has gone away', () => {
@@ -1505,5 +2035,129 @@ describe('teardown', () => {
         fireWindowResize();
 
         expect(stub.draws).toHaveLength(0);
+    });
+});
+
+/* ==========================================================================
+ * INJECTOR ISOLATION -- THE COMPONENT ASKS THE BRIDGE FOR NOTHING
+ *
+ * The plan for this spec proves the component's service appetite by supplying a
+ * mock injector that THROWS for anything it was not given, and showing that a
+ * map holding only the translation service is enough. That proof no longer
+ * applies, because the component asks for no service at all: its owner passes
+ * the lookup down as a prop.
+ *
+ * The replacement is stricter, and it is the absence of scaffolding rather than
+ * the presence of it. Every case in this file renders the component with NO
+ * provider anywhere above it, so the bridge context holds its default value of
+ * null -- and the bridge's accessor hook rejects that, by design, so a component
+ * that reached for a service would fail on mount. The cases below make that
+ * implicit proof explicit, since a reader should not have to notice an absence.
+ *
+ * This is what requirement I9's coverage gate depends on: a component that owns
+ * no data and resolves no service is a pure function of its props, and can be
+ * exercised exhaustively in a browserless runner. Every branch of this
+ * component is reached above without a single framework double.
+ * ========================================================================== */
+
+describe('injector isolation', () => {
+    it('mounts with NO bridge provider above it', () => {
+        // No provider, no injector, no root scope, no AngularJS module -- and the
+        // component both renders and draws. Nothing is imported from the bridge in
+        // this file beyond the translator's type, which is the compiler's own record
+        // of the same fact.
+        const stub = createFlotStub(1254);
+
+        expect((): Harness =>
+            mountChart({ stats: statsWith(TWO_SPRINTS) }),
+        ).not.toThrow();
+        expect(stub.draws).toHaveLength(1);
+    });
+
+    it('reaches nothing on the window except the charting global', () => {
+        /*
+         * ⭐ THE BROWSERLESS GUARANTEE (HR-5), stated as a property of the component
+         * rather than of the configuration: the only ambient thing it touches is the
+         * charting factory the vendor bundle installs. Nothing here transfers data or
+         * persists anything, so the suite needs no network, no server, no fixture and
+         * no browser binary.
+         *
+         * ⚠ EVERY PRIMITIVE IS INSTRUMENTED THROUGH ITS PROTOTYPE, AND THE STORAGE ONE
+         * HAS TO BE. The runner's storage object is a proxy whose property writes are
+         * STORAGE WRITES, so replacing a method on the instance stores a value under
+         * that name instead of substituting the method -- the spy silently fails to
+         * install and the assertion then passes for no reason at all. Instrumenting
+         * `Storage.prototype` is the form that actually takes effect. The request
+         * primitive is taken from its prototype for the same reason of robustness: the
+         * prototype exists however an individual call would have been made.
+         *
+         * The fetch probe is INSTALLED rather than spied on, because this runner
+         * provides no fetch implementation at all -- an even stronger guarantee, but
+         * one that would make a spy-based assertion depend on the runner's version
+         * rather than on the component. Installing a recorder works either way:
+         * whatever the runner does or does not ship, a call would land here.
+         */
+        const openSpy = jest.spyOn(XMLHttpRequest.prototype, 'open');
+        const sendSpy = jest.spyOn(XMLHttpRequest.prototype, 'send');
+        const storageSpy = jest.spyOn(Storage.prototype, 'setItem');
+
+        const fetchProbe = jest.fn();
+        const runnerSuppliesFetch = 'fetch' in globalThis;
+        const suppliedFetch: unknown = Reflect.get(globalThis, 'fetch');
+
+        Object.defineProperty(globalThis, 'fetch', {
+            value: fetchProbe,
+            configurable: true,
+            writable: true,
+        });
+
+        try {
+            const stub = createFlotStub(1254);
+            const { unmount } = mountChart({ stats: statsWith(THREE_SPRINTS) });
+
+            fireWindowResize();
+            unmount();
+
+            // A full lifecycle -- mount, redraw, teardown -- and not one of them.
+            expect(stub.draws).toHaveLength(2);
+            expect(fetchProbe).not.toHaveBeenCalled();
+            expect(openSpy).not.toHaveBeenCalled();
+            expect(sendSpy).not.toHaveBeenCalled();
+            expect(storageSpy).not.toHaveBeenCalled();
+        } finally {
+            if (runnerSuppliesFetch) {
+                Object.defineProperty(globalThis, 'fetch', {
+                    value: suppliedFetch,
+                    configurable: true,
+                    writable: true,
+                });
+            } else {
+                Reflect.deleteProperty(globalThis, 'fetch');
+            }
+        }
+    });
+
+    it('takes its translator from the prop it was handed, not from a global', () => {
+        // Two mounts, two independent doubles: the captions each chart resolves come
+        // from ITS OWN translator. A component reading a shared or module-scoped lookup
+        // would produce identical captions here.
+        const first = createFlotStub(1254);
+        const one = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        one.changeLanguageTo('es');
+        fireWindowResize();
+
+        expect(first.draws[1]?.options.xaxis.axisLabel).toBe(
+            'es:BACKLOG.CHART.XAXIS_LABEL',
+        );
+
+        // The second chart's own translator is untouched by the first one's language
+        // change, because there is no shared state between them to change.
+        const second = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(second.translate).not.toBe(one.translate);
+        expect(first.draws[first.draws.length - 1]?.options.xaxis.axisLabel).toBe(
+            'en:BACKLOG.CHART.XAXIS_LABEL',
+        );
     });
 });

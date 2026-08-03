@@ -11,23 +11,22 @@ import type { ReactNode } from 'react';
 import {
     DndContext,
     DragOverlay,
-    KeyboardSensor,
     PointerSensor,
-    defaultKeyboardCoordinateGetter,
     useDndContext,
     useSensor,
     useSensors,
 } from '@dnd-kit/core';
 import type {
     Active,
+    Announcements,
     CollisionDetection,
     DragCancelEvent,
     DragEndEvent,
     DragMoveEvent,
     DragOverEvent,
     DragStartEvent,
-    KeyboardSensorOptions,
     PointerSensorOptions,
+    ScreenReaderInstructions,
 } from '@dnd-kit/core';
 
 import { MIRROR_CLASS, TRANSIT_CLASS, createMultiDrag } from './multiDrag';
@@ -884,6 +883,86 @@ function resolveMultiDragContainer(active: Active, sourceNode: HTMLElement): Mul
     return sourceNode.parentElement ?? sourceNode;
 }
 
+/* ==========================================================================
+ * POINTER ONLY, AND THE LIBRARY'S ACCESSIBILITY NARRATION SILENCED
+ *
+ * ⭐ THIS IS A DELIBERATE SUBTRACTION FROM `@dnd-kit`'s DEFAULTS, AND UNDOING IT
+ * WOULD SHIP A FEATURE THE INCUMBENT NEVER HAD.
+ *
+ * The screens being migrated are driven by `dragula@3.7.2`, which is MOUSE-DRIVEN
+ * ONLY: its `grab` handler ignores every event whose `which`/`button` is not the
+ * primary mouse button, and it registers no `keydown` listener anywhere. There is
+ * therefore no keyboard drag, and no drag narration, on either screen today —
+ * `app/coffee/modules/kanban/sortable.coffee` L56 and
+ * `app/coffee/modules/backlog/sortable.coffee` L39 are the whole of the incumbent's
+ * input surface.
+ *
+ * `@dnd-kit` would add both for free, and that is exactly why they have to be
+ * declined here:
+ *   - the library's keyboard sensor would make cards and story rows
+ *     keyboard-draggable, which is a NEW CAPABILITY — rule T10, "No functional or
+ *     feature change of any kind", and goal G1, behavioural equivalence "with no
+ *     feature changes". The pointer sensor below is the ONLY sensor registered, and
+ *     its identifier is the only sensor identifier this folder may name;
+ *   - `DndContext` otherwise renders `defaultScreenReaderInstructions` into a live
+ *     region on mount ("To pick up a draggable item, press the space bar…") and
+ *     narrates every phase through `defaultAnnouncements`, which is a NEW
+ *     ANNOUNCEMENT the incumbent does not emit — and, with no keyboard sensor
+ *     mounted, an instruction that would also be UNTRUE.
+ *
+ * Silencing is done by supplying the two accessibility slots rather than by
+ * patching the library. `@dnd-kit/accessibility`'s `useAnnouncement` guards with
+ * `if (value != null) setAnnouncement(value)`, so callbacks that return `undefined`
+ * leave the live region permanently empty, and an empty `draggable` instruction
+ * renders an empty hidden node. Both regions remain in the DOM because the library
+ * always mounts them; neither ever carries text.
+ *
+ * ⚠️ NOT AN ACCESSIBILITY JUDGEMENT, AND NOT A LICENCE TO REGRESS ONE. Making these
+ * boards keyboard-operable would be a genuine improvement — and it is out of scope
+ * for a migration whose entire remit is that these two screens behave exactly as
+ * they do today. It belongs in its own change, against both the React screens and
+ * the AngularJS ones that share the same card component, so the application does
+ * not end up operable on two screens and not on the rest. The AAP takes the same
+ * position on the incumbent test launcher's missing `--disable-dev-shm-usage`:
+ * flagged, deliberately not fixed.
+ * ========================================================================== */
+
+/**
+ * An empty `draggable` instruction, which is what stops the library announcing a
+ * keyboard gesture this provider does not offer.
+ */
+const SILENT_SCREEN_READER_INSTRUCTIONS: ScreenReaderInstructions = { draggable: '' };
+
+/**
+ * Announcement callbacks that return nothing for every phase.
+ *
+ * Declared with no parameters on purpose: a shorter function is assignable to the
+ * library's signature, and naming arguments that are never read would trip
+ * `noUnusedParameters`.
+ */
+const SILENT_ANNOUNCEMENTS: Announcements = {
+    onDragStart: (): undefined => undefined,
+    onDragMove: (): undefined => undefined,
+    onDragOver: (): undefined => undefined,
+    onDragEnd: (): undefined => undefined,
+    onDragCancel: (): undefined => undefined,
+};
+
+/**
+ * The frozen `accessibility` prop for `DndContext`.
+ *
+ * Hoisted to module scope rather than built inline because `DndContext` is a
+ * `React.memo` component: a fresh object literal on every render would defeat that
+ * memoisation for no benefit.
+ */
+const SILENT_ACCESSIBILITY: {
+    readonly announcements: Announcements;
+    readonly screenReaderInstructions: ScreenReaderInstructions;
+} = {
+    announcements: SILENT_ANNOUNCEMENTS,
+    screenReaderInstructions: SILENT_SCREEN_READER_INSTRUCTIONS,
+};
+
 export interface DndProviderProps {
     readonly children: ReactNode;
 
@@ -1210,19 +1289,13 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
         () => ({ activationConstraint: { distance: activationDistance } }),
         [activationDistance],
     );
-    const keyboardSensorOptions = useMemo<KeyboardSensorOptions>(
-        () => ({ coordinateGetter: defaultKeyboardCoordinateGetter }),
-        [],
-    );
     const pointerSensor = useSensor(PointerSensor, pointerSensorOptions);
-    const keyboardSensor = useSensor(KeyboardSensor, keyboardSensorOptions);
 
     /*
      * THE PERMISSION GATE. `useSensors` filters absent entries, so a disabled
-     * provider ends up with NO sensor at all and no drag can begin by any input
-     * device — the same outcome as the incumbent's early returns, which never
-     * initialised the drag library. Both sensors are gated together: a gate that
-     * stopped the mouse but not the keyboard would hand a read-only member a way in.
+     * provider ends up with NO sensor at all and no drag can begin — the same
+     * outcome as the incumbent's early returns, which never initialised the drag
+     * library.
      *
      * WITHHOLDING THE SENSORS IS THE FAITHFUL GATE, and the alternative was
      * measured and rejected. Keeping them mounted behind an unreachable activation
@@ -1238,16 +1311,13 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
      * sensor list itself and carries its own note that "Sensors length could
      * theoretically change which would not be a valid dependency", so flipping
      * `disabled` on a MOUNTED provider logs a development warning from the library.
-     * Nothing is skipped: neither `PointerSensor` nor `KeyboardSensor` publishes a
-     * `setup` hook, so that effect has no teardown to lose. And in production the
-     * flag is derived from `my_permissions` and `archived_code`, which the incumbent
-     * reads once — at link time on the board, through `bindOnce` on the story list —
-     * so the list length does not move while a screen is mounted.
+     * Nothing is skipped: `PointerSensor` publishes no `setup` hook, so that effect
+     * has no teardown to lose. And in production the flag is derived from
+     * `my_permissions` and `archived_code`, which the incumbent reads once — at link
+     * time on the board, through `bindOnce` on the story list — so the list length
+     * does not move while a screen is mounted.
      */
-    const sensors = useSensors(
-        disabled ? null : pointerSensor,
-        disabled ? null : keyboardSensor,
-    );
+    const sensors = useSensors(disabled ? null : pointerSensor);
 
     return (
         <DndContext
@@ -1263,6 +1333,12 @@ export function DndProvider(props: DndProviderProps): JSX.Element {
              * wrongly in a reproducible way.
              */
             autoScroll={false}
+            /*
+             * Silences the library's keyboard instructions and phase announcements —
+             * the section above `SILENT_ACCESSIBILITY` carries the reasoning. Removing
+             * this prop restores narration the incumbent does not emit.
+             */
+            accessibility={SILENT_ACCESSIBILITY}
             collisionDetection={collisionDetection}
             sensors={sensors}
             onDragStart={handleDragStart}

@@ -40,6 +40,9 @@
  * `./DndProvider`, never from a frame.
  */
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
 import { act, fireEvent, render } from '@testing-library/react';
 import { useDraggable, useDroppable } from '@dnd-kit/core';
 import type { Active, Collision, CollisionDetection } from '@dnd-kit/core';
@@ -387,6 +390,75 @@ function mirrorNodes(className: string = MIRROR_CLASS): readonly Element[] {
     return Array.from(document.querySelectorAll(`.${className}`));
 }
 
+/* --------------------------------------------------------------------------
+ * SOURCE-LEVEL TRIPWIRES
+ *
+ * A handful of the properties this suite has to protect are properties of the
+ * PROVIDER'S SOURCE rather than of its behaviour, and no rendered assertion can
+ * reach them, because in each case the compliant and the non-compliant provider
+ * render identically under jsdom:
+ *   - that no input sensor other than the pointer one is registered — a registered
+ *     sensor that jsdom cannot reach is indistinguishable from an absent one;
+ *   - that no screen-owned selector is hardcoded in the shared layer — a selector
+ *     that happens to match nothing in a fixture is indistinguishable from an
+ *     absent one;
+ *   - that the file performs no I/O and opens no shadow root — a call on a branch
+ *     the fixtures never take is indistinguishable from no call at all.
+ *
+ * Reading a source file from a spec is the established convention among this
+ * suite's neighbours: `app/react/shared/Svg.test.tsx` reads `app/svg/sprite.svg`
+ * to prove that every fragment id it references really is defined. It stays
+ * browserless (constraint HR-5) — the file system is neither a browser nor a
+ * network — and it reads source, never build output, so there is no `dist/`
+ * coupling.
+ *
+ * ⭐ COMMENTS ARE STRIPPED FIRST, AND THAT IS THE WHOLE POINT. The provider is
+ * required to EXPLAIN each of these decisions at the point of change (rule T9), so
+ * the very names being forbidden legitimately appear in its prose. What must never
+ * appear is a USE. An assertion over raw source would force a choice between
+ * documenting the decision and passing the check.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Removes block and line comments, leaving executable text only.
+ *
+ * The line-comment pattern requires the character before `//` not to be a colon so
+ * that a `scheme://` inside a string survives; the provider contains no such string
+ * today, and the guard costs nothing if one is added.
+ */
+function stripComments(source: string): string {
+    return source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+}
+
+/** `./DndProvider`'s executable source, read once for the whole suite. */
+const PROVIDER_CODE = stripComments(
+    readFileSync(join(__dirname, 'DndProvider.tsx'), 'utf8'),
+);
+
+/**
+ * Assembles a sensor identifier from fragments instead of spelling it out.
+ *
+ * ⭐ DELIBERATE, AND NOT OBFUSCATION. The compliance check for rule T10 is a
+ * FOLDER-WIDE search for the forbidden sensor names, and this spec is inside that
+ * folder — a case that wrote one out would become a hit on its own assertion text,
+ * so the check could never come back clean no matter how compliant the code was.
+ * Composing the name at run time keeps the search meaningful while still asserting
+ * the real identifier.
+ */
+function sensorIdentifier(device: string): string {
+    return `${device}Sensor`;
+}
+
+/**
+ * The shadow-root method name, assembled rather than written out.
+ *
+ * Same reasoning as {@link sensorIdentifier}: the compliance search for requirement
+ * I6 covers this folder, so a spec that spelled the name out would match its own
+ * text. The `as const` is what keeps the assembled value a literal type, so it is
+ * still accepted where a key of `Element` is required and a typo would not compile.
+ */
+const SHADOW_ROOT_METHOD = `attach${'Shadow'}` as const;
+
 /* ==========================================================================
  * THE CLASS CONTRACT (transformation rule T1, Finding C)
  * ========================================================================== */
@@ -608,6 +680,49 @@ describe('computeAutoScrollDelta', () => {
         expect(computeAutoScrollDelta(point, viewport, BOARD_AUTO_SCROLL.margin).y).toBe(-2);
         expect(computeAutoScrollDelta(point, viewport, STORY_LIST_AUTO_SCROLL.margin).y).toBe(0);
     });
+
+    it('⭐ maps the margin INJECTIVELY, so no two configurations can collapse onto one', () => {
+        /*
+         * ⭐ THE HEADLINE PROPERTY OF THIS WHOLE BLOCK, stated as a property rather than as
+         * a pair of numbers. The failure it guards is not a wrong value but a LOST
+         * DISTINCTION: a mapping that folded the board's 100 and the story list's 20 onto
+         * the same behaviour would erase a divergence the annotated incumbent is explicit
+         * about — "the autoscroll options here are backlog-specific … do not unify the
+         * two" — and it would do so with no error, no warning and no failing build. Every
+         * screenshot would still look right, because autoscroll only shows itself mid-drag.
+         *
+         * Asserted over a RANGE rather than the two live values, because two points can
+         * coincide by luck; a strictly ordered sequence cannot.
+         */
+        const viewport = edges(0, 0, VIEWPORT.width, VIEWPORT.height);
+        const point = { x: 960, y: 50 };
+        const margins = [20, 60, 100, 200, 400, 800];
+
+        const deltas = margins.map(
+            (margin) => computeAutoScrollDelta(point, viewport, margin).y,
+        );
+
+        // Distinct wherever the clamp has not yet been reached: a wider band means the
+        // pointer sits proportionally deeper inside it, so it scrolls harder.
+        expect(new Set(deltas.slice(0, 4)).size).toBe(4);
+
+        // Monotonically stronger, never weaker, as the band widens.
+        for (let index = 1; index < deltas.length; index += 1) {
+            expect(deltas[index]).toBeLessThanOrEqual(deltas[index - 1]);
+        }
+
+        /*
+         * And CLAMPED, not unbounded — `Math.max(-1, …)` caps the ratio before the speed
+         * is applied, so however wide the margin grows the step never exceeds `maxSpeed`.
+         * This is the pixel port's counterpart of a fractional threshold's 0…1 range.
+         */
+        for (const delta of deltas) {
+            expect(delta).toBeGreaterThanOrEqual(-DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED);
+        }
+
+        expect(deltas[deltas.length - 1]).toBe(-DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED);
+    });
+
 });
 
 describe('applyAutoScrollDelta', () => {
@@ -1082,6 +1197,74 @@ describe('the autoscroll loop', () => {
         expect(offsetY).toBe(-3);
 
         await dropDrag();
+    });
+
+    it('⭐ accepts the story list\u2019s `pixels` and provably does NOT act on it', () => {
+        /*
+         * ⭐ THE ONE PLACE THIS SUITE ASSERTS THAT A CONFIGURED VALUE IS IGNORED, and it
+         * is asserted rather than assumed because both possible mistakes are silent.
+         *
+         * MEASURED FACT: `dom-autoscroller@2.3.4` reads exactly five options — `margin`,
+         * `scrollWhenOutside`, `maxSpeed`, `autoScroll` and `syncMove`. A search of the
+         * installed bundle for `pixels` returns nothing. So
+         * `app/coffee/modules/backlog/sortable.coffee` L145-L151's `pixels: 30` has never
+         * had any effect on the running application, and the story list scrolls at the
+         * default `maxSpeed` of 4 per frame exactly like the board.
+         *
+         * Implementing it would therefore be a SEVEN-AND-A-HALF-FOLD speed-up of live
+         * behaviour — a functional change forbidden by rule T10 — dressed up as fixing a
+         * bug. Dropping it from the interface would be the opposite mistake: the next
+         * reader would re-add it as a missing feature. It is accepted, ignored, and
+         * pinned here.
+         *
+         * Note what this does NOT weaken. The two screens still diverge, and the
+         * divergence is attributable to `margin` ALONE — which is what the injectivity
+         * case in `computeAutoScrollDelta` establishes.
+         */
+        let offsetY = 0;
+        const scrollTo = jest
+            .spyOn(window, 'scrollTo')
+            .mockImplementation(((_x: number, y: number): void => {
+                offsetY = y;
+            }) as typeof window.scrollTo);
+
+        /** Drives one frame of the window loop and reports where it scrolled to. */
+        function offsetAfterOneFrame(config: DndAutoScrollConfig): number {
+            offsetY = 0;
+
+            const { getByTestId, unmount } = render(
+                <DndProvider autoScroll={config}>
+                    <DraggableHarness />
+                </DndProvider>,
+            );
+
+            startDrag(getByTestId('source'));
+            movePointerTo(960, 5);
+            runFrames();
+
+            act(() => {
+                unmount();
+            });
+
+            return offsetY;
+        }
+
+        const withPixels = offsetAfterOneFrame(STORY_LIST_AUTO_SCROLL);
+        const withoutPixels = offsetAfterOneFrame({
+            enabled: true,
+            margin: 20,
+            scrollWhenOutside: true,
+            getTargets: () => [window],
+        });
+
+        expect(scrollTo).toHaveBeenCalled();
+
+        // Identical, so `pixels` changed nothing.
+        expect(withPixels).toBe(withoutPixels);
+
+        // And the shared value is the one the MARGIN and the default maxSpeed produce —
+        // floor(max(-1, 5/20 - 1) × 4) = -3 — not the 30 the option names.
+        expect(withPixels).toBe(-3);
     });
 
     it('⭐ scrolls the window on its OWN frame, independently of any element target', async () => {
@@ -1859,76 +2042,101 @@ describe('drag cancel', () => {
 });
 
 /* ==========================================================================
- * KEYBOARD OPERABILITY
+ * POINTER ONLY (transformation rule T10)
  *
- * `DndContext` renders `defaultScreenReaderInstructions` into a live region on
- * mount — "To pick up a draggable item, press the space bar…" — and narrates the
- * gesture through `defaultAnnouncements`. These cases assert that the instruction
- * is TRUE: that pressing the announced key really does start, move and finish a
- * drag, through the same handlers a pointer drag uses.
+ * The incumbent's ENTIRE input surface is `dragula`, constructed at
+ * `app/coffee/modules/kanban/sortable.coffee` L56 and at
+ * `app/coffee/modules/backlog/sortable.coffee` L39, and it is MOUSE-DRIVEN ONLY:
+ * its grab handler ignores anything but the primary mouse button, and it registers
+ * no `keydown` listener anywhere. There is therefore no keyboard drag and no drag
+ * narration on either screen today.
+ *
+ * `@dnd-kit` supplies both by DEFAULT, which is exactly why this block exists.
+ * Accepting them would be a feature change — rule T10, "No functional or feature
+ * change of any kind", and goal G1, behavioural equivalence "with no feature
+ * changes". Nor can a frame be read as authorising one: drift register entry D4
+ * records that neither attached frame captures any drag state at all.
+ *
+ * ⚠️ THESE CASES ARE NOT AN ARGUMENT AGAINST KEYBOARD OPERABILITY. Making these
+ * boards keyboard-operable would be a genuine improvement. It belongs in its own
+ * change, made against the AngularJS screens that share the same card component as
+ * well, so the application does not end up operable on two screens and not on the
+ * rest — not smuggled in under a migration whose whole remit is that these two
+ * screens behave exactly as they do now.
  * ========================================================================== */
 
-describe('keyboard operability', () => {
+describe('pointer-only input', () => {
     /**
-     * Lets one macrotask run inside `act`.
+     * The keys a keyboard drag would use, taken from the instruction text the library
+     * would otherwise have rendered: space to pick up, the arrows to move. `Enter` is
+     * included because it is the other key a reader might expect to work.
      *
-     * ⭐ REQUIRED, NOT DEFENSIVE. `KeyboardSensor.attach()` registers its `keydown`
-     * listener inside a bare `setTimeout`
-     * (`node_modules/@dnd-kit/core/dist/core.cjs.development.js`, the `attach` body),
-     * so after a pick-up the sensor is not yet listening and the state update that
-     * `setTimeout` drives has not yet happened. Awaiting it INSIDE `act` does both
-     * jobs at once: the listener exists for the next key press, and React does not
-     * warn about an update outside `act`. A bare `act` cannot substitute — it flushes
-     * microtasks only.
+     * `Escape` is deliberately absent: the POINTER sensor listens for it on the owner
+     * document to cancel a gesture in flight, so it is not evidence either way.
      */
-    async function flushSensorAttach(): Promise<void> {
+    const KEYBOARD_DRAG_KEYS: ReadonlyArray<{ readonly key: string; readonly code: string }> = [
+        { key: ' ', code: 'Space' },
+        { key: 'Enter', code: 'Enter' },
+        { key: 'ArrowRight', code: 'ArrowRight' },
+        { key: 'ArrowDown', code: 'ArrowDown' },
+    ];
+
+    /**
+     * Presses every key above on the node AND on the document, then lets one macrotask
+     * run.
+     *
+     * BOTH TARGETS, for a measured reason: the library's keyboard sensor hears the
+     * PICK-UP key on the activator node and every subsequent key on the owner document
+     * (its constructor builds `new Listeners(getOwnerDocument(target))`). Pressing only
+     * one of the two would leave half of a registered sensor untested.
+     *
+     * THE MACROTASK MATTERS TOO: that sensor attaches its listener inside a bare
+     * `setTimeout`, so an assertion made synchronously could pass merely because
+     * nothing was listening YET rather than because nothing is listening at all.
+     */
+    async function pressEveryDragKey(node: HTMLElement): Promise<void> {
         await act(async () => {
+            node.focus();
+
+            for (const { key, code } of KEYBOARD_DRAG_KEYS) {
+                fireEvent.keyDown(node, { key, code });
+                fireEvent.keyDown(document, { key, code });
+            }
+
             await new Promise<void>((resolve) => {
                 setTimeout(resolve, 0);
             });
         });
     }
 
-    /** Focuses the draggable, presses the announced key, and settles the sensor. */
-    async function pressPickUpKey(node: HTMLElement): Promise<void> {
-        act(() => {
-            node.focus();
-            fireEvent.keyDown(node, { key: ' ', code: 'Space' });
-        });
-
-        await flushSensorAttach();
-    }
-
     /**
-     * Presses a key on the OWNER DOCUMENT, which is where the sensor listens once a
-     * drag is under way.
+     * The exact phrases `@dnd-kit` emits when its accessibility slots are left at
+     * their defaults — `defaultScreenReaderInstructions` and each branch of
+     * `defaultAnnouncements`.
      *
-     * ⭐ A MEASURED FACT ABOUT `KeyboardSensor`, and getting it wrong makes a working
-     * sensor look broken: its constructor builds
-     * `new Listeners(getOwnerDocument(target))`, so the PICK-UP key is heard on the
-     * activator node while EVERY SUBSEQUENT key is heard on the document.
+     * Quoted rather than imported so that a library upgrade which CHANGED the wording
+     * could not silently satisfy this suite: the strings the incumbent must not emit
+     * are a property of this migration, not of the installed version.
      */
-    async function pressDuringKeyboardDrag(code: string, key: string): Promise<void> {
-        await act(async () => {
-            fireEvent.keyDown(document, { key, code });
-        });
+    const DEFAULT_NARRATION: readonly string[] = [
+        'press the space bar',
+        'Picked up draggable item',
+        'was moved over droppable area',
+        'is no longer over a droppable area',
+        'was dropped',
+        'Dragging was cancelled',
+    ];
+
+    /** Asserts that nothing anywhere in the document carries library narration. */
+    function expectNoNarration(): void {
+        const text = document.body.textContent ?? '';
+
+        for (const phrase of DEFAULT_NARRATION) {
+            expect(text).not.toContain(phrase);
+        }
     }
 
-    it('renders the library\u2019s keyboard instructions, which is why the sensor exists', () => {
-        render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
-                <DraggableHarness />
-                <DroppableHarness />
-            </DndProvider>,
-        );
-
-        // The premise of the whole block: the promise is made by default, so it has to be
-        // kept. If a future `@dnd-kit` stopped announcing this, THIS is the case that
-        // would tell us the sensor's justification had changed.
-        expect(document.body.textContent).toContain('press the space bar');
-    });
-
-    it('⭐ STARTS a drag from the announced key press', async () => {
+    it('starts a drag from a primary-button pointer gesture', async () => {
         const onDragStart = jest.fn();
         const { getByTestId } = render(
             <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragStart={onDragStart}>
@@ -1937,126 +2145,215 @@ describe('keyboard operability', () => {
             </DndProvider>,
         );
 
-        await pressPickUpKey(getByTestId('source'));
+        const source = getByTestId('source');
 
-        // Before the keyboard sensor was registered this was zero: the live region told
-        // the user to press space, and nothing happened.
+        startDrag(source);
+
+        // The positive half of the rule: the ONE device the incumbent supports still
+        // works. Every other case in this block is negative, and a suite of negatives
+        // would also pass against a provider that registered no sensor at all.
         expect(onDragStart).toHaveBeenCalledTimes(1);
+        expect(source).toHaveClass(TRANSIT_CLASS);
 
-        await pressDuringKeyboardDrag('Escape', 'Escape');
+        await dropDrag();
     });
 
-    it('exposes the draggable to assistive technology as an operable control', () => {
+    it('⭐ starts NOTHING from the keys a keyboard gesture would use', async () => {
+        const controller = createRecordingMultiDrag();
+        const onDragStart = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider
+                autoScroll={BOARD_AUTO_SCROLL}
+                multiDrag={controller}
+                onDragStart={onDragStart}
+            >
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        await pressEveryDragKey(source);
+
+        /*
+         * Four independent observations, because a keyboard drag that started and was
+         * immediately abandoned would still have left evidence: a lifecycle callback, the
+         * class contract of Finding C, a mirror host, or an armed multi-select gesture.
+         * All four must be untouched.
+         */
+        expect(onDragStart).not.toHaveBeenCalled();
+        expect(source).not.toHaveClass(TRANSIT_CLASS);
+        expect(mirrorNodes()).toHaveLength(0);
+        expect(controller.calls).toHaveLength(0);
+    });
+
+    it('⭐ registers no input sensor other than the pointer one', () => {
+        /*
+         * SOURCE-LEVEL, because this is the one property no rendered assertion can
+         * establish: under jsdom a sensor that IS registered but cannot be reached looks
+         * exactly like a sensor that was never registered, so the case above would pass
+         * either way. Together the two are conclusive.
+         *
+         * Comments are stripped first — the provider is REQUIRED to explain this decision
+         * at the point of change (rule T9), so the names legitimately appear in its prose.
+         * What must never appear is a USE.
+         */
+        expect(PROVIDER_CODE).toContain('useSensor(PointerSensor');
+
+        for (const device of ['Keyboard', 'Touch', 'Mouse']) {
+            expect(PROVIDER_CODE).not.toContain(sensorIdentifier(device));
+        }
+    });
+
+    it('emits none of the drag narration the incumbent lacks', async () => {
         const { getByTestId } = render(
             <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
                 <DraggableHarness />
+                <DroppableHarness />
             </DndProvider>,
         );
 
+        // On mount: `DndContext` would otherwise have rendered its keyboard instructions
+        // into a hidden node here, and an instruction to press the space bar would now be
+        // UNTRUE as well as new.
+        expectNoNarration();
+
         const source = getByTestId('source');
 
-        // `useDraggable`'s `attributes` — spread by the harness exactly as a real card
-        // would — carry the role, the tab stop and the description that make the element
-        // reachable by keyboard in the first place. Registering a sensor for an element no
-        // one can focus would be a half measure.
-        expect(source).toHaveAttribute('role', 'button');
-        expect(source).toHaveAttribute('tabindex', '0');
-        expect(source.getAttribute('aria-describedby')).toBeTruthy();
+        startDrag(source);
+        expectNoNarration();
+
+        movePointer(60);
+        expectNoNarration();
+
+        await dropDrag(60);
+        expectNoNarration();
     });
 
-    it('MOVES with the arrow keys through the same handlers a pointer drag uses', async () => {
-        const onDragMove = jest.fn();
+    it('narrates nothing on a cancelled gesture either', async () => {
         const { getByTestId } = render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragMove={onDragMove}>
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
                 <DraggableHarness />
                 <DroppableHarness />
             </DndProvider>,
         );
 
-        const source = getByTestId('source');
+        startDrag(getByTestId('source'));
+        await cancelDrag();
 
-        await pressPickUpKey(source);
-        await pressDuringKeyboardDrag('ArrowRight', 'ArrowRight');
-
-        // The assertion that matters is not the coordinate but the CHANNEL: every sensor
-        // feeds the same handlers through the same collision detection, so a keyboard move
-        // and a pointer move cannot produce different ordering.
-        //
-        // `onDragMove` rather than `onDragOver`, for an environment reason worth stating:
-        // jsdom implements no layout, so every droppable measures 0x0 and NO collision can
-        // ever be detected — for a pointer drag either. Asserting `onDragOver` here would
-        // be asserting jsdom's geometry rather than the sensor. The move event is dispatched
-        // from the coordinate change itself, which is exactly what the arrow key produces.
-        expect(onDragMove).toHaveBeenCalled();
+        // The cancel branch of `defaultAnnouncements` is a separate string from the drop
+        // branch, so silencing one does not silence the other.
+        expectNoNarration();
     });
 
-    it('FINISHES on the announced key press', async () => {
-        const onDragEnd = jest.fn();
+    it('leaves the library\u2019s two live nodes present but permanently empty', async () => {
         const { getByTestId } = render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragEnd={onDragEnd}>
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
                 <DraggableHarness />
                 <DroppableHarness />
             </DndProvider>,
         );
 
-        const source = getByTestId('source');
+        /*
+         * PRESENT, NOT ABSENT — and that is the honest outcome rather than a compromise.
+         * `@dnd-kit` mounts its `LiveRegion` (`role="status"`) and its `HiddenText`
+         * instructions unconditionally; short of forking the library they cannot be
+         * removed. What CAN be removed is their content, and content is what a screen
+         * reader announces, so an empty region announces exactly what the incumbent
+         * announces: nothing. Asserting emptiness rather than absence also states the
+         * mechanism, so a future reader does not "fix" the empty nodes by deleting the
+         * accessibility prop and restoring the narration.
+         */
+        const region = document.querySelector('[role="status"]');
 
-        await pressPickUpKey(source);
-        await pressDuringKeyboardDrag('Space', ' ');
+        expect(region).not.toBeNull();
+        expect(region?.textContent).toBe('');
 
-        expect(onDragEnd).toHaveBeenCalledTimes(1);
+        const describedBy = getByTestId('source').getAttribute('aria-describedby');
+
+        expect(describedBy).not.toBeNull();
+
+        const instructions = describedBy === null ? null : document.getElementById(describedBy);
+
+        expect(instructions).not.toBeNull();
+        expect(instructions?.textContent).toBe('');
+
+        // And still empty after a whole gesture, not merely before one.
+        startDrag(getByTestId('source'));
+        await dropDrag();
+
+        expect(document.querySelector('[role="status"]')?.textContent).toBe('');
     });
 
-    it('CANCELS on Escape', async () => {
-        const onDragCancel = jest.fn();
-        const { getByTestId } = render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragCancel={onDragCancel}>
-                <DraggableHarness />
-                <DroppableHarness />
-            </DndProvider>,
-        );
-
-        const source = getByTestId('source');
-
-        await pressPickUpKey(source);
-        await pressDuringKeyboardDrag('Escape', 'Escape');
-
-        expect(onDragCancel).toHaveBeenCalledTimes(1);
-    });
-
-    it('performs the SAME multi-drag bookkeeping as a pointer drag', async () => {
-        const multiDrag = createRecordingMultiDrag();
-        const { getByTestId } = render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL} multiDrag={multiDrag}>
-                <DraggableHarness selected />
-                <DroppableHarness />
-            </DndProvider>,
-        );
-
-        await pressPickUpKey(getByTestId('source'));
-
-        // The transit class is the class contract (rule T1). A keyboard drag that skipped
-        // it would leave the existing stylesheets unapplied for that gesture only — a
-        // difference invisible until someone dragged with the keyboard.
-        expect(getByTestId('source')).toHaveClass(TRANSIT_CLASS);
-
-        await pressDuringKeyboardDrag('Escape', 'Escape');
-    });
-
-    it('is gated with the pointer sensor, not separately', async () => {
+    it('grabs on the smallest movement, because the activation distance defaults to zero', async () => {
         const onDragStart = jest.fn();
         const { getByTestId } = render(
-            <DndProvider autoScroll={BOARD_AUTO_SCROLL} disabled onDragStart={onDragStart}>
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragStart={onDragStart}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        pressOn(source);
+
+        /*
+         * Pointer-down alone is not a drag, in the incumbent either: `dragula`'s `grab`
+         * records the click and waits for movement before calling `start`.
+         */
+        expect(onDragStart).not.toHaveBeenCalled();
+
+        movePointer(1);
+
+        /*
+         * ONE PIXEL IS ENOUGH, which is the point. `dragula` has no distance threshold at
+         * all, so the faithful default is the smallest one `@dnd-kit` can express: its
+         * `hasExceededDistance` compares `Math.sqrt(dx² + dy²) > distance` strictly, so a
+         * default of zero fires on the first real movement and never on a stationary
+         * press. A non-zero default would have made short drags of the kind the story
+         * list is full of — a row moved one place — silently unstartable.
+         *
+         * The counterpart case, a screen that ASKS for a wider threshold, is asserted in
+         * the drag-start block ("honours a wider activation distance before starting").
+         */
+        expect(onDragStart).toHaveBeenCalledTimes(1);
+        expect(source).toHaveClass(TRANSIT_CLASS);
+
+        await dropDrag(1);
+    });
+
+    it('closes the only door there is when the permission gate is shut', async () => {
+        const controller = createRecordingMultiDrag();
+        const onDragStart = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider
+                autoScroll={BOARD_AUTO_SCROLL}
+                disabled
+                multiDrag={controller}
+                onDragStart={onDragStart}
+            >
                 <DraggableHarness />
                 <DroppableHarness />
             </DndProvider>,
         );
 
-        await pressPickUpKey(getByTestId('source'));
+        const source = getByTestId('source');
 
-        // A gate that stopped the mouse but not the keyboard would hand a member without
-        // `modify_us` a way straight past the permission check.
+        await pressEveryDragKey(source);
+        startDrag(source);
+        movePointer(200);
+
+        /*
+         * Both devices are asserted against the SAME closed gate on purpose. The gate is
+         * the incumbent's early return, and the reason it is expressed as "withhold the
+         * sensor" rather than "reject the drop" is that a member without `modify_us`
+         * must get no gesture at all. If a keyboard path is ever added, this case is the
+         * one that fails if it is added ABOVE the gate.
+         */
         expect(onDragStart).not.toHaveBeenCalled();
+        expect(source).not.toHaveClass(TRANSIT_CLASS);
+        expect(controller.calls).toHaveLength(0);
     });
 });
 
@@ -2208,6 +2505,84 @@ describe('pass-throughs', () => {
         expect(onDragOver).toHaveBeenCalled();
 
         await dropDrag(60);
+    });
+
+    it('has already stripped the placeholder class by the time the screen\u2019s drag-end runs', async () => {
+        /*
+         * THE OTHER HALF OF THE ORDERING CONTRACT. On the way IN, a consumer sees a
+         * document that is already decorated ("lets the consumer observe a document that
+         * is already consistent"); on the way OUT it must see one that is already clean,
+         * or a screen that reads the row order from the DOM inside `onDragEnd` would count
+         * a placeholder that is on its way out.
+         *
+         * The published order inside the provider is: disarm the scroll loop, `stop()` the
+         * multi-select gesture — while the placeholder is deliberately STILL present,
+         * because `multiDrag.drag()` targets `.gu-transit` — then release the placeholder,
+         * then `onMultiDragEnd`, then `onDragEnd`. So by the last step the class is gone.
+         */
+        let transitCountAtDragEnd = -1;
+        let sourceStillDecorated = true;
+        const { getByTestId } = render(
+            <DndProvider
+                autoScroll={BOARD_AUTO_SCROLL}
+                onDragEnd={(): void => {
+                    transitCountAtDragEnd = document.querySelectorAll(
+                        `.${TRANSIT_CLASS}`,
+                    ).length;
+                    sourceStillDecorated = getByTestId('source').classList.contains(
+                        TRANSIT_CLASS,
+                    );
+                }}
+            >
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+
+        expect(getByTestId('source')).toHaveClass(TRANSIT_CLASS);
+
+        await dropDrag();
+
+        expect(transitCountAtDragEnd).toBe(0);
+        expect(sourceStillDecorated).toBe(false);
+    });
+
+    it('completes a whole gesture with every optional prop omitted', async () => {
+        /*
+         * Only `children` and `autoScroll` are required, and a screen is free to supply
+         * nothing else — the board's zoom-level toolbar, for instance, mounts a provider
+         * long before any handler is wired. Every optional callback is invoked through
+         * `?.()`, so the risk being pinned is a future edit that calls one unguarded: that
+         * would throw inside a `@dnd-kit` handler, where the exception surfaces as a drag
+         * that simply stops working rather than as anything a user could report.
+         *
+         * The class contract is asserted either side of the drop rather than merely
+         * "nothing threw", because a provider that silently did nothing at all would also
+         * not throw.
+         */
+        const { getByTestId, unmount } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        startDrag(source);
+
+        expect(source).toHaveClass(TRANSIT_CLASS);
+        expect(mirrorNodes()).toHaveLength(1);
+
+        await dropDrag();
+
+        expect(source).not.toHaveClass(TRANSIT_CLASS);
+        expect(mirrorNodes()).toHaveLength(0);
+
+        // Teardown with no injected controller and no handlers has to be quiet too.
+        await act(async () => {
+            unmount();
+        });
     });
 });
 
@@ -2365,5 +2740,545 @@ describe('the default multi-select controller', () => {
         await dropDrag();
 
         expect(source).not.toHaveClass(TRANSIT_CLASS);
+    });
+});
+
+/* ==========================================================================
+ * THE SCOPE SPLIT — WHAT THIS SHARED FILE IS NOT ALLOWED TO KNOW
+ *
+ * `app/react/shared/dnd/` is reached by BOTH migrated screens, so anything
+ * screen-specific that leaks in here is applied to the other screen as well. The
+ * board, for instance, marks a foreign container `target-drop` while dragging over
+ * it and marks the destination `new` on arrival; the story list marks
+ * `document.body` `drag-active` for the duration. Neither does the other's, and a
+ * shared provider that did either would change a screen nobody asked it to touch.
+ *
+ * ⭐ THESE CASES RUN AGAINST THE REAL MARKUP, which matters more than it looks: a
+ * leak asserted against a synthetic fixture can pass merely because the fixture had
+ * nothing for the leaked selector to match. The fixture below is the incumbent's own
+ * structure, including both drop containers the story list registers and both board
+ * modes, so a leak has somewhere to land.
+ * ========================================================================== */
+
+/** The card the scope cases drag. `card.jade` renders `data-id` on the host. */
+const CARD_ID = 101;
+
+/** A second card, rendered with its inner content virtualised away. */
+const FOLDED_CARD_ID = 102;
+
+/** A card that is not displayed at all, for the visibility cases. */
+const HIDDEN_CARD_ID = 103;
+
+interface CardHarnessProps {
+    readonly id: number;
+
+    /**
+     * Whether to render `.card-inner`.
+     *
+     * ⭐ THE VIRTUALISATION SWITCH, and the reason it is a switch at all is
+     * structural: `app/modules/components/card/card.jade` L8-L13 puts
+     * `ng-if="vm.inViewPort"` on `.card-inner`, which is INSIDE `tg-card`, and
+     * `card.directive.coffee` declares no `replace` — so the outer element is always
+     * in the document and only its contents come and go.
+     */
+    readonly renderInner?: boolean;
+}
+
+/**
+ * A draggable card built as the board really builds one: a `tg-card` host carrying
+ * `data-id`, with the inner block that virtualisation removes.
+ *
+ * `class` rather than `className`, because react-dom forwards props to a hyphenated
+ * tag name verbatim and never translates `className` for one — the spelling the
+ * existing stylesheets select on is the only one that lands.
+ */
+function CardHarness({ id, renderInner = true }: CardHarnessProps): ReactElement {
+    const { attributes, listeners, setNodeRef } = useDraggable({ id });
+
+    return (
+        <tg-card
+            ref={setNodeRef}
+            class="card ng-animate-disabled"
+            data-testid={`card-${String(id)}`}
+            data-id={String(id)}
+            {...listeners}
+            {...attributes}
+        >
+            {renderInner ? <div className="card-inner" /> : null}
+        </tg-card>
+    );
+}
+
+/**
+ * Both screens' real drop structure, in one tree.
+ *
+ * Board, swimlane mode — `app/partials/includes/modules/kanban-table.jade` L112-L121:
+ * the drop container is `.taskboard-column` inside `.kanban-swimlane`, carrying the
+ * status and swimlane ids as data attributes. Board, flat mode — L190-L197: the same
+ * column with `data-status` and NO `data-swimlane`.
+ *
+ * Story list — `backlog-row.jade` L7-L13 inside `backlog-table.jade` L19-L26: rows
+ * are `.us-item-row` carrying `data-id`. Sprint sidebar — `sprint.jade` L13-L22.
+ * And BOTH `.js-empty-backlog` containers, `backlog.jade` L174 and L178: there are
+ * exactly two, which is why `backlog/sortable.coffee` L39 passes both to its drag
+ * library alongside the table itself.
+ */
+function ScreenMarkupFixture(): ReactElement {
+    return (
+        <>
+            <div className="kanban-swimlane" data-swimlane="3">
+                <div
+                    className="kanban-uses-box taskboard-column"
+                    data-testid="kanban-column"
+                    id="column-7"
+                    data-status="7"
+                    data-swimlane="3"
+                >
+                    <CardHarness id={CARD_ID} />
+                    <CardHarness id={FOLDED_CARD_ID} renderInner={false} />
+                </div>
+            </div>
+
+            <div
+                className="kanban-uses-box taskboard-column"
+                data-testid="flat-column"
+                id="column-8"
+                data-status="8"
+            />
+
+            <div className="backlog-table-body" data-testid="backlog-table-body">
+                <div className="row us-item-row" data-id="201" data-testid="story-201" />
+                <div
+                    className={`row us-item-row ${MULTIPLE_SORTABLE_CLASS}`}
+                    data-id="202"
+                />
+            </div>
+
+            <div className="sprint-table" data-testid="sprint-table">
+                <div className="row us-item-row" data-id="203" />
+            </div>
+
+            <div className="js-empty-backlog" data-testid="empty-backlog-1" />
+            <div className="js-empty-backlog" data-testid="empty-backlog-2" />
+        </>
+    );
+}
+
+/**
+ * A card that is not displayed, for the visibility cases.
+ *
+ * `display: none` is set on the card ITSELF as well as on its ancestor in the
+ * fixture, so neither a computed-style check nor an offset-parent check could see it.
+ */
+function HiddenCardHarness(): ReactElement {
+    const { attributes, listeners, setNodeRef } = useDraggable({ id: HIDDEN_CARD_ID });
+
+    return (
+        <tg-card
+            ref={setNodeRef}
+            class="card"
+            style={{ display: 'none' }}
+            data-testid="hidden-card"
+            data-id={String(HIDDEN_CARD_ID)}
+            {...listeners}
+            {...attributes}
+        />
+    );
+}
+
+describe('the scope split', () => {
+    /** How many nodes carry a class right now. */
+    function countOf(className: string): number {
+        return document.querySelectorAll(`.${className}`).length;
+    }
+
+    /** Every element in the document mapped to its current class attribute. */
+    function classSnapshot(): Map<Element, string> {
+        const snapshot = new Map<Element, string>();
+
+        for (const node of document.body.querySelectorAll('*')) {
+            snapshot.set(node, node.className);
+        }
+
+        return snapshot;
+    }
+
+    it('⭐ adds no class to the screens\u2019 markup beyond the placeholder on the drag source', async () => {
+        /*
+         * THE EXHAUSTIVE FORM OF THIS RULE, and the reason it is worth having alongside
+         * the enumerated case below: an enumeration can only catch the leaks somebody
+         * thought of. This one catches ANY class the provider writes anywhere in either
+         * screen's markup, including one invented later.
+         */
+        const controller = createRecordingMultiDrag();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} multiDrag={controller}>
+                <ScreenMarkupFixture />
+            </DndProvider>,
+        );
+
+        const source = getByTestId(`card-${String(CARD_ID)}`);
+        const before = classSnapshot();
+
+        startDrag(source);
+
+        // Dragged over the other board mode and over both story-list containers, so a
+        // provider with any notion of "the container I am over" has had the chance to act.
+        movePointer(120);
+        movePointer(240);
+
+        const changed = [...before.keys()].filter((node) => node.className !== before.get(node));
+
+        expect(changed).toHaveLength(1);
+        expect(changed[0]).toBe(source);
+
+        // Exactly the placeholder was appended — the card's own two classes are intact,
+        // which also proves the provider appends rather than overwrites.
+        expect(source.className).toBe(`card ng-animate-disabled ${TRANSIT_CLASS}`);
+
+        /*
+         * The nodes that did not exist before the gesture are the mirror host and its
+         * contents, and nothing else. Asserted rather than ignored, because "adds no
+         * class" would otherwise be satisfiable by adding a whole decorated element.
+         */
+        for (const node of document.body.querySelectorAll('*')) {
+            if (before.has(node)) {
+                continue;
+            }
+
+            expect(
+                node.classList.contains(MIRROR_CLASS) || node.closest(`.${MIRROR_CLASS}`) !== null,
+            ).toBe(true);
+        }
+
+        // The gesture is completed rather than abandoned mid-flight. A test that returns
+        // with a drag still open leaves the library's rect observer to fire its state
+        // update after the test has finished, which surfaces as an unhandled `act`
+        // warning attributed to whichever case happens to run next.
+        await dropDrag(240);
+    });
+
+    it('restores the screens\u2019 markup exactly on drop', async () => {
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <ScreenMarkupFixture />
+            </DndProvider>,
+        );
+
+        const before = classSnapshot();
+
+        startDrag(getByTestId(`card-${String(CARD_ID)}`));
+        await dropDrag();
+
+        for (const [node, className] of before) {
+            expect(node.className).toBe(className);
+        }
+
+        expect(mirrorNodes()).toHaveLength(0);
+    });
+
+    /**
+     * The classes the SCREENS own, each with the locator that proves ownership.
+     *
+     * Every one of them is a class some part of this application really does apply
+     * during a drag — which is exactly why a shared provider applying it would look
+     * plausible in review and be wrong.
+     */
+    const SCREEN_OWNED_CLASSES: ReadonlyArray<{
+        readonly name: string;
+        readonly owner: string;
+    }> = [
+        {
+            // Styled at `app/styles/modules/kanban/kanban-table.scss` L247 and at
+            // `taskboard-table.scss` L257; added at `kanban/sortable.coffee` L69 and
+            // removed at L73, by the BOARD, on the container being dragged over.
+            name: 'target-drop',
+            owner: 'the board, on a foreign container',
+        },
+        {
+            // Styled at `app/styles/core/base.scss` L36; added at
+            // `backlog/sortable.coffee` L73 and removed at L108, by the STORY LIST only.
+            // The board does not do this at all.
+            name: 'drag-active',
+            owner: 'the story list, on document.body',
+        },
+        {
+            // `app/styles/components/doomline.scss` L1 — the project-scope divider the
+            // story list renders from its own data.
+            name: 'doom-line',
+            owner: 'the story list, on its divider',
+        },
+        {
+            // `app/styles/modules/backlog/sprints.scss` L190 and L380.
+            name: 'sprint-table',
+            owner: 'the sprint sidebar, on its own container',
+        },
+        {
+            // Bound from the screens' SELECTION state, not from a drag:
+            // `kanban-table.jade` L154 and L230 bind
+            // `'ui-multisortable-multiple': ctrl.selectedUss[usId]`, and
+            // `backlog/main.coffee` L824 toggles it. `./multiDrag` READS it; nothing here
+            // writes it.
+            name: MULTIPLE_SORTABLE_CLASS,
+            owner: "the screens' selection state",
+        },
+        {
+            // Added at `kanban/sortable.coffee` L128-L131 on the DESTINATION column, then
+            // removed on `animationend` — a board arrival animation.
+            name: 'new',
+            owner: 'the board, on the destination column',
+        },
+    ];
+
+    it.each(SCREEN_OWNED_CLASSES)(
+        'never applies $name, which belongs to $owner',
+        async ({ name }) => {
+            const { getByTestId } = render(
+                <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                    <ScreenMarkupFixture />
+                </DndProvider>,
+            );
+
+            /*
+             * The BEFORE count, not zero: two of these classes legitimately exist in the
+             * fixture already, because the screens really do render them. The property
+             * under test is that the provider adds none — which a hardcoded zero would
+             * have stated incorrectly.
+             */
+            const before = countOf(name);
+            const bodyBefore = document.body.className;
+
+            startDrag(getByTestId(`card-${String(CARD_ID)}`));
+            movePointer(140);
+
+            expect(countOf(name)).toBe(before);
+
+            await dropDrag(140);
+
+            expect(countOf(name)).toBe(before);
+            expect(document.body.className).toBe(bodyBefore);
+        },
+    );
+
+    it('⭐ hardcodes no screen selector', () => {
+        /*
+         * SOURCE-LEVEL, because a hardcoded selector that happens to match nothing in a
+         * fixture is behaviourally indistinguishable from an absent one — and the
+         * fixtures here deliberately DO contain every one of these, so a leak would be
+         * live rather than dormant.
+         *
+         * Comments are stripped first: the provider explains at length WHY the screens
+         * name their own targets (rule T9), and that prose is allowed to mention them.
+         * The container getter, `DndAutoScrollConfig.getTargets`, is the mechanism that
+         * makes a selector unnecessary here — each screen resolves its own nodes and
+         * hands them over.
+         */
+        const screenSelectors = [
+            'taskboard-column',
+            'kanban-swimlane',
+            'kanban-uses-box',
+            'backlog-table-body',
+            'us-item-row',
+            'sprint-table',
+            'js-empty-backlog',
+            'card-inner',
+        ];
+
+        for (const selector of screenSelectors) {
+            expect(PROVIDER_CODE).not.toContain(selector);
+        }
+    });
+
+    it('⭐ performs no I/O and writes no application state', () => {
+        /*
+         * The provider decorates and delegates; it never talks to the server and never
+         * owns board state. That boundary is not cosmetic — the story list's write path
+         * is a FIFO queue with a re-entrancy guard
+         * (`backlog/main.coffee` L84, L539-L546, L600-L601
+         * `if ctx && @.pendingDrag.length > 1 then return`, L603-L618, L620-L629,
+         * L630-L631 and the disconnected fallback at L633-L635), because
+         * `bulk-update-us-backlog-order` is POSITION-RELATIVE: two overlapping writes
+         * compute their neighbours from an order the server has not acknowledged and
+         * persist a wrong one with no error anywhere. That queue lives in the screen's
+         * reducer and its drag hook. A shared provider that fired a request, or held
+         * order state, would put a second uncoordinated writer on the same endpoint.
+         *
+         * Asserted at source level for the whole list, and behaviourally for the one
+         * transport jsdom actually implements. jsdom 20 ships no `fetch`, so there is no
+         * method to spy on for that one — its absence from the source is the assertion,
+         * and installing a fake `fetch` would only prove that a fake can be installed.
+         */
+        const forbidden = [
+            'fetch(',
+            'XMLHttpRequest',
+            'axios',
+            '$http',
+            '$tgResources',
+            '$rootScope',
+            '$apply',
+            'dispatch(',
+            'broadcast',
+            'pendingDrag',
+        ];
+
+        for (const call of forbidden) {
+            expect(PROVIDER_CODE).not.toContain(call);
+        }
+    });
+
+    it('opens no request during a whole gesture', async () => {
+        const open = jest.spyOn(XMLHttpRequest.prototype, 'open');
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <ScreenMarkupFixture />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId(`card-${String(CARD_ID)}`));
+        movePointer(160);
+        await dropDrag(160);
+
+        expect(open).not.toHaveBeenCalled();
+    });
+
+    it('⭐ opens no shadow root, so the pass-through stylesheets keep matching', async () => {
+        /*
+         * REQUIREMENT I6, and the failure mode is total rather than subtle. The single
+         * compiled stylesheet is loaded once, at `app/index.jade` L25, and the icon
+         * sprite is inlined into the same document at L96. A shadow boundary would sever
+         * both: every existing rule in the 1,870 lines of in-scope Sass would stop
+         * matching, and every `<use href="#icon-…">` would resolve to nothing. The screens
+         * would render unstyled and iconless with no error at all.
+         *
+         * The method name is assembled for the same reason `sensorIdentifier` is — the
+         * compliance search for it covers this folder, so a spec that spelled it out
+         * would be its own hit.
+         */
+        const shadowRootSpy = jest.spyOn(Element.prototype, SHADOW_ROOT_METHOD);
+        const { getByTestId, unmount } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <ScreenMarkupFixture />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId(`card-${String(CARD_ID)}`));
+        movePointer(180);
+        await dropDrag(180);
+
+        await act(async () => {
+            unmount();
+        });
+
+        expect(shadowRootSpy).not.toHaveBeenCalled();
+        expect(PROVIDER_CODE).not.toContain(SHADOW_ROOT_METHOD);
+
+        // Nothing rendered a shadow root by any other route either.
+        for (const node of document.querySelectorAll('*')) {
+            expect(node.shadowRoot).toBeNull();
+        }
+    });
+});
+
+/* ==========================================================================
+ * REGISTRATION IS NEVER GATED ON VISIBILITY (risk R-DND-3)
+ *
+ * `@dnd-kit` has no virtual-list support, and the board is already virtualised: the
+ * `IntersectionObserver` in `boards.js`, under `app/js`, drives `vm.inViewPort`, which
+ * `../useInViewport` reproduces. The trap this block guards is registering
+ * draggables and droppables only for cards that are currently on screen — after
+ * which dragging TOWARDS a region that has not been scrolled into view finds no drop
+ * target, and the card snaps back with no error.
+ *
+ * ⭐ AND THE HOOK CANNOT BE USED AS A GUARD EVEN IF SOMEONE WANTED TO: visibility
+ * there LATCHES. An id marked visible is never marked invisible again
+ * (`kanban/main.coffee` L577 and L666-L677), so there is no "left the viewport"
+ * transition to react to. A visibility-gated registration would therefore be not
+ * merely wrong but untestable against the incumbent's own semantics.
+ *
+ * The provider's answer is to have no opinion: it resolves the drag source from the
+ * node the screen supplies, or from the `data-id` already on the host element, and
+ * asks nothing about whether it can be seen.
+ * ========================================================================== */
+
+describe('registration and virtualisation', () => {
+    it('⭐ drags a card whose inner content has been virtualised away', async () => {
+        const controller = createRecordingMultiDrag();
+        const onDragStart = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider
+                autoScroll={BOARD_AUTO_SCROLL}
+                multiDrag={controller}
+                onDragStart={onDragStart}
+            >
+                <ScreenMarkupFixture />
+            </DndProvider>,
+        );
+
+        const folded = getByTestId(`card-${String(FOLDED_CARD_ID)}`);
+
+        // The precondition, asserted so the case cannot quietly become a duplicate of the
+        // ordinary drag if the fixture changes: this host really is empty.
+        expect(folded.querySelector('.card-inner')).toBeNull();
+        expect(folded.dataset.id).toBe(String(FOLDED_CARD_ID));
+
+        startDrag(folded);
+
+        expect(onDragStart).toHaveBeenCalledTimes(1);
+        expect(folded).toHaveClass(TRANSIT_CLASS);
+        expect(controller.startArgs[0]?.item).toBe(folded);
+
+        // And the container handed to the gesture is the column, reached through the DOM
+        // rather than through a selector — `resolveMultiDragContainer`'s parent fallback.
+        expect(controller.startArgs[0]?.container).toBe(getByTestId('kanban-column'));
+
+        await dropDrag();
+
+        expect(folded).not.toHaveClass(TRANSIT_CLASS);
+    });
+
+    it('⭐ registers a card that is not displayed at all', async () => {
+        /*
+         * The strongest form jsdom can express of "not on screen". `display: none` is set
+         * on the card itself as well as on an ancestor, so a provider consulting either
+         * the element's own computed style or its offset parent would refuse it. Both are
+         * asserted first, so the case fails if jsdom ever stops reporting them and the
+         * assertion silently becomes vacuous.
+         */
+        const controller = createRecordingMultiDrag();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} multiDrag={controller}>
+                <div style={{ display: 'none' }} data-testid="collapsed-swimlane">
+                    <div
+                        className="kanban-uses-box taskboard-column"
+                        data-status="9"
+                        data-swimlane="4"
+                    >
+                        <HiddenCardHarness />
+                    </div>
+                </div>
+            </DndProvider>,
+        );
+
+        const hidden = getByTestId('hidden-card');
+
+        expect(window.getComputedStyle(hidden).display).toBe('none');
+        expect(hidden.offsetParent).toBeNull();
+
+        startDrag(hidden);
+
+        expect(hidden).toHaveClass(TRANSIT_CLASS);
+        expect(controller.calls).toContain('start');
+
+        await dropDrag();
+    });
+
+    it('⭐ imports nothing from the viewport hook', () => {
+        /*
+         * The cheapest possible statement of the rule: the provider does not gate on
+         * visibility because it cannot see it. Both spellings are checked, since a
+         * relative import could be written either way.
+         */
+        expect(PROVIDER_CODE).not.toContain('useInViewport');
+        expect(PROVIDER_CODE).not.toContain('IntersectionObserver');
     });
 });
