@@ -8,202 +8,89 @@
 
 module = angular.module("taigaKanban")
 
-#############################################################################
-## React bridge -- the AngularJS -> React coexistence seam for the Kanban board.
-##
-## 1. WHAT THIS FILE IS
-## A strangler-fig seam, not a rewrite. `KanbanController`
-## (`app/coffee/modules/kanban/main.coffee:68`, registered at `:730`) is RETAINED
-## IN FULL as the data, permission, realtime and write layer; only the view-layer
-## directives that file used to register are retired. This file adds exactly ONE
-## injectable, `tgKanbanReactBridge`, whose single `build(ctrl)` call produces the
-## `{component, params, events}` payload published on `ctrl.reactBoard`
-## (`main.coffee:185`). `app/partials/kanban/kanban.jade` hosts it as
-##     tg-react-loader(tg-load-element="ctrl.reactBoard")
-## and `component: 'kanban-board'` is the key `app/react/bridge/registry.ts`
-## resolves to `app/react/kanban/KanbanBoard.tsx`. Precedent for the entire
-## hand-off: `app/modules/components/project-menu/project-menu.jade:9-12` driven
-## by `project-menu.controller.coffee:24-33`.
-##
-## This file holds no view logic, no transport, no realtime listener and no state
-## machine. Every behaviour it exposes already exists on the retained controller;
-## the only thing added here is the crossing.
-##
-## 2. WHY A FACTORY AND NOT A DIRECTIVE
-## `main.coffee` names `"tgKanbanReactBridge"` as the 24th and LAST entry of the
-## controller's `@.$inject` list (`:105`) and takes it as the last constructor
-## parameter (`:126`). Only a service/factory is injectable under that exact name:
-## a directive of the same name is published to the injector as
-## `tgKanbanReactBridgeDirective`, so AngularJS would raise
-## `[$injector:unpr] Unknown provider: tgKanbanReactBridgeProvider` and abort
-## linking the whole `ng-view` subtree -- taking the project rail and the page
-## title down with the board. That `$inject` list maps POSITIONALLY, which is why
-## the entry sits at the END of it: inserting it anywhere else would silently
-## misbind all 23 pre-existing services, with no error raised at all.
-##
-## Bundle order is deliberately irrelevant here. `gulpfile.js`
-## `paths.coffee_order` concatenates `coffee/modules/kanban/*.coffee`
-## alphabetically, so `main.coffee` is emitted BEFORE `react-bridge.coffee` and the
-## controller declares a dependency on a name that is registered later in the same
-## bundle. That is safe because AngularJS resolves dependencies lazily at
-## INSTANTIATION time, never at registration time. Do not "fix" the order by
-## renaming this file.
-##
-## 3. THE MODULE HANDLE ON LINE 9 MUST NEVER GAIN A SECOND ARGUMENT
-## Line 9 RETRIEVES the existing `taigaKanban` module. The declaring call -- the
-## one that passes the empty dependency array -- belongs to
-## `app/coffee/modules/kanban.coffee:9`. Passing `[]` from here as well would RESET
-## that module, and because `paths.coffee_order` concatenates
-## `coffee/modules/taskboard/*.coffee` (L147) BEFORE
-## `coffee/modules/kanban/*.coffee` (L148), the reset would silently detach the
-## OUT-OF-SCOPE taskboard's `tgTaskboardIssues`
-## (`taskboard/taskboard-issues.coffee:81`) and `tgTaskboardTasks`
-## (`taskboard/taskboard-tasks.coffee:157`), along with everything
-## `admin/lightboxes.coffee:13` hangs off the same handle. The breakage would
-## appear at bootstrap, in a screen this migration never touches.
-##
-## 4. DOM PROPERTIES, NOT ATTRIBUTES
-## `tgLoadElement` (`app/coffee/modules/base/load-element.coffee:17-39`, on module
-## `taigaBase`) is REUSED VERBATIM and MUST NOT BE MODIFIED. It assigns
-## `.component` (`:24`, unconditionally), `.params` (`:26-27`) and `.events`
-## (`:29-30`) onto the host element as PROPERTIES. Attributes stringify their
-## values; properties do not, so nested objects AND callback functions cross the
-## framework boundary structurally intact -- that is the entire trick, and it is
-## why nothing here is ever serialised. Because `:26-27` and `:29-30` are
-## truthiness-gated while `:24` is not, `params` and `events` below are ALWAYS
-## emitted as real objects: never `null`, never `undefined`, never conditionally
-## omitted.
-##
-## The React root mounts in LIGHT DOM only. A shadow root would sever the single
-## global stylesheet loaded at `app/index.jade:25` and break `<use href="#icon-add">`
-## against the sprite inlined at `app/index.jade:96`.
-##
-## 5. BUILT ONCE -- AND THE COROLLARY THAT MAKES THAT RULE SAFE
-## The watch expression at `load-element.coffee:19` takes NO third argument, so
-## `objectEquality` is false and it compares by REFERENCE IDENTITY. Re-running
-## `build(ctrl)` on any digest-frequency path would therefore re-fire that watcher
-## on every digest, re-assign all three properties and drive React into a
-## continuous re-render loop. It is called exactly ONCE, at the end of the
-## controller constructor, and the object it returns is never rebuilt.
-##
-## COROLLARY -- read it together with the rule above, or the rule above is
-## dangerously misleading: because that comparison is reference identity, MUTATING
-## `params` IN PLACE PRODUCES NO NOTIFICATION AT ALL. "Build once and mutate"
-## would hand React a stable reference with no change channel. This payload is
-## therefore a ONE-TIME HAND-OFF, NOT A STATE STREAM, and no change-notification
-## machinery is built here: no watcher, no event-bus relay, no emitter, no
-## observable. React re-reads live state through the accessor callbacks in
-## `events` -- stable function references, so the payload's identity never changes,
-## yet each call reads current controller and scope state -- and otherwise obtains
-## data through `useAngularService('$tgResources')` and its own `useRealtime` hook.
-## The only sanctioned post-mount push precedent in this repository is
-## `app/coffee/app.coffee:975-979`; do not invent another channel.
-##
-## `build` also runs BEFORE `loadInitialData()` (`main.coffee:678`) has resolved,
-## so `params` is an honest CONSTRUCTION-TIME SNAPSHOT: whatever the async load
-## chain has not populated yet is empty or absent in it. That is exactly what
-## `params` is for -- the first frame -- and it is why every value React needs to
-## keep current is ALSO reachable through an accessor in `events`.
-##
-## 6. FLATTENING AT THE BOUNDARY
-## No persistent collection (immutable.js `Map`/`List`) and no `$tgModel` instance
-## may cross the seam: immer rejects class instances, and `$tgModel` carries the
-## dirty-tracking state that makes changed-fields-only PATCH work, which React
-## must never touch. Everything is flattened here by `toPlain` below -- `.toJS()`
-## for persistent collections, `.getAttrs()` for `$tgModel`
-## (`app/coffee/modules/base/model.coffee:48`) -- following the house precedent at
-## `project-menu.controller.coffee:27` and `:21`, and at `kanban/main.coffee:661`.
-##
-## Unwrapping alone is not sufficient, so `stripAngularPrivates` then copies the
-## result and drops AngularJS's own `$$`-prefixed bookkeeping from it. Two reasons,
-## both spelled out at that function: `ng-repeat` stamps `$$hashKey` onto the
-## objects it iterates, and immer's `autoFreeze` would freeze whatever React keeps
-## -- freezing an object AngularJS still repeats over makes the next digest throw.
-## The seam therefore hands over plain, clean, freshly allocated JSON values.
-##
-## The AngularJS-side structures are deliberately LEFT ALONE. `usByStatus`,
-## `usMap`, `usByStatusSwimlanes` and `swimlanesList` stay persistent on the scope
-## (`main.coffee:144-154`) because out-of-scope consumers depend on their `.size`
-## and `.getIn()` contracts: `kanban.jade:17` switches the `swimlane` class on
-## `swimlanesList.size`, and `app/modules/components/card/card.controller.coffee:31`
-## reads the same property from the shared card component the taskboard also
-## renders (rule T4). They are flattened ONLY here, at this seam.
-##
-## 7. WHAT MUST NOT MOVE INTO REACT
-## Every read and write still goes through `$tgResources` / `$tgRepo` on the
-## retained controller, so the `Authorization: Bearer` header
-## (`app/coffee/modules/base/http.coffee:20-23`), the `X-Session-Id` header
-## (`app/coffee/app.coffee:590-602`), the single-flight 401 refresh, the
-## 400-with-`version` VERSION_ERROR toast, the 451 blocking interceptor, the
-## status-0 connection-error path and -- most importantly -- `$tgModel`'s
-## changed-fields-only PATCH carrying its optimistic-concurrency `version` are all
-## INHERITED rather than re-derived. A hand-rolled transport would begin sending
-## whole objects and turn every concurrent edit into a potential silent lost
-## update, which is a data-integrity regression rather than a stylistic one.
-##
-## Realtime also stays where it is: the controller's own handlers
-## (`main.coffee:341`) cover `changes.project.<id>.userstories` and
-## `changes.project.<id>.projects` -- those two routing keys only -- and this file
-## opens no realtime channel of its own. React must never force an AngularJS
-## digest by hand; digest cycles remain AngularJS's concern and React state is
-## driven by React. Several delegations below hand back `$q` promises, which the
-## React side marshals through `app/react/bridge/toNativePromise.ts` at the call
-## site rather than consuming directly.
-##
-## Teardown is not this file's business either. `load-element.coffee:32-33` only
-## releases its own watcher and performs NO property cleanup, so
-## `disconnectedCallback` on the host element alone owns unmounting the React root.
-## Nothing here tears React down or clears `ctrl.reactBoard`.
-##
-## 8. COORDINATION NOTES -- SURFACED HERE, DECIDED ELSEWHERE
-## (a) `app-loader/app-loader.coffee:110-114` still chains
-##     `elements.js -> app.js -> angular.bootstrap` with no `js/react.js` step. Until
-##     that load is inserted between `:111` and `:112`, the element definition runs
-##     after `angular.bootstrap`, `tg-react-loader` is an inert unknown element,
-##     `tgLoadElement` still assigns the three values as plain expando properties,
-##     NOTHING THROWS, and the board renders BLANK. Check that first for an empty
-##     board. That file belongs to another agent and is not edited from here.
-## (b) Component ownership is unresolved upstream: the plan states that
-##     `tg-kanban-board-zoom`, `tgInputSearch` and `tg-filter` stay AngularJS and are
-##     bridged to rather than reimplemented, yet all three sit inside the region
-##     (`kanban.jade:38-41`, `:44-46`, `:52-62`) that is replaced by a single
-##     `tg-react-loader`. This file deliberately does not pick a side: it exposes
-##     EVERY toolbar and filter method so either resolution works unchanged.
-## (c) `kanban.jade:56` carries a pre-existing duplicate attribute whose expression
-##     is broken (`ctl` instead of `ctrl`). It is left exactly as it is, and no alias
-##     is added here to compensate for it.
-#############################################################################
+# The AngularJS -> React seam for the Kanban board. `KanbanController` remains the
+# data, permission, realtime and write layer; this factory only publishes the
+# `{component, params, events}` payload that `tgLoadElement` assigns onto the host
+# element as DOM PROPERTIES. Properties, not attributes, is the whole trick:
+# attributes stringify their values, so only properties carry nested objects and
+# callbacks across the boundary intact. The React root mounts in light DOM, because
+# a shadow root would sever the global stylesheet cascade and break `<use>`
+# references into the sprite inlined in the document.
+#
+# The payload is a ONE-TIME HAND-OFF, not a state stream. `tgLoadElement` watches it
+# by reference identity, so rebuilding it re-renders React on every digest while
+# mutating it in place notifies nothing at all. `params` is therefore an honest
+# construction-time snapshot and every value that has to stay current is also
+# reachable through an accessor in `events`.
+#
+# Nothing that is not plain JSON may cross: persistent collections and models are
+# flattened here, because a model carries the dirty-tracking state that makes
+# changed-fields-only PATCH work. The AngularJS-side structures stay persistent on
+# the scope, since out-of-scope consumers depend on their `.size` and `.getIn()`
+# contracts.
+#
+# It is a factory rather than a directive because the controller injects it by this
+# exact name; a directive would be published as `…Directive` and the injector would
+# fail to link the whole view subtree.
 
-# Hand React a COPY with AngularJS's own private bookkeeping removed. Two
-# distinct hazards make this step mandatory rather than cosmetic:
-#
-# (a) `ng-repeat` WITHOUT a `track by` stamps a `$$hashKey` onto every object it
-#     iterates, and `kanban-table.jade:17` repeats over `usStatusList`, so the
-#     status objects reachable from the scope carry one. `$$`-prefixed properties
-#     are AngularJS internals scoped to a digest. As React props they are dead
-#     weight that also makes two otherwise identical status objects compare
-#     unequal, defeating the `React.memo` reference checks that replace
-#     immutable.js change detection.
-# (b) Sharing the very objects AngularJS is still rendering is worse than untidy.
-#     immer keeps `autoFreeze` ON, so anything entering React state is
-#     `Object.freeze`d -- and the next `ng-repeat` pass over a now-frozen object
-#     throws "Cannot add property $$hashKey, object is not extensible". Handing
-#     over a copy removes that failure mode instead of leaving it latent.
-#
-# `angular.toJson` is reused rather than hand-rolling a walk because it already
-# implements exactly this policy: it drops `$$`-prefixed keys at EVERY depth, and
-# it substitutes a sentinel for a window, a document or a `$scope` instead of
-# serialising it -- which makes "never pass a `$scope` or a DOM node across the
-# seam" structurally impossible here rather than merely documented.
+# A copy with AngularJS's private `$$` bookkeeping removed, which is mandatory
+# rather than cosmetic: `ng-repeat` without a `track by` stamps `$$hashKey` onto
+# every object it iterates, and anything React freezes would then make the next
+# repeat pass throw. `angular.toJson` is reused because it already drops `$$` keys
+# at every depth and substitutes a sentinel for a window, a document or a scope,
+# which makes passing one of those across the seam structurally impossible.
 stripAngularPrivates = (value) ->
     return value if not angular.isObject(value)
     json = angular.toJson(value)
-    # `angular.toJson` yields undefined only for input JSON cannot represent at
-    # all. Returning the value unchanged is then strictly better than handing
-    # React nothing, and it cannot arise for the plain server-shaped data this
-    # seam moves -- every params value is asserted JSON-serialisable at runtime.
     return value if not json?
     return angular.fromJson(json)
+
+# MEMO FOR THE PERSISTENT-COLLECTION BRANCH OF `toPlain` BELOW.
+#
+# WHY THIS EXISTS. The four board projections are read through live accessors in
+# `events`, so `getUsByStatus()` and its siblings are called whenever React needs
+# the current board -- and each call used to walk the whole projection twice, once
+# to flatten it and once more through `angular.toJson`/`angular.fromJson`. On a
+# real board that is O(board-size) allocation per read, and worse, EVERY read
+# handed back a fresh deep object graph. Fresh identities are exactly what
+# `React.memo` cannot see through, so the structural sharing that replaces
+# immutable.js change detection (`P-IMMER-4`) was being thrown away at the seam
+# that exists to preserve it.
+#
+# WHY KEYING ON SOURCE IDENTITY IS SOUND HERE, AND ONLY HERE. Every value reaching
+# this cache is a PERSISTENT collection -- the branch is guarded on `.toJS()`
+# existing. `taiga.defineImmutableProperty` (`app/coffee/utils.coffee:177-190`)
+# refuses to publish anything else: its getter throws
+# "defineImmutableProperty must return immutable data" for an object with no
+# `.size`, which is what guarantees that `usByStatus`, `usMap`,
+# `usByStatusSwimlanes` and `swimlanesList` (`main.coffee:144-154`) really are
+# persistent. A persistent collection is never mutated in place: any change
+# produces a NEW object. Its identity therefore IS its version, and that is the
+# explicit invalidation -- a changed collection arrives as a cache MISS by
+# construction, with no version counter to maintain and nothing to remember to
+# call. `foldedSwimlane` qualifies for the same reason (`Immutable.Map` at
+# `main.coffee:132`, replaced wholesale at `:680`).
+#
+# WHY THE OTHER TWO BRANCHES ARE DELIBERATELY NOT MEMOISED. A `$tgModel` instance
+# mutates its own attributes in place (`base/model.coffee`), and a plain scope
+# object can be mutated in place by AngularJS as well, so for those two the
+# identity says nothing about the contents and a cache would serve a stale copy.
+# They keep converting on every read, which is exactly what they do today: this
+# change removes repeated work without changing what any value converts to.
+#
+# A `WeakMap` rather than a `Map`, so a superseded collection is collected with its
+# copy and the cache cannot grow without bound over a long session. One per
+# `build(ctrl)` call, so two screens never share it.
+createImmutableSnapshotCache = () ->
+    cache = new WeakMap()
+
+    return (collection) ->
+        cached = cache.get(collection)
+        return cached if cached isnt undefined
+
+        snapshot = stripAngularPrivates(collection.toJS())
+        cache.set(collection, snapshot)
+        return snapshot
 
 # Flatten one value at the seam. Persistent collections expose `.toJS()`;
 # `$tgModel` instances expose `.getAttrs()` (`base/model.coffee:48`). The order
@@ -211,156 +98,357 @@ stripAngularPrivates = (value) ->
 # `.toJS()`, so at most one branch can ever apply. Whatever the unwrapping
 # produces is then copied and cleaned by `stripAngularPrivates` above. Plain
 # scalars, including `0`, `false` and `""`, fall through untouched.
-toPlain = (value) ->
+#
+# The persistent branch answers from `snapshotOf`, so an unchanged collection is
+# converted ONCE and every later read returns the same object -- see
+# `createImmutableSnapshotCache` for why that is sound for this branch alone. The
+# conversion itself is unchanged: the same `.toJS()`, the same deep copy and the
+# same `$$`-stripping, on the same values.
+toPlain = (snapshotOf, value) ->
     return value if not value?
-    return stripAngularPrivates(value.toJS()) if angular.isFunction(value.toJS)
+    return snapshotOf(value) if angular.isFunction(value.toJS)
     return stripAngularPrivates(value.getAttrs()) if angular.isFunction(value.getAttrs)
     return stripAngularPrivates(value)
 
 # Flatten a plain AngularJS array whose members may be models. Anything that is
 # not an array -- most often a collection the async load chain has not populated
 # yet -- becomes an empty array, so React never has to guard a `.map()`.
-toPlainList = (list) ->
+#
+# The ARRAY itself is not memoised, and must not be: it is a plain JavaScript
+# array on the scope, so AngularJS can push into it in place and its identity says
+# nothing about its contents. Its persistent MEMBERS, if any, still come from the
+# cache through `toPlain`.
+toPlainList = (snapshotOf, list) ->
     return [] if not angular.isArray(list)
-    return (toPlain(item) for item in list)
+    return (toPlain(snapshotOf, item) for item in list)
 
-# Read the project's permission list. The contents are passed through EXACTLY as
-# the server sent them: React evaluates its own gates (`add_us`, `modify_us`,
-# `view_milestones`, ...) from this array of permission codenames, the same way
-# `tg-check-permission` and `tg-class-permission` do today. No pre-computed
-# booleans are invented here. Copied with `slice` for the same reason as
-# `stripAngularPrivates` above -- the members are plain strings, so no deeper walk
-# is warranted, but the array itself must not be the one AngularJS still holds.
 toMyPermissions = (project) ->
     return [] if not project or not angular.isArray(project.my_permissions)
     return project.my_permissions.slice()
 
+# Resolve the PLAIN USER-STORY ATTRIBUTES that the retained `moveUsToTop` reads --
+# `us.id`, `us.status` and `us.swimlane` (`main.coffee:241-266`) -- out of whatever
+# the React side hands over.
+#
+# ⭐ THIS EXISTS BECAUSE `moveToTopDropdown` CANNOT BE DELEGATED VERBATIM. The
+# retained method is `@.moveUsToTop(us.toJS().model)` (`main.coffee:239-240`): it
+# takes an IMMUTABLE card straight out of `usMap` and unwraps it in TWO steps --
+# `.toJS()` for the persistent collection, then `.model` for the story attributes
+# nested inside the card (`kanban-usertories.coffee:307` is where that member is
+# written). §6 of the header flattens `usMap` AT THIS SEAM, so the value React
+# holds is the ALREADY-`toJS()`-ed card and the first step has already happened.
+# Calling the Immutable-only wrapper with it would throw
+# `us.toJS is not a function` the first time a card's "move to top" action is
+# used -- a crash inside the retained controller, reported from a line that names
+# neither this file nor React. The SECOND unwrapping step is still required, and
+# it is performed here.
+#
+# Accepts either shape so no call site can get it wrong: a flattened card, which
+# carries `.model`, or the story attributes themselves. `moveUsToTop` and the
+# `moveUs` it delegates to are safe with plain attributes -- `moveUs` re-resolves
+# every live `$tgModel` by id at `main.coffee:695-696` -- which is why no model
+# lookup is needed on this path, unlike the backlog seam.
+toStoryAttrs = (card) ->
+    return null if not angular.isObject(card)
+    return card.model if angular.isObject(card.model)
+    return card
 
-# No injected services: every value and every behaviour this bridge publishes
-# already lives on the controller instance handed to `build`. With no injectable
-# parameters there is nothing for a minifier to rename, so the plain function form
-# is registered rather than an inline array annotation -- the same reason
-# `main.coffee:730` registers its controller without one.
-KanbanReactBridgeFactory = () ->
+# Register a React handler for an AngularJS event on the CONTROLLER'S scope and
+# hand back AngularJS's own deregistration function.
+#
+# ⭐ THE WRAPPER IS THE POINT, NOT CEREMONY. `$scope.$on` invokes its listener as
+# `(event, payloadArgs...)`, so passing a React handler straight through would (a)
+# hand React AngularJS's event object -- which carries `targetScope` and
+# `currentScope` references and would put a live `$scope` on the React side of the
+# seam, the one thing §6 forbids most firmly -- and (b) SHIFT every real payload
+# argument by one position, silently. The wrapper drops the event object and
+# forwards only the payload, flattened by the seam's single `toPlain` helper so no
+# persistent collection and no `$tgModel` can cross either.
+#
+# Returning the deregistration function is equally load-bearing: React MUST call
+# it from its `useEffect` cleanup, and a leak here is silent -- it surfaces only as
+# duplicated work after navigating away and back.
+#
+# The four events `app/react/kanban/hooks/useWipLimit.ts` subscribes to, matching
+# the retired `KanbanWipLimitDirective` (`main.coffee:1097-1100`) event for event,
+# all reach THIS scope:
+#   * `redraw:wip` -- `@scope.$broadcast` on this very scope (`main.coffee:272`,
+#     `:283`, `:429`, `:492`, `:724`); `$broadcast` fires the emitting scope's own
+#     listeners as well as its descendants'.
+#   * `kanban:us:move` -- `$rootscope.$broadcast` (`sortable.coffee:341`), which
+#     propagates DOWN through this scope.
+#   * `usform:new:success` / `usform:bulk:success` -- `$rootscope.$broadcast` from
+#     the shared lightbox (`common/lightboxes.coffee:375`), same downward path.
+# `$emit` would NOT be observable here, which is exactly why
+# `app/react/bridge/useTranslate.ts` reaches the root scope through its own named
+# accessor instead of through this channel.
+registerAngularEvent = ($scope, eventName, handler) ->
+    return angular.noop if not angular.isFunction(handler)
+
+    deregister = $scope.$on eventName, (event, args...) ->
+        handler.apply(null, (toPlain(arg) for arg in args))
+
+    return deregister
+
+# One prefix for every refusal this file can emit, so a denied action is greppable
+# and cannot be mistaken for an application error.
+DENIED_PREFIX = "[tgKanbanReactBridge]"
+
+# Log a refusal WITHOUT logging what was refused beyond the permission name.
+# Deliberately no ids, no story data, no user data and no project payload: a
+# console diagnostic is readable by anyone with the page open, so it carries the
+# rule that fired and nothing that could identify a record or a person.
+denied = (action, reason) ->
+    console.warn("#{DENIED_PREFIX} #{action} refused: #{reason}.")
+    return false
+
+
+#############################################################################
+## AUTHORIZATION AT THE SEAM -- WHY IT LIVES HERE
+##
+## `.events` is assigned onto the host element as a DOM PROPERTY
+## (`load-element.coffee:29-30`). Anything holding a reference to that element
+## can therefore invoke any callback on it directly, with arguments of its own
+## choosing, and nothing in React is in the call path. Hiding a React control is
+## presentation, not protection.
+##
+## The incumbent markup gated each control declaratively, and those gates are
+## reproduced here VERBATIM rather than reinvented -- same permission codenames,
+## same service, same archived-project semantics:
+##
+##   `tg-check-permission="add_us"`   kanban-table.jade:34, :43 (also `ng-hide`
+##                                    on an archived status)
+##   `tg-check-permission="modify_us"` us-edit-popover.jade edit / move-to-top
+##   `tg-check-permission="delete_us"` us-edit-popover.jade delete
+##
+## `tgCheckPermission` renders through `projectService.canEdit(permission)`
+## (`common.coffee:86-89`), and `canEdit` is `false` for an ARCHIVED project
+## before it even looks at the permission
+## (`app/modules/services/project.service.coffee:107-110`):
+##
+##     isArchived: () -> @._project.get('archived_code')
+##     canEdit: (permission) ->
+##         return false if this.isArchived()
+##         return this.hasPermission(permission)
+##
+## So delegating to `canEdit` gets BOTH gates from one call, and gets them LIVE:
+## `tgProjectService` holds the current project, so a permission revoked or a
+## project archived after this payload was built is honoured on the next call.
+## Reading `$scope.project.my_permissions` instead would read a snapshot.
+##
+## The screen-level feature gate is checked too. `loadProject` (`main.coffee:663`
+## -`:664`) sends the user to the permission-denied view when
+## `is_kanban_activated` is false, but that only governs NAVIGATION; a callback
+## invoked directly needs the check itself.
+##
+## Finally every id is resolved against the controller's OWN collections before
+## it is used. `editUs`/`deleteUs` call `getUs(id).set(...)` and
+## `changeUsAssignedUsers` calls `getUsModel(id)` (`main.coffee:374`, `:393`,
+## `:435`), so an unknown id currently throws a raw TypeError from inside
+## AngularJS; an id belonging to ANOTHER project would be worse, because it would
+## be forwarded to a write. `usMap` is keyed by NUMERIC id
+## (`kanban-usertories.coffee:64`, `:150`, `:282`-`:283`), which is why the
+## helpers below normalise before looking up.
+##
+## WHAT IS DELIBERATELY NOT GATED, ENUMERATED SO THE OMISSION IS AUDITABLE:
+##
+##   * every `get*` accessor -- they expose exactly what the screen already
+##     renders to the user who is looking at it, they perform no write, and
+##     gating them would break the board for a viewer with read-only
+##     permissions, which the incumbent supports;
+##   * the view-state toggles `setZoom`, `toggleFold`, `toggleSwimlane`,
+##     `toggleSelectedUs`, `cleanSelectedUss`, `toggleOpenFilter`, and the
+##     `showPlaceHolder` / `isUsInArchivedHiddenStatus` predicates;
+##   * the filter callbacks `changeQ`, `addFilter`, `removeFilter`,
+##     `saveCustomFilter`, `selectCustomFilter`, `removeCustomFilter`.
+##
+## The last two groups do persist -- `toggleSwimlane` writes swimlane fold modes
+## through `rs.kanban.storeSwimlanesModes` (`main.coffee:429`) and the custom
+## filters go through `tgFilterRemoteStorageService` -- but what they persist is
+## PER-USER interface preference, not project data: it is stored against the
+## calling user, it changes nothing another member can observe, and the incumbent
+## markup carries no permission attribute on any of these controls. Gating them
+## would be a behaviour change, not a hardening (rule T10).
+#############################################################################
+KanbanReactBridgeFactory = (projectService) ->
     service = {}
 
-    # `ctrl` is the live `KanbanController` instance. Called exactly once, from the
-    # end of its constructor (`main.coffee:185`) -- see §5 on why it is never called
-    # again. Reads from `ctrl`, closes over it, and mutates nothing on it.
     service.build = (ctrl) ->
         if not ctrl or not ctrl.scope
-            # Fail loudly instead of returning a falsy payload. A `null` return would
-            # leave `ctrl.reactBoard` falsy, the watch expression at
-            # `load-element.coffee:19` would never see a truthy value, the host
-            # element would keep its default properties and the board would render
-            # EMPTY WITH NO ERROR -- precisely the silent failure mode this seam is
-            # most exposed to. The one sanctioned call site always passes the live
-            # controller, so this branch is unreachable in normal operation and
-            # exists to make a contract breach diagnosable at its origin.
+            # Throw rather than return a falsy payload: the watcher would never see a
+            # truthy value, the host element would keep its default properties, and
+            # the board would render empty with no error anywhere.
             throw new Error(
                 "tgKanbanReactBridge.build() requires the KanbanController instance and its scope")
 
         $scope = ctrl.scope
 
+        # One cache per screen, closed over by every accessor below, so a board
+        # projection that has not changed is converted once and read back with a
+        # STABLE identity for as long as it stands. See
+        # `createImmutableSnapshotCache` for why source identity is a sound key for
+        # the persistent branch and for no other. It holds nothing until the first
+        # read and, being weakly keyed, releases each entry when the collection it
+        # copied is superseded.
+        snapshotOf = createImmutableSnapshotCache()
+
+        # ---------------------------------------------------------------------
+        # GUARD HELPERS. All four read LIVE state on every call, so a permission
+        # revoked, a project archived or a story deleted after this payload was
+        # built is honoured immediately. None of them throws: a refused action
+        # returns a falsy value and warns, which is what a hidden control does
+        # today -- nothing happens.
+        # ---------------------------------------------------------------------
+
+        # The screen-level feature gate of `main.coffee:663`-`:664`, evaluated
+        # per call rather than once at load.
+        kanbanEnabled = ->
+            project = projectService.project
+            return true if not project           # not loaded yet: no basis to refuse
+            return project.get('is_kanban_activated') != false
+
+        # `tgCheckPermission`'s own test (`common.coffee:88`), which is archived
+        # -project-then-permission (`project.service.coffee:107`-`:110`).
+        #
+        # FAILS CLOSED WHEN THE PROJECT IS NOT LOADED. `projectService.project` is
+        # null until `setProject` runs (`project.service.coffee:22`, `:77`), and a
+        # mutation whose permission set is unknown cannot be authorised -- so it is
+        # refused rather than allowed through. This is also what keeps `canEdit`
+        # from being called on a null project, where `@._project.get(...)` would
+        # throw. In practice the project is always loaded long before any user
+        # interaction, because the board does not render without it.
+        allowed = (action, permission) ->
+            project = projectService.project
+            return denied(action, "the project is not loaded yet") if not project
+            return denied(action, "the kanban module is disabled for this project") if not kanbanEnabled()
+            return true if projectService.canEdit(permission)
+            return denied(action, "'#{permission}' is not granted, or the project is archived")
+
+        # Resolve a user-story id against the controller's OWN map. Returns the
+        # NORMALISED numeric id, or NULL when the id is not one this board holds --
+        # which covers a malformed id, a stale id and an id from another project.
+        # `usMap` is keyed by numeric id, so the coercion is required for the lookup
+        # to hit at all.
+        canonicalUsId = (action, usId) ->
+            usMap = $scope.usMap
+            if not usMap
+                denied(action, "the board has no user-story map yet")
+                return null
+            id = Number(if angular.isObject(usId) then usId.id else usId)
+            if not _.isFinite(id)
+                denied(action, "the user-story id is not a number")
+                return null
+            if not usMap.get(id)
+                denied(action, "that user story is not on this board")
+                return null
+            return id
+
+        # Every id in a list, or null if ANY of them fails. All-or-nothing on
+        # purpose: a partially validated list would still be written, and the write
+        # is position-relative, so persisting a subset of a multi-card move
+        # reorders the board in a way the user never asked for.
+        canonicalUsIds = (action, usList) ->
+            return null if not angular.isArray(usList) or usList.length == 0
+            ids = []
+            for us in usList
+                id = canonicalUsId(action, us)
+                return null if not id?
+                ids.push(id)
+            return ids
+
+        # Whether a status id may be used. A NULLISH id is accepted and left
+        # untouched: `addNewUs` is legitimately called with no status from the
+        # toolbar. `requireOpen` additionally rejects an ARCHIVED status,
+        # reproducing `ng-hide="s.is_archived"` on the two add controls
+        # (`kanban-table.jade:35`, `:44`).
+        isCanonicalStatusId = (action, statusId, requireOpen = false) ->
+            return true if not statusId?
+            byId = $scope.usStatusById
+            return denied(action, "the board has no status map yet") if not byId
+            id = Number(statusId)
+            return denied(action, "the status id is not a number") if not _.isFinite(id)
+            status = byId[id]
+            return denied(action, "that status does not belong to this project") if not status
+            return denied(action, "that status is archived") if requireOpen and status.is_archived
+            return true
+
+        # Whether a position anchor may be used. Anchors become
+        # `after_userstory_id` / `before_userstory_id` on the bulk-order write
+        # (`main.coffee:714`), so an anchor that is not on this board persists an
+        # order nobody asked for, silently. Absent anchors are legitimate -- a move
+        # to either end of a column has only one neighbour.
+        isCanonicalAnchor = (action, anchorId) ->
+            return true if not anchorId?
+            return canonicalUsId(action, anchorId)?
+
         return {
-            # Registry key resolved by `app/react/bridge/registry.ts`. Frozen
-            # contract: renaming it detaches the board from its React component.
             component: 'kanban-board'
 
-            # The first-frame snapshot, taken at construction time and never
-            # rebuilt (§5). Anything the async `loadInitialData()` chain
-            # (`main.coffee:678`) has not populated yet is empty here by
-            # definition; the matching accessor in `events` returns the live value
-            # from then on. Every persistent collection and every model is
-            # flattened (§6), so nothing that immer or React would choke on
-            # crosses the seam.
-            #
-            # Status, tag and epic colours, WIP limits and every count travel
-            # inside this data and are NEVER literals here: they come from
-            # `status.color`, `tag[1]`, `epic.color` and `status.wip_limit` per
-            # project, so hard-coding any of them would break every real project
-            # (rule T2).
             params: {
-                # Assigned synchronously at `main.coffee:141`, so this is the one
-                # value guaranteed to be populated when `build` runs.
                 sectionName: $scope.sectionName
 
                 # Already a plain object: `loadProject` (`main.coffee:661`) stores
                 # `@projectService.project.toJS()`. Flattened anyway so the seam
                 # never depends on that staying true.
-                project: toPlain($scope.project)
+                project: toPlain(snapshotOf, $scope.project)
                 myPermissions: toMyPermissions($scope.project)
 
                 # Board taxonomies, sorted and grouped by the controller
                 # (`main.coffee:669-672`).
-                points: toPlainList($scope.points)
-                pointsById: toPlain($scope.pointsById)
-                usStatusList: toPlainList($scope.usStatusList)
-                usStatusById: toPlain($scope.usStatusById)
+                points: toPlainList(snapshotOf, $scope.points)
+                pointsById: toPlain(snapshotOf, $scope.pointsById)
+                usStatusList: toPlainList(snapshotOf, $scope.usStatusList)
+                usStatusById: toPlain(snapshotOf, $scope.usStatusById)
 
                 # The four persistent projections defined at `main.coffee:144-154`.
                 # `kanbanUserstoriesService.reset()` runs first (`:128`), so all
                 # four are real empty collections rather than `undefined`, and
                 # `.toJS()` here yields `{}` / `[]` on the first frame.
-                usByStatus: toPlain($scope.usByStatus)
-                usByStatusSwimlanes: toPlain($scope.usByStatusSwimlanes)
-                usMap: toPlain($scope.usMap)
-                swimlanesList: toPlain($scope.swimlanesList)
-                swimlanes: toPlainList($scope.swimlanes)
-                swimlanesStatuses: toPlain($scope.swimlanesStatuses)
+                usByStatus: toPlain(snapshotOf, $scope.usByStatus)
+                usByStatusSwimlanes: toPlain(snapshotOf, $scope.usByStatusSwimlanes)
+                usMap: toPlain(snapshotOf, $scope.usMap)
+                swimlanesList: toPlain(snapshotOf, $scope.swimlanesList)
+                swimlanes: toPlainList(snapshotOf, $scope.swimlanes)
+                swimlanesStatuses: toPlain(snapshotOf, $scope.swimlanesStatuses)
 
                 # Fold state: a persistent `Map` at `main.coffee:132`, replaced
                 # from stored modes at `:680`. Its persisted form is already plain
                 # -- `:426` stores `@.foldedSwimlane.toJS()` -- so flattening here
                 # hands React exactly the shape the server round-trips.
-                foldedSwimlane: toPlain(ctrl.foldedSwimlane)
+                foldedSwimlane: toPlain(snapshotOf, ctrl.foldedSwimlane)
 
-                # Zoom is driven by `tg-kanban-board-zoom` through
-                # `setZoom(zoomLevel, zoom)` (`main.coffee:209`), which may not have
-                # fired yet when `build` runs.
                 zoom: ctrl.zoom
                 zoomLevel: ctrl.zoomLevel
 
-                # Toolbar and filter state. `openFilter` is initialised at
-                # `main.coffee:129`; the rest are populated by `generateFilters`
-                # (`controllerMixins.coffee:305`, `:316`, `:362`), which the async
-                # load chain triggers.
                 filterQ: ctrl.filterQ
                 openFilter: ctrl.openFilter
-                filters: toPlain(ctrl.filters)
+                filters: toPlain(snapshotOf, ctrl.filters)
                 selectedFilters: ctrl.selectedFilters or []
                 customFilters: ctrl.customFilters or []
             }
 
             # Stable function references, so the payload keeps one identity for the
-            # life of the screen (§5). Accessors read live state on every call;
-            # actions delegate to the retained controller and never reimplement it.
-            # Every callback uses the fat arrow, matching the precedent at
-            # `project-menu.controller.coffee:30`.
+            # life of the screen. Accessors read live state on every call; actions
+            # delegate to the controller and never reimplement it.
             events: {
                 # --- project, taxonomies and permissions ----------------------
-                getProject: => toPlain($scope.project)
+                getProject: => toPlain(snapshotOf, $scope.project)
                 getProjectId: => $scope.projectId
                 getMyPermissions: => toMyPermissions($scope.project)
-                getPoints: => toPlainList($scope.points)
-                getPointsById: => toPlain($scope.pointsById)
-                getUsStatusList: => toPlainList($scope.usStatusList)
-                getUsStatusById: => toPlain($scope.usStatusById)
+                getPoints: => toPlainList(snapshotOf, $scope.points)
+                getPointsById: => toPlain(snapshotOf, $scope.pointsById)
+                getUsStatusList: => toPlainList(snapshotOf, $scope.usStatusList)
+                getUsStatusById: => toPlain(snapshotOf, $scope.usStatusById)
 
                 # --- board data: persistent on the scope, flattened here -------
-                getUsByStatus: => toPlain($scope.usByStatus)
-                getUsByStatusSwimlanes: => toPlain($scope.usByStatusSwimlanes)
-                getUsMap: => toPlain($scope.usMap)
-                getSwimlanes: => toPlainList($scope.swimlanes)
-                getSwimlanesList: => toPlain($scope.swimlanesList)
-                getSwimlanesStatuses: => toPlain($scope.swimlanesStatuses)
-                getFoldedSwimlane: => toPlain(ctrl.foldedSwimlane)
+                getUsByStatus: => toPlain(snapshotOf, $scope.usByStatus)
+                getUsByStatusSwimlanes: => toPlain(snapshotOf, $scope.usByStatusSwimlanes)
+                getUsMap: => toPlain(snapshotOf, $scope.usMap)
+                getSwimlanes: => toPlainList(snapshotOf, $scope.swimlanes)
+                getSwimlanesList: => toPlain(snapshotOf, $scope.swimlanesList)
+                getSwimlanesStatuses: => toPlain(snapshotOf, $scope.swimlanesStatuses)
+                getFoldedSwimlane: => toPlain(snapshotOf, ctrl.foldedSwimlane)
 
-                # --- virtualisation, zoom and transient board state -----------
-                # `usCardVisibility` (`main.coffee:673`) is the id -> boolean latch
-                # the IntersectionObserver fills in; it is handed over by reference
-                # and is READ-ONLY for React, which owns its own visibility state
-                # through `useInViewport`.
                 getUsCardVisibility: => $scope.usCardVisibility or {}
                 getZoom: => ctrl.zoom
                 getZoomLevel: => ctrl.zoomLevel
@@ -371,34 +459,54 @@ KanbanReactBridgeFactory = () ->
                 getMovedUs: => ctrl.movedUs or []
                 getSelectedUss: => ctrl.selectedUss or {}
 
-                # --- filter state ---------------------------------------------
-                # Kanban's own names throughout. The backlog screen calls the
-                # equivalent state something else; the two are NOT unified, because
-                # `kanban.jade` binds `ctrl.openFilter` (`:23`, `:25`, `:29`, `:33`,
-                # `:48`) and nothing else.
                 getFilterQ: => ctrl.filterQ
-                getFilters: => toPlain(ctrl.filters)
+                getFilters: => toPlain(snapshotOf, ctrl.filters)
                 getSelectedFilters: => ctrl.selectedFilters or []
                 getCustomFilters: => ctrl.customFilters or []
                 getOpenFilter: => ctrl.openFilter
 
-                # --- board actions: delegated, never reimplemented ------------
-                # `moveUs` keeps the retained controller's signature VERBATIM
-                # (`main.coffee:692`), including the leading `ctx` -- the AngularJS
-                # event object when the controller is driven from the event bus, and
-                # `null` when it is called directly, exactly as `moveUsToTop` does.
-                # The write it performs is POSITION-RELATIVE: `previousCard` and
-                # `nextCard` become `after_userstory_id` / `before_userstory_id` on
-                # `bulkUpdateKanbanOrder` (`:714`), so an off-by-one in the caller
-                # persists a wrong order with no error surface at all.
+                # `moveUs` keeps the controller's signature verbatim, including the
+                # leading `ctx` -- the event object when it is driven from the event
+                # bus, `null` when it is called directly. Its write is
+                # position-relative: the two neighbour ids become
+                # `after_userstory_id` / `before_userstory_id`, so an off-by-one in
+                # the caller persists a wrong order with no error surface.
                 moveUs: (ctx, usList, newStatusId, newSwimlaneId, index, previousCard, nextCard) =>
+                    return if not allowed("moveUs", "modify_us")
+                    return if not canonicalUsIds("moveUs", usList)?
+                    return if not isCanonicalStatusId("moveUs", newStatusId)
+                    return if not isCanonicalAnchor("moveUs", previousCard)
+                    return if not isCanonicalAnchor("moveUs", nextCard)
                     ctrl.moveUs(ctx, usList, newStatusId, newSwimlaneId, index, previousCard, nextCard)
-                moveUsToTop: (uss) => ctrl.moveUsToTop(uss)
-                moveToTopDropdown: (us) => ctrl.moveToTopDropdown(us)
+                moveUsToTop: (uss) =>
+                    return if not allowed("moveUsToTop", "modify_us")
+                    return if not canonicalUsIds("moveUsToTop", uss)?
+                    ctrl.moveUsToTop(uss)
 
-                # Two arguments, deliberately: the zoom step and the zoom
-                # descriptor. Collapsing them would break `main.coffee:209-229`,
-                # which compares the step and uses the descriptor separately.
+                # NOT a verbatim delegation, and `toStoryAttrs` above documents why in
+                # full: the retained `moveToTopDropdown` unwraps an IMMUTABLE card with
+                # `us.toJS().model` (`main.coffee:239-240`), and the value React holds
+                # was already flattened at this seam, so calling it would throw. The
+                # second unwrapping step is performed here and the plain attributes go
+                # to `moveUsToTop`, which is the method the retained wrapper itself
+                # calls -- so the behaviour is identical, not merely equivalent.
+                moveToTopDropdown: (card) =>
+                    return if not allowed("moveToTopDropdown", "modify_us")
+
+                    story = toStoryAttrs(card)
+
+                    if not story? or not story.id? or not story.status?
+                        # Fail loudly at the seam rather than let an unusable value
+                        # reach the controller, where the symptom would be an
+                        # unreadable failure inside the board's ordering arithmetic.
+                        throw new Error(
+                            "tgKanbanReactBridge: moveToTopDropdown needs the flattened card " +
+                            "or its story attributes, carrying `id` and `status`")
+
+                    return if not canonicalUsId("moveToTopDropdown", story)?
+
+                    ctrl.moveUsToTop(story)
+
                 setZoom: (zoomLevel, zoom) => ctrl.setZoom(zoomLevel, zoom)
 
                 toggleFold: (id) => ctrl.toggleFold(id)
@@ -409,23 +517,55 @@ KanbanReactBridgeFactory = () ->
                 isUsInArchivedHiddenStatus: (usId) => ctrl.isUsInArchivedHiddenStatus(usId)
 
                 # `type` is "standard" or "bulk" (`main.coffee:362-372`); both open
-                # the existing shared lightboxes, which stay AngularJS.
-                addNewUs: (type, statusId) => ctrl.addNewUs(type, statusId)
-                editUs: (id) => ctrl.editUs(id)
-                deleteUs: (id) => ctrl.deleteUs(id)
-                changeUsAssignedUsers: (id) => ctrl.changeUsAssignedUsers(id)
+                # the existing shared lightboxes, which stay AngularJS. Gated on
+                # `add_us` and on the status being an OPEN status of this project,
+                # reproducing `tg-check-permission="add_us"` together with
+                # `ng-hide="s.is_archived"` (`kanban-table.jade:34-35`, `:43-44`).
+                # The original `statusId` is forwarded byte-for-byte once validated,
+                # including when it is absent, because the lightbox payload
+                # distinguishes absent from present.
+                addNewUs: (type, statusId) =>
+                    return if not allowed("addNewUs", "add_us")
+                    return if not isCanonicalStatusId("addNewUs", statusId, true)
+                    ctrl.addNewUs(type, statusId)
+                # `modify_us`: `us-edit-popover.jade` gates the edit control with it.
+                # The id is resolved first because `main.coffee:374` calls
+                # `getUs(id).set(...)`, which throws a raw TypeError on an unknown id.
+                editUs: (id) =>
+                    return if not allowed("editUs", "modify_us")
+                    return if not canonicalUsId("editUs", id)?
+                    ctrl.editUs(id)
+                # `delete_us`, its own permission -- NOT `modify_us`
+                # (`us-edit-popover.jade` delete control).
+                deleteUs: (id) =>
+                    return if not allowed("deleteUs", "delete_us")
+                    return if not canonicalUsId("deleteUs", id)?
+                    ctrl.deleteUs(id)
+                # Reassignment is a write to the story: `modify_us`. `main.coffee:435`
+                # calls `getUsModel(id)` and then `repo.save`, so an unresolvable id
+                # would throw before the save.
+                changeUsAssignedUsers: (id) =>
+                    return if not allowed("changeUsAssignedUsers", "modify_us")
+                    return if not canonicalUsId("changeUsAssignedUsers", id)?
+                    ctrl.changeUsAssignedUsers(id)
 
+                # Read paths. No permission gate -- the incumbent shows the archived
+                # column to anyone who can see the board, and gating reads would
+                # break a read-only member's view. The FEATURE gate and the canonical
+                # status id are still enforced: the id reaches a query
+                # (`main.coffee:607`-`:632`) and a broadcast, so an id from another
+                # project must not be forwarded.
                 loadUserstories: => ctrl.loadUserstories()
-                loadUserStoriesForStatus: (ctx, statusId) => ctrl.loadUserStoriesForStatus(ctx, statusId)
-                hideUserStoriesForStatus: (ctx, statusId) => ctrl.hideUserStoriesForStatus(ctx, statusId)
+                loadUserStoriesForStatus: (ctx, statusId) =>
+                    return if not kanbanEnabled()
+                    return if not isCanonicalStatusId("loadUserStoriesForStatus", statusId)
+                    ctrl.loadUserStoriesForStatus(ctx, statusId)
+                hideUserStoriesForStatus: (ctx, statusId) =>
+                    return if not kanbanEnabled()
+                    return if not isCanonicalStatusId("hideUserStoriesForStatus", statusId)
+                    ctrl.hideUserStoriesForStatus(ctx, statusId)
                 loadSwimlanes: => ctrl.loadSwimlanes()
 
-                # --- toolbar and filter actions -------------------------------
-                # `changeQ`, `addFilter`, `removeFilter`, `selectCustomFilter`,
-                # `saveCustomFilter` and `removeCustomFilter` are mixed into the
-                # controller by `taiga.UsFiltersMixin`
-                # (`controllerMixins.coffee:183-222`) and are reached under kanban's
-                # names, never the backlog variants.
                 changeQ: (q) => ctrl.changeQ(q)
                 addFilter: (newFilter) => ctrl.addFilter(newFilter)
                 removeFilter: (filter) => ctrl.removeFilter(filter)
@@ -433,17 +573,42 @@ KanbanReactBridgeFactory = () ->
                 selectCustomFilter: (filter) => ctrl.selectCustomFilter(filter)
                 removeCustomFilter: (filter) => ctrl.removeCustomFilter(filter)
 
-                # The filter panel's open/closed state lives in the template today
-                # as the inline expression `ctrl.openFilter = !ctrl.openFilter`
-                # (`kanban.jade:23`). That markup is replaced by the React toolbar,
-                # so the same flip is surfaced here rather than duplicated in React,
-                # keeping `.btn-filter`'s `active` class and `.kanban-manager`'s
-                # `expanded` class driven by the one boolean they already read.
-                # Returns the new value.
                 toggleOpenFilter: => ctrl.openFilter = !ctrl.openFilter
+
+                # --- the AngularJS -> React event channel ---------------------
+                # `params`/`events` are a ONE-TIME hand-off (§5), so this is the only
+                # way React observes an AngularJS-side broadcast. It is required, not
+                # optional: `app/react/kanban/hooks/useWipLimit.ts` takes a
+                # `registerEvent(eventName, handler) => deregister` seam and subscribes
+                # to `redraw:wip`, `kanban:us:move`, `usform:new:success` and
+                # `usform:bulk:success` -- the same four the retired
+                # `KanbanWipLimitDirective` used (`main.coffee:1097-1100`) -- so WIP
+                # marker redraw parity is unreachable without it.
+                #
+                # Registered on the controller's own scope, with the Angular event
+                # object stripped and the payload flattened; returns AngularJS's own
+                # deregistration function, which React MUST invoke from its
+                # `useEffect` cleanup. See `registerAngularEvent` above for the
+                # argument-shifting and `$scope`-leak hazards this closes, and for the
+                # proof that all four events reach this scope.
+                #
+                # Other names React may legitimately observe on this screen, all
+                # emitted from this module: `kanban:userstories:loaded`
+                # (`main.coffee:698`), `usform:edit:success`, `usform:bulk:success`,
+                # `usform:new:success`, `redraw:wip`, `kanban:us:move`, and the shared
+                # `filters:update`. A React handler must never call
+                # `$rootScope.$apply()`: these handlers already run inside a digest.
+                onAngularEvent: (eventName, handler) =>
+                    registerAngularEvent($scope, eventName, handler)
             }
         }
 
     return service
 
-module.factory("tgKanbanReactBridge", KanbanReactBridgeFactory)
+# The array annotation is REQUIRED now that the factory takes an injectable:
+# `gulpfile.js` minifies the concatenated bundle for a deploy build, and a
+# minifier renames the parameter, after which AngularJS's implicit annotation
+# would ask the injector for a one-letter provider and abort linking the whole
+# `ng-view` subtree. `main.coffee:730` registers its controller without one only
+# because that controller carries its own `@.$inject` list.
+module.factory("tgKanbanReactBridge", ["tgProjectService", KanbanReactBridgeFactory])

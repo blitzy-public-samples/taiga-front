@@ -42,6 +42,26 @@
  * Nothing else in `e2e-react/` may read `TAIGA_ADMIN_PASSWORD`. Import
  * {@link adminCredentials} (or {@link adminPassword}) instead.
  *
+ * WHY THE CREDENTIAL MUST NEVER BE ENTERED UNDER TRACING
+ * ---------------------------------------------------------------------------
+ * {@link login} types a real password and then leaves the browser holding a
+ * bearer token and a session identifier. A Playwright TRACE records both halves
+ * of that: an action's parameters — the value handed to a fill — and the request
+ * and response headers of the traffic that follows. So a trace of any test in
+ * this layer contains the admin credential AND a live session, and
+ * `playwright.config.ts` writes its evidence into a directory that is COMMITTED.
+ * One failing run would be enough to put all three into the repository's
+ * history, where deleting the file afterwards does not remove them.
+ *
+ * `playwright.config.ts` therefore sets `trace: "off"`, and this file does not
+ * merely rely on that: {@link login} REFUSES TO TYPE THE CREDENTIAL while
+ * tracing is enabled, whether it was enabled by editing the config or by passing
+ * `--trace` on the command line. The invariant is enforced at the point of
+ * entry, so it cannot be lost to a well-meaning edit somewhere else.
+ *
+ * Nothing here persists a session either: no `storageState` is saved, no HAR is
+ * recorded, and Playwright discards the browser context after every test.
+ *
  * WHAT THIS FILE DELIBERATELY DOES NOT DO
  * ---------------------------------------------------------------------------
  * It never mutates state. No user creation, no project creation, no seeding,
@@ -76,176 +96,47 @@
  * @see e2e-react/fixtures/seed.ts - asserts the seeded dataset, never reseeds
  */
 
-import { test as base, errors, expect, type Page } from "@playwright/test";
+import { test as base, errors, expect, type FullProject, type Page } from "@playwright/test";
 
-/* ===========================================================================
- * Credentials
- * ======================================================================== */
-
-/**
- * The account every capture authenticates as.
- *
- * Matches `--username admin` in the out-of-band `createsuperuser` invocation
- * quoted in the module header. It is a superuser, so it can reach every seeded
- * project without membership juggling.
- */
 export const ADMIN_USERNAME = "admin";
 
-/**
- * Documented development default for the admin password.
- *
- * This is the ONLY credential literal permitted anywhere in `e2e-react/`, and
- * it is deliberate rather than an oversight: the stack under test is a
- * self-contained localhost proof of concept, `TAIGA_ADMIN_PASSWORD` exists
- * nowhere else in the repository, and a missing injected value must never
- * block an automated run. It is intentionally NOT exported — callers go
- * through {@link adminPassword} so there is exactly one resolution path.
- *
- * Note what this is NOT: the retired Protractor suites hardcode a different,
- * upstream fixture password (`e2e/suites/auth/auth.e2e.js` L82). That value
- * does not exist in this deployment and is deliberately not carried over.
- */
 const DEV_DEFAULT_ADMIN_PASSWORD = "admin123";
 
-/** Resolved credential pair, as consumed by {@link login}. */
 export interface AdminCredentials {
     readonly username: string;
     readonly password: string;
 }
 
-/* ===========================================================================
- * Selectors
- *
- * Every selector below was verified against the DEPLOYED bundle served by the
- * nginx gateway, not merely against the Jade sources, because the two can
- * diverge and one of them does (see LOGIN_SUBMIT_SELECTOR).
- * ======================================================================== */
-
-/** Login form username field. Unchanged from `e2e/utils/common.js` L162. */
 const USERNAME_INPUT_SELECTOR = 'input[name="username"]';
 
-/** Login form password field. Unchanged from `e2e/utils/common.js` L163. */
 const PASSWORD_INPUT_SELECTOR = 'input[name="password"]';
 
-/**
- * Login form submit control — the one DELIBERATE DIVERGENCE from the incumbent.
- *
- * `e2e/utils/common.js` L165 clicks a bare `.submit-button`. That class is NOT
- * present on the login screen: `app/partials/includes/modules/login-form.jade`
- * renders the control as `button.btn-small.full(variant="primary"
- * type="submit")`, and the compiled `auth/login.html` inside the deployed
- * `templates.js` confirms it verbatim —
- *
- *     <button variant="primary" type="submit" title="..."
- *             translate="LOGIN_COMMON.ACTION_SIGN_IN" class="btn-small full">
- *
- * `.submit-button` is defined at `app/styles/components/buttons.scss:194` and
- * used by other forms (lightboxes, admin, user settings), so the incumbent
- * selector is simply stale here. Porting it literally would match zero
- * elements, stall for the configured action timeout and fail every login —
- * which would silently destroy the entire capture chain.
- *
- * The selector list therefore targets the submit control by its type, scoped to
- * the login form so it can never reach another form's button, while still
- * accepting the historical class should it ever be restored. Both branches
- * resolve to the same single element, so the locator stays strict.
- */
 const LOGIN_SUBMIT_SELECTOR =
     'form.login-form button[type="submit"], form.login-form .submit-button';
 
-/**
- * The application's single global loading overlay.
- *
- * `app/partials/includes/modules/loader.jade` renders `.loader(tg-loader)` and
- * `app/index.jade` L60 includes it exactly once, so this resolves to one
- * element for the lifetime of the page.
- */
 const LOADER_SELECTOR = ".loader";
 
-/** Class the loader carries while a route is still resolving. */
 const LOADER_ACTIVE_CLASS = "active";
 
-/**
- * Intro.js "skip" control, i.e. the guided-tour dismissal.
- *
- * Supplied by the `intro.js` dependency rather than by application markup, so
- * the class name cannot be derived from `app/` sources; it is taken from the
- * incumbent helper (`e2e/utils/common.js` L497) and was confirmed present in
- * the deployed `libs.js` bundle.
- */
 const JOYRIDE_SKIP_SELECTOR = ".introjs-skipbutton";
 
-/**
- * Login route, relative to the `baseURL` declared in `playwright.config.ts`.
- *
- * Relative on purpose: the origin is configured in exactly one place, so no
- * host or port literal appears in this file and the fixture cannot drift onto
- * a different origin than the one the config captures.
- */
 const LOGIN_PATH = "/login";
 
-/* ===========================================================================
- * Timeout budgets
- *
- * Reproduced from the incumbent rather than invented, so a wait that used to
- * pass does not start failing (or start hiding a regression) after the port.
- * ======================================================================== */
-
-/** Post-submit navigation budget. From `e2e/utils/common.js` L171. */
 const LOGIN_URL_TIMEOUT_MS = 10000;
 
-/** Loader settle budget. From `e2e/utils/common.js` L125. */
 const LOADER_TIMEOUT_MS = 5000;
 
-/** Post-dismissal settle. From `browser.sleep(600)`, `common.js` L501. */
 const JOYRIDE_SETTLE_MS = 600;
 
-/**
- * Upper bound on how long the guided tour is given to appear before concluding
- * that no tour is configured for this route.
- *
- * The incumbent needed no such value because `browser.waitForAngular()`
- * (`common.js` L495) implicitly waited for AngularJS's pending `$http` traffic
- * to drain, and the tour is gated on exactly such a request — see
- * {@link closeJoyride}. Playwright has no digest-aware equivalent, so the wait
- * has to be explicit. The incumbent's own loader budget is reused rather than a
- * new number invented; it is a ceiling only, since the wait resolves the
- * instant the control appears.
- */
 const JOYRIDE_APPEAR_TIMEOUT_MS = LOADER_TIMEOUT_MS;
 
-/**
- * Cookie written to suppress the cookie-consent banner.
- *
- * Name and value are reproduced exactly from `e2e/utils/common.js` L155
- * (`document.cookie='cookieConsent=1'`). The name cannot be inferred from the
- * application sources — it appears nowhere under `app/` — because the banner is
- * injected by a hosted-deployment plugin, so it must not be "improved".
- */
 const COOKIE_CONSENT_STATEMENT = "cookieConsent=1";
 
-/* ===========================================================================
- * Credential resolution — the single point
- * ======================================================================== */
-
-/**
- * Resolves the admin password: the injected `TAIGA_ADMIN_PASSWORD` when it
- * carries a value, otherwise the documented development default.
- *
- * Treats an empty string exactly like an unset variable, because that is the
- * precise silent-failure mode this file exists to prevent — an unset shell
- * variable expands to empty, and an empty password would be submitted happily,
- * fail authentication, and leave a green-looking run with worthless artifacts.
- * This function therefore NEVER returns an empty string.
- *
- * The value is read on every call rather than captured at module load, so a
- * spec that adjusts the environment is not silently ignored. The raw value is
- * returned untrimmed: surrounding whitespace can be a legitimate part of a
- * password, and quietly rewriting a credential would be worse than passing it
- * through.
- *
- * @returns a non-empty password string
- */
+// Every login resolves its password through this ONE function, and the account is created with
+// the same variable and the same fallback, so the two values are identical by construction
+// rather than by convention. An empty string is treated as absent deliberately: an unset
+// variable expands to empty at account-creation time and would otherwise silently create an
+// account that no password can open.
 export function adminPassword(): string {
     const injected = process.env.TAIGA_ADMIN_PASSWORD;
 
@@ -256,16 +147,95 @@ export function adminPassword(): string {
     return DEV_DEFAULT_ADMIN_PASSWORD;
 }
 
-/**
- * Resolves the full credential pair used by {@link login}.
- *
- * @returns the admin username paired with {@link adminPassword}'s result
- */
 export function adminCredentials(): AdminCredentials {
     return {
         username: ADMIN_USERNAME,
         password: adminPassword(),
     };
+}
+
+/* ===========================================================================
+ * Tracing guard — the credential is never typed into a traced run
+ * ======================================================================== */
+
+/**
+ * The `trace` option exactly as Playwright resolves it for the running project,
+ * taken from Playwright's own type so this guard cannot drift from the shape it
+ * inspects. It is a mode string, the deprecated `"retry-with-trace"` spelling, an
+ * object carrying a `mode`, or absent.
+ */
+type ConfiguredTrace = FullProject["use"]["trace"];
+
+/** The single value of the `trace` option under which authentication is allowed. */
+const TRACING_DISABLED = "off";
+
+/**
+ * Flattens the three shapes of the `trace` option to the mode it selects.
+ *
+ * An absent option means Playwright records nothing, which is the same as
+ * disabled. `"retry-with-trace"` is a deprecated spelling that still enables
+ * recording, so it flattens to itself rather than to `"off"` — the guard below
+ * only ever compares against `"off"`, so any spelling that is not literally
+ * disabled is treated as enabled, which is the safe direction to fail in.
+ *
+ * @param configured - the resolved `trace` option, of whichever shape
+ * @returns the selected mode, or `"off"` when nothing is configured
+ */
+function resolveTraceMode(configured: ConfiguredTrace): string {
+    if (configured === undefined) {
+        return TRACING_DISABLED;
+    }
+
+    if (typeof configured === "string") {
+        return configured;
+    }
+
+    return configured.mode;
+}
+
+/**
+ * Refuses to continue when the running project would record a trace.
+ *
+ * WHY THIS IS A RUNTIME CHECK AND NOT A COMMENT. A trace stores an action's
+ * parameters together with the request and response headers of the traffic it
+ * caused, so a trace taken across {@link login} holds the admin password, the
+ * `Authorization: Bearer` token and the `X-Session-Id` — and
+ * `playwright.config.ts` writes its evidence into a COMMITTED directory. The
+ * config sets `trace: "off"` for exactly that reason, but a config value is one
+ * edit or one `--trace` flag away from being reversed, and the artifact it would
+ * then produce looks entirely innocuous. Failing here converts that silent
+ * disclosure into a loud, immediate stop, before a single character of the
+ * credential has been typed.
+ *
+ * The option is read from the RESOLVED project configuration rather than from the
+ * config file, so a command-line override is caught as surely as an edit.
+ *
+ * The way to debug with a trace is the way the message says: authenticate outside
+ * the traced portion of the run, and keep the archive out of every tracked path.
+ *
+ * @throws when the running project's `trace` option is anything but `"off"`
+ */
+function assertCredentialEntryIsNotTraced(): void {
+    const project = base.info().project;
+    const mode = resolveTraceMode(project.use.trace);
+
+    if (mode === TRACING_DISABLED) {
+        return;
+    }
+
+    // A project declared without a name reports an empty string, so the subject
+    // of the sentence is chosen rather than interpolated blindly.
+    const subject = project.name.length > 0 ? `the "${project.name}" project` : "this run";
+
+    throw new Error(
+        `Refusing to authenticate: ${subject} has trace: "${mode}". A trace records ` +
+            "fill() parameters and request headers, so it would capture the admin " +
+            "password, the Authorization bearer token and the X-Session-Id — and " +
+            "playwright.config.ts writes its artifacts under the committed " +
+            'e2e-react/artifacts/ root. Restore trace: "off" (and drop any --trace ' +
+            "flag). To capture a trace for debugging, authenticate outside the traced " +
+            "part of the run and keep the archive out of any tracked directory.",
+    );
 }
 
 /* ===========================================================================
@@ -310,37 +280,9 @@ export async function acceptCookieConsent(page: Page): Promise<void> {
     }, COOKIE_CONSENT_STATEMENT);
 }
 
-/**
- * Waits until the global loading overlay is no longer active.
- *
- * PORTED FROM `e2e/utils/common.js` L118-L126, which polled the incumbent
- * `hasClass` helper (L45-L49) for up to 5000 ms.
- *
- * WHY `page.waitForLoadState()` IS NOT A SUBSTITUTE: the AngularJS shell keeps
- * `.loader.active` on screen AFTER the HTTP response has landed, while it
- * compiles templates and resolves the route. Load-state completion therefore
- * does not imply the screen is rendered, and asserting at that moment races the
- * very content under test. Every navigation in the incumbent suites is followed
- * by this wait for exactly that reason, so it is exported for page objects and
- * specs to do the same.
- *
- * TWO DELIBERATE HARDENINGS over the incumbent:
- *
- * 1. An ABSENT overlay resolves immediately instead of throwing. The incumbent
- *    called `getAttribute('class')` on the match and would have failed outright
- *    had the element been missing; "no overlay" plainly means "not loading".
- * 2. The match is on the WHOLE class name via `classList.contains`, whose
- *    exact class-list membership test mirrors the incumbent's
- *    `split(' ').indexOf(cls)`. A substring test would wrongly treat a
- *    hypothetical `inactive` as active and hang until the budget expired.
- *
- * Faithful to the incumbent, exceeding the budget REJECTS rather than resolving
- * quietly: `retries: 0` is configured, so a stuck loader must surface as a
- * failure instead of being papered over.
- *
- * @param page - the page to observe
- * @throws if the overlay is still active after 5000 ms
- */
+// The application signals "busy" by adding a class to a loader element that is never removed
+// from the document, so waiting for the element to disappear would wait forever. A missing
+// loader counts as settled, which is what lets this run against a page that has none.
 export async function waitLoader(page: Page): Promise<void> {
     await page.waitForFunction(
         (probe: { selector: string; activeClass: string }): boolean => {
@@ -357,44 +299,6 @@ export async function waitLoader(page: Page): Promise<void> {
     );
 }
 
-/**
- * Dismisses the Intro.js guided tour if it is showing, and does nothing if it
- * is not.
- *
- * PORTED FROM `e2e/utils/common.js` L494-L503.
- *
- * WHY THIS IS MANDATORY RATHER THAN DEFENSIVE: the tour is configured on
- * precisely the screens this migration rebuilds, plus the page login lands on.
- * In `app/coffee/app.coffee` the home route declares `joyride: "dashboard"`
- * (L81), the backlog route `joyride: "backlog"` (L231) and the kanban route
- * `joyride: "kanban"` (L240). Skipping this step leaves the Intro.js overlay
- * covering the board in every committed screenshot and video.
- *
- * WHY THE ORDER IS LOADER-THEN-TOUR, AND WHY THE WAIT IS BOUNDED:
- * `app/modules/components/joy-ride/joy-ride.directive.coffee` starts the tour
- * on `$routeChangeSuccess` only after the route's `loader:end` event, and then
- * only once `currentUserService.loadJoyRideConfig()` resolves — an asynchronous
- * user-storage request. So the tour cannot appear before the loader clears, and
- * it need not have appeared the instant it does. An immediate presence check
- * would race that request; hence {@link waitLoader} first (standing in for the
- * incumbent's `browser.waitForAngular()`, which has no Playwright equivalent)
- * and then a bounded wait for the control itself.
- *
- * ONLY the timeout is swallowed, and only to mean "no tour here". Every other
- * error propagates, so this cannot mask a real fault. Dismissal is also
- * one-shot per account by design: `intro.onexit` calls
- * `currentUserService.disableJoyRide()`, which persists `dashboard`, `backlog`
- * and `kanban` all false (`current-user.service.coffee` L67-L80). Later calls
- * are therefore expected to find nothing and must stay non-fatal.
- *
- * Visibility, not mere presence, is the trigger — a divergence from the
- * incumbent's `isPresent()`. Playwright's `click()` waits for an element to be
- * visible and actionable, so a present-but-hidden control would stall for the
- * full action timeout; visibility is the condition that actually implies a
- * dismissable tour.
- *
- * @param page - the page to inspect and, if a tour is up, act on
- */
 export async function closeJoyride(page: Page): Promise<void> {
     await waitLoader(page);
 
@@ -406,9 +310,10 @@ export async function closeJoyride(page: Page): Promise<void> {
             timeout: JOYRIDE_APPEAR_TIMEOUT_MS,
         });
     } catch (error) {
+        // The guided tour only appears for an account that has not dismissed it, so its absence
+        // is the normal case on every run after the first and must not fail the fixture. Only a
+        // timeout is swallowed; anything else is a real failure.
         if (error instanceof errors.TimeoutError) {
-            // No tour on this route, or it was already dismissed for this
-            // account. Nothing to close — this is the expected steady state.
             return;
         }
 
@@ -417,10 +322,8 @@ export async function closeJoyride(page: Page): Promise<void> {
 
     await skip.click();
 
-    // Fixed settle reproducing `browser.sleep(600)` (`common.js` L501). It
-    // covers Intro.js tearing its overlay and helper layers back down; those
-    // elements are removed by the library rather than by application state, so
-    // there is no application-level condition to await instead.
+    // The tour fades out, and its overlay keeps intercepting pointer events until it does, so a
+    // fixed settle beats asserting on a node that is mid-animation.
     await page.waitForTimeout(JOYRIDE_SETTLE_MS);
 }
 
@@ -449,16 +352,36 @@ export async function closeJoyride(page: Page): Promise<void> {
  *   5. Settle the loader, then dismiss the guided tour that the landing route
  *      configures.
  *
+ * IT TAKES NO CREDENTIAL ARGUMENT, AND THAT IS THE POINT (constraint HR-7).
+ * The pair is resolved INSIDE, through {@link adminCredentials}, so the value
+ * used at every login is the value {@link adminPassword} resolves from
+ * `TAIGA_ADMIN_PASSWORD` — the same variable, read the same way, with the same
+ * documented fallback the out-of-band `createsuperuser` invocation uses. An
+ * override parameter, even one defaulted to `adminCredentials()`, would make
+ * that agreement a CONVENTION every caller has to keep; with no parameter to
+ * pass it is a property of the code, which is what "identical by construction"
+ * means. A capture that authenticated as somebody else, or with a stale
+ * password, would not fail loudly — it would produce plausible-looking
+ * artifacts of the wrong session, and this signature makes that unreachable.
+ *
+ * Nothing in `e2e-react/` needs a different account: the seeded dataset is
+ * reached entirely through the superuser, and negative-authentication cases are
+ * not part of this migration (rule T10 — no functional or feature change). If
+ * one is ever required, it belongs in a separate, explicitly non-capture helper
+ * rather than as a parameter on the path every artifact is produced through.
+ *
  * @param page - the page to authenticate
- * @param credentials - override pair; defaults to {@link adminCredentials},
- *   which is the only value any capture should ever use. The parameter exists
- *   solely to preserve the incumbent's `login(username, password)` capability
- *   and is deliberately not a user-management API.
  */
-export async function login(
-    page: Page,
-    credentials: AdminCredentials = adminCredentials(),
-): Promise<void> {
+export async function login(page: Page): Promise<void> {
+    // STEP 0, BEFORE ANY CREDENTIAL IS TYPED: refuse to run at all while Playwright
+    // tracing is on, because a trace records `fill()` parameters and full request
+    // headers and would commit the password and the bearer token alongside the
+    // evidence. See `assertCredentialEntryIsNotTraced` for what a trace captures.
+    assertCredentialEntryIsNotTraced();
+
+    const credentials: AdminCredentials = adminCredentials();
+
+
     await acceptCookieConsent(page);
 
     await page.goto(LOGIN_PATH);
@@ -476,33 +399,6 @@ export async function login(
     await closeJoyride(page);
 }
 
-/* ===========================================================================
- * Playwright fixtures
- * ======================================================================== */
-
-/**
- * The test object every spec in `e2e-react/specs/` should import, extended with
- * an already-authenticated page.
- *
- * Using `authedPage` instead of `page` moves login, consent and tour dismissal
- * out of the specs entirely, so no spec can forget a step and quietly produce a
- * contaminated capture. `expect` is re-exported alongside it so a spec needs a
- * single import line:
- *
- *     import { test, expect } from "../fixtures/auth";
- *
- *     test("board renders", async ({ authedPage }) => {
- *         await authedPage.goto("/project/project-3/kanban");
- *         await waitLoader(authedPage);
- *         await expect(authedPage.locator(".kanban-table")).toBeVisible();
- *     });
- *
- * The fixture only authenticates: it navigates nowhere in particular and
- * changes no data, leaving each spec in charge of its own route. Teardown is
- * intentionally empty — logging out would add a capability the migration does
- * not need, and Playwright discards the browser context after every test, so
- * no session can leak between them.
- */
 export const test = base.extend<{ authedPage: Page }>({
     authedPage: async ({ page }, use) => {
         await login(page);
@@ -512,4 +408,3 @@ export const test = base.extend<{ authedPage: Page }>({
 });
 
 export { expect };
-

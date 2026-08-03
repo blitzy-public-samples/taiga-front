@@ -6,185 +6,15 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-/**
- * projects.ts — the typed facade over the `projects` namespace of the AngularJS
- * `$tgResources` service, for the React rebuild of the Kanban board and the
- * Backlog / Sprint-Planning screen.
- *
- * ---------------------------------------------------------------------------------------
- * 1. WHAT THIS FILE IS, AND THE MANDATE IT IMPLEMENTS
- * ---------------------------------------------------------------------------------------
- * AAP §0.5.1 describes this folder as "`shared/api/` … Thin typed wrappers over
- * `$tgResources` endpoints", and AAP §0.6.2 records the row for it verbatim:
- *
- *     `taiga-front/app/react/shared/api/*.ts` | CREATE |
- *     source: `app/coffee/modules/resources.coffee` |
- *     "Typed wrappers over the named `$tgResources` endpoints; no new transport."
- *
- * This migration is a strangler-fig, in-place coexistence migration: the AngularJS
- * 1.5.10 shell survives untouched, both screen controllers survive as thin bridges, and
- * only the *rendering* layer of the two screens moves to React 18. Nothing here opens a
- * connection, resolves a URL or parses a response. Every read goes through the incumbent
- * resource layer that the two screens already use today, so the backend cannot tell the
- * difference (goal G2, "frozen backend contract").
- *
- * The incumbent service exposes roughly fifteen methods. Exactly TWO of them are reachable
- * from either in-scope screen, so exactly two are faceted here — see §5 for the inventory
- * of what is deliberately left alone and why.
- *
- * ---------------------------------------------------------------------------------------
- * 2. ⭐ THE ASYMMETRY — the single most important fact in this file (rule T9)
- * ---------------------------------------------------------------------------------------
- * The two methods look interchangeable. They are not. Both take one project id, both
- * address a sub-path of the same registry entry, and they resolve FUNDAMENTALLY DIFFERENT
- * KINDS OF VALUE, because they go through two different repository query methods:
- *
- *   `app/coffee/modules/resources/projects.coffee:42-43`
- *       service.stats      -> $repo.queryOneRaw(...)   ==> PLAIN JSON
- *   `app/coffee/modules/resources/projects.coffee:95-96`
- *       service.tagsColors -> $repo.queryOne(...)      ==> A `$tgModel` INSTANCE
- *
- * The divergence is one line deep in the repository layer:
- *
- *   `app/coffee/modules/base/repository.coffee:173-180` — `queryOneRaw` ends at `:180`
- *       with `.then (data) => return data.data`, so the PARSED BODY is what resolves.
- *   `app/coffee/modules/base/repository.coffee:163-171` — `queryOne` ends at `:171`
- *       with `.then (data) => return @model.make_model(name, data.data)`, so a live
- *       dirty-tracking MODEL WRAPPER is what resolves.
- *
- * Consequences, which is why the two functions below have deliberately different return
- * types rather than one shared shape:
- *
- *   • {@link getProjectStats} resolves plain JSON. It is SAFE to spread and SAFE to hand
- *     to immer.
- *   • {@link getProjectTagsColors} resolves a `$tgModel` instance. It is NOT safe to
- *     spread and NOT safe to hand to immer. See the pitfall note on that function.
- *
- * Getting this wrong is not a compile error in a loosely typed codebase and it is not a
- * crash at run time either — it is a silently empty tag-colour map. Hence two types, two
- * doc blocks, and this section.
- *
- * ---------------------------------------------------------------------------------------
- * 3. RULE T5 — NO PARALLEL HTTP CLIENT (verbatim)
- * ---------------------------------------------------------------------------------------
- *     "Reuse `$tgResources`; do not build a parallel HTTP client. New TypeScript files
- *      are typed facades over the existing repository layer."
- *
- * So: no browser request API, no browser XHR API, no third-party HTTP client, no realtime
- * transport, no direct use of the AngularJS HTTP service — none of them appears anywhere
- * below, in code or in a name. This facade never resolves a URL, never touches the URL
- * registry service, and never reads a stored credential.
- *
- * ⭐ A PRECEDENT THAT MUST NOT BE COPIED. `service.import`
- * (`app/coffee/modules/resources/projects.coffee:182-196`) is the ONLY place in the whole
- * incumbent resource layer that bypasses the shared HTTP service: it builds a multipart
- * body and a raw browser XHR by hand and sets the authorization header itself at `:194`.
- * That exists solely for a multipart FILE UPLOAD — never for a JSON API read — and it
- * REINFORCES T5 rather than licensing an exception to it. It is also out of scope here
- * (§5). Nothing of it is carried across.
- *
- * ---------------------------------------------------------------------------------------
- * 4. WHAT GOING THROUGH THE INCUMBENT LAYER INHERITS FOR FREE (requirement I7)
- * ---------------------------------------------------------------------------------------
- * Both functions are reads, and routing them through the resource layer means React
- * inherits, rather than re-derives:
- *
- *   • Request-header injection — the authorization and preferred-language headers built by
- *     `app/coffee/modules/base/http.coffee:17-30` and merged into every request at `:33`,
- *     plus the session-id header from `app/coffee/app.coffee:590-594`, applied to
- *     delete/patch/post/put at `:596-599` with GET receiving the session id alone at
- *     `:600-602`.
- *   • The SINGLE-FLIGHT 401 refresh, so concurrent requests do not each trigger their own
- *     token refresh (`app/coffee/app.coffee:609-613`).
- *   • The 400-carrying-`version` VERSION_ERROR toast, raised for 10,000 ms — how an
- *     optimistic-concurrency conflict becomes visible to the user at all.
- *   • The 451 blocked-project interceptor.
- *   • The status-0 / status-(-1) path, which closes open lightboxes and shows the
- *     full-page connection-error view.
- *   • GET de-duplication: the shared HTTP service installs its own cache on GET and clears
- *     it in a `finally`, so concurrent identical GETs collapse into one request. Both
- *     functions below are GETs, and neither reimplements nor defeats that.
- *
- * A bespoke client would drop all of it, and the loss would stay invisible until a token
- * expired or two users edited the same story. Rejections therefore also pass through
- * untouched: the interceptor chain communicates through rejection VALUES, so re-wrapping,
- * normalising or logging-and-swallowing one here would hide exactly the conditions the
- * chain exists to surface.
- *
- * ---------------------------------------------------------------------------------------
- * 5. WHAT IS DELIBERATELY *NOT* FACETED (rule T9, and the Minimal Change Clause)
- * ---------------------------------------------------------------------------------------
- * Every other member of the incumbent service is left alone on purpose. Naming them here
- * makes their absence a reviewed decision rather than an oversight:
- *
- *     get · getBySlug · list · listByMember · templates · usersList · rolesList ·
- *     bulkUpdateOrder (the `bulkUpdateProjectsOrder` endpoint of AAP §0.7.5) ·
- *     the four regenerate_*_csv_uuid and the four delete_*_csv_uuid members ·
- *     patch_default_swimlane · leave · memberStats · deleteTag · createTag · editTag ·
- *     mixTags (`:122`) · export (`:126`) · import (`:130-198`) · changeLogo (`:200`) ·
- *     removeLogo (`:221`) · and the project-transfer family
- *     (transferValidateToken / transferAccept / transferStart / transferReject).
- *
- * Each one belongs to the admin, project-profile, import-export, timeline or discover
- * screens, and AAP §0.2.2 places every screen other than Kanban and Backlog out of scope:
- * "Every `taiga-front` screen other than Kanban and Backlog: epics, issues, wiki, admin,
- * auth, user profile, search, team, discover, project home, taskboard". Adding one would
- * violate the Minimal Change Clause. When a future screen needs one, it is added then,
- * with its own consumer as the evidence.
- *
- * ---------------------------------------------------------------------------------------
- * 6. RULE T2 — TAG COLOURS ARE DATA, NEVER DESIGN TOKENS
- * ---------------------------------------------------------------------------------------
- *     "All status, tag, and epic colours remain data-bound. They come from `s.color`,
- *      `tag[1]`, and `epic.color`; the values visible in the Figma frames are
- *      `sample_data` artefacts and must never be hardcoded."
- *
- * {@link getProjectTagsColors} is precisely the mechanism that keeps every tag pill
- * data-coloured. Consequently this file contains NO colour literal whatsoever — not one,
- * not even in a comment, and specifically none of the per-status values visible in the two
- * Figma frames, which are seeded sample data and would break every real project if
- * hardcoded (AAP §0.3.6, drift entry D3).
- *
- * ---------------------------------------------------------------------------------------
- * 7. WHY THESE ARE PLAIN FUNCTIONS AND NOT HOOKS (requirement I9)
- * ---------------------------------------------------------------------------------------
- *     "The >=70% coverage gate forces a presentational/container split. Jest runs
- *      browserless in jsdom with no `dist/` dependency, so data-fetching and drag effects
- *      must be isolated in hooks and containers, leaving pure components independently
- *      testable."
- *
- * Both functions take the `projects` sub-resource service as their FIRST PARAMETER instead
- * of reaching for the injector themselves. The screens' data hooks —
- * `../../backlog/hooks/useBacklogData.ts` and `../../kanban/hooks/useKanbanData.ts` — own
- * the single `useAngularService('$tgResources')` call and pass `rs.projects` in.
- *
- * That inversion is what makes this module testable with no React renderer, no injector
- * and no provider: a spec hands in a two-method object literal. It also means these
- * functions are callable from a reducer effect, an event handler or another facade without
- * dragging in React's rules of hooks.
- *
- * ---------------------------------------------------------------------------------------
- * Governing constraints honoured here: T5 (no parallel transport), T8 (all new code
- * isolated under `app/react/**`; this module adds no barrel file and no shared types
- * file), T9 (the seam is commented at the point of change), T10 and the Minimal Change
- * Clause (no retries, no timeouts, no caching, no cancellation, no field renaming, no
- * rounding, no default substitution, no merging of the two calls, no third function),
- * G2 (the frozen backend contract — field names are surfaced verbatim), I5 (the
- * persistent-collection library the AngularJS side uses stays installed for its 124
- * out-of-scope consumers and is never imported here), I7 (React calls the existing
- * repository and model layer), I9 (see §7), HR-2 (the pinned dependency set is closed —
- * no validation library, no HTTP client, no AngularJS type package is added; every shape
- * below is either imported from the bridge or declared locally and structurally), and
- * P-IMMER-1/3/4 (see the note on {@link getProjectTagsColors}).
- *
- * Permission gates are NOT this module's concern: React reads the same `my_permissions`
- * array the `tg-check-permission` and `tg-class-permission` directives read and computes
- * no independent notion of what the user may do, so this file exposes no permission helper
- * and derives no policy.
- */
-
 import { toNativePromise } from '../../bridge/toNativePromise';
 import type { AngularServices, TaigaModel } from '../../bridge/useAngularService';
+// TYPE-ONLY, AND DELIBERATELY SO. `import type` is erased entirely by the compiler
+// (`isolatedModules` requires it to be written as such), so this creates NO runtime
+// dependency and NO module cycle: `../../backlog/state/types` imports exactly one
+// module, `../../shared/types/userStory`, and never reaches back here. The canonical
+// stats contract therefore lives in ONE place and this facade adapts to it, rather
+// than restating it and letting the two definitions drift.
+import type { ProjectStats } from '../../backlog/state/types';
 
 /**
  * The `projects` sub-resource service, obtained by INDEXING the injector-surface map that
@@ -197,7 +27,7 @@ import type { AngularServices, TaigaModel } from '../../bridge/useAngularService
  * independent copy here would be a second source of truth that compiles happily while
  * disagreeing with the service it claims to describe.
  *
- * Resolves to the two-member shape declared at `../../bridge/useAngularService.ts:662-679`,
+ * Resolves to the two-member shape declared at `../../bridge/useAngularService.ts:835-852`,
  * both members generic over their payload so a facade supplies the concrete type at the
  * call site — which is exactly what the two functions below do.
  */
@@ -207,104 +37,243 @@ type ProjectsService = AngularServices['$tgResources']['projects'];
  * The parsed body of the project-statistics read, as it arrives from the incumbent raw
  * repository query — the payload behind the Backlog screen's dark summary bar.
  *
- * ⭐ TYPED LOCALLY ON PURPOSE (rule T9). The canonical `ProjectStats` domain type is owned
- * by `app/react/backlog/state/types.ts`, the screen that consumes it, and `../types/`
- * deliberately holds NO project or statistics type — its surface is exactly six domain
- * models: tag, epic, status, swimlane, user story and sprint. This interface is therefore a
- * LOCAL, NON-EXPORTED, purely structural description of the wire shape, so that:
+ * ⭐ THIS IS THE WIRE SHAPE, NOT THE DOMAIN TYPE, and the distinction is the whole point of
+ * the pair {@link ProjectStatsResponse} / {@link toProjectStats}.
  *
- *   • this module needs no import from `../types/` at all, and
- *   • no second canonical type is created, and no new file is added to this folder to
- *     hold one (neither a barrel nor a shared types module belongs here).
+ * The canonical domain type is `ProjectStats`, owned by `app/react/backlog/state/types.ts`
+ * — the screen that consumes it. This interface describes only what the SERVER SENDS, and
+ * the adapter below is what turns one into the other. Neither type restates the other, so
+ * they cannot drift: `ProjectStats` is IMPORTED (type-only, cycle-free) and named as the
+ * adapter's return type, so any change to the canonical contract fails the type gate right
+ * here rather than at some later, more confusing place.
  *
- * Because the description is structural rather than nominal, the Backlog screen's own
- * canonical type satisfies it without either side importing the other.
+ * WHY A LOCAL WIRE TYPE RATHER THAN REUSING THE CANONICAL ONE DIRECTLY: they are genuinely
+ * different shapes, by exactly one member. `completedPercentage` is REQUIRED on the domain
+ * type and IS NOT SENT BY THE SERVER AT ALL — it is derived client-side. Declaring the wire
+ * payload as the domain type would therefore assert the presence of a field the response
+ * never carries, and every consumer would read `undefined` through a `number` annotation.
+ * Two types plus one adapter is what makes that impossible to get wrong.
+ *
+ * MEASURED AGAINST THE LIVE SERVER, not inferred. `GET /api/v1/projects/<id>/stats` against
+ * the running stack returns eleven members: the seven declared below plus `name` and the
+ * three `*_per_role` dictionaries (`assigned_points_per_role`, `closed_points_per_role`,
+ * `defined_points_per_role`). Those four are DELIBERATELY OMITTED: no in-scope consumer
+ * reads any of them, and typing a field no one reads is speculative work the Minimal Change
+ * Clause forbids. The omission is recorded here so a future reader knows this narrowing was
+ * measured rather than overlooked, and knows what is available if a requirement ever needs
+ * it. Extra members on the response are harmless — nothing here validates or strips them.
  *
  * FIELD NAMES ARE VERBATIM. The payload genuinely mixes naming conventions — the point
  * totals are snake_case while the derived percentage is camelCase — and it stays that way.
  * Renaming a field would be a response transformation (T10) and would break the frozen
  * contract (G2). No field is invented: every one below is cited to the line that reads it.
  *
+ * ⭐⭐ IT DESCRIBES THE WHOLE RESPONSE, NOT JUST THE SUMMARY BAR'S SLICE — and that is a
+ * correctness property rather than completeness for its own sake. This interface once
+ * carried only the five fields `summary.jade` renders, which had two consequences: two
+ * fields the screen genuinely reads unguarded were absent from the type, and the value
+ * could not be handed to the canonical `ProjectStats` of
+ * `app/react/backlog/state/types.ts` at all without an assertion or a transformation —
+ * which is exactly what a typed facade exists to make unnecessary. The two additions are
+ * measured, not assumed:
+ *
+ *   • `assigned_points` seeds both running sums that walk the backlog —
+ *     `app/coffee/modules/backlog/main.coffee:493` in `calculateForecasting` and `:818` in
+ *     the doomline — and both add to it immediately, so it is required and non-nullable.
+ *   • `milestones` IS the burndown series. `backlog/main.coffee:1326-1328` watches `stats`
+ *     and calls `redrawChart(element, $scope.stats)`, whose parameter is then indexed as
+ *     `dataToDraw.milestones` at `:1221`, `:1231`, `:1237`, `:1243-1244`, `:1250`, `:1273`
+ *     and `:1306`. So the series arrives INSIDE this payload rather than from a separate
+ *     fetch, and a chart component reading it off `stats` is reading a real field.
+ *
  * OPTIONALITY AND NULLABILITY ARE EVIDENCE-DRIVEN, not defensive guesswork. Each field is
  * as narrow as the incumbent proves it can be and no narrower:
  *
  *   • `total_points` and `total_milestones` carry an EXISTENTIAL check at
- *     `app/coffee/modules/backlog/main.coffee:266`, and the summary bar additionally gates
+ *     `app/coffee/modules/backlog/main.coffee:312`, and the summary bar additionally gates
  *     its project-points block on `total_points` being truthy at
  *     `app/partials/includes/components/summary.jade:14` — so both are nullable.
- *   • `defined_points` is used as the FALLBACK total at `backlog/main.coffee:259` and the
- *     result is then truthy-guarded at `:261`, which is the incumbent defending against it
- *     being empty — so it is nullable too.
+ *   • `defined_points` is NOT nullable, and the earlier nullable declaration was the
+ *     defect. `backlog/main.coffee:305` uses it as the FALLBACK total and `:307` then
+ *     truthy-guards the RESULT of that fallback chain — a guard that fires just as well for
+ *     a zero total, which is what a project with nothing estimated actually sends. The
+ *     summary bar corroborates: `summary.jade:18` renders it UNCONDITIONALLY, with no
+ *     `ng-if`, unlike the project-points block four lines above. The canonical
+ *     `ProjectStats` declares it required for the same two reasons.
  *   • `closed_points` and `speed` are read unguarded — in the arithmetic at
- *     `backlog/main.coffee:262` and in the summary bar at `summary.jade:24` — so they are
+ *     `backlog/main.coffee:308` and in the summary bar at `summary.jade:24` — so they are
  *     modelled as plain numbers, exactly the assumption the incumbent already makes.
+ *
+ * HOW THE CANONICAL HAND-OFF WORKS, since this type is deliberately one field short of it.
+ * `completedPercentage` is client-derived (see below), so the consuming hook builds the
+ * canonical value by deriving it and spreading:
+ *
+ *     const raw = await getProjectStats(projects, projectId);
+ *     const totalPoints = raw.total_points ? raw.total_points : raw.defined_points;
+ *     const stats: ProjectStats = {
+ *         ...raw,
+ *         completedPercentage: totalPoints ? Math.round((100 * raw.closed_points) / totalPoints) : 0,
+ *     };
+ *
+ * That assignment type-checks with NO assertion and NO transformation, which is the whole
+ * point of modelling the response completely — and the derivation stays exactly where the
+ * incumbent performs it, in the screen (`backlog/main.coffee:305-310`), never here (T10).
  *
  * `readonly` throughout (P-IMMER-4). This is a live server response: a caller that needs a
  * derived value builds a new object rather than mutating the one every other consumer
- * holds. That matters here specifically because the incumbent controller DOES mutate it —
- * see `completedPercentage` below.
+ * holds. That matters here specifically because the incumbent controller DOES mutate it — it
+ * writes `completedPercentage` onto the resolved object at `backlog/main.coffee:308`. React
+ * spreads instead, which is the immer-safe form of the same behaviour; the note at the end of
+ * the member list records why that member is deliberately not declared here.
  */
+/**
+ * One sample of the burndown series, as it arrives inside the statistics payload.
+ *
+ * ⭐ DECLARED LOCALLY AND STRUCTURALLY, exactly like {@link ProjectStatsResponse} itself and
+ * for the same reason (rule T9). The canonical `BurndownMilestone` is owned by
+ * `app/react/backlog/state/types.ts`, the screen that consumes it. This module must NOT
+ * import it: `shared/api/**` is below `backlog/**` in the layering, transport must not
+ * depend on a screen's domain state, and that file's own header forbids the reverse import
+ * too. Because both descriptions are structural and member-for-member identical, the
+ * canonical type is satisfied by this one with neither side importing the other — which is
+ * what makes the spread shown on {@link ProjectStatsResponse} compile.
+ *
+ * Every member is one of the five reads the authoritative burndown configuration performs
+ * over `dataToDraw.milestones` at `app/coffee/modules/backlog/main.coffee:1217-1338`, which
+ * `BurndownChart.tsx` reproduces rather than replaces (gap G-DS-2 retains the existing
+ * chart, because substituting a charting library would change pixels for no benefit).
+ */
+interface ProjectStatsBurndownMilestone {
+    /**
+     * The sprint name, shown in the tooltip of all four labelled series
+     * (`backlog/main.coffee:1306`, and again at `:1309`, `:1312` and `:1315`).
+     *
+     * NOT UNIQUE, so it cannot key a rendered list: live data repeats one generic label
+     * across every sprint that has not started yet.
+     */
+    readonly name: string;
+
+    /**
+     * The ideal remaining-points value: series 1, the optimal line. Mapped with no guard at
+     * `backlog/main.coffee:1231`, so it is required and non-nullable.
+     */
+    readonly optimal: number;
+
+    /**
+     * The measured remaining-points value: series 2, the real evolution line.
+     *
+     * NULLABLE, AND NULL ENTRIES ARE DROPPED RATHER THAN ZERO-FILLED.
+     * `backlog/main.coffee:1237` builds the series through an EXISTENTIAL FILTER, so a
+     * sprint with no measurement yet contributes no point and the line simply stops.
+     * Substituting zero would draw a false plunge to the axis.
+     */
+    readonly evolution: number | null;
+
+    /**
+     * Points the team added during the sprint: the negative-going team increment, series 4.
+     *
+     * ⭐ THE QUOTED, HYPHENATED KEY IS MANDATORY, not decorative: a hyphen is not a valid
+     * bare identifier, and the incumbent reads exactly this spelling at
+     * `backlog/main.coffee:1250` and `:1244`. A camelCase rename would read nothing off the
+     * payload and draw a blank series with no error at all.
+     */
+    readonly 'team-increment': number;
+
+    /**
+     * Points the client added during the sprint; series 3 subtracts it together with the
+     * team increment at `backlog/main.coffee:1243-1244`. Quoted for the same reason.
+     */
+    readonly 'client-increment': number;
+}
+
 interface ProjectStatsResponse {
+    /**
+     * Points already committed to a sprint.
+     *
+     * Not rendered by the summary bar, and read UNGUARDED twice: `calculateForecasting`
+     * seeds its running sum from it at `app/coffee/modules/backlog/main.coffee:493`, and the
+     * doomline seeds the same sum at `:818` before finding the row at which committed points
+     * overflow the project total. Both add to it immediately, so a null there would poison
+     * the sum rather than fail — hence required and non-nullable, matching the canonical
+     * `ProjectStats`.
+     */
+    readonly assigned_points: number;
+
     /**
      * Total points across the project, rendered as "n project points" by
      * `app/partials/includes/components/summary.jade:15` and used as the preferred
-     * denominator of the completion percentage at `app/coffee/modules/backlog/main.coffee:259`.
+     * denominator of the completion percentage at `app/coffee/modules/backlog/main.coffee:305`.
      */
     readonly total_points: number | null;
 
     /**
-     * Points that have been estimated, rendered by `summary.jade:18`, and the fallback
-     * denominator when `total_points` is empty (`backlog/main.coffee:259`).
+     * Points that have been estimated: the fallback denominator when `total_points` is
+     * falsy (`backlog/main.coffee:305`), rendered UNCONDITIONALLY by `summary.jade:18`.
+     *
+     * REQUIRED AND NON-NULLABLE. The truthy guard at `backlog/main.coffee:307` tests the
+     * RESULT of the fallback chain, not this field's existence, and it fires just as well
+     * for the zero a project with nothing estimated actually sends. The unconditional
+     * render is the second corroboration, and the canonical `ProjectStats` declares it the
+     * same way — which is what lets the spread in this interface's own documentation
+     * type-check.
      */
-    readonly defined_points: number | null;
+    readonly defined_points: number;
 
-    /** Points already closed, rendered by `summary.jade:21`. */
     readonly closed_points: number;
 
-    /** Points per sprint, rendered by `summary.jade:24`. */
     readonly speed: number;
 
     /**
-     * Number of milestones in the project. Not rendered by the summary bar; read at
-     * `app/coffee/modules/backlog/main.coffee:266` together with `total_points` to decide
-     * whether the burndown chart is replaced by its placeholder.
+     * The burndown series: one entry per milestone, IN SPRINT ORDER.
+     *
+     * Proven to belong to this payload by the watch-to-`redrawChart` chain traced on this
+     * interface above. Series order is significant — the incumbent pairs each entry with its
+     * index at `backlog/main.coffee:1221` and `:1273` — so the array is `readonly` and a
+     * consumer needing a mutable sequence copies first.
+     *
+     * ⚠ DO NOT DERIVE `total_milestones` FROM ITS LENGTH, NOR ITS LENGTH FROM
+     * `total_milestones`. The two disagree in live data: the server appends a synthetic
+     * terminal point beyond the counted milestones, whose `optimal` is floating-point
+     * residue rather than a clean zero.
+     */
+    readonly milestones: readonly ProjectStatsBurndownMilestone[];
+
+    /**
+     * Number of milestones in the project — A COUNT, NOT THE LENGTH OF `milestones`.
+     *
+     * Not rendered by the summary bar; read at `app/coffee/modules/backlog/main.coffee:312`
+     * together with `total_points` in an EXISTENTIAL test that decides whether the burndown
+     * chart is replaced by its placeholder. An existential guard on a value that could never
+     * be absent would be dead code, so the field is nullable and every consumer reproduces
+     * the guard before showing the chart.
      */
     readonly total_milestones: number | null;
 
-    /**
-     * ⭐ DERIVED CLIENT-SIDE, NOT SENT BY THE SERVER — which is why it is optional.
+    /*
+     * ⭐ `completedPercentage` IS DELIBERATELY ABSENT FROM THIS INTERFACE, and its absence is
+     * load-bearing rather than an omission.
      *
-     * The incumbent controller computes it and writes it ONTO the resolved response:
-     * `Math.round(100 * stats.closed_points / totalPoints)` at
-     * `app/coffee/modules/backlog/main.coffee:262`, or `0` at `:264` when there is no
-     * denominator. The summary bar then renders it as a percentage at
+     * The server never sends it. The incumbent controller DERIVES it and writes it onto the
+     * already-resolved response — `Math.round(100 * stats.closed_points / totalPoints)` at
+     * `app/coffee/modules/backlog/main.coffee:308`, or `0` at `:310` when there is no
+     * denominator — and the summary bar then renders it at
      * `app/partials/includes/components/summary.jade:12`.
      *
-     * That write is only possible BECAUSE this payload is plain mutable JSON rather than a
-     * model wrapper — the asymmetry of §2 in action. Declaring the field optional
-     * describes the wire shape truthfully (G2) while leaving the derivation exactly where
-     * the incumbent puts it: in the screen, not in this facade (T10). With the field
-     * `readonly`, the React caller derives it into a NEW object rather than mutating the
-     * response in place, which is the immer-safe form of the same behaviour.
+     * This interface describes the WIRE, so a field the wire does not carry does not belong on
+     * it (G2). Declaring it here — even optionally — would reintroduce exactly the defect this
+     * file was corrected for: one object described two ways, with a member a caller could read
+     * and always find `undefined`. Leaving it out makes the type total over what the response
+     * actually contains, and forces the derivation to stay where the incumbent performs it, in
+     * the screen (T10) — see the canonical hand-off documented on this interface above, which
+     * derives and spreads with no assertion.
+     *
+     * The canonical `ProjectStats` in `app/react/backlog/state/types.ts:317` declares it
+     * REQUIRED; that is the one member by which the two shapes differ, and the spread is what
+     * closes the gap. `projects.test.ts` pins both halves: that a resolved response has no such
+     * key at runtime, and that the derive-and-spread satisfies the canonical type.
      */
-    readonly completedPercentage?: number;
 }
 
-/**
- * The tag-name-to-colour dictionary that the tag-colour read wraps.
- *
- * A DICTIONARY, keyed by tag name. Not to be confused with the `Tag` domain type in
- * `../types/`, which is a TUPLE of name and colour describing a tag as it appears ON a
- * user story. The two shapes are different and are deliberately not conflated, which is
- * why nothing is imported from `../types/` here.
- *
- * The colour is nullable because a tag may legitimately have none: the incumbent
- * tag-creation path sets `data.color = null` and only overwrites it when a colour was
- * supplied (`app/coffee/modules/resources/projects.coffee:102-109`).
- *
- * Values are DATA (rule T2, §6 of the file header) — read from the project, never
- * hardcoded.
- */
 type ProjectTagsColorsAttrs = Readonly<Record<string, string | null>>;
 
 /**
@@ -312,7 +281,7 @@ type ProjectTagsColorsAttrs = Readonly<Record<string, string | null>>;
  *
  * Faces `service.stats` at `app/coffee/modules/resources/projects.coffee:42-43`, whose
  * sole in-scope consumer is `loadProjectStats` in
- * `app/coffee/modules/backlog/main.coffee:256-268` — the call itself is `:257`.
+ * `app/coffee/modules/backlog/main.coffee:302-315` — the call itself is `:303`.
  *
  * ⭐ RESOLVES PLAIN JSON. This is the raw half of the asymmetry documented in §2 of the
  * file header: `service.stats` delegates to the repository's `queryOneRaw`, which resolves
@@ -354,26 +323,84 @@ export function getProjectStats(
     projects: ProjectsService,
     projectId: number,
 ): Promise<ProjectStatsResponse> {
-    // TECHNOLOGY SEAM (rule T9): `$q` -> native `Promise`.
-    //
-    // Everything the AngularJS service layer returns is a `$q` promise, whose resolution
-    // is coupled to the AngularJS digest loop rather than to the microtask queue. The
-    // sibling marshaller converts it once, here at the boundary, so every React consumer
-    // above this line is plain modern JavaScript that can `await` the result. It forwards
-    // both fulfilment and rejection values byte-for-byte and adds no timeout, retry,
-    // cancellation or logging.
-    //
-    // The incoming value is therefore typed as a thenable, never as a native promise —
-    // and no digest is ever triggered from React: digest cycles remain AngularJS's
-    // concern, and React state is driven by React.
-    //
-    // The type argument is supplied at BOTH calls rather than left to inference: the
-    // incumbent member is generic over its payload precisely so a facade can name the
-    // concrete shape, and being explicit is what turns this file into the one place the
-    // wire shape is asserted.
     return toNativePromise<ProjectStatsResponse>(
         projects.stats<ProjectStatsResponse>(projectId),
     );
+}
+
+/**
+ * Turns a raw statistics response into the canonical `ProjectStats` the Backlog screen
+ * consumes, by supplying the ONE member the server does not send.
+ *
+ * ⭐ WHY THIS EXISTS AT ALL. `completedPercentage` is required by the canonical type and is
+ * absent from every response: it is derived on the client. The incumbent derives it by
+ * MUTATING the resolved response —
+ *
+ *     totalPoints = if stats.total_points then stats.total_points else stats.defined_points
+ *     if totalPoints
+ *         @scope.stats.completedPercentage = Math.round(100 * stats.closed_points / totalPoints)
+ *     else
+ *         @scope.stats.completedPercentage = 0
+ *
+ * — at `app/coffee/modules/backlog/main.coffee:259-264`. React cannot copy that shape: the
+ * response is shared, `readonly`, and destined for an immer-managed store whose `autoFreeze`
+ * would reject the write (P-IMMER-4). So the SAME ARITHMETIC produces a NEW object here
+ * instead, and the mutation disappears without the behaviour changing.
+ *
+ * THE ARITHMETIC IS REPRODUCED EXACTLY, and each detail is load-bearing:
+ *
+ *   • The denominator is a TRUTHY fallback, not a null-coalescing one. `total_points` of `0`
+ *     falls through to `defined_points` — `??` or a `!= null` test would not. `:259` is a
+ *     CoffeeScript `if/else` on the bare value, so truthiness is the incumbent's rule and it
+ *     is preserved verbatim.
+ *   • The result is then TRUTHY-GUARDED, so a zero denominator yields `0` rather than
+ *     `NaN` or `Infinity` (`:261` against `:264`). A project with no points is the ordinary
+ *     case for a freshly created project, not an edge case.
+ *   • `Math.round`, not `Math.floor` and not a fixed-decimal string: the value is rendered
+ *     as `stats.completedPercentage + '%'` at
+ *     `app/partials/includes/components/summary.jade:12` and also drives the bar's fill at
+ *     `:9`, so a change of rounding would be visible on screen.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO:
+ *
+ *   • NO CAST, anywhere. The declared return type is the imported canonical type and the
+ *     returned object literal satisfies it structurally, so the compiler — not a
+ *     type-assertion — is what proves the mapping complete. Add a member to `ProjectStats`
+ *     and this function stops compiling, which is precisely the intended failure.
+ *   • NO MUTATION of the argument, and no reuse of its identity: a fresh object is returned,
+ *     so the response stays exactly as the server sent it for any other consumer.
+ *   • NO other derivation. `showGraphPlaceholder` (`:266`) is a VIEW decision that belongs to
+ *     the screen and its existential guard on `total_points` and `total_milestones` must be
+ *     reproduced there; `calculateForecasting` (`:267`) is likewise the screen's. This
+ *     function supplies the one field the canonical CONTRACT is missing and stops.
+ *   • NO validation, no default and no coercion. Every other member is forwarded exactly as
+ *     received, including nulls.
+ *
+ * A pure function rather than a hook, so the browserless suite can assert the arithmetic
+ * directly, and so a caller may apply it wherever the response happens to arrive.
+ *
+ * @param response - a statistics body as {@link getProjectStats} resolved it.
+ * @returns a new canonical `ProjectStats` carrying the derived completion percentage.
+ */
+export function toProjectStats(response: ProjectStatsResponse): ProjectStats {
+    // `:259` — the TRUTHY fallback chain, not a nullish one.
+    const totalPoints = response.total_points ? response.total_points : response.defined_points;
+
+    // `:261-264` — guarded so an absent or zero denominator yields 0, never NaN.
+    const completedPercentage = totalPoints
+        ? Math.round((100 * response.closed_points) / totalPoints)
+        : 0;
+
+    return {
+        assigned_points: response.assigned_points,
+        closed_points: response.closed_points,
+        completedPercentage,
+        defined_points: response.defined_points,
+        milestones: response.milestones,
+        speed: response.speed,
+        total_milestones: response.total_milestones,
+        total_points: response.total_points,
+    };
 }
 
 /**
@@ -438,10 +465,6 @@ export function getProjectTagsColors(
     projects: ProjectsService,
     projectId: number,
 ): Promise<TaigaModel<ProjectTagsColorsAttrs>> {
-    // Second crossing of the same `$q` -> native seam described on
-    // {@link getProjectStats}. Marshalled through the identical adapter so both facades
-    // behave alike, and typed as a model rather than as a dictionary so the asymmetry
-    // survives all the way into the caller's type.
     return toNativePromise<TaigaModel<ProjectTagsColorsAttrs>>(
         projects.tagsColors<ProjectTagsColorsAttrs>(projectId),
     );

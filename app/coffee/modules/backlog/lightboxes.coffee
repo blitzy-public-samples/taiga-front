@@ -13,29 +13,15 @@ debounce = @.taiga.debounce
 module = angular.module("taigaBacklog")
 
 #############################################################################
-## AngularJS / React coexistence seam (strangler-fig migration)
-##
-## This module is RETRIEVED, never re-declared. `angular.module("taigaBacklog")`
-## must NEVER gain a second argument: the declaration is owned by
-## `app/coffee/modules/backlog.coffee:9` (`angular.module("taigaBacklog", [])`)
-## and `app/coffee/modules/taskboard/sortable.coffee:17` retrieves the SAME
-## module *after* this folder in the Gulp `coffee_order`. Passing `[]` here would
-## reset the module and silently detach the out-of-scope taskboard's
-## `tgTaskboardSortable` at bootstrap.
-##
-## This file now carries ZERO AngularJS registrations, BY DESIGN. Its single
-## directive registration (`tgLbCreateEditSprint`) is retired at the foot of the
-## file; the sprint create/edit form is rendered by
-## `app/react/backlog/SprintFormLightbox.tsx`. The `CreateEditSprint` factory
-## below is deliberately LEFT IN PLACE, unregistered, because it is the
-## authoritative validation-behaviour reference for that React successor -- only
-## the registration call itself is removed. See the retirement comment at the
-## foot of the file for the full behavioural inventory.
-#############################################################################
-
-#############################################################################
 ## Creare/Edit Sprint Lightbox Directive
 #############################################################################
+## The factory below is intentionally unregistered: the sprint form is rendered by
+## React, and this body is the authoritative reference for the behaviour it has to
+## reproduce -- three required fields, `form.reset()` on every open, dates read from
+## the DOM and converted through the locale-driven picker format, and the two
+## non-interchangeable debounces (200 ms on the name model, 2000 ms on submit).
+## Its three success broadcasts must keep firing: an out-of-scope project service
+## lists all three among the signals that trigger its refetch.
 
 CreateEditSprint = ($repo, $confirm, $rs, $rootscope, lightboxService, $loading, $translate, projectService, $timeout) ->
     link = ($scope, $el, attrs) ->
@@ -253,41 +239,3 @@ CreateEditSprint = ($repo, $confirm, $rs, $rootscope, lightboxService, $loading,
         resetSprint()
 
     return {link: link}
-
-
-## RETIRED (React coexistence migration): the `tgLbCreateEditSprint` directive
-## registration is removed. The sprint create/edit lightbox is superseded by
-## `app/react/backlog/SprintFormLightbox.tsx`, which builds its shell from the
-## in-repo `lightbox()` mixin (`app/styles/dependencies/mixins/lightbox.scss`)
-## and its markup from `app/partials/includes/modules/lightbox-sprint-add-edit.jade`
-## -- never from a Figma frame, because neither frame captures any lightbox state.
-## With this registration gone the file registers nothing at all; the now-inert
-## `tg-lb-create-edit-sprint` attribute on `app/partials/backlog/backlog.jade:201`
-## is simply ignored by AngularJS.
-##
-## The `CreateEditSprint` factory above is retained as the authoritative
-## behavioural reference for that successor. What it specifies:
-##
-##  * FOUR validation rules, declared in the jade, replacing `checksley`:
-##    `name` required + maxlength 500, `estimated_start` required,
-##    `estimated_finish` required. No custom validator needs porting -- the
-##    global `re_weburl` validator from `app/coffee/app.coffee:957` is unused here.
-##  * TWO DISTINCT debounces: a 200 ms *model* debounce on `name`
-##    (`ng-model-options` in the jade) and the 2,000 ms *submit* debounce at the
-##    head of `submit` above. They are not interchangeable.
-##  * Reset-on-open: `form.reset()` runs inside the `sprintform:create` handler,
-##    after `resetSprint()`, every time the lightbox opens.
-##  * Dates are read FROM THE DOM (`.date-start` / `.date-end`), not from the
-##    model, then converted with `moment(value, prettyDate).format("YYYY-MM-DD")`
-##    where `prettyDate` is the locale-driven `COMMON.PICKERDATE.FORMAT`.
-##  * The failure path adds `.disappear` to `.last-sprint-name` and returns.
-##  * Delete is gated on the `delete_milestone` permission.
-##  * Writes go through `$tgRepo`: `$repo.create("milestones", ...)` on create and
-##    `$repo.save(...)` after `realClone()` on edit, so `$tgModel` dirty-tracking
-##    keeps PATCHing only changed fields plus the optimistic-concurrency
-##    `version`. React must reuse this layer, never a hand-rolled HTTP client.
-##  * Three broadcasts MUST keep firing: `sprintform:create:success`,
-##    `sprintform:edit:success` and `sprintform:remove:success`. The out-of-scope
-##    `app/modules/services/project.service.coffee:43-45` lists all three in
-##    `fetchRequiredSignals`, so dropping any one silently stops the project
-##    refetch -- a cross-screen regression. `BacklogController` also listens.

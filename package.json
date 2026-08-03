@@ -21,14 +21,15 @@
     "test": "jest",
     "test:karma": "./node_modules/karma/bin/karma start",
     "e2e": "./node_modules/.bin/babel-node run-e2e.js",
-    "e2e:react": "playwright test",
+    "e2e:react": "playwright test --project=firefox",
+    "e2e:react:chromium": "playwright test --project=chromium",
     "start": "npx gulp",
     "ci:test": "npx gulp deploy && ./node_modules/karma/bin/karma start --single-run --browsers=ChromeHeadlessCI"
   },
   "devDependencies": {
     "@dnd-kit/core": "6.3.1",
     "@playwright/test": "1.44.1",
-    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/jest-dom": "6.10.0",
     "@testing-library/react": "14.3.1",
     "@types/jest": "29.5.14",
     "@types/react": "18.2.79",
@@ -114,6 +115,9 @@
     "typescript": "5.9.3",
     "uuid": "^3.3.2",
     "vinyl-fs": "^2.1.1"
+  },
+  "overrides": {
+    "node-releases": "2.0.19"
   },
   "pre-commit": [
     "scss-lint"

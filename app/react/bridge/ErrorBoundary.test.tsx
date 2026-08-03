@@ -406,10 +406,13 @@ describe('ErrorBoundary', () => {
             expect(pill).toHaveClass('tag');
         });
 
-        it('escapes user-authored content that arrives through a thrown error message', () => {
-            // The fallback appends the failure description as text. A story
-            // subject frequently ends up inside a thrown message, so this is the
-            // same exposure by a different route and is asserted the same way.
+        it('does not render a thrown error message at all, hostile or otherwise', () => {
+            // A story subject frequently ends up inside a thrown message, so the
+            // message is a user-authored-content channel too. It is now WITHHELD
+            // from the fallback rather than escaped into it: escaping defeats the
+            // markup attack but still discloses the content, and an internal
+            // exception message is written for a developer, not for the person
+            // looking at the board.
             const hostileMessage = '<img src=x onerror="alert(1)"> could not be saved';
 
             const { container } = render(
@@ -420,7 +423,8 @@ describe('ErrorBoundary', () => {
 
             const fallback = screen.getByRole('alert');
 
-            expect(fallback.textContent).toBe(`${FALLBACK_MESSAGE} ${hostileMessage}`);
+            expect(fallback.textContent).toBe(FALLBACK_MESSAGE);
+            expect(fallback.textContent).not.toContain('could not be saved');
             expect(fallback.children).toHaveLength(0);
             expect(fallback.innerHTML).not.toContain('<img');
             expect(container.querySelector('img')).toBeNull();
@@ -469,7 +473,10 @@ describe('ErrorBoundary', () => {
             ).not.toThrow();
 
             expect(screen.getByRole('alert')).toBeInTheDocument();
-            expect(screen.getByRole('alert').textContent).toContain('board render failed');
+            // The generic sentence, and only that: the failure is local and
+            // visible without the internal description being painted into the page.
+            expect(screen.getByRole('alert').textContent).toBe(FALLBACK_MESSAGE);
+            expect(screen.getByRole('alert').textContent).not.toContain('board render failed');
         });
 
         it('flips to the fallback on the same commit as the failed render', () => {
@@ -495,24 +502,76 @@ describe('ErrorBoundary', () => {
             expect(derived.error).toBe(thrown);
         });
 
-        it('reports the failure with the error and a React component stack', () => {
+        it('logs ONE sanitised argument: no error object, no message, no component stack', () => {
+            // The console is readable by anyone with the page open and is routinely
+            // pasted into tickets. An error object logged there exposes its message
+            // AND its stack, and the React component stack maps out the internal
+            // component tree. Both are withheld; the class name is the one variable
+            // that survives, because it is a fixed label rather than a string
+            // composed at the throw site.
             render(
                 <ErrorBoundary>
-                    <ThrowingChild thrown={new Error('stack please')} />
+                    <ThrowingChild thrown={new TypeError('stack please')} />
                 </ErrorBoundary>,
             );
 
             const diagnostics = boundaryDiagnostics(consoleErrorSpy);
 
             expect(diagnostics).toHaveLength(1);
-            expect(diagnostics[0]).toHaveLength(3);
-            expect(diagnostics[0][1]).toBeInstanceOf(Error);
-            expect(diagnostics[0][1]).toHaveProperty('message', 'stack please');
-            // The component stack is the only way to locate the failing
-            // component once esbuild has bundled the tree into one file.
-            expect(typeof diagnostics[0][2]).toBe('string');
-            expect(diagnostics[0][2]).toContain('ThrowingChild');
-            expect(diagnostics[0][2]).toContain('ErrorBoundary');
+            // EXACTLY ONE argument. A second one would be the error or the stack.
+            expect(diagnostics[0]).toHaveLength(1);
+
+            const [line] = diagnostics[0];
+
+            expect(typeof line).toBe('string');
+            expect(line).toContain('(TypeError)');
+            expect(line).not.toContain('stack please');
+            expect(line).not.toContain('ThrowingChild');
+            expect(line).toContain('onError');
+        });
+
+        it('replaces an error class name that is not a plain identifier', () => {
+            // A `name` is only logged when it is a bare identifier. Anything
+            // carrying punctuation, whitespace, a path or a quotation mark could be
+            // a composed string rather than a class label, so it is discarded
+            // wholesale rather than trimmed.
+            const smuggled = new Error('inner');
+
+            smuggled.name = 'Error: /api/v1/userstories/42 for user jane.doe';
+
+            render(
+                <ErrorBoundary>
+                    <ThrowingChild thrown={smuggled} />
+                </ErrorBoundary>,
+            );
+
+            const [line] = boundaryDiagnostics(consoleErrorSpy)[0];
+
+            expect(line).toContain('(Error)');
+            expect(line).not.toContain('/api/v1/');
+            expect(line).not.toContain('jane.doe');
+        });
+
+        it('survives an error whose name getter throws', () => {
+            const hostile = new Error('inner');
+
+            Object.defineProperty(hostile, 'name', {
+                get(): string {
+                    throw new Error('hostile name getter');
+                },
+            });
+
+            expect(() =>
+                render(
+                    <ErrorBoundary>
+                        <ThrowingChild thrown={hostile} />
+                    </ErrorBoundary>,
+                ),
+            ).not.toThrow();
+
+            const [line] = boundaryDiagnostics(consoleErrorSpy)[0];
+
+            expect(line).toContain('(Error)');
         });
 
         it('invokes the onError prop with the error and the component stack, and still renders the fallback', () => {
@@ -581,16 +640,24 @@ describe('ErrorBoundary', () => {
             const diagnostics = boundaryDiagnostics(consoleErrorSpy);
 
             expect(screen.getByRole('alert')).toBeInTheDocument();
-            expect(screen.getByRole('alert').textContent).toContain('original failure');
+            expect(screen.getByRole('alert').textContent).toBe(FALLBACK_MESSAGE);
             expect(diagnostics).toHaveLength(2);
+            expect(diagnostics[1]).toHaveLength(1);
             expect(diagnostics[1][0]).toContain('onError callback threw');
+            // The reporter's own failure is sanitised too: this line is not routed
+            // anywhere else, so the label is all the console may have.
+            expect(diagnostics[1][0]).toContain('(Error)');
+            expect(diagnostics[1][0]).not.toContain('reporter exploded');
+            expect(diagnostics[1][0]).not.toContain('original failure');
         });
 
-        it('degrades gracefully when no component stack is available', () => {
+        it('logs the same single line when no component stack is available', () => {
             // The React typings make the component stack optional, and a
             // production build may omit it. Invoked directly because React's
-            // development build always supplies one, so this degradation is
-            // otherwise unreachable from a render.
+            // development build always supplies one, so this path is otherwise
+            // unreachable from a render. There is nothing to degrade any more --
+            // the stack was never logged -- so the assertion is that the absence
+            // changes neither the shape nor the content of the diagnostic.
             const boundaryRef = createRef<ErrorBoundary>();
 
             render(
@@ -600,12 +667,49 @@ describe('ErrorBoundary', () => {
             );
 
             expect(boundaryRef.current).not.toBeNull();
-            boundaryRef.current?.componentDidCatch(new Error('no stack available'), {});
+            boundaryRef.current?.componentDidCatch(new RangeError('no stack available'), {});
 
             const diagnostics = boundaryDiagnostics(consoleErrorSpy);
 
             expect(diagnostics).toHaveLength(1);
-            expect(diagnostics[0][2]).toBe('(component stack unavailable)');
+            expect(diagnostics[0]).toHaveLength(1);
+            expect(diagnostics[0][0]).toContain('(RangeError)');
+            expect(diagnostics[0][0]).not.toContain('no stack available');
+        });
+
+        it('forwards a non-Error throw to the reporter as a real Error', () => {
+            // React hands `componentDidCatch` whatever was thrown, typed as an
+            // `Error` it may not be. Normalising once before reporting is what
+            // makes the declared `onError` signature honest.
+            const onError = jest.fn<void, [Error, ErrorInfo]>();
+            const boundaryRef = createRef<ErrorBoundary>();
+
+            render(
+                <ErrorBoundary ref={boundaryRef} onError={onError}>
+                    <span>Healthy subtree</span>
+                </ErrorBoundary>,
+            );
+
+            boundaryRef.current?.componentDidCatch('thrown as a string' as unknown as Error, {});
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0]).toBeInstanceOf(Error);
+            expect(onError.mock.calls[0][0].message).toBe('thrown as a string');
+        });
+
+        it('forwards a thrown Error to the reporter BY IDENTITY', () => {
+            // The counterpart of the case above: normalisation must not clone an
+            // error that already is one, or a host comparing references breaks.
+            const onError = jest.fn<void, [Error, ErrorInfo]>();
+            const thrown = new Error('the same object');
+
+            render(
+                <ErrorBoundary onError={onError}>
+                    <ThrowingChild thrown={thrown} />
+                </ErrorBoundary>,
+            );
+
+            expect(onError.mock.calls[0][0]).toBe(thrown);
         });
 
         it('describes every kind of thrown value without ever failing itself', () => {
@@ -671,6 +775,143 @@ describe('ErrorBoundary', () => {
      * and one console with a live AngularJS application.
      * -------------------------------------------------------------------------
      */
+    describe('⭐ generic fallback copy and owner-supplied localisation', () => {
+        it('renders the built-in generic sentence, and only that, when no copy is supplied', () => {
+            render(
+                <ErrorBoundary>
+                    <ThrowingChild thrown={new Error('an endpoint path a user must not see')} />
+                </ErrorBoundary>,
+            );
+
+            const fallback = screen.getByRole('alert');
+
+            expect(fallback.textContent).toBe(FALLBACK_MESSAGE);
+            expect(fallback.children).toHaveLength(0);
+        });
+
+        it('renders the pre-translated copy the owner supplies instead of the default', () => {
+            // Standing in for the owner resolving the existing catalogue key on
+            // the AngularJS side of the seam and handing the result down. The
+            // wording is deliberately not English, to prove the unit renders what
+            // it is given rather than anything of its own.
+            const translated = 'Ha ocurrido un error al mostrar esta seccion.';
+
+            render(
+                <ErrorBoundary message={translated}>
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            const fallback = screen.getByRole('alert');
+
+            expect(fallback.textContent).toBe(translated);
+            expect(fallback.textContent).not.toContain(FALLBACK_MESSAGE);
+            expect(screen.queryByText(FALLBACK_MESSAGE)).toBeNull();
+        });
+
+        it('trims the supplied copy, since a translation catalogue can carry padding', () => {
+            render(
+                <ErrorBoundary message={'  Se ha producido un error.  '}>
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            expect(screen.getByRole('alert').textContent).toBe('Se ha producido un error.');
+        });
+
+        it.each([
+            ['an empty string', ''],
+            ['a blank string', '   '],
+            ['a whitespace-only string', '\n\t '],
+        ])('falls back to the built-in sentence for %s, never to an empty region', (_label, message) => {
+            // A missing catalogue entry, or a translator that resolved to nothing,
+            // must not leave the failure silent - the user has to be told that
+            // something failed even when the copy for saying so is unavailable.
+            render(
+                <ErrorBoundary message={message}>
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            expect(screen.getByRole('alert').textContent).toBe(FALLBACK_MESSAGE);
+        });
+
+        it('still refuses to render the exception message when copy IS supplied', () => {
+            // The two props are independent: supplying copy must not become a
+            // route back to appending the failure description to it.
+            render(
+                <ErrorBoundary message="Se ha producido un error.">
+                    <ThrowingChild thrown={new Error('token=abcdef leaked into the message')} />
+                </ErrorBoundary>,
+            );
+
+            const fallback = screen.getByRole('alert');
+
+            expect(fallback.textContent).toBe('Se ha producido un error.');
+            expect(fallback.textContent).not.toContain('token=');
+        });
+
+        it('renders the supplied copy as text, never as markup', () => {
+            // The owner is trusted to supply generic copy, not trusted to supply
+            // safe markup: a translation catalogue is a data file, and this is the
+            // same guarantee the children path carries.
+            const { container } = render(
+                <ErrorBoundary message={'<img src=x onerror="alert(1)">'}>
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            const fallback = screen.getByRole('alert');
+
+            expect(fallback.textContent).toBe('<img src=x onerror="alert(1)">');
+            expect(fallback.children).toHaveLength(0);
+            expect(container.querySelector('img')).toBeNull();
+        });
+
+        it('lets a caller-supplied fallback element outrank the copy prop', () => {
+            // Precedence, asserted rather than assumed: a caller who supplies a
+            // whole element has replaced the region, so the copy prop is moot and
+            // the alert role goes with the region it belonged to.
+            render(
+                <ErrorBoundary message="ignored copy" fallback={<span>Custom recovery copy</span>}>
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            expect(screen.getByText('Custom recovery copy')).toBeInTheDocument();
+            expect(screen.queryByRole('alert')).toBeNull();
+            expect(screen.queryByText('ignored copy')).toBeNull();
+        });
+
+        it('adds no attribute and no element of its own for the copy prop', () => {
+            // Rule T1 again: the localised region is the same single element with
+            // the same single attribute, so no stylesheet learns about it.
+            render(
+                <ErrorBoundary message="Se ha producido un error.">
+                    <ThrowingChild thrown={new Error('boom')} />
+                </ErrorBoundary>,
+            );
+
+            const fallback = screen.getByRole('alert');
+
+            expect(fallback.tagName).toBe('DIV');
+            expect(fallback.getAttributeNames()).toEqual(['role']);
+            expect(fallback.outerHTML).not.toMatch(HEX_COLOUR_PATTERN);
+        });
+
+        it('renders the copy prop nowhere at all while nothing has failed', () => {
+            render(
+                <ErrorBoundary message="Se ha producido un error.">
+                    <span className="user-story-name">Reorder the sprint</span>
+                </ErrorBoundary>,
+            );
+
+            expect(screen.getByText('Reorder the sprint')).toBeInTheDocument();
+            expect(screen.queryByRole('alert')).toBeNull();
+            expect(screen.queryByText('Se ha producido un error.')).toBeNull();
+        });
+    });
+
     describe('coexistence constraints', () => {
         it('renders in light DOM, reachable from the document, with no shadow root', () => {
             // Requirement I6, and the reason it is not negotiable. A shadow root
@@ -815,8 +1056,12 @@ describe('ErrorBoundary', () => {
             expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
             expect(onError).toHaveBeenCalledTimes(1);
             expect(boundaryDiagnostics(consoleErrorSpy)).toHaveLength(1);
-            expect(screen.getByRole('alert').textContent).toContain('first failure');
+            expect(screen.getByRole('alert').textContent).toBe(FALLBACK_MESSAGE);
+            expect(screen.getByRole('alert').textContent).not.toContain('first failure');
             expect(screen.getByRole('alert').textContent).not.toContain('second failure');
+            // The first error is still held in state, so a host-supplied fallback
+            // can present whatever it judges appropriate.
+            expect(onError.mock.calls[0][0].message).toBe('first failure');
         });
 
         it('gives every mount its own state, so a later boundary is unaffected', () => {
@@ -864,11 +1109,13 @@ describe('ErrorBoundary', () => {
             expect(own[0][0]).toContain('the surrounding AngularJS shell is unaffected');
 
             // React and jsdom report the same throw through their own channels,
-            // which is exactly why the prefix exists. The boundary's line is also
-            // structurally distinct: three arguments - message, error, component
-            // stack - against the single formatted string the others emit.
+            // which is exactly why the prefix exists -- and it is also why the
+            // boundary's own line has to stay sanitised: those foreign channels
+            // are outside this migration's control, whereas this one is not.
             expect(foreign.length).toBeGreaterThan(0);
-            expect(own[0]).toHaveLength(3);
+            // ONE argument. Not the error, not the component stack.
+            expect(own[0]).toHaveLength(1);
+            expect(own[0][0]).not.toContain('attributable failure');
         });
 
         it('never logs when nothing fails', () => {
@@ -937,7 +1184,7 @@ describe('ErrorBoundary', () => {
 
 /*
  * -----------------------------------------------------------------------------
- * Second, independently authored pass over the same bulkhead.
+ * A second pass over the same bulkhead, from the normalisation angle.
  * -----------------------------------------------------------------------------
  * TECHNOLOGY-SPECIFIC SEAM SPEC (rule T9). This block was written separately
  * from the suite above and is retained in full: it approaches the boundary from
@@ -960,6 +1207,34 @@ describe('ErrorBoundary, normalisation and export surface', () => {
 
     const FALLBACK_PREFIX = 'Something went wrong while rendering this section.';
     const UNKNOWN_DESCRIPTION = 'An unknown error was thrown during render.';
+
+    /**
+     * Renders a throwing subtree and returns the description the boundary
+     * normalised, observed THROUGH THE REPORTER.
+     *
+     * The reporter is where the description goes now. It used to be appended to
+     * the fallback sentence, and every normalisation case below asserted on the
+     * rendered text; that made the page itself the disclosure channel for
+     * whatever a throw site had interpolated -- story subjects, tag names, epic
+     * names, project slugs, request URLs. The normalisation behaviour is unchanged
+     * and is still pinned case for case; only the observation point moved to the
+     * host-controlled sink. Every call also asserts that the PAGE shows the
+     * generic sentence and nothing else, so the two halves are proven together.
+     */
+    function normalisedMessageFor(thrown: unknown): string {
+        const onError = jest.fn<void, [Error, ErrorInfo]>();
+
+        render(
+            <ErrorBoundary onError={onError}>
+                <Exploding thrown={thrown} />
+            </ErrorBoundary>,
+        );
+
+        expect(screen.getByRole('alert').textContent).toBe(FALLBACK_PREFIX);
+        expect(onError).toHaveBeenCalledTimes(1);
+
+        return onError.mock.calls[0]?.[0].message ?? '';
+    }
 
     let consoleErrorSpy: jest.SpyInstance;
 
@@ -1007,29 +1282,23 @@ describe('ErrorBoundary, normalisation and export surface', () => {
                 expect(alert).not.toHaveAttribute('style');
             });
 
-            it("appends the error's own message as text", () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={new Error('kanban board blew up')} />
-                    </ErrorBoundary>,
+            it("routes the error's own message to the reporter, never to the page", () => {
+                expect(normalisedMessageFor(new Error('kanban board blew up'))).toBe(
+                    'kanban board blew up',
                 );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} kanban board blew up`,
-                );
+                expect(screen.getByRole('alert').textContent).not.toContain('blew up');
             });
 
-            it('renders user-authored content as text and never as markup', () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={new Error('<img src=x onerror="alert(1)">')} />
-                    </ErrorBoundary>,
+            it('keeps user-authored content out of the page entirely, as markup or as text', () => {
+                expect(normalisedMessageFor(new Error('<img src=x onerror="alert(1)">'))).toBe(
+                    '<img src=x onerror="alert(1)">',
                 );
 
                 const alert = screen.getByRole('alert');
 
                 expect(alert.querySelector('img')).toBeNull();
-                expect(alert.textContent).toContain('<img src=x onerror="alert(1)">');
+                expect(alert.textContent).not.toContain('<img');
+                expect(alert.textContent).not.toContain('onerror');
             });
 
             it('renders a caller-supplied fallback instead of the default', () => {
@@ -1111,51 +1380,21 @@ describe('ErrorBoundary, normalisation and export surface', () => {
 
         describe('normalising whatever was thrown', () => {
             it('uses a string throw as the message', () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown="a bare string" />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} a bare string`,
-                );
+                expect(normalisedMessageFor('a bare string')).toBe('a bare string');
             });
 
             it('falls back to the generic description for an empty string', () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown="" />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} ${UNKNOWN_DESCRIPTION}`,
-                );
+                expect(normalisedMessageFor('')).toBe(UNKNOWN_DESCRIPTION);
             });
 
             it('uses the `message` of an error-like object that does not extend Error', () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={{ message: 'cross-realm failure' }} />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} cross-realm failure`,
+                expect(normalisedMessageFor({ message: 'cross-realm failure' })).toBe(
+                    'cross-realm failure',
                 );
             });
 
             it('falls back to the generic description for an object with no message', () => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={{ status: 500 }} />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} ${UNKNOWN_DESCRIPTION}`,
-                );
+                expect(normalisedMessageFor({ status: 500 })).toBe(UNKNOWN_DESCRIPTION);
             });
 
             it.each([
@@ -1163,15 +1402,7 @@ describe('ErrorBoundary, normalisation and export surface', () => {
                 ['a boolean', true, 'true'],
                 ['a bigint', BigInt(9), '9'],
             ])('stringifies %s throw', (_label, thrown, expected) => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={thrown} />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} ${expected}`,
-                );
+                expect(normalisedMessageFor(thrown)).toBe(expected);
             });
 
             it('degrades to the generic description for a hostile `message` getter', () => {
@@ -1235,15 +1466,7 @@ describe('ErrorBoundary, normalisation and export surface', () => {
                 ['null', null],
                 ['undefined', undefined],
             ])('falls back to the generic description when %s is thrown', (_label, thrown) => {
-                render(
-                    <ErrorBoundary>
-                        <Exploding thrown={thrown} />
-                    </ErrorBoundary>,
-                );
-
-                expect(screen.getByRole('alert')).toHaveTextContent(
-                    `${FALLBACK_PREFIX} ${UNKNOWN_DESCRIPTION}`,
-                );
+                expect(normalisedMessageFor(thrown)).toBe(UNKNOWN_DESCRIPTION);
             });
 
             it('exposes the normalised error through `getDerivedStateFromError`', () => {
@@ -1265,17 +1488,22 @@ describe('ErrorBoundary, normalisation and export surface', () => {
          * Minimal Change Clause forbids.
          */
         describe('defensive branches', () => {
-            it('substitutes placeholder text when React supplies no component stack', () => {
+            it('logs one sanitised line even when React supplies no component stack', () => {
                 const boundary = new ErrorBoundary({});
-                const failure = new Error('stackless');
+                const failure = new TypeError('stackless');
 
                 boundary.componentDidCatch(failure, { componentStack: null });
 
-                expect(
-                    consoleErrorSpy.mock.calls.some((call) =>
-                        call.includes('(component stack unavailable)'),
-                    ),
-                ).toBe(true);
+                const own = consoleErrorSpy.mock.calls.filter((call) =>
+                    String(call[0]).includes('[taiga-react-bridge:ErrorBoundary]'),
+                );
+
+                expect(own).toHaveLength(1);
+                // One argument, and no stack placeholder to substitute: the stack was
+                // never logged, so its absence changes nothing.
+                expect(own[0]).toHaveLength(1);
+                expect(own[0][0]).toContain('(TypeError)');
+                expect(own[0][0]).not.toContain('stackless');
             });
 
             it('renders the bare fallback sentence when the error state carries no error', () => {

@@ -1,153 +1,11 @@
-/**
- * toNativePromise — the AngularJS `$q` → native `Promise` marshaller that sits on the
- * AngularJS ↔ React seam.
+/*
+ * This source code is licensed under the terms of the
+ * GNU Affero General Public License found in the LICENSE file in
+ * the root directory of this source tree.
  *
- * ---------------------------------------------------------------------------------------
- * 1. WHAT THIS FILE IS
- * ---------------------------------------------------------------------------------------
- * This migration is a strangler-fig, in-place coexistence migration: the AngularJS 1.5.10
- * shell survives untouched, `KanbanController` and `BacklogController` survive as thin
- * bridges, and only the *rendering* layer of the Kanban and Backlog screens moves to
- * React 18. React is handed data through the repository's existing custom-element
- * hand-off (`tgLoadElement`, `app/coffee/modules/base/load-element.coffee:17-39`, which is
- * reused verbatim and never modified), and it reaches every service — HTTP, realtime,
- * translation, permissions — through the AngularJS injector rather than reimplementing
- * them.
- *
- * Everything AngularJS returns from that service layer is a `$q` promise. This module is
- * the one place where a `$q` promise becomes a native ES `Promise`, so that every React
- * consumer above it (hooks, containers, typed API facades) is plain modern JavaScript.
- *
- * @example
- * // Old — CoffeeScript controller, constructor injection (AAP §0.7.4):
- * //   @rs.userstories.list(projectId).then (uss) => @scope.userstories = uss
- * // New — React hook, marshalled once at the seam:
- * //   const uss = await toNativePromise(rs.userstories.list(projectId));
- *
- * ---------------------------------------------------------------------------------------
- * 2. WHY IT EXISTS
- * ---------------------------------------------------------------------------------------
- * `$q` resolution is coupled to the AngularJS digest loop: a `$q` promise settles when
- * AngularJS processes it, not when the microtask queue drains. Awaiting one directly from
- * React leaks that coupling into React code and — worse — tempts a caller into forcing a
- * digest to "make the await work". Converting once, here, at the seam, contains the
- * coupling to a single ten-line function and leaves every consumer with an ordinary
- * `Promise` it can `await`, `Promise.all`, or hand to `useEffect`.
- *
- * ---------------------------------------------------------------------------------------
- * 3. PROHIBITION 1 — NEVER TRIGGER AN ANGULARJS DIGEST FROM REACT
- * ---------------------------------------------------------------------------------------
- * AAP §0.7.4 is explicit that React code must never call AngularJS's digest triggers —
- * the rootScope/scope `apply()` and `digest()` family and `applyAsync()`. Digest cycles
- * stay AngularJS's concern. (AngularJS service and provider identifiers are deliberately
- * written throughout these comments without their `$` sigils where the sigilled spelling
- * would collide with a banned token: this folder is scanned for the digest-trigger and
- * transport tokens to catch real calls, and a comment naming them literally would trip a
- * gate that exists for a good reason.)
- *
- * Three verified facts make that prohibition safe to obey rather than a leap of faith:
- *
- *   a. AngularJS's own HTTP provider is already configured with `useApplyAsync(true)` at
- *      `app/coffee/app.coffee:604`. AngularJS itself already schedules HTTP resolution
- *      asynchronously; nothing needs nudging.
- *   b. `$tgEvents` dispatch with a *null* scope runs OUTSIDE any digest —
- *      `app/coffee/modules/events.coffee:185-190` branches on `if subscription.scope`
- *      (line 185) and only then wraps the callback; the else branch at lines 189-190
- *      invokes `subscription.callback(data.data)` directly. React's realtime callbacks,
- *      which subscribe with a null scope, therefore already arrive digest-free.
- *   c. React state is driven by React (`useState` / `useReducer`), never by a digest.
- *
- * If a `$q` promise appears not to settle in a test, the fix belongs in the TEST HARNESS —
- * pump the injected rootScope there — never in production code.
- *
- * ---------------------------------------------------------------------------------------
- * 4. PROHIBITION 2 — NEVER BUILD A PARALLEL HTTP CLIENT
- * ---------------------------------------------------------------------------------------
- * Rule T5, verbatim: "Reuse `$tgResources`; do not build a parallel HTTP client. New
- * TypeScript files are typed facades over the existing repository layer."
- *
- * No transport of any kind may appear anywhere under `app/react/bridge/`. This module does
- * not open, wrap, configure or reference a transport; it only adapts a promise that
- * AngularJS has already produced. What routing every request through `$tgResources` →
- * `$tgRepo` → `$tgHttp` inherits, and what a hand-rolled client would silently drop
- * (requirement I7):
- *
- *   • `Authorization: Bearer <token>` and `Accept-Language`, built by
- *     `app/coffee/modules/base/http.coffee:17-30` (token read at line 21, header set at
- *     line 23; preferred language read at line 26, header set at line 28) and merged into
- *     every request at line 33 via `_.assign({}, options.headers or {}, @.headers())`.
- *   • `X-Session-Id`, from the `defaultHeaders` literal at `app/coffee/app.coffee:590-594`
- *     (line 593), applied to delete/patch/post/put at lines 596-599, with GET receiving
- *     `X-Session-Id` alone at lines 600-602.
- *   • The interceptor chain, which supplies behaviour no React code may reimplement: the
- *     single-flight 401 refresh (`app/coffee/app.coffee:609-613` holds the shared
- *     in-progress/promise pair, so concurrent requests do not each trigger their own
- *     refresh); the 400-with-`version` VERSION_ERROR toast raised for 10,000 ms
- *     (lines 740-747); the 451 blocked-project interceptor (lines 764, 775); and the
- *     status-0 / status-−1 connection-error path (line 619).
- *
- * ---------------------------------------------------------------------------------------
- * 5. WHY REJECTION VALUES MUST PASS THROUGH UNTOUCHED
- * ---------------------------------------------------------------------------------------
- * The interceptor chain communicates through rejection *values*, not through exception
- * types: `versionCheckHttpIntercept` ends with `return $q.reject(response)` at
- * `app/coffee/app.coffee:750`, so the rejection value IS the AngularJS response object
- * carrying `status` and `data`. The repository layer likewise rejects with the raw server
- * payload — `defered.reject(data)` at `app/coffee/modules/base/repository.coffee:33` and
- * `:83`. Re-wrapping, normalising, logging-and-swallowing, or converting a rejection into
- * a resolution would hide VERSION_ERROR conflicts, 451 blocking and connection loss from
- * the callers whose job it is to surface them. This adapter therefore forwards the
- * rejection value byte-for-byte and adds nothing.
- *
- * Fulfilment values are forwarded with the same discipline. `$tgRepo` resolves with live
- * `$tgModel` instances — `defered.resolve(model)` at `repository.coffee:43`, `:58`, `:80`,
- * `:91` — and occasionally with a `[model, headers()]` tuple (`:78`). Unwrapping
- * `response.data`, cloning, or flattening here would change what every call site receives,
- * which rule T10 ("No functional or feature change of any kind") forbids.
- *
- * ---------------------------------------------------------------------------------------
- * 6. THE `$tgModel` DIRTY-TRACKING GUARANTEE
- * ---------------------------------------------------------------------------------------
- * Preserving those live model instances is a data-integrity requirement, not a stylistic
- * preference. `$tgModel.getAttrs(patch)` at `app/coffee/modules/base/model.coffee:48-54`
- * copies the optimistic-concurrency `version` into the modified-attribute set (lines
- * 49-50) and, when `patch` is true, returns `_.extend({}, @._modifiedAttrs)` (lines
- * 52-53) — ONLY the fields the user actually changed, plus `version`; the non-patch branch
- * at line 54 returns the full `_.extend({}, @._attrs, @._modifiedAttrs)` merge.
- * `$tgRepo.save()` (`repository.coffee:54-85`) sends exactly that as the PATCH body at
- * line 63, and short-circuits entirely when the model is unmodified (lines 57-59).
- *
- * A hand-rolled client would send the whole object instead, turning every edit into a
- * potential silent lost update: two users editing different fields of the same user story
- * would overwrite each other. There is no error, no toast and no console warning — the
- * corruption surfaces only on the next page load. That is the failure this file's
- * "adapt, never replace" contract exists to prevent.
- *
- * ---------------------------------------------------------------------------------------
- * Governing constraints honoured here: T5 (no parallel HTTP client), T8 (all new code
- * isolated under `app/react/**`; this module adds no barrel, helper or constants file),
- * T9 (comment the seam at the point of change), T10 and the Minimal Change Clause (no
- * timeouts, retries, cancellation, logging, unwrapping or error transformation — the
- * incumbent has none of them and adding any would be an enhancement), I7 (React calls the
- * existing `$tgRepo`/`$tgModel` layer), and HR-2 (the dependency set is closed —
- * `@types/angular` is deliberately absent, hence the minimal local `Thenable` type below
- * instead of an imported `ng.IPromise`).
+ * Copyright (c) 2021-present Kaleidos INC
  */
 
-/**
- * The minimal structural contract this adapter needs from an AngularJS `$q` promise.
- *
- * `$q` promises are Promises/A-compatible in the one way that matters here: they expose
- * `then(onFulfilled, onRejected)`. Some AngularJS call sites additionally use `catch()`
- * and `finally()`, but this adapter deliberately relies on `then` and nothing else, so it
- * works for any `$q`-like value — a `$q` promise, a `$q.all()` aggregate, a native
- * `Promise`, or a hand-rolled thenable in a unit test — without importing a type package.
- *
- * Declared locally and structurally on purpose: `@types/angular` is not part of the
- * pinned dependency set (HR-2) and must not be added.
- *
- * @typeParam T - the value the thenable fulfils with, forwarded unchanged.
- */
 export interface Thenable<T> {
     then(
         onFulfilled: (value: T) => unknown,
@@ -156,37 +14,82 @@ export interface Thenable<T> {
 }
 
 /**
- * Narrows an arbitrary value to {@link Thenable} using the Promises/A+ definition of a
- * thenable: a non-null object *or function* exposing a callable `then`. Functions are
- * included because `Promise.resolve()` adopts them too, and this helper is specified to
- * follow `Promise.resolve(thenable)` semantics.
+ * The `then` method of a {@link Thenable}, detached from its receiver.
  *
- * A type predicate rather than a cast to a permissive type: the parameter is `unknown`, so
- * the structural probe below needs no escape hatch and the whole module stays free of
- * loosely typed values.
+ * Named so that {@link readThenOnce} can hand back the method it read WITHOUT having read
+ * it twice, and so the call below can be written as an explicit `.call(source, …)` — which
+ * is what re-supplies the receiver that detaching removed.
+ *
+ * @typeParam T - the value the thenable fulfils with.
+ */
+type ThenMethod<T> = Thenable<T>['then'];
+
+/**
+ * Reads `then` off a candidate value EXACTLY ONCE and hands it back when it is callable.
+ *
+ * ⭐⭐ THE SINGLE-READ GUARANTEE, AND WHY IT IS NOT PEDANTRY. Promises/A+ defines a
+ * thenable as a non-null object *or function* exposing a callable `then`, and
+ * `Promise.resolve` performs exactly ONE `Get(x, "then")` before invoking it. An adapter
+ * that probed `then` to decide whether the value is thenable and then read it AGAIN to
+ * call it would observe the property twice — so a getter-backed or otherwise stateful
+ * `then` could return one function to the probe and a different one (or nothing) to the
+ * call, and the adapter's behaviour would silently diverge from the native semantics it
+ * claims to follow. Reading once removes that class of divergence rather than documenting
+ * it. Functions are accepted as well as objects, because `Promise.resolve` adopts a
+ * callable thenable too.
+ *
+ * The result is a discriminating read rather than a type predicate: a predicate would have
+ * to be handed the property it had already read to stay honest about the single access,
+ * whereas returning the method itself makes "found a callable `then`" and "here is the
+ * exact function to call" one indivisible answer. `null` means "not a thenable".
  *
  * @typeParam T - the value the thenable is expected to fulfil with.
  * @param value - candidate value, of entirely unknown shape.
- * @returns `true` when `value` exposes a callable `then`.
+ * @returns the callable `then` that was read, or `null` when `value` is not a thenable.
  */
-function isThenable<T>(value: unknown): value is Thenable<T> {
+function readThenOnce<T>(value: unknown): ThenMethod<T> | null {
     if (value === null) {
-        return false;
+        return null;
     }
 
     const kind = typeof value;
 
     if (kind !== 'object' && kind !== 'function') {
-        return false;
+        return null;
     }
 
-    return typeof (value as { then?: unknown }).then === 'function';
+    // THE ONE AND ONLY READ of `then` in this module.
+    const then: unknown = (value as { then?: unknown }).then;
+
+    return typeof then === 'function' ? (then as ThenMethod<T>) : null;
 }
 
 /**
- * Marshals an AngularJS `$q` promise into a native ES `Promise`.
+ * Recognises a value that is ALREADY a native `Promise`.
  *
- * Behavioural contract — deliberately the smallest one that is correct:
+ * A type predicate whose body is a single `instanceof` check, so it introduces no cast. It
+ * exists to make the identity branch below expressible without one: `Promise.resolve`
+ * returns its argument UNCHANGED when that argument is a native promise built by the same
+ * constructor, and reproducing that is what makes this adapter genuinely idempotent rather
+ * than merely idempotent-in-value.
+ *
+ * @typeParam T - the value the promise fulfils with.
+ * @param value - candidate value, of entirely unknown shape.
+ * @returns whether `value` is a native `Promise`.
+ */
+function isNativePromise<T>(value: unknown): value is Promise<T> {
+    return value instanceof Promise;
+}
+
+/**
+ * Marshals an AngularJS `$q` promise into a native `Promise`.
+ *
+ * Fulfilment and rejection both pass through UNTOUCHED. Nothing is unwrapped,
+ * cloned or flattened, so a live model reaches the caller with its dirty tracking
+ * intact; and nothing is swallowed or converted, because the interceptor chain
+ * surfaces version conflicts, blocked projects and connection loss as rejection
+ * values. There is deliberately no timeout, retry, cancellation or logging: the
+ * AngularJS code being bridged has none.
  *
  * - **Fulfilment** resolves with the *exact same value*, unmodified: no unwrapping of
  *   `response.data`, no cloning, no flattening. Live `$tgModel` instances therefore reach
@@ -195,10 +98,14 @@ function isThenable<T>(value: unknown): value is Thenable<T> {
  *   interceptor chain surfaces VERSION_ERROR, 451 blocking and connection loss through
  *   rejection values (see §5 of the file header). Rejections are never swallowed, never
  *   logged, and never converted into resolutions.
- * - **Already-native inputs** are adopted rather than double-wrapped: passing a native
- *   `Promise` (or any other thenable) yields a promise that settles with it, exactly as
- *   `Promise.resolve(thenable)` does — so the helper is idempotent and safe to apply at a
- *   call site whose return type may already have been marshalled.
+ * - **Already-native inputs are returned AS THEMSELVES**, not re-wrapped: a native
+ *   `Promise` is handed straight back, exactly as `Promise.resolve(promise)` does. Any
+ *   other thenable is adopted instead. Either way the helper is idempotent and safe to
+ *   apply at a call site whose return type may already have been marshalled, and applying
+ *   it twice allocates nothing the second time.
+ * - **`then` IS READ EXACTLY ONCE**, and invoked with the source as its receiver, which is
+ *   again precisely what `Promise.resolve` does. See {@link readThenOnce} for why a second
+ *   read would let a getter-backed thenable diverge from native semantics.
  * - **Non-thenable inputs** resolve directly instead of throwing, so call sites that may
  *   return a synchronous value — `$tgRepo.save()` short-circuits an unmodified model at
  *   `app/coffee/modules/base/repository.coffee:57-59`, and cached AngularJS getters can
@@ -219,18 +126,34 @@ function isThenable<T>(value: unknown): value is Thenable<T> {
  *          passed through untouched.
  */
 export function toNativePromise<T>(value: Thenable<T> | T): Promise<T> {
+    if (isNativePromise<T>(value)) {
+        // ALREADY NATIVE: hand it straight back. `Promise.resolve` returns its argument
+        // unchanged in exactly this case, so re-wrapping would add an allocation and a
+        // microtask hop that the semantics this module claims to follow do not have.
+        return value;
+    }
+
+    // THE ONE READ of `then`, taken BEFORE the executor runs so that detection and
+    // invocation cannot observe the property twice (see `readThenOnce`).
+    const then = readThenOnce<T>(value);
+
     return new Promise<T>((resolve, reject) => {
-        if (isThenable<T>(value)) {
-            // A single `then` call, handing the native resolve/reject functions straight
-            // to the source promise. Nothing is inspected, copied or re-thrown in
-            // between, which is what guarantees the untouched pass-through both branches
-            // of the contract above promise.
-            value.then(resolve, reject);
+        if (then === null) {
+            // Not a thenable: settle with the synchronous value as-is. `readThenOnce`
+            // returning nothing is precisely the negative of the union's thenable half,
+            // so the remaining value is the plain one.
+            resolve(value as T);
 
             return;
         }
 
-        // Not a thenable: settle with the synchronous value as-is.
-        resolve(value);
+        // A single `then` INVOCATION of the function already read, with `value` re-supplied
+        // as the receiver — `then` was detached from it, and a `$q` promise's `then` reads
+        // its own state through `this`. The native resolve/reject functions are handed
+        // straight over: nothing is inspected, copied or re-thrown in between, which is
+        // what guarantees the untouched pass-through both branches of the contract above
+        // promise. Called EAGERLY inside the executor rather than deferred to a microtask,
+        // which keeps the subscription timing the incumbent call sites already have.
+        then.call(value, resolve, reject);
     });
 }

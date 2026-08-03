@@ -100,47 +100,30 @@
  * whatever that happens to be.
  */
 
-import { getProjectStats, getProjectTagsColors } from './projects';
+import { getProjectStats, getProjectTagsColors, toProjectStats } from './projects';
+// TYPE-ONLY AND TEST-ONLY, and the direction matters. Production code under
+// `shared/api/**` must never import a screen's state module -- transport does not depend on
+// domain state, and the facade therefore describes the statistics payload structurally
+// instead. The reconciliation spec below imports the canonical type to PROVE the two
+// structural descriptions still agree, which is a property only a test can assert.
+import type { ProjectStats } from '../../backlog/state/types';
 import type {
     AngularPromise,
     ProjectsResource,
     TaigaModel,
 } from '../../bridge/useAngularService';
 
-/* ==========================================================================
- * FIXTURES AND DOUBLES
- * ========================================================================== */
-
-/** A project id fixture. Forwarded unchanged by both facades. */
 const PROJECT_ID = 42;
 
-/**
- * Presents a fixed fixture as the payload type the caller asked for.
- *
- * Both faced members are GENERIC over their payload — see
- * `../../bridge/useAngularService.ts:662-679` — and the facade, not the double, chooses the
- * type argument, while a double necessarily holds one concrete fixture. This helper bridges
- * that gap in one clearly named place instead of scattering conversions through the doubles.
- * Test-only, and never used by production code.
- */
 function asPayload<T>(value: unknown): T {
     return value as T;
 }
 
-/** How a doubled member should settle: fulfil, reject, or never settle at all. */
 type Outcome =
     | { readonly kind: 'fulfil'; readonly value: unknown }
     | { readonly kind: 'reject'; readonly reason: unknown }
     | { readonly kind: 'pending' };
 
-/**
- * A stand-in for an AngularJS `$q` promise: the smallest thenable the marshaller relies on.
- *
- * Deliberately NOT a native promise. The incumbent resource layer returns `$q` promises,
- * whose resolution is tied to the AngularJS digest loop, and the whole purpose of the seam
- * the facade crosses is to convert one into a native promise. Handing the facade a native
- * promise here would test nothing about that conversion.
- */
 function thenableFor<T>(outcome: Outcome): AngularPromise<T> {
     return {
         then(onFulfilled, onRejected) {
@@ -152,25 +135,16 @@ function thenableFor<T>(outcome: Outcome): AngularPromise<T> {
                 return onRejected(outcome.reason);
             }
 
-            // 'pending': never settles, so neither handler is ever invoked.
             return undefined;
         },
     };
 }
 
-/** Every argument list each doubled member was called with, in call order. */
 interface CallLog {
     readonly stats: number[][];
     readonly tagsColors: number[][];
 }
 
-/**
- * Builds a double of the `projects` sub-resource service.
- *
- * Records the FULL argument list of every call — not just the first argument — because one
- * of the properties under test is that the facade forwards the project id and NOTHING else:
- * no params bag, no options object, no composed path.
- */
 function projectsDouble(
     statsOutcome: Outcome,
     tagsColorsOutcome: Outcome,
@@ -194,67 +168,23 @@ function projectsDouble(
     return { service, log };
 }
 
-/**
- * A faithful stand-in for a `$tgModel` instance, built the way the real one is built.
- *
- * A CLASS, not an object literal, and that choice is load-bearing rather than stylistic.
- * The real model is a CoffeeScript class (`base/model.coffee:9-127`), so its members live on
- * a PROTOTYPE and are therefore NOT copied by a spread. A literal would put them on the
- * instance as own enumerable properties, quietly making the P-IMMER-1 pitfall assertion
- * below pass for the wrong reason and, worse, making a spread look survivable when against
- * the real class it is not.
- *
- * Everything else mirrors the original too:
- *
- *   - the attribute bag and the modified set are own, enumerable bookkeeping fields
- *     (`:11-13`, `:58-61`) -- which is exactly why a spread leaks them;
- *   - one enumerable, configurable accessor pair per attribute is installed with
- *     `Object.defineProperty` (`:94-101`), so attributes are NOT own data properties;
- *   - `getAttrs()` returns a FRESH plain merge of the bag and the modified set (`:48-54`),
- *     never the bag itself.
- *
- * ⚠ `enumerable: true` IS VERIFIED, NOT ASSUMED, AND MUST NOT BE "CORRECTED" TO FALSE.
- * `Object.defineProperty` defaults `enumerable` to false, which would make a spread of a
- * model capture NOTHING at all -- a tempting and wrong mental model. The real code passes
- * the flag EXPLICITLY: `enumerable: true` at `base/model.coffee:98`, alongside
- * `configurable: true` at `:99`, inside the per-attribute loop at `:94-101`. So a spread of
- * a real model DOES read the attribute values through their getters -- and still fails to be
- * a flattening, because it simultaneously drags the private bookkeeping in and leaves every
- * prototype method behind. That is precisely what the P-IMMER-1 test below demonstrates, and
- * it is a stronger result than "the spread is empty" because the wreckage LOOKS usable.
- * Flipping this double to a non-enumerable accessor would make the suite assert a behaviour
- * the incumbent does not have, which is the one thing a migration spec must never do
- * (rule T10, goal G2: behaviour follows the AngularJS implementation).
- *
- * Declared as implementing the bridge's model type so the facade's real signature is
- * exercised rather than a look-alike.
- */
 class ModelDouble<TAttrs extends object> implements TaigaModel<TAttrs> {
-    /** `model.coffee:11`. The raw attribute bag -- own and enumerable, as in the original. */
     public _attrs: TAttrs;
 
-    /** `model.coffee:12`. The resource name the model was created under. */
     public _name = 'projects';
 
-    /** `model.coffee:58`. Pending changes, empty until something is written. */
     public _modifiedAttrs: Record<string, unknown> = {};
 
-    /** `model.coffee:61`. The dirty flag the repository's write path short-circuits on. */
     public _isModified = false;
 
     public constructor(attrs: TAttrs) {
         this._attrs = { ...attrs };
 
-        // A keyed view of the same object, so the accessors below can read it by name
-        // without forcing the public attribute type to carry an index signature.
         const bagByKey: Record<string, unknown> = asPayload<Record<string, unknown>>(
             this._attrs,
         );
         const modified = this._modifiedAttrs;
 
-        // `model.coffee:94-101` -- accessors over the bag, not data properties on the
-        // instance. Reading an attribute therefore runs a getter, which is the mechanism
-        // the flattening discipline exists because of.
         for (const key of Object.keys(bagByKey)) {
             Object.defineProperty(this, key, {
                 get: () => (key in modified ? modified[key] : bagByKey[key]),
@@ -268,7 +198,6 @@ class ModelDouble<TAttrs extends object> implements TaigaModel<TAttrs> {
         }
     }
 
-    /** `model.coffee:48-54`. A fresh plain merge -- the sanctioned flattening path. */
     public getAttrs(patch?: boolean): TAttrs {
         if (patch === true) {
             return asPayload<TAttrs>({ ...this._modifiedAttrs });
@@ -277,52 +206,80 @@ class ModelDouble<TAttrs extends object> implements TaigaModel<TAttrs> {
         return asPayload<TAttrs>({ ...this._attrs, ...this._modifiedAttrs });
     }
 
-    /** `model.coffee:63-65`. Records a change and marks the model modified. */
     public setAttr(name: string, value: unknown): void {
         this._modifiedAttrs[name] = value;
         this._isModified = true;
     }
 
-    /** `model.coffee:110-111`. */
     public isModified(): boolean {
         return this._isModified;
     }
 
-    /** `model.coffee:45-46`. */
     public getName(): string {
         return this._name;
     }
 
-    /** `model.coffee:28-32`. Shallow clone. */
     public clone(): TaigaModel<TAttrs> {
         return new ModelDouble<TAttrs>(this._attrs);
     }
 }
 
-/** Convenience constructor for {@link ModelDouble}, so call sites read as fixtures. */
 function modelDouble<TAttrs extends object>(attrs: TAttrs): TaigaModel<TAttrs> {
     return new ModelDouble<TAttrs>(attrs);
 }
 
-/* ==========================================================================
- * getProjectStats -- the PLAIN JSON half of the asymmetry
- * ========================================================================== */
-
 describe('getProjectStats', () => {
-    /**
-     * The statistics payload as the server sends it, with the field names the summary bar
-     * reads: `app/partials/includes/components/summary.jade:15`, `:18`, `:21` and `:24`,
-     * plus the milestone total read at `backlog/main.coffee:266`.
-     *
-     * Note what is ABSENT: the completion percentage. The incumbent controller derives it
-     * at `backlog/main.coffee:262` / `:264` -- it is not a wire field.
-     */
     const statsPayload = {
+        assigned_points: 101.5,
         total_points: 392,
         defined_points: 392.5,
         closed_points: 21,
         speed: 0,
         total_milestones: 5,
+        milestones: [
+            {
+                name: 'Sprint 2026-6-8',
+                optimal: 392,
+                evolution: 392,
+                'team-increment': 0,
+                'client-increment': 0,
+            },
+            {
+                name: 'Sprint 2026-6-22',
+                optimal: 326.7,
+                evolution: 371,
+                'team-increment': 0,
+                'client-increment': 0,
+            },
+            {
+                name: 'Sprint 2026-7-6',
+                optimal: 261.3,
+                evolution: null,
+                'team-increment': 12,
+                'client-increment': 5,
+            },
+            {
+                name: 'Sprint 2026-7-20',
+                optimal: 196,
+                evolution: null,
+                'team-increment': 0,
+                'client-increment': 0,
+            },
+            {
+                name: 'Sprint 2026-8-3',
+                optimal: 130.7,
+                evolution: null,
+                'team-increment': 0,
+                'client-increment': 0,
+            },
+            {
+                name: 'Sprint 2026-8-17',
+                optimal: 0.00000000001,
+                evolution: null,
+                'team-increment': 0,
+                'client-increment': 0,
+            },
+        ],
     };
 
     it('forwards the project id unchanged as the only argument', async () => {
@@ -333,9 +290,6 @@ describe('getProjectStats', () => {
 
         await getProjectStats(service, PROJECT_ID);
 
-        // Exactly one delegation, carrying exactly one argument. No params bag, no options
-        // object, and above all no composed path: the sub-path is built inside the
-        // incumbent repository layer at `repository.coffee:175`, never here (rule T5).
         expect(log.stats).toEqual([[PROJECT_ID]]);
     });
 
@@ -347,7 +301,6 @@ describe('getProjectStats', () => {
 
         await getProjectStats(service, PROJECT_ID);
 
-        // The two reads are never merged into one round trip (rule T10).
         expect(log.tagsColors).toEqual([]);
     });
 
@@ -359,8 +312,6 @@ describe('getProjectStats', () => {
 
         const result = getProjectStats(service, PROJECT_ID);
 
-        // The seam did its job: what comes back is a real promise, so React code above it
-        // can await it with no AngularJS digest involvement whatsoever.
         expect(result).toBeInstanceOf(Promise);
 
         return expect(result).resolves.toBe(statsPayload);
@@ -374,8 +325,6 @@ describe('getProjectStats', () => {
 
         const stats = await getProjectStats(service, PROJECT_ID);
 
-        // Identity, not deep equality: a clone would satisfy `toEqual` while proving that
-        // something in between had rebuilt the payload.
         expect(stats).toBe(statsPayload);
     });
 
@@ -387,23 +336,8 @@ describe('getProjectStats', () => {
 
         const spread: Record<string, unknown> = { ...(await getProjectStats(service, PROJECT_ID)) };
 
-        // ⭐ THE MATCHED PAIR to the model-spread assertion in the sibling describe below,
-        // and the reason both exist. `service.stats` goes through the repository's RAW query
-        // (`resources/projects.coffee:43` -> `base/repository.coffee:173-180`), which
-        // resolves `data.data` at `:180` -- the parsed body itself, with no wrapper. So a
-        // spread here is LOSSLESS: it reproduces the payload exactly, which is what makes
-        // this value safe to place in React state and safe to hand to an immer producer.
-        //
-        // Read the two assertions together: identical call shape, two-parameter signature,
-        // one project id -- and yet spreading THIS result yields the data while spreading
-        // the tag-colour result yields a broken hybrid. That difference is structural, not
-        // incidental, and pinning it here is what stops a future change from "simplifying"
-        // both facades to one return type.
         expect(spread).toEqual(statsPayload);
-        // No private bookkeeping field rides along, because there is no wrapper to leak one.
         expect(Object.keys(spread).some((key) => key.startsWith('_'))).toBe(false);
-        // A spread is a copy, so identity is deliberately NOT expected here -- the identity
-        // of the resolved value itself is asserted by the preceding test.
         expect(spread).not.toBe(statsPayload);
     });
 
@@ -415,66 +349,85 @@ describe('getProjectStats', () => {
 
         const stats = await getProjectStats(service, PROJECT_ID);
 
-        // snake_case totals and nothing renamed to camelCase: renaming would be a response
-        // transformation (T10) and would break the frozen contract (G2).
         expect(Object.keys(stats).sort()).toEqual([
+            'assigned_points',
             'closed_points',
             'defined_points',
+            'milestones',
             'speed',
             'total_milestones',
             'total_points',
         ]);
+        expect(stats.assigned_points).toBe(101.5);
         expect(stats.total_points).toBe(392);
         expect(stats.defined_points).toBe(392.5);
         expect(stats.closed_points).toBe(21);
         expect(stats.speed).toBe(0);
         expect(stats.total_milestones).toBe(5);
+        // The series arrives BY IDENTITY and in order: the chart pairs each entry with its
+        // index (`backlog/main.coffee:1221`, `:1273`), so a reordering or a copy would both
+        // be transformations the facade must not make.
+        expect(stats.milestones).toBe(statsPayload.milestones);
+        expect(stats.milestones.map((milestone) => milestone.name)).toEqual(
+            statsPayload.milestones.map((milestone) => milestone.name),
+        );
     });
 
-    it('forwards the summary bar payload untransformed, mixed conventions and all', async () => {
-        // THE EXACT FIVE VALUES THE DARK SUMMARY BAR RENDERS, in one object:
-        // `summary.jade:12` the percentage, `:15` project points, `:18` defined points,
-        // `:21` closed points, `:24` points per sprint. Asserted as a whole rather than
-        // field by field, because the property under test is that the payload arrives as
-        // ONE UNTOUCHED OBJECT.
+    it('forwards the payload untransformed, mixed conventions and all', async () => {
+        // Asserted as a whole rather than field by field, because the property under test is
+        // that the payload arrives as ONE UNTOUCHED OBJECT.
         //
-        // ⚠ THE MIXTURE OF CONVENTIONS IS THE POINT, and it is deliberately NOT tidied:
-        // `completedPercentage` is camelCase while every point total is snake_case. That is
-        // what the summary bar consumes today, so it is what must survive the seam.
-        // Normalising the casing, renaming a field, rounding the percentage, or coercing
-        // `speed: 0` into a default would each be a response transformation (rule T10) and
-        // would break the frozen backend contract (goal G2). `toEqual` against the identical
-        // literal is what makes each of those a failing test rather than a silent change.
-        //
-        // The percentage is carried here because the screen derives it and writes it onto
-        // this very object (`backlog/main.coffee:262`, or `0` at `:264` when there is no
-        // denominator) -- a write that is only possible because this half of the asymmetry
-        // is plain mutable JSON. What the WIRE sends is asserted separately by the next
-        // test, which pins the field's absence and proves the facade substitutes no default.
-        const summaryBarPayload = {
-            completedPercentage: 5,
-            total_points: 392,
-            defined_points: 392.5,
-            closed_points: 21,
-            speed: 0,
-        };
+        // ⚠ NOTHING IS TIDIED, and that is the point. Normalising the snake_case casing,
+        // renaming a field, rounding a non-integer total, or coercing `speed: 0` into a
+        // default would each be a response transformation (rule T10) and would break the
+        // frozen backend contract (goal G2). `toEqual` against the fixture is what makes
+        // every one of those a failing test rather than a silent change.
         const { service } = projectsDouble(
-            { kind: 'fulfil', value: summaryBarPayload },
+            { kind: 'fulfil', value: statsPayload },
             { kind: 'pending' },
         );
 
         const stats = await getProjectStats(service, PROJECT_ID);
 
-        expect(stats).toEqual(summaryBarPayload);
-        // Field-for-field, so a failure names the offender instead of dumping two objects.
-        expect(stats.completedPercentage).toBe(5);
-        expect(stats.total_points).toBe(392);
+        expect(stats).toEqual(statsPayload);
         // A non-integer total survives as a non-integer: nothing is rounded or truncated.
         expect(stats.defined_points).toBe(392.5);
-        expect(stats.closed_points).toBe(21);
         // Zero is preserved as zero, not replaced by a fallback and not dropped as falsy.
         expect(stats.speed).toBe(0);
-        expect(Object.keys(stats)).toHaveLength(5);
+        expect(Object.keys(stats)).toHaveLength(7);
+    });
+
+    it('reconciles with the screen canonical state by deriving the one client-side field', async () => {
+        const { service } = projectsDouble(
+            { kind: 'fulfil', value: statsPayload },
+            { kind: 'pending' },
+        );
+
+        const raw = await getProjectStats(service, PROJECT_ID);
+
+        // ⭐ THE POINT OF THIS TEST IS THAT IT COMPILES. `ProjectStats` is the canonical
+        // eight-member state type owned by the Backlog screen, and the facade's response type is
+        // deliberately one member short of it: `completedPercentage` is derived on the client,
+        // never sent. So the hand-off is a DERIVE-AND-SPREAD, with no assertion, no double cast
+        // and no transformation of the seven wire fields -- and it type-checks only because the
+        // response is modelled completely and with the same nullability the canonical type
+        // declares. Asserting it here is what stops the two structural descriptions drifting
+        // apart unnoticed.
+        const totalPoints = raw.total_points ? raw.total_points : raw.defined_points;
+        const stats: ProjectStats = {
+            ...raw,
+            completedPercentage: totalPoints
+                ? Math.round((100 * raw.closed_points) / totalPoints)
+                : 0,
+        };
+
+        // The incumbent arithmetic reproduced exactly: 21 of 392 rounds to 5, the value the
+        // summary bar renders in the design frame.
+        expect(stats.completedPercentage).toBe(5);
+        expect(stats.assigned_points).toBe(101.5);
+        expect(stats.milestones).toBe(raw.milestones);
+        // Every wire field crosses untouched; only the derived member is added.
+        expect(Object.keys(stats)).toHaveLength(Object.keys(raw).length + 1);
     });
 
     it('leaves the client-derived completion percentage absent', async () => {
@@ -485,16 +438,21 @@ describe('getProjectStats', () => {
 
         const stats = await getProjectStats(service, PROJECT_ID);
 
-        // The facade adds no default and computes nothing (T10). Deriving the percentage
-        // stays with the screen, exactly where the incumbent controller does it
-        // (`backlog/main.coffee:262` / `:264`).
-        expect('completedPercentage' in stats).toBe(false);
-        expect(stats.completedPercentage).toBeUndefined();
+        // The READ adds no default and computes nothing (T10): the percentage is not a wire
+        // field, and this facade does not invent one. Supplying it is `toProjectStats`'s job
+        // and is asserted separately below -- keeping the two apart is what stops a consumer
+        // from believing a raw response already carries it.
+        //
+        // Read through a plain-record view rather than off the typed value, because the wire
+        // type NO LONGER DECLARES the member at all: its absence is now a compile-time fact
+        // as well as a runtime one, and `stats.completedPercentage` would not compile.
+        const asRecord: Record<string, unknown> = { ...stats };
+
+        expect('completedPercentage' in asRecord).toBe(false);
+        expect(asRecord.completedPercentage).toBeUndefined();
     });
 
     it('passes empty nullable totals through as null instead of substituting a zero', async () => {
-        // A brand-new project: the incumbent guards these three with existential and truthy
-        // checks at `backlog/main.coffee:259`, `:261` and `:266`, and at `summary.jade:14`.
         const emptyProject = {
             total_points: null,
             defined_points: null,
@@ -512,24 +470,11 @@ describe('getProjectStats', () => {
         expect(stats.total_points).toBeNull();
         expect(stats.defined_points).toBeNull();
         expect(stats.total_milestones).toBeNull();
-        // Not zero and not undefined: a substituted default would silently turn "unknown"
-        // into "none", and the summary bar's own truthy guard at `summary.jade:14` is the
-        // incumbent already relying on that distinction.
         expect(stats.total_points).not.toBe(0);
         expect(stats.defined_points).not.toBeUndefined();
     });
 
     it('coerces nothing, even where the wire disagrees with the declared shape', async () => {
-        // Every point total empty, INCLUDING `closed_points` -- which the facade's own
-        // response type declares as a plain number because the incumbent reads it unguarded
-        // (`backlog/main.coffee:262`, `summary.jade:21`). A static type is a claim about the
-        // server, not a runtime coercion, and this facade adds none: whatever the wire sends
-        // is what the caller receives.
-        //
-        // Asserting the pessimistic case matters because the alternative failure is silent.
-        // Had the facade "helpfully" defaulted an empty total to zero, a project with
-        // unknown progress would render as a project with none, and no test that fed it a
-        // well-formed payload would ever notice (rule T10, goal G2).
         const emptyTotals = {
             total_points: null,
             defined_points: null,
@@ -546,22 +491,16 @@ describe('getProjectStats', () => {
 
         expect(stats.closed_points).toBeNull();
         expect(stats.closed_points).not.toBe(0);
-        // The whole payload, unaltered -- no field added, removed, renamed or defaulted.
         expect(stats).toEqual(emptyTotals);
     });
 
     it('rejects with the incumbent rejection value untouched', async () => {
-        // Shaped like a real interceptor rejection: the interceptor pipeline communicates
-        // failure through rejection VALUES carrying status and body, which is how a version
-        // conflict, a blocked project or connection loss reaches the screen at all.
         const rejection = { status: 400, data: { version: 3 } };
         const { service } = projectsDouble(
             { kind: 'reject', reason: rejection },
             { kind: 'pending' },
         );
 
-        // Identity again: re-wrapping or normalising the reason would hide the very
-        // conditions the interceptor pipeline exists to surface.
         await expect(getProjectStats(service, PROJECT_ID)).rejects.toBe(rejection);
     });
 
@@ -575,9 +514,6 @@ describe('getProjectStats', () => {
         await getProjectStats(service, PROJECT_ID);
         await getProjectStats(service, 7);
 
-        // Three calls in, three delegations out. GET de-duplication already exists one
-        // layer down in the shared HTTP service; reimplementing it here would be an
-        // enhancement (T10) and would defeat it.
         expect(log.stats).toEqual([[PROJECT_ID], [PROJECT_ID], [7]]);
     });
 
@@ -590,8 +526,199 @@ describe('getProjectStats', () => {
             Promise.resolve(pendingSentinel),
         ]);
 
-        // The incumbent has no timeout, retry or cancellation, so neither does the facade.
         expect(winner).toBe(pendingSentinel);
+    });
+});
+
+/* ==========================================================================
+ * toProjectStats -- THE ONE DERIVED MEMBER
+ *
+ * The adapter closes the gap between the wire shape and the canonical
+ * `ProjectStats` the Backlog screen consumes. Exactly one member is derived, and
+ * these specs hold the derivation to `app/coffee/modules/backlog/main.coffee:259`
+ * -`:264` arithmetic-for-arithmetic -- including the two details that are easy to
+ * "improve" into a behaviour change: the fallback is TRUTHY rather than nullish,
+ * and the guarded zero case yields 0 rather than NaN.
+ * ========================================================================== */
+
+describe('toProjectStats', () => {
+    /** The minimum well-formed wire response, parameterised on the point totals. */
+    function wireResponse(totals: {
+        readonly total_points: number | null;
+        readonly defined_points: number;
+        readonly closed_points: number;
+    }): Parameters<typeof toProjectStats>[0] {
+        return {
+            assigned_points: 101.5,
+            speed: 0,
+            total_milestones: 5,
+            milestones: [],
+            ...totals,
+        };
+    }
+
+    it('derives the percentage from the project total when it is truthy', () => {
+        // `:259` prefers `total_points`; `:262` is `Math.round(100 * closed / total)`.
+        // 100 * 21 / 392 = 5.357…, which rounds to 5 -- the value the summary bar shows for
+        // the first seeded project.
+        const stats = toProjectStats(
+            wireResponse({ total_points: 392, defined_points: 392.5, closed_points: 21 }),
+        );
+
+        expect(stats.completedPercentage).toBe(5);
+    });
+
+    it('falls back to the defined total when the project total is null', () => {
+        // 100 * 21 / 392.5 = 5.35…, still 5 -- so the fallback is asserted with a SECOND
+        // case below where the two totals give different answers, rather than only here.
+        const stats = toProjectStats(
+            wireResponse({ total_points: null, defined_points: 392.5, closed_points: 21 }),
+        );
+
+        expect(stats.completedPercentage).toBe(5);
+    });
+
+    it('uses the defined total, not the project total, when it falls back', () => {
+        // Chosen so the two denominators disagree: 50/100 is 50%, 50/200 is 25%. A fallback
+        // that silently kept reading `total_points` would report 25 here.
+        const stats = toProjectStats(
+            wireResponse({ total_points: null, defined_points: 100, closed_points: 50 }),
+        );
+
+        expect(stats.completedPercentage).toBe(50);
+    });
+
+    it('⭐ treats a project total of ZERO as absent, exactly as the incumbent does', () => {
+        // THE TRUTHY-VERSUS-NULLISH DISTINCTION, and the reason this spec is starred.
+        // `:259` is a CoffeeScript `if/else` on the bare value, so `0` falls through to the
+        // defined total. A nullish fallback (`??`) or a `!= null` test would keep the zero,
+        // divide by it, and produce Infinity -- which would render as "Infinity%" in the
+        // summary bar rather than failing anywhere a test could see it.
+        const stats = toProjectStats(
+            wireResponse({ total_points: 0, defined_points: 200, closed_points: 50 }),
+        );
+
+        expect(stats.completedPercentage).toBe(25);
+        expect(Number.isFinite(stats.completedPercentage)).toBe(true);
+    });
+
+    it.each([
+        ['both totals zero', { total_points: 0, defined_points: 0, closed_points: 0 }],
+        ['project total null and defined zero', {
+            total_points: null,
+            defined_points: 0,
+            closed_points: 0,
+        }],
+        ['a closed count against no total', {
+            total_points: 0,
+            defined_points: 0,
+            closed_points: 7,
+        }],
+    ])('yields 0 rather than NaN or Infinity when there is no denominator (%s)', (_label, totals) => {
+        // `:264`. A brand-new project has no points at all, so this is the ordinary case
+        // rather than an edge case, and an unguarded division would put NaN or Infinity
+        // straight into the summary bar and the progress fill.
+        const stats = toProjectStats(wireResponse(totals));
+
+        expect(stats.completedPercentage).toBe(0);
+    });
+
+    it('ROUNDS, and rounds half up, exactly as Math.round does', () => {
+        // 100 * 1 / 8 = 12.5 -> 13. `Math.floor` would give 12 and a fixed-decimal string
+        // would give '12.50'; both are visible on screen, because the value is rendered as a
+        // percentage at `summary.jade:12` and drives the bar's fill at `:9`.
+        const stats = toProjectStats(
+            wireResponse({ total_points: 8, defined_points: 8, closed_points: 1 }),
+        );
+
+        expect(stats.completedPercentage).toBe(13);
+    });
+
+    it('forwards every other member untouched, nulls included', () => {
+        const response = {
+            assigned_points: 101.5,
+            total_points: null,
+            defined_points: 392.5,
+            closed_points: 21,
+            speed: 0,
+            total_milestones: null,
+            milestones: [
+                {
+                    name: 'Sprint 2026-6-8',
+                    optimal: 392,
+                    evolution: null,
+                    'team-increment': 0,
+                    'client-increment': 0,
+                },
+            ],
+        };
+
+        const stats = toProjectStats(response);
+
+        expect(stats.assigned_points).toBe(101.5);
+        expect(stats.defined_points).toBe(392.5);
+        expect(stats.closed_points).toBe(21);
+        expect(stats.speed).toBe(0);
+        // Nulls are FORWARDED, not defaulted: the screen's own existential guard at
+        // `backlog/main.coffee:266` depends on being able to tell "unknown" from "none".
+        expect(stats.total_points).toBeNull();
+        expect(stats.total_milestones).toBeNull();
+        // The series crosses by identity and is not copied, so the chart's index pairing is
+        // untouched.
+        expect(stats.milestones).toBe(response.milestones);
+    });
+
+    it('produces the canonical shape: eight members, no more and no fewer', () => {
+        const stats = toProjectStats(
+            wireResponse({ total_points: 392, defined_points: 392.5, closed_points: 21 }),
+        );
+
+        // The seven wire members plus the one derived member. The compiler already proves
+        // completeness -- the declared return type is the canonical interface and there is no
+        // cast anywhere in the adapter -- so this asserts the other direction: that nothing
+        // EXTRA was added, which a type annotation on a return value does not catch.
+        expect(Object.keys(stats).sort()).toEqual([
+            'assigned_points',
+            'closed_points',
+            'completedPercentage',
+            'defined_points',
+            'milestones',
+            'speed',
+            'total_milestones',
+            'total_points',
+        ]);
+    });
+
+    it('DOES NOT MUTATE the response, unlike the incumbent it reproduces', () => {
+        // `backlog/main.coffee:262` assigns the percentage straight onto the resolved
+        // response. React cannot: the object is shared, readonly, and bound for an
+        // immer-managed store whose `autoFreeze` would reject the write (P-IMMER-4). So the
+        // arithmetic is identical and the mutation is gone -- and this asserts the second
+        // half, which is the part a reader would otherwise have to take on trust.
+        const response = wireResponse({
+            total_points: 392,
+            defined_points: 392.5,
+            closed_points: 21,
+        });
+        const before = JSON.stringify(response);
+
+        const stats = toProjectStats(response);
+
+        expect(JSON.stringify(response)).toBe(before);
+        expect('completedPercentage' in response).toBe(false);
+        expect(stats).not.toBe(response);
+    });
+
+    it('is pure: the same response yields equal results and touches nothing', () => {
+        const response = wireResponse({
+            total_points: 392,
+            defined_points: 392.5,
+            closed_points: 21,
+        });
+
+        expect(toProjectStats(response)).toEqual(toProjectStats(response));
+        // A fresh object each time, so two consumers cannot share and freeze one another's.
+        expect(toProjectStats(response)).not.toBe(toProjectStats(response));
     });
 });
 
@@ -600,12 +727,6 @@ describe('getProjectStats', () => {
  * ========================================================================== */
 
 describe('getProjectTagsColors', () => {
-    /**
-     * A tag-name-to-colour dictionary. Synthetic values on purpose (rule T2): colours are
-     * per-project data, and one tag deliberately has none, which the incumbent
-     * tag-creation path allows by defaulting the colour to null
-     * (`resources/projects.coffee:102-109`).
-     */
     const tagsColorsAttrs = {
         'needs-review': 'fixture-colour-token-a',
         blocked: 'fixture-colour-token-b',
@@ -657,31 +778,6 @@ describe('getProjectTagsColors', () => {
 
         const resolved = await getProjectTagsColors(service, PROJECT_ID);
 
-        // ⭐⭐ THE ASYMMETRY, ASSERTED -- the executable proof that these two
-        // identically-shaped facades resolve structurally different kinds of value.
-        //
-        //   `service.stats`      (`resources/projects.coffee:43`)
-        //       -> `base/repository.coffee:173-180`, ending `return data.data` at `:180`
-        //       ==> PLAIN JSON. Spreadable, immer-safe. See the spread assertion above.
-        //   `service.tagsColors` (`resources/projects.coffee:96`)
-        //       -> `base/repository.coffee:163-171`, ending
-        //          `return @model.make_model(name, data.data)` at `:171`
-        //       ==> A LIVE `$tgModel` INSTANCE. Neither spreadable nor immer-safe.
-        //
-        // PITFALL P-IMMER-1, verbatim: "immer dislikes class instances. `$tgModel` returns
-        // model classes carrying dirty-tracking state; passing one into a draft produces
-        // undefined behaviour. Convert to plain objects at the boundary."
-        //
-        // FLATTENING IS THE CALLER'S JOB, NOT THIS FACADE'S (rule T10 -- no unrequested
-        // transformation). The facade must hand back exactly what the incumbent resolved,
-        // which is what `toBe` pins here; a facade that quietly returned `getAttrs()` would
-        // be more convenient and would silently change the contract, breaking the caller's
-        // ability to hand the model back to the repository's write path (requirement I7).
-        // The established house style at this seam is for the boundary code to flatten,
-        // immediately before handing data across:
-        // `components/project-menu/project-menu.controller.coffee:27` for the project and
-        // `:21` for its milestones. (AAP §0.5.2 cites the first as L28; the verified locator
-        // is L27 -- L28 is the closing brace.)
         expect(resolved).toBe(model);
         expect(typeof resolved.getAttrs).toBe('function');
     });
@@ -695,12 +791,8 @@ describe('getProjectTagsColors', () => {
         const model = await getProjectTagsColors(service, PROJECT_ID);
         const attrs = model.getAttrs();
 
-        // The public accessor (`model.coffee:48-54`) is the sanctioned flattening path --
-        // the React equivalent of the private-field read the incumbent performs at
-        // `kanban/main.coffee:370`.
         expect(attrs).toEqual(tagsColorsAttrs);
         expect(attrs.untagged).toBeNull();
-        // A fresh plain merge, not the private bag itself.
         expect(attrs).not.toBe(tagsColorsAttrs);
     });
 
@@ -712,8 +804,6 @@ describe('getProjectTagsColors', () => {
 
         const model = await getProjectTagsColors(service, PROJECT_ID);
 
-        // Nothing was stripped in transit: the dirty-tracking surface survives, which is
-        // what keeps the changed-fields-only write path intact (requirement I7).
         expect(model.getName()).toBe('projects');
         expect(model.isModified()).toBe(false);
         expect(model.clone().getAttrs()).toEqual(tagsColorsAttrs);
@@ -728,59 +818,23 @@ describe('getProjectTagsColors', () => {
         const model = await getProjectTagsColors(service, PROJECT_ID);
         const spread: Record<string, unknown> = { ...model };
 
-        // ⭐ THE NEGATIVE HALF OF THE MATCHED PAIR. Spreading the statistics payload above
-        // reproduced it exactly; spreading THIS resolved value does not, and the assertion
-        // below is the whole difference between the two facades made executable.
-        //
-        // A spread runs the enumerable accessors installed at `base/model.coffee:94-101`
-        // (`enumerable: true` at `:98`), so it DOES read the attribute values -- and that is
-        // exactly what makes the hazard dangerous rather than obvious. What comes out is not
-        // the dictionary but a hybrid: the attributes, PLUS the private bookkeeping fields,
-        // MINUS every prototype method. It has the right values in it and is still the wrong
-        // object.
         expect(spread).not.toEqual(tagsColorsAttrs);
-        // The private bookkeeping leaks in -- fields no tag-colour consumer should ever see,
-        // and which immer would happily draft and freeze as if they were data.
         expect(spread._attrs).toBeDefined();
         expect(spread._modifiedAttrs).toBeDefined();
         expect(Object.keys(spread)).toEqual(expect.arrayContaining(['_attrs', '_name']));
-        // The behaviour goes missing -- so the value can no longer be handed back to the
-        // repository's write path, which is what preserves changed-fields-only PATCH
-        // semantics (requirement I7).
         expect(spread.getAttrs).toBeUndefined();
         expect(spread.isModified).toBeUndefined();
         expect(Object.keys(spread)).not.toEqual(Object.keys(tagsColorsAttrs));
 
-        // `getAttrs()` is the correct path and yields exactly the dictionary, with no
-        // private field in sight -- which is why the facade documents it and why immer must
-        // never be handed the instance (a class instance is not draftable, so mutations to
-        // one escape the draft instead of being recorded, and with `autoFreeze` left on --
-        // P-IMMER-4 -- freezing a structure AngularJS still holds is its own hazard).
         expect(model.getAttrs()).toEqual(tagsColorsAttrs);
         expect('_attrs' in model.getAttrs()).toBe(false);
         expect('_modifiedAttrs' in model.getAttrs()).toBe(false);
-        // And the sanctioned path is a strict improvement on the spread in both directions:
-        // exactly the tag names, and nothing else.
         expect(Object.keys(model.getAttrs()).sort()).toEqual(
             Object.keys(tagsColorsAttrs).sort(),
         );
     });
 
     it('treats every colour as opaque DATA: no validation, no normalisation, no default', async () => {
-        // Rule T2, verbatim: "All status, tag, and epic colours remain data-bound. They come
-        // from `s.color`, `tag[1]`, and `epic.color`; the values visible in the Figma frames
-        // are `sample_data` artefacts and must never be hardcoded."
-        //
-        // The facade's job is therefore to be INCURIOUS about colour. These fixtures are
-        // deliberately not well-formed CSS colours, and one is empty and one is absent
-        // entirely: whatever the project database holds is what must arrive. A facade that
-        // validated the format, upper-cased the digits, expanded a shorthand or filled a
-        // missing colour with a palette default would be inventing design decisions the
-        // stylesheets already own (rules T2 and T10, AAP §0.3.6 drift entry D3).
-        //
-        // No real colour value appears anywhere in this file, in code or in a comment --
-        // including none of the per-status values visible in the two Figma frames, which are
-        // seeded sample data and would break every real project if they were ever hardcoded.
         const awkwardColours = {
             'tag-with-token': 'fixture-colour-token-c',
             'tag-with-mixed-case': 'FixtureColourTokenD',
@@ -796,16 +850,10 @@ describe('getProjectTagsColors', () => {
         const attrs = (await getProjectTagsColors(service, PROJECT_ID)).getAttrs();
 
         expect(attrs).toEqual(awkwardColours);
-        // Preserved character for character: not trimmed, not re-cased, not parsed.
         expect(attrs['tag-with-mixed-case']).toBe('FixtureColourTokenD');
         expect(attrs['tag-with-whitespace']).toBe('  fixture-colour-token-e  ');
-        // An empty colour stays an empty string and is NOT promoted to null...
         expect(attrs['tag-with-empty-colour']).toBe('');
-        // ...and a null colour stays null and is NOT demoted to an empty string. The
-        // incumbent tag-creation path establishes null as a legitimate value by defaulting
-        // to it (`resources/projects.coffee:102-109`).
         expect(attrs['tag-with-no-colour']).toBeNull();
-        // Tag names are data too: dictionary keys arrive exactly as stored, none dropped.
         expect(Object.keys(attrs).sort()).toEqual(Object.keys(awkwardColours).sort());
     });
 
@@ -844,10 +892,6 @@ describe('getProjectTagsColors', () => {
     });
 });
 
-/* ==========================================================================
- * MODULE SURFACE
- * ========================================================================== */
-
 describe('the projects facade module surface', () => {
     it('exports exactly the two faced reads and nothing else', async () => {
         const facade: Record<string, unknown> = await import('./projects');
@@ -856,57 +900,40 @@ describe('the projects facade module surface', () => {
             .sort();
 
         // Only two of the incumbent service's members are reachable from either in-scope
-        // screen, so only two are faced. The remaining members belong to the admin,
+        // screen, so only two are FACED. The remaining members belong to the admin,
         // project-profile, import-export, timeline and discover screens, all placed out of
         // scope by AAP §0.2.2 -- adding one would violate the Minimal Change Clause.
-        expect(exported).toEqual(['getProjectStats', 'getProjectTagsColors']);
+        //
+        // `toProjectStats` is the third export and is NOT a faced read: it performs no I/O,
+        // touches no service and reaches no endpoint. It is the pure adapter that supplies
+        // the one member of the canonical `ProjectStats` contract the server does not send,
+        // and it lives here because this is the module that owns the wire shape. Counting it
+        // among the reads would be the mistake; leaving it out of this assertion would let
+        // an actual fourth export slip in unnoticed.
+        expect(exported).toEqual(['getProjectStats', 'getProjectTagsColors', 'toProjectStats']);
     });
 
     it('has not grown a facade for an out-of-scope service member', async () => {
         const facade: Record<string, unknown> = await import('./projects');
 
-        // ⭐ THE PERMANENT SCOPE-CREEP GUARD, and the reason it names members explicitly
-        // rather than relying on the exact-equality assertion above: a name that is spelled
-        // out here fails LOUDLY and self-describingly the day someone adds it, and the
-        // failure message says which out-of-scope screen it belongs to.
-        //
-        // The incumbent service declares 28 members
-        // (`resources/projects.coffee:16-221`). Exactly two are read by the Kanban or
-        // Backlog screen. Every name below is a real member of the incumbent surface --
-        // verified, not invented -- and every one belongs to a screen AAP §0.2.2 places out
-        // of scope: "Every `taiga-front` screen other than Kanban and Backlog: epics,
-        // issues, wiki, admin, auth, user profile, search, team, discover, project home,
-        // taskboard".
         const outOfScopeMembers = [
-            // Admin tag administration -- `:122`.
             'mixTags',
-            // Import/export -- `:126` and `:130-198`. The second is also the raw-upload
-            // non-precedent described in the file header: never to be replicated (rule T5).
             'export',
             'import',
-            // Project profile branding -- `:200` and `:221`.
             'changeLogo',
             'removeLogo',
-            // Project ordering, the `bulk-update-projects-order` endpoint of AAP §0.7.5 --
-            // `:45`, resolving the registry entry at `resources.coffee:63`. Note the two
-            // bulk-ordering endpoints the Kanban and Backlog screens DO use are user-story
-            // ordering and live on the `userstories` namespace, not this one.
             'bulkUpdateOrder',
             'bulkUpdateProjectsOrder',
-            // CSV export uuid administration -- `:49-86`, eight members in total.
             'regenerate_epics_csv_uuid',
             'regenerate_userstories_csv_uuid',
             'regenerate_tasks_csv_uuid',
             'regenerate_issues_csv_uuid',
-            // Admin membership and swimlane administration -- `:88`, `:92`, `:77`.
             'leave',
             'memberStats',
             'patch_default_swimlane',
-            // Admin tag editing -- `:98`, `:102`, `:111`.
             'deleteTag',
             'createTag',
             'editTag',
-            // Project listing and lookup, used by discover and project home -- `:16-40`.
             'get',
             'getBySlug',
             'list',
@@ -914,11 +941,6 @@ describe('the projects facade module surface', () => {
             'templates',
             'usersList',
             'rolesList',
-            // Neighbouring out-of-scope surfaces, named because they are the ones most
-            // likely to be reached for next: the profile/project timeline reads, and the
-            // project-transfer family, which lives on the sibling project-resource service
-            // (`app/modules/resources/projects-resource.service.coffee:147-174`) rather than
-            // on this namespace at all.
             'getTimeline',
             'transferStart',
             'transferValidateToken',
@@ -931,19 +953,22 @@ describe('the projects facade module surface', () => {
             expect(member in facade).toBe(false);
         }
 
-        // Nor a barrel, a default export, a shared client object or a config hook: there is
-        // no second place for surface to accumulate in this folder.
         expect(facade.default).toBeUndefined();
-        expect(Object.keys(facade).filter((key) => key !== '__esModule')).toHaveLength(2);
+        expect(Object.keys(facade).filter((key) => key !== '__esModule')).toHaveLength(3);
     });
 
     it('exposes both reads as plain two-parameter functions, not hooks', () => {
-        // Service first, id second: the calling hook owns the single injector lookup and
-        // passes the sub-resource in, which is what makes this module testable with no
-        // React renderer and no provider (requirement I9).
         expect(typeof getProjectStats).toBe('function');
         expect(typeof getProjectTagsColors).toBe('function');
         expect(getProjectStats).toHaveLength(2);
         expect(getProjectTagsColors).toHaveLength(2);
+    });
+
+    it('exposes the adapter as a plain one-parameter function that needs no service', () => {
+        // One parameter, and it is the response -- not a service, not an id, not a hook. That
+        // signature is what lets the derivation be asserted directly, with no promise, no
+        // injector double and no renderer.
+        expect(typeof toProjectStats).toBe('function');
+        expect(toProjectStats).toHaveLength(1);
     });
 });

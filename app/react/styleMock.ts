@@ -37,21 +37,26 @@
  * It is a real runtime module and deliberately not a `.d.ts`: a declaration file
  * emits no executable code, so there would be nothing for a loader to return.
  *
- * DO NOT REPOINT `moduleNameMapper` AT THIS FILE
- * ----------------------------------------------
- * `jest.config.js` maps `\.(css|scss|sass)$` onto the CommonJS sibling
- * `app/react/test-support/styleStub.js` and NOT onto this module. That asymmetry
- * is load-bearing, because a mapped specifier is reached through `require()` and
- * the two module formats do not yield the same value:
+ * THIS FILE IS THE SINGLE `moduleNameMapper` TARGET
+ * -------------------------------------------------
+ * `jest.config.js` maps `\.(css|scss|sass)$` onto this module and onto nothing
+ * else. There is no second, parallel stub: two interchangeable mock modules
+ * invite exactly the drift where the configuration quietly stops using the one
+ * the specs describe.
  *
- *     test-support/styleStub.js   `module.exports = {}`  ->  require() is {}
- *     this module                 `export default {}`    ->  require() is { default: {} }
+ * One consequence is worth stating, because it is the only observable difference
+ * a spec can see. A mapped specifier is reached through `require()`, and this is
+ * an ES module compiled by ts-jest, so the value handed back is the module
+ * NAMESPACE rather than the stub itself:
  *
- * `app/react/test-support/jestConfigContract.test.tsx` asserts the mapped value
- * with `toEqual({})`, so routing the mapper here would wrap the stub in a
- * `default` key and break that contract. The runtime mapper target therefore
- * stays CommonJS, and this module is the typed stand-in for callers that import
- * an inert stylesheet value directly under TypeScript.
+ *     require('./Foo.scss')            ->  { default: {} }
+ *     require('./Foo.scss').default    ->  {}          <- the inert value
+ *
+ * That distinction never reaches production code, because a stylesheet is always
+ * brought in as a side-effect import (`import "./Foo.scss";`) whose value is
+ * discarded. It matters only to the two specs that assert the wiring itself:
+ * `styleMock.test.ts` beside this file and
+ * `app/react/test-support/jestConfigContract.test.tsx`.
  *
  * NEVER BUNDLED. No module in the esbuild graph imports it, so it cannot reach
  * `js/react.js` or the browser. This is test infrastructure only.

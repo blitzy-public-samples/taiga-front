@@ -21,7 +21,7 @@
  * --------------------------------------------------------------------------
  * The Backlog / Sprint-Planning screen's realtime wiring, and nothing else:
  *
- *     useBacklogRealtime(projectId, {
+ *     useBacklogRealtime(events.onAngularEvent, {
  *         onUserStoriesChanged: reloadStoriesAndSprints,
  *         onMilestonesChanged: reloadSprintsAndStats,
  *     });
@@ -30,17 +30,25 @@
  * beside `useBacklogData.ts`, `useStoryDrag.ts` and `useSprints.ts`, and AAP
  * 0.6.2 sources it from `app/coffee/modules/backlog/main.coffee`.
  *
- * IT COMPOSES THE GENERIC PRIMITIVE `../../bridge/useRealtime`; it does not
- * replace it, wrap it in a second abstraction, or reimplement it. That
- * division is deliberate and load-bearing:
+ * IT OPENS NO SUBSCRIPTION. The RETAINED `BacklogController` is the sole
+ * `$tgEvents` owner of both of this screen's routing keys -- section 8 carries
+ * the measured reason that is an invariant rather than a preference -- and it
+ * re-publishes each RAW payload on its own scope. This hook LISTENS to those
+ * two scope events through a registrar the container injects, normally
+ * `events.onAngularEvent` from
+ * `app/coffee/modules/backlog/react-bridge.coffee`, which is a direct
+ * `$scope.$on`. That division is deliberate and load-bearing:
  *
- *   - the PRIMITIVE owns the mechanics of one subscription -- resolving
- *     `$tgEvents` through the typed accessor, passing the literal `null`
- *     scope, holding the handler in a ref, and tearing the subscription down
- *     in its own effect cleanup;
- *   - THIS HOOK owns the Backlog screen's frozen realtime CONTRACT -- which
- *     resources it listens to, which wire options each subscription carries,
- *     and which of the caller's reload actions each message drives.
+ *   - the RETAINED CONTROLLER owns the mechanics of the two subscriptions --
+ *     the routing keys, the wire options, its own reloads, and the automatic
+ *     teardown it gets by handing `$tgEvents` a real scope;
+ *   - THIS HOOK owns the REACT side of the Backlog screen's realtime contract
+ *     -- which two events it listens to, which of the caller's reload actions
+ *     each message drives, and the guarantee that neither runs after unmount.
+ *
+ * `../../bridge/useRealtime.ts` is NOT used here, and that is the whole point
+ * of section 8: it remains the sanctioned primitive for a routing key React
+ * ever owns OUTRIGHT, and neither migrated screen has one.
  *
  * It performs NO input or output of its own. It opens no connection, sends no
  * request, reads no store and holds no screen state. Every reload is executed
@@ -93,11 +101,15 @@
  * 3. THE FIVE FROZEN FACTS (GOAL G2)
  * --------------------------------------------------------------------------
  * Goal G2 freezes the realtime contract: the same resources are subscribed,
- * with the same wire options, driving the same reloads. Reproduced exactly:
+ * with the same wire options, driving the same reloads. All five facts survive
+ * because the subscriptions themselves are UNCHANGED -- they are still the
+ * retained controller's, exactly as quoted above. This hook is held to facts
+ * (1), (2) and (3), and facts (4) and (5) are now purely the controller's
+ * business:
  *
- *   (1) EXACTLY TWO SUBSCRIPTIONS, for the `userstories` resource and the
- *       `milestones` resource. Section 4 explains why that is a pair rather
- *       than the triple the AAP's goal statement lists.
+ *   (1) EXACTLY TWO STREAMS, the `userstories` resource and the `milestones`
+ *       resource, so exactly two listeners here. Section 4 explains why that is
+ *       a pair rather than the triple the AAP's goal statement lists.
  *   (2) THE `userstories` MESSAGE DRIVES TWO RELOADS -- the paginated story
  *       reload at `:272` (`loadAllPaginatedUserstories`, defined `:381`) then
  *       the open-sprint reload at `:273` (`loadSprints`, defined `:350`).
@@ -110,10 +122,11 @@
  *       `:271` passes no options object whatsoever, and the difference is
  *       observable on the wire: the service branches on truthiness at
  *       `app/coffee/modules/events.coffee:211` and omits the `options` member
- *       from the outgoing command entirely when nothing was supplied. Passing
- *       the object to both subscriptions, or dropping it from the second,
- *       silently changes which pushes the server delivers -- a breach of goal
- *       G2 and of rule T10.
+ *       from the outgoing command entirely when nothing was supplied. Because
+ *       the controller still performs both subscribes, this option is inherited
+ *       here rather than restated: there is no options object anywhere in this
+ *       file, and there must not be one, because a React subscribe is exactly
+ *       what section 8 forbids.
  *   (5) EACH KEY IS BUILT FROM FOUR DOT-SEPARATED SEGMENTS -- the literal
  *       `changes`, the literal `project`, the numeric project id, and the
  *       resource name -- interpolated from the live id exactly as `:270` and
@@ -156,7 +169,8 @@
  * outright, and it is not added.
  *
  * --------------------------------------------------------------------------
- * 5. WHY TEARDOWN IS OURS: THE NULL SCOPE (AAP 0.6.3, ITEM 8)
+ * 5. WHY TEARDOWN IS STILL OURS, EVEN THOUGH THE SUBSCRIPTION IS NOT
+ *    (AAP 0.6.3, ITEM 8)
  * --------------------------------------------------------------------------
  * AAP 0.6.3 item 8, verbatim:
  *
@@ -172,82 +186,70 @@
  *     scope.$on("$destroy", => @.unsubscribe(routingKey)) if scope
  *
  * The trailing `if scope` guard is the whole argument. AngularJS registers its
- * automatic teardown ONLY when a scope was supplied, which is why the
- * surviving controller at `:271` and `:276` can subscribe and forget -- it
- * hands over its own scope. React has no scope and must never be given one,
- * so the primitive passes the literal `null`, the guard is false, and NOTHING
- * unsubscribes on its own. The primitive's effect cleanup is the only teardown
- * that exists.
+ * automatic teardown ONLY when a scope was supplied, which is exactly why the
+ * retained controller at `:271` and `:276` can subscribe and forget -- it hands
+ * over its own scope, and its subscriptions die with it. React has no scope and
+ * must never be given one, which is the second reason this hook listens rather
+ * than subscribes: what it holds is not a subscription but two scope listeners,
+ * and `$scope.$on` hands back a deregistration function.
  *
- * Subscribing with a null scope is established house style rather than a novel
- * usage: the service itself does it at `app/coffee/modules/events.coffee:73`
- * (announcements), `:83` (desktop notifications) and `:115` (web
- * notifications). Each of those is a process-lifetime subscription that is
- * never torn down, which is exactly why none of them had to solve the problem
- * this seam solves.
- *
- * "Silent" is the operative word, and it is why this file is written the way
- * it is. A leaked subscription throws nothing, logs nothing, and passes every
- * test that mounts a screen once. It surfaces as a Backlog that reloads twice,
- * then three times, then four, as a user walks between Backlog and Kanban --
- * attributed, when someone finally notices, to the reload code rather than to
- * the subscription that was never released.
+ * "Silent" is the operative word, and it is why this file is written the way it
+ * is. A leaked LISTENER throws nothing, logs nothing, and passes every test that
+ * mounts a screen once. It surfaces as a Backlog that reloads twice, then three
+ * times, then four, as a user walks between Backlog and Kanban -- attributed,
+ * when someone finally notices, to the reload code rather than to the listener
+ * that was never released. So the effect below calls BOTH deregistration
+ * functions unconditionally, and its co-located spec asserts that it does.
  *
  * --------------------------------------------------------------------------
- * 6. HAZARD H1 -- UNSUBSCRIBING DOES NOT FORGET THE CALLBACK
+ * 6. HAZARD H1 -- A DELIVERY CAN STILL ARRIVE DURING TEARDOWN
  * --------------------------------------------------------------------------
  * `unsubscribe` (`app/coffee/modules/events.coffee:219-230`) does exactly one
- * thing: it sends `{"cmd": "unsubscribe", "routing_key": routingKey}`. It
- * never removes the local registry entry written at `:214`. A message already
- * in flight -- or one the server dispatches before it has processed the
- * command -- therefore still finds that entry at `:180`, still reaches `:190`,
- * and still invokes the stored callback AFTER React's cleanup has run.
+ * thing: it sends `{"cmd": "unsubscribe", "routing_key": routingKey}`. It never
+ * removes the local registry entry written at `:214`, so a message already in
+ * flight -- or one the server dispatches before it has processed the command --
+ * still finds that entry at `:180` and still reaches `:190`. That is the
+ * controller's exposure now, and it is PRESERVED, NOT PATCHED:
+ * `app/coffee/modules/events.coffee` is reference-only in this migration, a
+ * service the whole application shares, and adding a registry deletion there
+ * would change behaviour for every AngularJS consumer of it.
  *
- * THIS DEFECT IS PRESERVED, NOT PATCHED. `app/coffee/modules/events.coffee` is
- * reference-only in this migration: it is a service the whole application
- * shares, and adding a registry deletion there would change behaviour for
- * every AngularJS consumer of it. The Minimal Change Clause forbids that, so
- * the mitigation belongs on the React side of the seam, which is here.
+ * The React-side consequence is narrower but real: a broadcast can be delivered
+ * to a listener in the same digest in which React is unmounting, and a caller's
+ * handler must never run after this hook has torn down. THE LIFECYCLE GUARD
+ * answers that -- a ref, armed on mount and set in a cleanup that React runs
+ * BEFORE the listeners are released, because cleanups run in the order their
+ * effects were created and the guard's effect is created first. While it is set,
+ * neither deliverer touches the caller's handlers at all.
  *
- * Two guards answer it, at two different levels, and both are wanted:
- *
- *   - THE PRIMITIVE'S PER-SUBSCRIPTION FLAG. Each of its effect runs owns a
- *     private boolean that its cleanup sets BEFORE calling `unsubscribe`, so a
- *     late delivery on that one subscription becomes a no-op.
- *   - THIS HOOK'S OWN LIFECYCLE GUARD. A ref, armed on mount and set in a
- *     cleanup that React runs BEFORE either subscription is torn down --
- *     because cleanups run in the order their effects were created, and the
- *     guard's effect is created before both `useRealtime` calls below. While
- *     it is set, neither deliverer touches the caller's handlers at all.
- *
- * The second guard is not redundant. It is what makes the invariant "the
- * caller's handlers are never invoked after this hook unmounts" a property of
- * THIS file, provable by its own co-located spec, instead of a property
- * inherited from another file's internals.
+ * The guard is not redundant with deregistration. It is what makes the invariant
+ * "the caller's handlers are never invoked after this hook unmounts" a property
+ * of THIS file, provable by its own co-located spec, instead of a property
+ * inherited from AngularJS's listener bookkeeping.
  *
  * --------------------------------------------------------------------------
- * 7. DELIVERY RUNS WITH NO DIGEST CYCLE AROUND IT
+ * 7. DELIVERY ARRIVES INSIDE A DIGEST, AND NOTHING HERE DRIVES ONE
  * --------------------------------------------------------------------------
- * A correction to a common misreading of this seam, recorded so it is not
- * re-introduced. `processMessage`
- * (`app/coffee/modules/events.coffee:177-190`) branches on the stored scope:
+ * `processMessage` (`app/coffee/modules/events.coffee:177-190`) branches on the
+ * stored scope:
  *
  *     if subscription.scope             # :185
- *         subscription.scope.$apply ->  # :186  <- AngularJS consumers
+ *         subscription.scope.$apply ->  # :186  <- the retained controller
  *             subscription.callback(data.data)
  *     else                              # :189
- *         subscription.callback(data.data)  # :190  <- this seam's callback
+ *         subscription.callback(data.data)  # :190  <- a null-scope consumer
  *
- * With a null scope, delivery takes the `:189-190` branch, so the handlers
- * this hook drives run OUTSIDE the AngularJS digest -- they are NOT already
- * inside one, as the shape of `:186` might suggest at a glance.
+ * The controller supplies a real scope, so delivery takes the `:185-187` branch
+ * and its callback -- including the re-publishing broadcast this hook listens
+ * for -- runs INSIDE a digest. A React state update made from there is
+ * perfectly ordinary: React schedules its own render and React 18's automatic
+ * batching coalesces the updates.
  *
- * That changes nothing about what this file does. It sets React state through
- * the caller's handlers, React schedules its own render, and React 18's
- * automatic batching coalesces the updates. Digest cycles remain AngularJS's
- * concern and are never forced from React code (AAP 0.7.4 makes that a
- * prohibition, not a preference); the formal reason none is needed is that the
- * AngularJS HTTP provider is configured with `useApplyAsync(true)` at
+ * What must NOT happen is React driving a digest of its own. AAP 0.7.4 makes
+ * that a prohibition rather than a preference, and nothing in this file calls
+ * any digest driver: the payload reaches it as two plain callback arguments. The
+ * formal reason none is needed elsewhere either is that the AngularJS HTTP
+ * provider is configured with `useApplyAsync(true)` at
  * `app/coffee/app.coffee:604`, so responses arriving on the shared transport
  * schedule their own. Where a caller's handler ultimately calls into an
  * AngularJS function, that function manages its own digest.
@@ -264,14 +266,26 @@
  *   - either consumer's `unsubscribe` kills the server-side subscription for
  *     BOTH, because the wire command carries only the key.
  *
- * So "one live consumer per key" is an INVARIANT THIS HOOK UPHOLDS rather
- * than a problem it engineers around: it creates EXACTLY ONE subscription per
- * resource, never two, and it is mounted once per Backlog screen. The Kanban
- * screen subscribes to a `userstories` key built the same way, but the two
- * screens are separate routes (`app/coffee/app.coffee:228` and `:237`) and
- * never mount together, so that overlap is not a practical conflict. It is
- * likewise preserved rather than "fixed" -- deduplicating subscriptions across
- * screens would be new behaviour, which rule T10 forbids.
+ * ⭐ THAT IS WHY THIS HOOK SUBSCRIBES TO NOTHING. The retained
+ * `BacklogController` already owns both of this screen's keys, and it is not
+ * going anywhere: it is still the data, permission and write layer that feeds
+ * this screen. A React subscription to `…userstories` or `…milestones` would
+ * OVERWRITE the controller's callback -- the screen would silently stop
+ * reloading -- and whichever side unmounted first would take the shared
+ * server-side subscription down with it. Neither failure raises anything.
+ *
+ * The resolution is the one the seam already provides: the controller
+ * re-publishes each raw payload on its scope and React LISTENS. One `$tgEvents`
+ * subscription per key, one AngularJS owner, and as many React listeners as the
+ * screen needs -- scope listeners are an array push, so several are cheap and
+ * none can displace another.
+ *
+ * The Kanban screen owns a `userstories` key built the same way, through its own
+ * retained controller. The two screens are separate routes
+ * (`app/coffee/app.coffee:228` and `:237`) and never mount together, so that
+ * overlap is not a practical conflict; it is preserved rather than "fixed",
+ * because deduplicating subscriptions across screens would be new behaviour,
+ * which rule T10 forbids.
  *
  * --------------------------------------------------------------------------
  * 9. WHAT THIS HOOK DELIBERATELY DOES NOT DO (RULE T10)
@@ -327,59 +341,77 @@
  * what makes goal G4's coverage gate reachable here rather than aspirational.
  *
  * Strict typing -- `tsconfig.json` sets `strict: true` with no per-flag
- * opt-outs, plus `noUnusedLocals`, `noUnusedParameters` and
- * `isolatedModules`. There is no `baseUrl` and no `paths`, so both imports
- * below are relative; the options type is IMPORTED from the primitive rather
- * than redeclared, because the primitive declares it as a type alias
- * deliberately -- an interface would not satisfy the open-record parameter
- * that `$tgEvents.subscribe` types its fourth argument as.
+ * opt-outs, plus `noUnusedLocals`, `noUnusedParameters` and `isolatedModules`.
+ * The only import below is `react` itself: this hook resolves no service, holds
+ * no transport type and therefore needs nothing from the bridge folder. The
+ * registrar's shape is declared here, structurally, so any `$scope.$on`-shaped
+ * function satisfies it -- the bridge payload's `events.onAngularEvent` in the
+ * browser, a recording stub in the browserless suite.
  * ========================================================================== */
 
 import { useCallback, useEffect, useRef } from 'react';
 
-import { useRealtime } from '../../bridge/useRealtime';
-import type { RealtimeSubscriptionOptions } from '../../bridge/useRealtime';
-
 /* --------------------------------------------------------------------------
- * Wire options
+ * Public constants
  * -------------------------------------------------------------------------- */
 
 /**
- * The subscribe-time wire options carried by the `milestones` subscription, and
- * by that subscription ALONE.
+ * The AngularJS scope event on which the retained controller re-publishes every
+ * RAW payload delivered on this screen's `userstories` routing key.
  *
- * Reproduces the fourth argument supplied at
- * `app/coffee/modules/backlog/main.coffee:280` (`:234` before the view-layer
- * retirement commit). `selfNotification` asks the server to deliver milestone
- * changes that this very session caused, which it otherwise suppresses -- and
- * the Backlog needs them, because a sprint edit made here has to refresh the
- * closed-sprint list and the project statistics too.
- *
- * HOISTED TO MODULE SCOPE ON PURPOSE, for three reasons:
- *
- *   1. One reference exists for the process's whole lifetime, so the object can
- *      never be the cause of a resubscription. The primitive already guards
- *      against identity churn by deriving a normalised value from the object's
- *      contents rather than depending on the object itself, so an inline
- *      literal would in fact be harmless -- but relying on another module's
- *      internal defence to keep this one correct is exactly the kind of
- *      coupling that breaks quietly later.
- *   2. It states the intent where a reader will look: there is ONE options
- *      object in this screen's contract, and it belongs to ONE subscription.
- *   3. It cannot be recreated by mistake inside a branch, which is how the
- *      object ends up attached to the wrong key.
- *
- * The type is IMPORTED from the primitive rather than redeclared, so a change
- * to the accepted option set is a compile error here instead of a value the
- * server quietly ignores.
+ * Broadcast by `initializeSubscription` in
+ * `app/coffee/modules/backlog/main.coffee`, immediately AFTER the controller's
+ * own two reloads, so the ordering the incumbent guarantees between them is
+ * untouched.
  */
-const MILESTONES_SUBSCRIBE_OPTIONS: RealtimeSubscriptionOptions = {
-    selfNotification: true,
-};
+export const BACKLOG_REALTIME_USERSTORIES_EVENT = 'backlog:realtime:userstories';
+
+/**
+ * The AngularJS scope event on which the retained controller re-publishes every
+ * RAW payload delivered on this screen's `milestones` routing key -- the
+ * subscription that carries `{ selfNotification: true }`, which is inherited
+ * here rather than restated (section 3, fact 4).
+ */
+export const BACKLOG_REALTIME_MILESTONES_EVENT = 'backlog:realtime:milestones';
 
 /* --------------------------------------------------------------------------
  * Public types
  * -------------------------------------------------------------------------- */
+
+/** One of the two scope events the retained controller re-publishes on. */
+export type BacklogRealtimeEventName =
+    | typeof BACKLOG_REALTIME_USERSTORIES_EVENT
+    | typeof BACKLOG_REALTIME_MILESTONES_EVENT;
+
+/**
+ * The teardown function a registration hands back.
+ *
+ * `$scope.$on` returns exactly this, and the effect below calls both of the ones
+ * it holds on cleanup. Section 5 explains why leaving one uncalled leaks
+ * silently.
+ */
+export type BacklogRealtimeEventDeregistrar = () => void;
+
+/**
+ * Registers a listener for one of the two controller-published events and
+ * returns its deregistration function.
+ *
+ * This is the whole of the AngularJS seam, injected by the container rather than
+ * resolved here, so this hook touches no injector, no `$scope` and no service.
+ * The natural implementation is the bridge payload's own
+ * `events.onAngularEvent`, which is a direct `$scope.$on` on the retained
+ * controller's scope; a spec satisfies it with a stub that records the handler.
+ *
+ * The listener signature carries BOTH AngularJS arguments in AngularJS's order
+ * -- the event object first, the payload second -- because reading the payload
+ * out of the wrong position is the classic way to get a `$scope.$on` consumer
+ * wrong. Neither deliverer in this file reads either argument (section 3), and
+ * declaring them both keeps that a visible decision rather than an accident.
+ */
+export type BacklogRealtimeEventRegistrar = (
+    eventName: BacklogRealtimeEventName,
+    handler: (event: unknown, message: unknown) => void,
+) => BacklogRealtimeEventDeregistrar;
 
 /**
  * What the caller must do when each of the Backlog's two realtime resources
@@ -403,23 +435,38 @@ export interface BacklogRealtimeHandlers {
     /**
      * Invoked for each message on the `userstories` resource.
      *
-     * Must drive the incumbent's TWO reloads, in order: the paginated story
-     * reload at `app/coffee/modules/backlog/main.coffee:272`
-     * (`loadAllPaginatedUserstories`, defined `:381`) followed by the
-     * open-sprint reload at `:273` (`loadSprints`, defined `:350`). Sprints are
-     * reloaded alongside the stories because a story that moved into or out of
-     * a sprint changes that sprint's own totals.
+     * ⚠ IT MUST NOT REPEAT THE INCUMBENT'S RELOADS. The retained controller has
+     * ALREADY issued both of them, in order, in the same digest -- the paginated
+     * story reload at `app/coffee/modules/backlog/main.coffee:272`
+     * (`loadAllPaginatedUserstories`, defined `:381`) followed by the open-sprint
+     * reload at `:273` (`loadSprints`, defined `:350`) -- and only then does it
+     * broadcast the event this handler is invoked from. Sprints are reloaded
+     * alongside the stories because a story that moved into or out of a sprint
+     * changes that sprint's own totals. Calling either loader again through the
+     * bridge would double every realtime refresh, which is server traffic no
+     * session generates today (rule T10).
+     *
+     * What it IS for: bringing the React tree into step with the controller's
+     * refreshed state. Those reloads are asynchronous, so a container that needs
+     * the settled data reads it when the controller announces it -- the same
+     * registrar also carries `userstories:loaded`
+     * (`app/coffee/modules/backlog/main.coffee:317`, `:468`) and
+     * `sprints:loaded` (`:389`) -- while this event is the earliest possible
+     * signal that a change arrived at all.
      */
     readonly onUserStoriesChanged: () => void;
 
     /**
      * Invoked for each message on the `milestones` resource.
      *
-     * Must drive the incumbent's THREE reloads, in order: open sprints at
+     * ⚠ Same prohibition, same reason. The retained controller has already
+     * issued all THREE reloads, in order: open sprints at
      * `app/coffee/modules/backlog/main.coffee:277`, closed sprints at `:278`
      * (`loadClosedSprints`, defined `:327`) and project statistics at `:279`
      * (`loadProjectStats`, defined `:302`, which also recomputes the completed
-     * percentage and the velocity forecast).
+     * percentage and the velocity forecast). The completion announcements a
+     * container can read instead are `sprints:loaded` (`:389`) and
+     * `closed-sprints:reloaded` (`:342`, `:358`).
      */
     readonly onMilestonesChanged: () => void;
 }
@@ -429,80 +476,62 @@ export interface BacklogRealtimeHandlers {
  * -------------------------------------------------------------------------- */
 
 /**
- * Subscribes the Backlog / Sprint-Planning screen to its two realtime
- * resources for as long as the calling component is mounted, and releases both
- * when it unmounts or when the project changes.
+ * Keeps the React Backlog / Sprint-Planning screen in step with its two realtime
+ * streams for as long as the calling component is mounted, and releases both
+ * listeners when it unmounts.
  *
- * The React replacement for `BacklogController.initializeSubscription`
- * (`app/coffee/modules/backlog/main.coffee:269-280`), and the whole of it:
+ * The React half of `BacklogController.initializeSubscription`
+ * (`app/coffee/modules/backlog/main.coffee:269-280`); the subscribing half stays
+ * in that controller, which owns both routing keys (section 8):
  *
  * ```ts
  * // AngularJS: @events.subscribe @scope, routingKey1, (message) => ...
+ * //            ... then @scope.$broadcast("backlog:realtime:userstories", message)
  * // React:
- * useBacklogRealtime(projectId, {
- *     onUserStoriesChanged: reloadStoriesAndSprints,
- *     onMilestonesChanged: reloadSprintsAndStats,
+ * useBacklogRealtime(events.onAngularEvent, {
+ *     onUserStoriesChanged: syncStoriesAndSprints,
+ *     onMilestonesChanged: syncSprintsAndStats,
  * });
  * ```
  *
  * Behavioural contract:
  *
  * - **EXACTLY TWO SUBSCRIPTIONS**, for the `userstories` and `milestones`
- *   resources, with the options object on the second alone (section 3 of the
- *   file header). The project-attributes resource belongs to the Kanban screen
- *   and is deliberately absent (section 4).
- * - **A FALSY `projectId` SUBSCRIBES TO NOTHING.** The id is unknown until the
- *   project resolves, and a key built from an unresolved id would name a
- *   routing key that never delivers. Both `useRealtime` calls are still made
- *   unconditionally, as React's rules of hooks require; the primitive's own
- *   early return does the rest. This truthiness test is behavioural parity, not
- *   a stylistic choice -- the incumbent loader guards itself the same way, with
- *   `return null if !@scope.projectId` at
- *   `app/coffee/modules/backlog/main.coffee:388`.
- * - **CHANGING `projectId` MOVES BOTH SUBSCRIPTIONS**, releasing the old keys
- *   before taking the new ones.
- * - **THE LATEST HANDLERS ALWAYS WIN, WITHOUT RESUBSCRIBING.** A caller may
+ *   resources (section 3 of the file header). The project-attributes resource
+ *   belongs to the Kanban screen and is deliberately absent (section 4).
+ * - **IT SUBSCRIBES TO NOTHING.** The retained controller is the sole
+ *   `$tgEvents` owner of both routing keys, and there is deliberately no
+ *   `projectId` parameter: the keys are composed and owned there (section 8).
+ * - **THE LATEST HANDLERS ALWAYS WIN, WITHOUT RE-REGISTERING.** A caller may
  *   pass a fresh object literal on every render; it is read through a ref, so
- *   the subscriptions are untouched by the caller's rendering (section 6).
- * - **AFTER UNMOUNT, NEITHER HANDLER IS EVER INVOKED AGAIN**, even though the
- *   service keeps its registry entry after unsubscribing (hazard H1,
- *   section 6).
+ *   the two listeners are untouched by the caller's rendering (section 6).
+ * - **AFTER UNMOUNT, NEITHER HANDLER IS EVER INVOKED AGAIN**, even for a
+ *   delivery already in flight (hazard H1, section 6).
+ * - **BOTH LISTENERS ARE RELEASED ON CLEANUP** (section 5).
  * - **NOTHING IS RETURNED, AND NOTHING IS LOADED HERE** (sections 1 and 9).
  *
- * Safe under React 18 StrictMode: its development-only mount / unmount /
- * remount cycle releases and retakes the same two keys in order, re-arming the
- * lifecycle guard on the way back in, and leaves exactly one live subscription
- * per resource.
+ * Safe under React 18 StrictMode: its development-only mount / unmount / remount
+ * cycle releases and retakes the same two listeners in order, re-arming the
+ * lifecycle guard on the way back in, and leaves exactly one live listener per
+ * stream.
  *
- * @param projectId - the live project id. A falsy value means "not resolved
- *                    yet" and subscribes to nothing.
- * @param handlers - the reload actions each resource's messages drive. May be a
- *                   fresh object on every render.
+ * @param registerAngularEvent - how to register a listener on the retained
+ *                    controller's scope; normally `events.onAngularEvent` from
+ *                    the bridge payload.
+ * @param handlers - what to do when each stream reports a change. May be a fresh
+ *                   object on every render.
  */
 export function useBacklogRealtime(
-    projectId: number | null | undefined,
+    registerAngularEvent: BacklogRealtimeEventRegistrar,
     handlers: BacklogRealtimeHandlers,
 ): void {
-    // ------------------------------------------------------------------
-    // The lifecycle guard -- hazard H1 (section 6 of the file header).
-    //
-    // Declared FIRST, before the two `useRealtime` calls at the end of this
-    // hook, and that ordering is the mechanism rather than a formatting
-    // preference: React runs a component's effect cleanups in the order their
-    // effects were created, so this cleanup is guaranteed to have run before
-    // either subscription is released. A message the service dispatches into a
-    // stale registry entry after teardown therefore finds both deliverers
-    // already silenced.
-    // ------------------------------------------------------------------
+    // A message can arrive after this screen has gone: the handlers reload the backlog, so
+    // delivering one post-unmount would fetch into a dead component. The cancellation flag is
+    // checked at delivery, and the handlers themselves are held in a ref so that a parent
+    // re-rendering with fresh closures does not resubscribe and lose queued messages.
     const cancelledRef = useRef<boolean>(false);
 
     useEffect(() => {
-        // Re-armed on every mount rather than only at initialisation: React 18
-        // StrictMode remounts a component onto the SAME ref object in
-        // development, so a guard that was set during the first cleanup would
-        // otherwise stay set and silently swallow every message of the second
-        // mount -- a failure that appears only in development and looks exactly
-        // like a broken server.
         cancelledRef.current = false;
 
         return () => {
@@ -510,43 +539,12 @@ export function useBacklogRealtime(
         };
     }, []);
 
-    // ------------------------------------------------------------------
-    // The handlers ref.
-    //
-    // Callers pass an object literal, which is a new identity on every render.
-    // Holding it in a ref decouples the subscriptions' lifetime from the
-    // caller's rendering entirely, so no call site has to remember to memoise
-    // anything for the subscriptions to stay put -- forgetting that would be
-    // invisible, and by hazard H2 (section 8) a resubscription storm is
-    // destructive rather than merely wasteful.
-    //
-    // Seeded with the first render's value so it is already correct before the
-    // effects run, and republished from an effect rather than during render:
-    // under concurrent rendering a render may be discarded or replayed, and
-    // writing a ref then would publish a value from a render that never
-    // committed.
-    // ------------------------------------------------------------------
     const handlersRef = useRef<BacklogRealtimeHandlers>(handlers);
 
     useEffect(() => {
         handlersRef.current = handlers;
     }, [handlers]);
 
-    // ------------------------------------------------------------------
-    // The two deliverers.
-    //
-    // Stable for the component's whole lifetime -- empty dependency lists, and
-    // every varying value reached through a ref. Each reads the CURRENT
-    // handlers, so it can never invoke a stale closure.
-    //
-    // Neither declares a parameter. The service hands the callback the message
-    // payload (`app/coffee/modules/events.coffee:190`), and the incumbent
-    // callbacks name it and then never consult it -- the arrival of a message
-    // is the entire signal, and both reloads re-read the resource from the
-    // repository layer instead of trusting the push. Declaring no parameter
-    // reproduces that faithfully and keeps the contract honest: this hook
-    // cannot narrow a payload whose shape it does not inspect.
-    // ------------------------------------------------------------------
     const deliverUserStoriesChange = useCallback((): void => {
         if (cancelledRef.current) {
             return;
@@ -564,41 +562,41 @@ export function useBacklogRealtime(
     }, []);
 
     // ------------------------------------------------------------------
-    // The two routing keys, composed here because composing them is the
-    // CALLER's job as far as the primitive is concerned -- it hardcodes none.
+    // THE SEAM ITSELF (section 8), and the only place this file touches
+    // AngularJS: two listeners on the retained controller's scope, and the two
+    // deregistration functions it handed back, called on cleanup.
     //
-    // Four dot-separated segments each, interpolating the live id exactly as
-    // `app/coffee/modules/backlog/main.coffee:270` and `:275` interpolate
-    // `@scope.projectId`. Recomputed on every render and compared by value
-    // inside the primitive, so an unchanged id produces an unchanged key and
-    // leaves both subscriptions alone.
+    // Registration is a single effect rather than one per stream, because the two
+    // listeners share one lifetime exactly: they are taken together, released
+    // together, and there is no key, id or option that could ever move one
+    // without moving the other. Its dependency list is the registrar and the two
+    // stable deliverers, so an ordinary re-render never touches either listener.
     //
-    // `null` while the id is unresolved, which the primitive reads as "not
-    // yet" and skips.
+    // Neither listener DECLARES an argument, because neither deliverer consults
+    // one (see above) and a zero-argument function satisfies the registrar's
+    // two-argument listener type. The type still spells both arguments out, in
+    // AngularJS's order -- event object first, payload second -- so that a future
+    // listener which does need the payload cannot read it out of the first
+    // position, which is the classic way to get a `$scope.$on` consumer wrong.
     // ------------------------------------------------------------------
-    const userStoriesRoutingKey = projectId
-        ? `changes.project.${projectId}.userstories`
-        : null;
+    useEffect(() => {
+        const deregisterUserStories = registerAngularEvent(
+            BACKLOG_REALTIME_USERSTORIES_EVENT,
+            (): void => {
+                deliverUserStoriesChange();
+            },
+        );
 
-    const milestonesRoutingKey = projectId
-        ? `changes.project.${projectId}.milestones`
-        : null;
+        const deregisterMilestones = registerAngularEvent(
+            BACKLOG_REALTIME_MILESTONES_EVENT,
+            (): void => {
+                deliverMilestonesChange();
+            },
+        );
 
-    // ------------------------------------------------------------------
-    // EXACTLY TWO SUBSCRIPTIONS, both unconditional and both at the top level
-    // of this hook -- never inside a branch, a loop or a conditional
-    // expression, which React's rules of hooks forbid and which a "loop over an
-    // array of keys" refactor would introduce. Conditionality lives in the KEYS
-    // above, never in whether the hook is called.
-    //
-    // The options object goes to the SECOND call alone, mirroring
-    // `app/coffee/modules/backlog/main.coffee:280`. The first call passes no
-    // third argument at all, so the primitive forwards `undefined` and the
-    // service omits the `options` member from the outgoing command entirely
-    // (`app/coffee/modules/events.coffee:211-212`) -- which is a different wire
-    // message from one carrying an empty object.
-    // ------------------------------------------------------------------
-    useRealtime(userStoriesRoutingKey, deliverUserStoriesChange);
-
-    useRealtime(milestonesRoutingKey, deliverMilestonesChange, MILESTONES_SUBSCRIBE_OPTIONS);
+        return () => {
+            deregisterUserStories();
+            deregisterMilestones();
+        };
+    }, [registerAngularEvent, deliverUserStoriesChange, deliverMilestonesChange]);
 }

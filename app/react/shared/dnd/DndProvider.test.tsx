@@ -46,12 +46,21 @@ import type { Active, Collision, CollisionDetection } from '@dnd-kit/core';
 import type { ReactElement, ReactNode } from 'react';
 
 import {
+    DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED,
     DndProvider,
     MIRROR_CLASS,
     TRANSIT_CLASS,
-    toDndKitAutoScroll,
+    applyAutoScrollDelta,
+    autoScrollTargetEdges,
+    computeAutoScrollDelta,
+    isPointInsideAutoScrollTarget,
+    resolveAutoScrollTarget,
 } from './DndProvider';
-import type { DndAutoScrollConfig, DndMultiDragCallOrder } from './DndProvider';
+import type {
+    AutoScrollEdges,
+    DndAutoScrollConfig,
+    DndProviderProps,
+} from './DndProvider';
 import {
     MULTIPLE_SORTABLE_CLASS,
     MIRROR_CLASS as MULTI_DRAG_MIRROR_CLASS,
@@ -104,27 +113,72 @@ afterAll(() => {
  * The board's incumbent autoscroll configuration —
  * `app/coffee/modules/kanban/sortable.coffee` L155-L160. Declared in the SUITE
  * rather than imported, because the provider deliberately exports no preset.
+ *
+ * `getTargets` yields nothing by default: most cases in this suite exercise the
+ * drag lifecycle rather than scrolling, and an empty target set is the honest way
+ * to say "no scroll container here". The cases that DO exercise scrolling supply
+ * their own.
  */
 const BOARD_AUTO_SCROLL: DndAutoScrollConfig = {
     enabled: true,
     margin: 100,
     scrollWhenOutside: true,
+    getTargets: () => [],
 };
 
 /**
  * The story list's incumbent autoscroll configuration —
- * `app/coffee/modules/backlog/sortable.coffee` L145-L151. Note the `pixels`
- * field, which the board does not have.
+ * `app/coffee/modules/backlog/sortable.coffee` L145-L151. Note `pixels`, which the
+ * board does not have and which the installed library does not read, and the
+ * `[window]` target, which the board does not use.
  */
 const STORY_LIST_AUTO_SCROLL: DndAutoScrollConfig = {
     enabled: true,
     margin: 20,
     pixels: 30,
     scrollWhenOutside: true,
+    getTargets: () => [window],
 };
 
 /** A deterministic extent, so no assertion depends on jsdom's default viewport. */
 const VIEWPORT = { width: 1920, height: 1080 };
+
+/**
+ * Builds a rect for the arithmetic specs.
+ *
+ * Named so a case reads as geometry rather than as four numbers, and so the
+ * measured column width (292 px, AAP §0.3.2) can be used verbatim.
+ */
+function edges(left: number, top: number, width: number, height: number): AutoScrollEdges {
+    return { left, top, right: left + width, bottom: top + height };
+}
+
+/**
+ * A scroll-target element double with settable, observable scroll offsets and a
+ * rect under the suite's control.
+ *
+ * jsdom implements neither layout nor scrolling, so `getBoundingClientRect` returns
+ * zeroes and `scrollTop` never moves on its own. Both are supplied here, which is
+ * what lets the port be asserted in pixels with no browser.
+ */
+function scrollTargetDouble(rect: AutoScrollEdges): HTMLElement {
+    const element = document.createElement('div');
+
+    element.getBoundingClientRect = (): DOMRect =>
+        ({
+            top: rect.top,
+            left: rect.left,
+            right: rect.right,
+            bottom: rect.bottom,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+            x: rect.left,
+            y: rect.top,
+            toJSON: () => ({}),
+        }) as DOMRect;
+
+    return element;
+}
 
 /** The identifier the draggable harness uses, and the `data-id` it renders. */
 const SOURCE_ID = 7;
@@ -364,141 +418,722 @@ describe('the exported class contract', () => {
 });
 
 /* ==========================================================================
- * THE AUTOSCROLL TRANSLATION
+ * THE AUTOSCROLL PORT
+ *
+ * `dom-autoscroller@2.3.4` reproduced arithmetic-for-arithmetic. Every expected
+ * number below was computed by hand from the library's own expressions, so a
+ * failure here means the port drifted rather than that a fixture is stale.
  * ========================================================================== */
 
-describe('toDndKitAutoScroll', () => {
-    it('turns the board\u2019s pixel margin into a per-axis fraction', () => {
-        const options = toDndKitAutoScroll(BOARD_AUTO_SCROLL, VIEWPORT);
+describe('autoScrollTargetEdges', () => {
+    it('measures an element with getBoundingClientRect, viewport-relative', () => {
+        // The measured status-column width, AAP §0.3.2.
+        const column = scrollTargetDouble(edges(216, 165, 292, 900));
 
-        expect(options.enabled).toBe(true);
-        expect(options.threshold).toEqual({
-            x: 100 / VIEWPORT.width,
-            y: 100 / VIEWPORT.height,
+        expect(autoScrollTargetEdges(column)).toEqual({
+            left: 216,
+            top: 165,
+            right: 508,
+            bottom: 1065,
         });
     });
 
-    it('leaves acceleration untouched when the screen supplies no pixel step', () => {
-        /*
-         * The board configures no `pixels`
-         * (`app/coffee/modules/kanban/sortable.coffee` L155-L160), so the field
-         * must be ABSENT rather than zero or invented — an absent field is what
-         * lets `@dnd-kit`'s own default stand.
-         */
-        const options = toDndKitAutoScroll(BOARD_AUTO_SCROLL, VIEWPORT);
-
-        expect('acceleration' in options).toBe(false);
-        expect(options.acceleration).toBeUndefined();
-    });
-
-    it('maps the story list\u2019s pixel step onto acceleration', () => {
-        const options = toDndKitAutoScroll(STORY_LIST_AUTO_SCROLL, VIEWPORT);
-
-        expect(options.acceleration).toBe(30);
-        expect(options.threshold).toEqual({
-            x: 20 / VIEWPORT.width,
-            y: 20 / VIEWPORT.height,
+    it('SYNTHESISES the window rect from innerWidth/innerHeight, not the document', () => {
+        // `dom-plane`'s `createWindowRect()`: the viewport in its own coordinates,
+        // anchored at the origin. This is what makes the story list's 20 px band a
+        // band at the edge of what the user can SEE, rather than of the document.
+        expect(autoScrollTargetEdges(window)).toEqual({
+            left: 0,
+            top: 0,
+            right: window.innerWidth,
+            bottom: window.innerHeight,
         });
     });
+});
 
-    it('keeps the two screens\u2019 configurations observably distinct', () => {
-        /*
-         * THE POINT OF THE WHOLE FUNCTION. If the translation ever collapses the
-         * board's margin of 100 and the story list's margin of 20 onto one output,
-         * both screens start scrolling identically and nothing reports it. The
-         * annotated story-list reference is explicit: "Do not unify the two."
-         */
-        const board = toDndKitAutoScroll(BOARD_AUTO_SCROLL, VIEWPORT);
-        const storyList = toDndKitAutoScroll(STORY_LIST_AUTO_SCROLL, VIEWPORT);
+describe('isPointInsideAutoScrollTarget', () => {
+    const column = scrollTargetDouble(edges(100, 100, 200, 200));
 
-        expect(board).not.toEqual(storyList);
-        expect(board.threshold).not.toEqual(storyList.threshold);
-        expect('acceleration' in board).not.toBe('acceleration' in storyList);
+    it('is true strictly inside', () => {
+        expect(isPointInsideAutoScrollTarget({ x: 200, y: 200 }, column)).toBe(true);
     });
 
-    it('produces different thresholds per axis on a non-square viewport', () => {
-        const options = toDndKitAutoScroll(BOARD_AUTO_SCROLL, VIEWPORT);
-
-        expect(options.threshold?.x).not.toBe(options.threshold?.y);
+    it.each([
+        ['the left edge', { x: 100, y: 200 }],
+        ['the right edge', { x: 300, y: 200 }],
+        ['the top edge', { x: 200, y: 100 }],
+        ['the bottom edge', { x: 200, y: 300 }],
+    ])('⭐ is FALSE exactly on %s, because the library compares strictly', (_label, point) => {
+        // All four of `dom-plane`'s comparisons are strict. Reproduced rather than
+        // tidied: it is what decides whether `scrollWhenOutside` retains a target on a
+        // boundary pixel.
+        expect(isPointInsideAutoScrollTarget(point, column)).toBe(false);
     });
 
-    it('carries the enabled flag through unchanged', () => {
-        const options = toDndKitAutoScroll(
-            { ...BOARD_AUTO_SCROLL, enabled: false },
-            VIEWPORT,
-        );
+    it('is false outside', () => {
+        expect(isPointInsideAutoScrollTarget({ x: 50, y: 200 }, column)).toBe(false);
+        expect(isPointInsideAutoScrollTarget({ x: 400, y: 200 }, column)).toBe(false);
+    });
+});
 
-        expect(options.enabled).toBe(false);
+describe('computeAutoScrollDelta', () => {
+    /** A 292 px column at x 216, tall enough that only the x axis is interesting. */
+    const column = edges(216, 0, 292, 10000);
+
+    it('⭐ honours the board margin AS 100 PIXELS, not as a viewport fraction', () => {
+        // THE DEFECT THIS PORT EXISTS TO FIX, stated as a test. The retired conversion
+        // divided 100 by the viewport width (1920) and handed `@dnd-kit` ≈0.052, which
+        // that library then applied to the column's OWN 292 px rect — an activation band
+        // of about 15 px. Here the band is 100 px wide, measured inward from x 216, so a
+        // pointer 60 px in still scrolls.
+        const insideTheBand = computeAutoScrollDelta({ x: 276, y: 5000 }, column, 100);
+
+        expect(insideTheBand.x).toBeLessThan(0);
+
+        // And a pointer just PAST the band does not, which is what makes the band a band
+        // rather than a gradient over the whole column. Under the fractional conversion
+        // this point was far outside its ~15 px band and scrolled nothing.
+        expect(computeAutoScrollDelta({ x: 316, y: 5000 }, column, 100).x).toBe(0);
     });
 
-    it('collapses a non-positive or unusable margin to no activation band', () => {
-        for (const margin of [0, -1, Number.NaN, Number.NEGATIVE_INFINITY]) {
-            const options = toDndKitAutoScroll(
-                { ...BOARD_AUTO_SCROLL, margin },
-                VIEWPORT,
-            );
+    it.each([
+        // (position - left) / margin - 1, clamped at -1, × 4, floored.
+        ['at the near edge', 216, -4],
+        ['a quarter into the band', 241, -3],
+        ['halfway into the band', 266, -2],
+        ['three quarters in', 291, -1],
+        ['one pixel inside the band', 315, -1],
+        ['exactly one margin in', 316, 0],
+        ['well past the band', 400, 0],
+        ['beyond the near edge', 100, -4],
+    ])('scrolls %s by %d px on x', (_label, x, expected) => {
+        expect(computeAutoScrollDelta({ x, y: 5000 }, column, 100).x).toBe(expected);
+    });
 
-            expect(options.threshold).toEqual({ x: 0, y: 0 });
+    it.each([
+        // (position - right) / margin + 1, clamped at 1, × 4, ceiled. right = 508.
+        ['at the far edge', 508, 4],
+        ['a quarter into the band', 483, 3],
+        ['halfway into the band', 458, 2],
+        ['three quarters in', 433, 1],
+        ['one pixel inside the band', 409, 1],
+        ['exactly one margin in', 408, 0],
+        ['beyond the far edge', 700, 4],
+    ])('scrolls %s by %d px on x', (_label, x, expected) => {
+        expect(computeAutoScrollDelta({ x, y: 5000 }, column, 100).x).toBe(expected);
+    });
+
+    it('⭐ has NO DEAD ZONE at the inner lip of the band', () => {
+        // `Math.floor` on the negative side and `Math.ceil` on the positive mean that
+        // ANY depth inside the band scrolls: one pixel in gives floor(-0.01 × 4) =
+        // floor(-0.04) = -1, not 0. Rounding to nearest would invent a dead zone across
+        // the inner three quarters of the band, and the drag would feel broken there.
+        expect(computeAutoScrollDelta({ x: 315.99, y: 5000 }, column, 100).x).toBe(-1);
+        expect(computeAutoScrollDelta({ x: 408.01, y: 5000 }, column, 100).x).toBe(1);
+    });
+
+    it('CLAMPS the magnitude to maxSpeed however far past the edge the pointer goes', () => {
+        // The clamp is `Math.max(-1, …)` / `Math.min(1, …)` INSIDE the multiplication, so
+        // it bounds the ratio rather than the product.
+        for (const x of [216, 0, -500, -100000]) {
+            expect(computeAutoScrollDelta({ x, y: 5000 }, column, 100).x).toBe(-4);
+        }
+
+        for (const x of [508, 2000, 100000]) {
+            expect(computeAutoScrollDelta({ x, y: 5000 }, column, 100).x).toBe(4);
         }
     });
 
-    it('clamps a margin that covers the extent to the whole region', () => {
-        const options = toDndKitAutoScroll(
-            { ...BOARD_AUTO_SCROLL, margin: VIEWPORT.width * 2 },
-            VIEWPORT,
-        );
-
-        expect(options.threshold).toEqual({ x: 1, y: 1 });
+    it('defaults maxSpeed to the library default of 4', () => {
+        expect(DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED).toBe(4);
+        expect(computeAutoScrollDelta({ x: 216, y: 5000 }, column, 100).x).toBe(-4);
+        expect(
+            computeAutoScrollDelta(
+                { x: 216, y: 5000 },
+                column,
+                100,
+                DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED,
+            ).x,
+        ).toBe(-4);
     });
 
-    it('treats an unmeasurable extent as the whole region', () => {
-        /*
-         * A pixel margin cannot be expressed as a fraction of nothing. Answering
-         * with the maximum keeps the field within the range `@dnd-kit` accepts,
-         * which a division by zero would not.
-         */
-        const zero = toDndKitAutoScroll(BOARD_AUTO_SCROLL, { width: 0, height: 0 });
-        const unusable = toDndKitAutoScroll(BOARD_AUTO_SCROLL, {
-            width: Number.NaN,
-            height: Number.NEGATIVE_INFINITY,
+    it('scales with an explicit maxSpeed', () => {
+        expect(computeAutoScrollDelta({ x: 216, y: 5000 }, column, 100, 10).x).toBe(-10);
+        expect(computeAutoScrollDelta({ x: 266, y: 5000 }, column, 100, 10).x).toBe(-5);
+    });
+
+    it('treats the two axes independently, so a diagonal drag scrolls both', () => {
+        const box = edges(0, 0, 1000, 1000);
+        const delta = computeAutoScrollDelta({ x: 10, y: 995 }, box, 20);
+
+        expect(delta.x).toBeLessThan(0);
+        expect(delta.y).toBeGreaterThan(0);
+    });
+
+    it('scrolls nothing in the middle of a target', () => {
+        expect(computeAutoScrollDelta({ x: 500, y: 500 }, edges(0, 0, 1000, 1000), 20)).toEqual({
+            x: 0,
+            y: 0,
+        });
+    });
+
+    it.each([
+        ['zero', 0],
+        ['negative — the library default of -1', -1],
+    ])('scrolls nothing when the margin is %s', (_label, margin) => {
+        // `this.margin = options.margin || -1` means an UNSET margin can never satisfy
+        // either band test, so an autoscroller configured without one is inert. Both
+        // screens pass a margin, so this is the degenerate case rather than a live one.
+        const delta = computeAutoScrollDelta({ x: 0, y: 0 }, edges(0, 0, 1000, 1000), margin);
+
+        expect(delta).toEqual({ x: 0, y: 0 });
+    });
+
+    it('reproduces the STORY LIST configuration against the viewport', () => {
+        // margin 20 against `[window]`: a pointer 5 px from the top of the viewport gives
+        // floor(max(-1, 5/20 - 1) × 4) = floor(-3) = -3.
+        const viewport = edges(0, 0, VIEWPORT.width, VIEWPORT.height);
+
+        expect(computeAutoScrollDelta({ x: 960, y: 5 }, viewport, 20).y).toBe(-3);
+        // And `pixels: 30` changes NOTHING, because the installed library never reads it.
+        expect(STORY_LIST_AUTO_SCROLL.pixels).toBe(30);
+        expect(computeAutoScrollDelta({ x: 960, y: 5 }, viewport, 20).y).not.toBe(-30);
+    });
+
+    it('⭐ keeps the two screens observably different, so neither inherits the other', () => {
+        const viewport = edges(0, 0, VIEWPORT.width, VIEWPORT.height);
+        const point = { x: 960, y: 50 };
+
+        // 50 px from the top: inside the board's 100 px band, outside the list's 20 px one.
+        expect(computeAutoScrollDelta(point, viewport, BOARD_AUTO_SCROLL.margin).y).toBe(-2);
+        expect(computeAutoScrollDelta(point, viewport, STORY_LIST_AUTO_SCROLL.margin).y).toBe(0);
+    });
+});
+
+describe('applyAutoScrollDelta', () => {
+    it('moves an element RELATIVELY, one axis at a time', () => {
+        const column = scrollTargetDouble(edges(0, 0, 292, 900));
+
+        column.scrollTop = 100;
+        column.scrollLeft = 50;
+
+        applyAutoScrollDelta(column, { x: -4, y: 3 });
+
+        expect(column.scrollTop).toBe(103);
+        expect(column.scrollLeft).toBe(46);
+    });
+
+    it('does not touch an axis whose delta is zero', () => {
+        const column = scrollTargetDouble(edges(0, 0, 292, 900));
+        const writes: string[] = [];
+
+        Object.defineProperty(column, 'scrollTop', {
+            get: () => 0,
+            set: () => writes.push('y'),
+        });
+        Object.defineProperty(column, 'scrollLeft', {
+            get: () => 0,
+            set: () => writes.push('x'),
         });
 
-        expect(zero.threshold).toEqual({ x: 1, y: 1 });
-        expect(unusable.threshold).toEqual({ x: 1, y: 1 });
+        applyAutoScrollDelta(column, { x: 0, y: 0 });
+
+        expect(writes).toEqual([]);
+
+        applyAutoScrollDelta(column, { x: 2, y: 0 });
+
+        expect(writes).toEqual(['x']);
     });
 
-    it('omits acceleration when the pixel step is not a usable number', () => {
-        for (const pixels of [Number.NaN, Number.POSITIVE_INFINITY]) {
-            const options = toDndKitAutoScroll(
-                { ...STORY_LIST_AUTO_SCROLL, pixels },
-                VIEWPORT,
-            );
+    it('⭐ scrolls the window ABSOLUTELY, applying y first and re-reading the offsets', () => {
+        // Both window axes go through `scrollTo`, which takes an absolute position, so the
+        // second call would UNDO the first if it reused a cached offset. The library's
+        // `scrollY`/`scrollX` each read `pageXOffset`/`pageYOffset` afresh, which is the
+        // only reason a diagonal drag scrolls diagonally. Asserted through the calls
+        // themselves, because jsdom does not actually scroll.
+        let offsetX = 0;
+        let offsetY = 0;
+        const calls: Array<[number, number]> = [];
 
-            expect('acceleration' in options).toBe(false);
+        const scrollTo = jest
+            .spyOn(window, 'scrollTo')
+            .mockImplementation(((x: number, y: number): void => {
+                calls.push([x, y]);
+                offsetX = x;
+                offsetY = y;
+            }) as typeof window.scrollTo);
+
+        /*
+         * `Object.defineProperty` rather than `jest.spyOn(…, 'get')`: in jsdom both
+         * offsets are plain VALUE properties, so spying on an accessor that does not
+         * exist throws "does not have access type get". The originals are captured and
+         * put back in `finally`, since `restoreMocks` only undoes jest's own spies.
+         */
+        const originalPageX = Object.getOwnPropertyDescriptor(window, 'pageXOffset');
+        const originalPageY = Object.getOwnPropertyDescriptor(window, 'pageYOffset');
+
+        Object.defineProperty(window, 'pageXOffset', {
+            configurable: true,
+            get: () => offsetX,
+        });
+        Object.defineProperty(window, 'pageYOffset', {
+            configurable: true,
+            get: () => offsetY,
+        });
+
+        try {
+            applyAutoScrollDelta(window, { x: 3, y: -2 });
+        } finally {
+            if (originalPageX !== undefined) {
+                Object.defineProperty(window, 'pageXOffset', originalPageX);
+            }
+
+            if (originalPageY !== undefined) {
+                Object.defineProperty(window, 'pageYOffset', originalPageY);
+            }
         }
+
+        expect(calls).toEqual([
+            // y first, from (0, 0).
+            [0, -2],
+            // then x, re-reading the offsets, so the y move survives.
+            [3, -2],
+        ]);
+        expect(scrollTo).toHaveBeenCalledTimes(2);
     });
 
-    it('honours an explicit pixel step of zero', () => {
-        /*
-         * Zero is a legitimate configuration meaning "do not advance", and it is
-         * NOT the same as an absent field, which means "use the library default".
-         * Conflating the two would silently re-enable scrolling.
-         */
-        const options = toDndKitAutoScroll(
-            { ...STORY_LIST_AUTO_SCROLL, pixels: 0 },
-            VIEWPORT,
+    it('leaves the window alone when both deltas are zero', () => {
+        const scrollTo = jest
+            .spyOn(window, 'scrollTo')
+            .mockImplementation((() => undefined) as typeof window.scrollTo);
+
+        applyAutoScrollDelta(window, { x: 0, y: 0 });
+
+        // A `scrollTo` with an unchanged value still fires a `scroll` event, which the
+        // library's own guards exist to avoid.
+        expect(scrollTo).not.toHaveBeenCalled();
+    });
+});
+
+describe('resolveAutoScrollTarget', () => {
+    const first = scrollTargetDouble(edges(0, 0, 400, 400));
+    const second = scrollTargetDouble(edges(200, 0, 400, 400));
+    const inside = { x: 100, y: 100 };
+    const outside = { x: 900, y: 900 };
+
+    it('acquires the target under the point', () => {
+        expect(resolveAutoScrollTarget(inside, [first], null, true)).toBe(first);
+    });
+
+    it('acquires nothing when the point is over no target', () => {
+        expect(resolveAutoScrollTarget(outside, [first], null, true)).toBeNull();
+    });
+
+    it('⭐ RETAINS the remembered target once the pointer leaves it, when scrollWhenOutside', () => {
+        // The whole of `scrollWhenOutside`, which the retired translation carried across
+        // and never implemented. It is what lets a drag pull a long column past its own
+        // edge — the case the incumbent's annotation warns about.
+        expect(resolveAutoScrollTarget(outside, [first], first, true)).toBe(first);
+    });
+
+    it('FORGETS it when scrollWhenOutside is false', () => {
+        expect(resolveAutoScrollTarget(outside, [first], first, false)).toBeNull();
+    });
+
+    it('keeps the remembered target while the pointer is still inside it', () => {
+        expect(resolveAutoScrollTarget(inside, [first], first, false)).toBe(first);
+    });
+
+    it('⭐ picks the LAST registered overlapping target, not the first and not the innermost', () => {
+        // `getElementUnderPoint` iterates the whole array and keeps overwriting, so
+        // registration ORDER decides. Reproduced rather than "improved" into a depth test:
+        // a depth test would silently change which container a nested board scrolls.
+        const overlap = { x: 300, y: 100 };
+
+        expect(resolveAutoScrollTarget(overlap, [first, second], null, true)).toBe(second);
+        expect(resolveAutoScrollTarget(overlap, [second, first], null, true)).toBe(first);
+    });
+
+    it('replaces the remembered target when a different one is acquired', () => {
+        expect(resolveAutoScrollTarget({ x: 500, y: 100 }, [first, second], first, true)).toBe(
+            second,
+        );
+    });
+
+    it('holds the remembered target when nothing is under the point', () => {
+        expect(resolveAutoScrollTarget(outside, [first, second], second, true)).toBe(second);
+    });
+});
+
+/* ==========================================================================
+ * THE AUTOSCROLL LOOP, DRIVEN THROUGH A REAL DRAG
+ *
+ * The arithmetic above is pure and asserted directly. What is asserted here is the
+ * LIFETIME: that the loop runs only inside a drag, that it moves the target the
+ * pointer is over, and that nothing survives the drop. `requestAnimationFrame` is
+ * driven by hand, because jsdom's runs on a timer this suite does not control.
+ * ========================================================================== */
+
+describe('the autoscroll loop', () => {
+    /** Pending animation-frame callbacks, newest last. */
+    let frames: Array<() => void>;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+
+        frames = [];
+
+        jest.spyOn(window, 'requestAnimationFrame').mockImplementation(
+            ((callback: FrameRequestCallback): number => {
+                frames.push(() => {
+                    callback(0);
+                });
+
+                return frames.length;
+            }) as typeof window.requestAnimationFrame,
+        );
+        jest.spyOn(window, 'cancelAnimationFrame').mockImplementation(
+            ((handle: number): void => {
+                if (handle >= 1 && handle <= frames.length) {
+                    frames[handle - 1] = (): void => undefined;
+                }
+            }) as typeof window.cancelAnimationFrame,
+        );
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    /**
+     * Runs every frame requested so far, then flushes the deferred applications the
+     * frames queued.
+     *
+     * Two stages because the library applies its delta inside a bare `setTimeout`
+     * rather than in the frame itself, and the port reproduces that.
+     */
+    function runFrames(): void {
+        const queued = frames;
+
+        frames = [];
+
+        act(() => {
+            for (const frame of queued) {
+                frame();
+            }
+
+            jest.runOnlyPendingTimers();
+        });
+    }
+
+    /** Moves the pointer over the whole window, which is what the loop listens to. */
+    function movePointerTo(x: number, y: number): void {
+        act(() => {
+            fireEvent.mouseMove(window, { clientX: x, clientY: y });
+        });
+    }
+
+    function boardConfigFor(target: HTMLElement): DndAutoScrollConfig {
+        return {
+            enabled: true,
+            margin: 100,
+            scrollWhenOutside: true,
+            getTargets: () => [target],
+        };
+    }
+
+    it('scrolls the target the pointer is over, in PIXELS, during a drag', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
         );
 
-        expect(options.acceleration).toBe(0);
+        startDrag(getByTestId('source'));
+
+        // 50 px below the column's top edge: inside the 100 px band, so
+        // floor(max(-1, 50/100 - 1) × 4) = floor(-2) = -2 per frame.
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(498);
+
+        // The loop re-arms itself, so holding the pointer still keeps scrolling — which
+        // is the entire purpose of an autoscroller.
+        runFrames();
+
+        expect(column.scrollTop).toBe(496);
+
+        await dropDrag();
     });
 
-    it('measures against the ambient viewport when none is supplied', () => {
-        const options = toDndKitAutoScroll(BOARD_AUTO_SCROLL);
+    it('does NOTHING before a drag begins', () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
 
-        expect(options.threshold).toEqual({
-            x: 100 / window.innerWidth,
-            y: 100 / window.innerHeight,
-        });
+        column.scrollTop = 500;
+
+        render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        // The port of the incumbent predicate `this.down && drake.dragging`. The
+        // annotation on the incumbent warns that dropping it "scrolls the board on plain
+        // hover"; this is that warning as a test.
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+        expect(frames).toHaveLength(0);
+    });
+
+    it('STOPS on drop, and leaves no frame or deferred scroll behind', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        movePointerTo(300, 50);
+
+        // Dropped with a frame already requested and a scroll already deferred.
+        await dropDrag();
+
+        const scrollAtDrop = column.scrollTop;
+
+        runFrames();
+        movePointerTo(300, 50);
+        runFrames();
+
+        // A scroll applied after the drop would move a board no one is dragging.
+        expect(column.scrollTop).toBe(scrollAtDrop);
+    });
+
+    it('STOPS on cancel too', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        await cancelDrag();
+
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+    });
+
+    it('stops when the subtree is unmounted mid-drag', () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId, unmount } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        movePointerTo(300, 50);
+
+        // No drag-end event is produced by a torn-down subtree, so the unmount cleanup is
+        // the only thing that can release the listeners — the counterpart of the
+        // incumbent's `autoScroller.destroy()` beside `drake.destroy()`.
+        unmount();
+
+        const scrollAtUnmount = column.scrollTop;
+
+        runFrames();
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(scrollAtUnmount);
+    });
+
+    it('does not scroll a target the pointer never entered', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+
+        // Far away from the column, and never inside it, so nothing is ever remembered.
+        movePointerTo(1500, 500);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+
+        await dropDrag();
+    });
+
+    it('⭐ keeps scrolling a target the pointer has LEFT, per scrollWhenOutside', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={boardConfigFor(column)}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+
+        // Enter the column, then leave it entirely.
+        movePointerTo(300, 400);
+        movePointerTo(1500, 50);
+        runFrames();
+
+        // Still scrolling the remembered column: y 50 is inside its 100 px top band, and
+        // the retention rule is what keeps it current.
+        expect(column.scrollTop).toBe(498);
+
+        await dropDrag();
+    });
+
+    it('FORGETS the target when scrollWhenOutside is false', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider
+                autoScroll={{ ...boardConfigFor(column), scrollWhenOutside: false }}
+            >
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        movePointerTo(300, 400);
+        movePointerTo(1500, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+
+        await dropDrag();
+    });
+
+    it('does not arm at all when the configuration is disabled', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={{ ...boardConfigFor(column), enabled: false }}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+
+        await dropDrag();
+    });
+
+    it('scrolls the WINDOW when that is the configured target, as the story list does', async () => {
+        let offsetY = 0;
+        const scrollTo = jest
+            .spyOn(window, 'scrollTo')
+            .mockImplementation(((_x: number, y: number): void => {
+                offsetY = y;
+            }) as typeof window.scrollTo);
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={STORY_LIST_AUTO_SCROLL}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+
+        // 5 px from the top of the viewport, against the story list's 20 px margin:
+        // floor(max(-1, 5/20 - 1) × 4) = floor(-3) = -3.
+        movePointerTo(960, 5);
+        runFrames();
+
+        expect(scrollTo).toHaveBeenCalled();
+        expect(offsetY).toBe(-3);
+
+        await dropDrag();
+    });
+
+    it('⭐ scrolls the window on its OWN frame, independently of any element target', async () => {
+        // The library requests the window's frame BEFORE its `if (!current) return`, so the
+        // window scrolls even when the pointer is over no registered element. Reproduced,
+        // because the story list registers `[window]` and nothing else.
+        const scrollTo = jest
+            .spyOn(window, 'scrollTo')
+            .mockImplementation((() => undefined) as typeof window.scrollTo);
+
+        const { getByTestId } = render(
+            <DndProvider autoScroll={STORY_LIST_AUTO_SCROLL}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+        movePointerTo(960, 5);
+        runFrames();
+
+        expect(scrollTo).toHaveBeenCalled();
+
+        await dropDrag();
+    });
+
+    it('reads the CURRENT configuration, so a rebuilt object is honoured next drag', async () => {
+        const column = scrollTargetDouble(edges(216, 0, 292, 900));
+
+        column.scrollTop = 500;
+
+        const { getByTestId, rerender } = render(
+            <DndProvider autoScroll={{ ...boardConfigFor(column), margin: 100 }}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        rerender(
+            <DndProvider autoScroll={{ ...boardConfigFor(column), margin: 10 }}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        startDrag(getByTestId('source'));
+
+        // y 50 is inside a 100 px band but outside a 10 px one, so the NEW margin is the
+        // one in force — the runner is not holding the object it was created with.
+        movePointerTo(300, 50);
+        runFrames();
+
+        expect(column.scrollTop).toBe(500);
+
+        await dropDrag();
     });
 });
 
@@ -943,8 +1578,12 @@ describe('drag start', () => {
  * ========================================================================== */
 
 describe('the multi-drag call order', () => {
+    // The call-order union is reached through the public props type rather than
+    // through a second exported alias, so this spec exercises exactly the surface
+    // a screen has: `DndProviderProps['multiDragCallOrder']` already admits
+    // `undefined`, which is the "let the default apply" case below.
     async function recordOrder(
-        order: DndMultiDragCallOrder | undefined,
+        order: DndProviderProps['multiDragCallOrder'],
     ): Promise<readonly string[]> {
         const controller = createRecordingMultiDrag();
         const { getByTestId, unmount } = render(
@@ -1220,6 +1859,209 @@ describe('drag cancel', () => {
 });
 
 /* ==========================================================================
+ * KEYBOARD OPERABILITY
+ *
+ * `DndContext` renders `defaultScreenReaderInstructions` into a live region on
+ * mount — "To pick up a draggable item, press the space bar…" — and narrates the
+ * gesture through `defaultAnnouncements`. These cases assert that the instruction
+ * is TRUE: that pressing the announced key really does start, move and finish a
+ * drag, through the same handlers a pointer drag uses.
+ * ========================================================================== */
+
+describe('keyboard operability', () => {
+    /**
+     * Lets one macrotask run inside `act`.
+     *
+     * ⭐ REQUIRED, NOT DEFENSIVE. `KeyboardSensor.attach()` registers its `keydown`
+     * listener inside a bare `setTimeout`
+     * (`node_modules/@dnd-kit/core/dist/core.cjs.development.js`, the `attach` body),
+     * so after a pick-up the sensor is not yet listening and the state update that
+     * `setTimeout` drives has not yet happened. Awaiting it INSIDE `act` does both
+     * jobs at once: the listener exists for the next key press, and React does not
+     * warn about an update outside `act`. A bare `act` cannot substitute — it flushes
+     * microtasks only.
+     */
+    async function flushSensorAttach(): Promise<void> {
+        await act(async () => {
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 0);
+            });
+        });
+    }
+
+    /** Focuses the draggable, presses the announced key, and settles the sensor. */
+    async function pressPickUpKey(node: HTMLElement): Promise<void> {
+        act(() => {
+            node.focus();
+            fireEvent.keyDown(node, { key: ' ', code: 'Space' });
+        });
+
+        await flushSensorAttach();
+    }
+
+    /**
+     * Presses a key on the OWNER DOCUMENT, which is where the sensor listens once a
+     * drag is under way.
+     *
+     * ⭐ A MEASURED FACT ABOUT `KeyboardSensor`, and getting it wrong makes a working
+     * sensor look broken: its constructor builds
+     * `new Listeners(getOwnerDocument(target))`, so the PICK-UP key is heard on the
+     * activator node while EVERY SUBSEQUENT key is heard on the document.
+     */
+    async function pressDuringKeyboardDrag(code: string, key: string): Promise<void> {
+        await act(async () => {
+            fireEvent.keyDown(document, { key, code });
+        });
+    }
+
+    it('renders the library\u2019s keyboard instructions, which is why the sensor exists', () => {
+        render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        // The premise of the whole block: the promise is made by default, so it has to be
+        // kept. If a future `@dnd-kit` stopped announcing this, THIS is the case that
+        // would tell us the sensor's justification had changed.
+        expect(document.body.textContent).toContain('press the space bar');
+    });
+
+    it('⭐ STARTS a drag from the announced key press', async () => {
+        const onDragStart = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragStart={onDragStart}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        await pressPickUpKey(getByTestId('source'));
+
+        // Before the keyboard sensor was registered this was zero: the live region told
+        // the user to press space, and nothing happened.
+        expect(onDragStart).toHaveBeenCalledTimes(1);
+
+        await pressDuringKeyboardDrag('Escape', 'Escape');
+    });
+
+    it('exposes the draggable to assistive technology as an operable control', () => {
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL}>
+                <DraggableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        // `useDraggable`'s `attributes` — spread by the harness exactly as a real card
+        // would — carry the role, the tab stop and the description that make the element
+        // reachable by keyboard in the first place. Registering a sensor for an element no
+        // one can focus would be a half measure.
+        expect(source).toHaveAttribute('role', 'button');
+        expect(source).toHaveAttribute('tabindex', '0');
+        expect(source.getAttribute('aria-describedby')).toBeTruthy();
+    });
+
+    it('MOVES with the arrow keys through the same handlers a pointer drag uses', async () => {
+        const onDragMove = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragMove={onDragMove}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        await pressPickUpKey(source);
+        await pressDuringKeyboardDrag('ArrowRight', 'ArrowRight');
+
+        // The assertion that matters is not the coordinate but the CHANNEL: every sensor
+        // feeds the same handlers through the same collision detection, so a keyboard move
+        // and a pointer move cannot produce different ordering.
+        //
+        // `onDragMove` rather than `onDragOver`, for an environment reason worth stating:
+        // jsdom implements no layout, so every droppable measures 0x0 and NO collision can
+        // ever be detected — for a pointer drag either. Asserting `onDragOver` here would
+        // be asserting jsdom's geometry rather than the sensor. The move event is dispatched
+        // from the coordinate change itself, which is exactly what the arrow key produces.
+        expect(onDragMove).toHaveBeenCalled();
+    });
+
+    it('FINISHES on the announced key press', async () => {
+        const onDragEnd = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragEnd={onDragEnd}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        await pressPickUpKey(source);
+        await pressDuringKeyboardDrag('Space', ' ');
+
+        expect(onDragEnd).toHaveBeenCalledTimes(1);
+    });
+
+    it('CANCELS on Escape', async () => {
+        const onDragCancel = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} onDragCancel={onDragCancel}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        const source = getByTestId('source');
+
+        await pressPickUpKey(source);
+        await pressDuringKeyboardDrag('Escape', 'Escape');
+
+        expect(onDragCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it('performs the SAME multi-drag bookkeeping as a pointer drag', async () => {
+        const multiDrag = createRecordingMultiDrag();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} multiDrag={multiDrag}>
+                <DraggableHarness selected />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        await pressPickUpKey(getByTestId('source'));
+
+        // The transit class is the class contract (rule T1). A keyboard drag that skipped
+        // it would leave the existing stylesheets unapplied for that gesture only — a
+        // difference invisible until someone dragged with the keyboard.
+        expect(getByTestId('source')).toHaveClass(TRANSIT_CLASS);
+
+        await pressDuringKeyboardDrag('Escape', 'Escape');
+    });
+
+    it('is gated with the pointer sensor, not separately', async () => {
+        const onDragStart = jest.fn();
+        const { getByTestId } = render(
+            <DndProvider autoScroll={BOARD_AUTO_SCROLL} disabled onDragStart={onDragStart}>
+                <DraggableHarness />
+                <DroppableHarness />
+            </DndProvider>,
+        );
+
+        await pressPickUpKey(getByTestId('source'));
+
+        // A gate that stopped the mouse but not the keyboard would hand a member without
+        // `modify_us` a way straight past the permission check.
+        expect(onDragStart).not.toHaveBeenCalled();
+    });
+});
+
+
+/* ==========================================================================
  * THE PERMISSION GATE
  * ========================================================================== */
 
@@ -1269,6 +2111,17 @@ describe('the permission gate', () => {
          * to be shown to reopen, which is what this case establishes.
          */
         const onDragStart = jest.fn();
+
+        /*
+         * The library reports that warning through `console.error`. It is EXPECTED
+         * OUTPUT for this case, so it is captured and asserted rather than left to
+         * print: a green run whose stderr carries a warning trains a reader to ignore
+         * stderr. `restoreMocks` puts the real console back afterwards.
+         */
+        const consoleErrorSpy = jest
+            .spyOn(console, 'error')
+            .mockImplementation((): undefined => undefined);
+
         const { getByTestId, rerender } = render(
             <DndProvider autoScroll={BOARD_AUTO_SCROLL} disabled onDragStart={onDragStart}>
                 <DraggableHarness />
@@ -1291,6 +2144,14 @@ describe('the permission gate', () => {
         startDrag(getByTestId('source'));
 
         expect(onDragStart).toHaveBeenCalledTimes(1);
+
+        // The warning really was the library's changing-sensor-list note, and not some
+        // other error this case happened to swallow.
+        expect(
+            consoleErrorSpy.mock.calls.some((call) =>
+                String(call[0]).includes('changed size between renders'),
+            ),
+        ).toBe(true);
 
         await dropDrag();
     });

@@ -331,6 +331,105 @@ export interface SortableDropResult extends SortableNeighbours {
 }
 
 /* ==========================================================================
+ * IDENTIFIER VALIDATION
+ * ========================================================================== */
+
+/**
+ * What a positional identifier is allowed to look like.
+ *
+ * A canonical positive decimal integer with no sign, no leading zero, no
+ * fraction, no exponent and no radix prefix — which is exactly the form the
+ * server produces for a user-story primary key, and exactly the form the
+ * templates interpolate into `data-id`.
+ *
+ * Everything else is rejected, and the pattern is what does most of the
+ * rejecting because `Number()` is far more permissive than it looks. `Number`
+ * accepts `'0x10'` as 16, `'1e3'` as 1000, `' 7 '` as 7, `'+7'` as 7, `'-7'` as
+ * -7, `'1.5'` as 1.5, `'Infinity'` as Infinity and `'abc'` as a not-a-number
+ * value — nine different ways for a malformed attribute to become a plausible
+ * looking identifier.
+ */
+const CANONICAL_ID_PATTERN = /^[1-9][0-9]*$/;
+
+/**
+ * Whether a value may be used as a positional identifier.
+ *
+ * Exported so the screens' write layers can apply the SAME rule to identifiers
+ * that reach them from anywhere else, rather than each inventing its own.
+ *
+ * ZERO IS NOT A VALID IDENTIFIER, and that is deliberate rather than an
+ * off-by-one. Server primary keys start at 1, so no story can have id 0; and
+ * the neighbour arithmetic below tests anchors for FALSINESS (`!previousId`), so
+ * a 0 anchor would be indistinguishable from "no anchor" anyway. Admitting it
+ * would create a value that reads as present in one place and absent in another.
+ *
+ * @param value - any candidate.
+ * @returns whether it is a positive safe integer.
+ */
+export function isValidItemId(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * Parse an attribute value into a positional identifier, or `null`.
+ *
+ * ⭐ WHY THE STRICTNESS IS LOAD-BEARING, and not defensive tidiness. Every value
+ * this function produces travels into a bulk ordering write as
+ * `after_userstory_id` / `before_userstory_id` or as a member of the moved-story
+ * list. That endpoint is POSITION-RELATIVE, so it cannot detect a wrong anchor —
+ * it does what it is told and returns 200. Worse, `JSON.stringify` turns
+ * `NaN` and `Infinity` into `null`, so a malformed attribute does not even arrive
+ * as an obviously broken number: it arrives as an absent field, and the server
+ * reorders the backlog around it. There is no error, no toast and no console
+ * warning; the corruption surfaces on the next page load, as an order the user
+ * never chose.
+ *
+ * The predecessor of this function read the attribute, tested it for TRUTHINESS,
+ * and then applied a bare `Number(...)` — reproducing the incumbent CoffeeScript
+ * exactly, including its two blind spots: a non-numeric attribute became a
+ * not-a-number value, and `'0'` passed the truthiness test and became 0. The
+ * guard caught only the absent and the empty attribute. This function keeps the
+ * two behaviours that were CORRECT (an absent or empty attribute yields `null`,
+ * never a number) and closes the rest.
+ *
+ * @param raw - the attribute value, or `null`/`undefined` when it is absent.
+ * @returns the identifier, or `null` when `raw` is absent, empty or malformed.
+ */
+export function parseItemId(raw: string | null | undefined): number | null {
+    if (raw === null || raw === undefined || raw === '') {
+        return null;
+    }
+
+    if (!CANONICAL_ID_PATTERN.test(raw)) {
+        return null;
+    }
+
+    const parsed = Number(raw);
+
+    // A canonical decimal string can still exceed the exactly-representable
+    // integer range, and beyond it `Number` silently ROUNDS: two different ids
+    // can parse to the same value, which would move the wrong card.
+    return isValidItemId(parsed) ? parsed : null;
+}
+
+/**
+ * An id, or `null` when the value may not be used as one.
+ *
+ * The numeric counterpart of {@link parseItemId}, for the projected-order path,
+ * which receives NUMBERS rather than DOM and so has no attribute to parse. It
+ * exists so that path can refuse an unusable anchor in exactly the place the DOM
+ * path refuses one — at the read, not by removing the value from the arrangement
+ * — which is what keeps the two paths in agreement.
+ *
+ * @param candidate - a value taken from an ordering, or `undefined` when the
+ *                    index addressed nothing.
+ * @returns the identifier, or `null`.
+ */
+function keepValidId(candidate: number | undefined): number | null {
+    return isValidItemId(candidate) ? candidate : null;
+}
+
+/* ==========================================================================
  * INTERNAL HELPERS
  * ========================================================================== */
 
@@ -342,19 +441,26 @@ export interface SortableDropResult extends SortableNeighbours {
  *     if prev.length && prev[0].dataset.id
  *         previousCard = Number(prev[0].dataset.id)
  *
- * Three details are load-bearing and all three are reproduced:
+ * ⭐ THE CONVERSION IS VALIDATED, NOT BARE, AND THAT IS A DELIBERATE DEPARTURE
+ * FROM THE INCUMBENT LINE ABOVE. The incumbent guards the attribute for
+ * TRUTHINESS and then applies `Number(...)`, which leaves three holes: a
+ * non-numeric attribute becomes a not-a-number value, `'0'` passes the guard and
+ * becomes 0, and `'0x10'` / `'1e3'` / `'1.5'` / `'-7'` / `' 7 '` all become
+ * plausible-looking numbers. Every one of those values then travels into a
+ * position-relative ordering write that cannot detect it — and `JSON.stringify`
+ * turns the non-finite ones into `null`, so they arrive as an ABSENT field rather
+ * than an obviously broken one. See {@link parseItemId} for the full argument.
  *
- *   - The guard is a TRUTHINESS test on the raw attribute value. An absent
- *     attribute and an empty attribute are both falsy, so both leave the result
- *     `null`. `NaN` therefore never reaches a payload through this path — which
- *     matters, because `NaN` in `after_userstory_id` is exactly the kind of
- *     write that fails silently rather than loudly.
- *   - `'0'` is a NON-EMPTY string and so passes the guard, yielding the number
- *     0. That is what makes TRAP 3 reachable at all, and it is preserved.
- *   - The conversion is bare `Number(...)`, so a non-numeric attribute yields
- *     `NaN` here just as it does upstream. Preserved under transformation rule
- *     T10 ("No functional or feature change of whatever kind"); the measured
- *     markup always interpolates a numeric id, so this is a defensive path.
+ * What is preserved is the behaviour that was correct: an absent attribute and an
+ * empty attribute both yield `null`, never a number, so a missing id can never
+ * become a `0` anchor. What changes is that a MALFORMED attribute now also yields
+ * `null` instead of a number nobody checked.
+ *
+ * `null` from this function means "no usable id here". The two callers treat that
+ * differently and on purpose: the neighbour walk keeps looking outward (an
+ * unreadable neighbour is skipped, exactly as an id-less one always was), while
+ * {@link readDatasetIds} refuses the whole selection, because a dragged card
+ * whose identity cannot be established must not be written.
  *
  * The attribute is read with `getAttribute('data-id')` rather than through the
  * dataset map, because `getAttribute` is declared on `Element` — so the sibling
@@ -375,13 +481,7 @@ export interface SortableDropResult extends SortableNeighbours {
  * `UseSortableListConfig`, where exactly that distinction is load-bearing.
  */
 function readPositionalId(element: Element): number | null {
-    const raw = element.getAttribute('data-id');
-
-    if (!raw) {
-        return null;
-    }
-
-    return Number(raw);
+    return parseItemId(element.getAttribute('data-id'));
 }
 
 /**
@@ -679,23 +779,44 @@ export function isUnchangedDrop(index: number, oldIndex: number, sameContainer: 
  * primary first, so re-sorting here would be redundant work at best and a
  * reordering bug at worst.
  *
- * An element whose positional attribute is absent or empty is OMITTED rather
- * than contributing `NaN`. The return type promises numbers, and a `NaN` inside
- * the bulk payload is precisely the silently-wrong write this module exists to
- * prevent. Every measured item carries the attribute —
+ * ⭐ ALL OR NOTHING: `null` MEANS REFUSE THE DRAG. If ANY dragged element has no
+ * canonical id — absent, empty or malformed ({@link parseItemId}) — this returns
+ * `null` rather than a shorter list.
+ *
+ * The predecessor OMITTED such an element and returned the rest, which is the
+ * more forgiving behaviour and the wrong one, for two independent reasons:
+ *
+ *   - The write is POSITION-RELATIVE. Persisting a SUBSET of a multi-card
+ *     selection reorders the board around the cards that survived the filter,
+ *     leaving the dropped ones where they were. The endpoint returns 200 for
+ *     that, so the user sees a partial move they never asked for and nothing
+ *     reports it.
+ *   - An empty result is indistinguishable from an empty selection. A selection
+ *     of one card with a broken attribute would have yielded `[]`, which reads
+ *     downstream as "nothing was dragged" — the id-less move that TRAP 1 of the
+ *     file header is about.
+ *
+ * Every measured item carries a well-formed attribute —
  * `app/partials/includes/modules/kanban-table.jade` L151 and L227,
  * `app/partials/includes/components/backlog-row.jade` L12 and
- * `app/partials/backlog/sprint.jade` L20 — so this is a defensive path only.
+ * `app/partials/backlog/sprint.jade` L20 — so `null` means the DOM is not what
+ * this module was told it would be, and the honest response to that is to
+ * persist nothing.
+ *
+ * An EMPTY input array yields an empty array, not `null`: nothing was dragged, so
+ * there is nothing to refuse.
  */
-export function readDatasetIds(elements: readonly HTMLElement[]): readonly number[] {
+export function readDatasetIds(elements: readonly HTMLElement[]): readonly number[] | null {
     const ids: number[] = [];
 
     for (const element of elements) {
         const id = readPositionalId(element);
 
-        if (id !== null) {
-            ids.push(id);
+        if (id === null) {
+            return null;
         }
+
+        ids.push(id);
     }
 
     return ids;
@@ -721,7 +842,8 @@ export function readDatasetIds(elements: readonly HTMLElement[]): readonly numbe
  * The projection is deliberately literal: remove every moved id from the order,
  * insert the primary at the target index, then read off the neighbour on each
  * side — with the SAME falsy `!previousId` test as the DOM path, so TRAP 3
- * behaves identically on both sides.
+ * behaves identically on both sides, and with the SAME refusal of an unusable
+ * anchor, so identifier validation does too.
  *
  * @param orderedIds  The container's current ids, in document order.
  * @param movedIds    The dragged ids, primary first — i.e. `readDatasetIds` of
@@ -743,7 +865,37 @@ export function computeNeighboursFromOrder(
     }
 
     const primaryId = movedIds[0];
+
+    /*
+     * An anchor pair says "put THIS story after that one". If the story being
+     * moved cannot be named, there is nothing for the pair to be about, so none is
+     * produced — the same answer this function already gives for an empty
+     * selection, and one the caller handles today.
+     *
+     * This is the ONE place the projected-order path is stricter than the DOM
+     * path, and it is stricter because it CAN be: it is handed the moved id,
+     * whereas `computeNeighbours` is handed the moved ELEMENT and never reads that
+     * element's own attribute. The asymmetry cannot make the two disagree on a
+     * well-formed input, which is what the equivalence between them asserts.
+     */
+    if (!isValidItemId(primaryId)) {
+        return NO_NEIGHBOURS;
+    }
+
     const moved = new Set<number>(movedIds);
+    /*
+     * ⭐ THE MOVED IDS COME OUT, AND NOTHING ELSE DOES. A non-canonical entry in
+     * the container's order still OCCUPIES ITS POSITION here, because removing it
+     * would shift every index after it and land the primary somewhere the caller
+     * never asked for — a silent one-place error, which is the very failure this
+     * validation exists to prevent. It is refused where it would do harm instead:
+     * at the two anchor reads below, so it can never be EMITTED.
+     *
+     * That is precisely what the DOM path does, and the agreement is the point.
+     * `nearestCandidateSibling` returns the neighbour whatever its attribute says,
+     * and `readPositionalId` then declines to turn a malformed attribute into a
+     * number — the neighbour keeps its position and contributes no anchor.
+     */
     const remaining = orderedIds.filter((id) => !moved.has(id));
     const insertAt = Math.min(Math.max(targetIndex, 0), remaining.length);
 
@@ -756,14 +908,16 @@ export function computeNeighboursFromOrder(
     let previousId: number | null = null;
 
     if (insertAt > 0) {
-        previousId = projected[insertAt - 1];
+        previousId = keepValidId(projected[insertAt - 1]);
     }
 
     let nextId: number | null = null;
 
-    // TRAP 2 and TRAP 3, identical to the DOM path above.
+    // TRAP 2 and TRAP 3, identical to the DOM path above. An unusable previous
+    // anchor is falsy for the same reason an absent one is, so the fall-through
+    // treats "could not be read" and "was not there" alike — as the DOM path does.
     if (!previousId && insertAt + 1 < projected.length) {
-        nextId = projected[insertAt + 1];
+        nextId = keepValidId(projected[insertAt + 1]);
     }
 
     return { previousId, nextId };
@@ -880,6 +1034,31 @@ export interface UseSortableListConfig<TContainer> {
      * :146-:149).
      */
     readonly isSameContainer: (from: TContainer, to: TContainer) => boolean;
+
+    /**
+     * Whether `id` is a story the screen currently holds.
+     *
+     * ⭐ REQUIRED, not optional, and that is the point. Validating an identifier's
+     * FORM ({@link parseItemId}) proves only that the DOM contained a plausible
+     * number; it cannot prove the number belongs to this board, this project or
+     * this session. A `data-id` is an ordinary DOM attribute: it is editable from
+     * the console, it survives in a stale detached node, and it is trivially
+     * confusable between two projects whose ids overlap. An id that passes the
+     * format check but names a story the screen does not hold would be written
+     * anyway, because the ordering endpoint is position-relative and accepts what
+     * it is given.
+     *
+     * A screen therefore answers this from its OWN state — the story map or list
+     * it already renders from — and the hook refuses any drop that names anything
+     * else. Making it required means a new screen cannot silently omit the check:
+     * leaving it out is a compile error, not an unnoticed gap.
+     *
+     * Called with a value that has already passed the format check, so an
+     * implementation only has to answer membership. It must be a pure lookup: it
+     * runs inside pointer-event handling, once per dragged item and once per
+     * anchor.
+     */
+    readonly isKnownItemId: (id: number) => boolean;
 }
 
 /**
@@ -925,6 +1104,12 @@ export interface SortableListApi<TContainer> {
      * KANBAN:125 and BACKLOG:121 — meaning there is nothing to persist. It never
      * throws for that case, and it never reports a result whose `unchanged` is
      * `true`.
+     *
+     * IT ALSO RETURNS `null` WHEN THE DROP CANNOT BE TRUSTED: when any dragged
+     * element carries no canonical positional id, or when any of them names a
+     * story `isKnownItemId` does not recognise. Both refusals travel through the
+     * same channel as the guard on purpose, so a caller needs no extra branch and
+     * an untrustworthy drop is simply not persisted.
      */
     endDrag(
         item: HTMLElement,
@@ -1064,13 +1249,69 @@ export function useSortableList<TContainer>(
         [measureIndex],
     );
 
-    const recordNeighbours = useCallback((item: HTMLElement): SortableNeighbours => {
-        const neighbours = computeNeighbours(item, configRef.current.itemSelector);
+    /**
+     * Keeps an anchor only when the screen recognises it.
+     *
+     * A non-member anchor is DISCARDED rather than making the whole drop fail,
+     * because an anchor is an optimisation of position, not the identity of what
+     * moves: dropping it degrades to "no anchor on that side", which the write
+     * layer already handles for a move to either end of a container — the api
+     * layer adds `after_userstory_id` and `before_userstory_id` only when truthy
+     * (`resources/userstories.coffee` L98-L104 and L121-L126). Keeping one the
+     * screen does not recognise would persist an order relative to a story that
+     * is not there, and refusing the drop over it would lose a move the user
+     * actually made because of a neighbour they never touched.
+     *
+     * ⭐ AND NOTHING IS SUBSTITUTED FOR WHAT IS DISCARDED. See the note in
+     * `recordNeighbours` on why that is the minimal correction rather than a
+     * missing improvement.
+     */
+    const keepKnownAnchor = useCallback((anchorId: number | null): number | null => {
+        if (anchorId === null) {
+            return null;
+        }
 
-        neighboursRef.current = neighbours;
-
-        return neighbours;
+        return configRef.current.isKnownItemId(anchorId) ? anchorId : null;
     }, []);
+
+    const recordNeighbours = useCallback(
+        (item: HTMLElement): SortableNeighbours => {
+            const computed = computeNeighbours(item, configRef.current.itemSelector);
+
+            const previousId = keepKnownAnchor(computed.previousId);
+
+            /*
+             * TRAP 3 again, and the ONE ASYMMETRY worth understanding in this file.
+             * The following id is consulted only when the preceding one is falsy, so
+             * the two ways an anchor can be unusable are graded differently — by
+             * WHICH BEHAVIOUR THE INCUMBENT ALREADY HAD, not by preference.
+             *
+             *   FORM. An unreadable attribute is already indistinguishable from an
+             *   absent one, so `computeNeighbours` returns `previousId: null` and its
+             *   own falsy test has ALREADY computed the following id. That promotion
+             *   is incumbent behaviour and survives untouched; the filter here then
+             *   applies membership to the promoted value, which is why this line
+             *   exists at all.
+             *
+             *   MEMBERSHIP. The incumbent has no such case — it would read the id and
+             *   send it. So the correction withholds that anchor and STOPS: with a
+             *   truthy `computed.previousId`, `computed.nextId` was never computed and
+             *   is not computed here either. Substituting the following id would send
+             *   a `before_userstory_id` the incumbent would never have sent, which is
+             *   a behaviour change smuggled in behind a security fix — forbidden by
+             *   rule T10. Both anchors absent is a well-formed write; a wrong anchor
+             *   is not.
+             */
+            const nextId = previousId === null ? keepKnownAnchor(computed.nextId) : null;
+
+            const neighbours: SortableNeighbours = { previousId, nextId };
+
+            neighboursRef.current = neighbours;
+
+            return neighbours;
+        },
+        [keepKnownAnchor],
+    );
 
     const endDrag = useCallback(
         (
@@ -1103,11 +1344,50 @@ export function useSortableList<TContainer>(
                 return null;
             }
 
+            /*
+             * ⭐ IDENTITY IS ESTABLISHED BEFORE ANYTHING IS REPORTED, and a
+             * failure here refuses the drop through the SAME channel the guard
+             * above uses — `null`, meaning "persist nothing". The caller needs no
+             * new branch, and a refused drop behaves exactly like a drop that
+             * changed nothing: the DOM has already been re-rendered by React, so
+             * the card returns to where the state says it belongs.
+             *
+             * Two independent checks, in this order:
+             *   1. FORM — `readDatasetIds` returns `null` when any dragged element
+             *      has no canonical id (see its own note on why partial results
+             *      are worse than none).
+             *   2. MEMBERSHIP — every id must name a story the screen holds. The
+             *      format check cannot establish this: `data-id` is an ordinary
+             *      editable DOM attribute, and the ordering endpoint is
+             *      position-relative, so an unrecognised id would be written
+             *      without complaint.
+             */
+            const ids = readDatasetIds(dragged);
+
+            if (ids === null) {
+                return null;
+            }
+
+            const { isKnownItemId } = configRef.current;
+
+            if (!ids.every((id: number): boolean => isKnownItemId(id))) {
+                return null;
+            }
+
+            /*
+             * Anchors are re-filtered here as well as in `recordNeighbours`,
+             * because the stored value can predate the current state: the anchors
+             * are reset only inside `recordNeighbours` (the incumbent protocol), so
+             * a cancelled drag leaves the previous drop's anchors in place and a
+             * realtime deletion can retire a story between the two calls.
+             */
             const neighbours = neighboursRef.current;
+            const previousId = keepKnownAnchor(neighbours.previousId);
+            const nextId = previousId === null ? keepKnownAnchor(neighbours.nextId) : null;
 
             return {
-                previousId: neighbours.previousId,
-                nextId: neighbours.nextId,
+                previousId,
+                nextId,
                 index,
                 /*
                  * `-1` reports "no drag start was captured". The guard above was
@@ -1116,10 +1396,10 @@ export function useSortableList<TContainer>(
                  */
                 oldIndex: capturedOldIndex ?? NOT_FOUND,
                 unchanged,
-                ids: readDatasetIds(dragged),
+                ids,
             };
         },
-        [measureIndex],
+        [measureIndex, keepKnownAnchor],
     );
 
     const cancelDrag = useCallback((): void => {

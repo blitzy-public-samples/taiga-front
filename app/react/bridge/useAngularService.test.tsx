@@ -6,158 +6,22 @@
  * Copyright (c) 2021-present Kaleidos INC
  */
 
-/* ==========================================================================
- * useAngularService.test.tsx -- CO-LOCATED SPEC FOR THE SERVICE ACCESSOR
- * ==========================================================================
- *
- * Rule T9 ("Comment every technology-specific change at the point of change,
- * especially at the AngularJS/React seam") applies here as much as it does to
- * the unit under test: this spec is the executable statement of what the seam
- * is allowed to do, so every non-obvious assertion below says why it exists.
- *
- * --------------------------------------------------------------------------
- * 1. WHAT IS UNDER TEST
- * --------------------------------------------------------------------------
- * `./useAngularService.ts` -- the typed accessor that REPLACES AngularJS
- * constructor injection for React code, plus the `unknown`-returning escape
- * hatch beside it. The uniform transformation it implements (AAP 0.7.4) is:
- *
- *     Old: @.$inject = ["$tgResources", "$tgEvents", "$tgConfirm"]
- *     New: const rs = useAngularService('$tgResources');
- *
- * It is reached through `./AngularBridgeContext.tsx`, whose provider carries the
- * live AngularJS `$injector`, and it is fed here by `./mockInjector.ts`.
- *
- * THE SCALE THIS REPLACES, with both locators verified by reading the sources
- * rather than taken on trust:
- *
- *   - `KanbanController.$inject` -- `app/coffee/modules/kanban/main.coffee`
- *     opens the list on L31 and closes it on L55, so the entries occupy
- *     L32-L54: EXACTLY 23 of them. It is 24 in the current tree, because
- *     `"tgKanbanReactBridge"` is appended as the LAST entry (`$inject` maps
- *     POSITIONALLY onto the constructor parameters, so appending anywhere else
- *     would silently misbind every service after the insertion point).
- *     CORRECTION: the folder brief cites L30-L53; the verified locator is
- *     L31-L55.
- *   - `BacklogController.$inject` -- `app/coffee/modules/backlog/main.coffee`
- *     opens on L26 and closes on L48, entries L27-L47: EXACTLY 21 of them.
- *     CORRECTION: AAP 0.5.2 states 23 services for this controller; the
- *     verified count is 21.
- *
- * Both controllers inject `$tgResources` AND `tgResources`. They are two
- * DIFFERENT services on two different modules, so the specs below keep them
- * apart deliberately rather than treating the pair as a typo.
- *
- * --------------------------------------------------------------------------
- * 2. WHY A PARTIAL MOCK MAP IS THE POINT, NOT A SHORTCUT (requirement I9)
- * --------------------------------------------------------------------------
- * Those two lists are opaque: a controller receives all 23 (or 21) services
- * whether it uses them or not, so ANY test of ANY behaviour inside one has to
- * stand up the whole list. `useAngularService` turns them into EXPLICIT PER-HOOK
- * DEPENDENCIES -- each hook asks for only what it uses -- and that is precisely
- * what makes requirement I9's browserless Jest layer viable. The specs in
- * "per-hook dependencies" below supply THREE of the fifteen available services
- * and resolve all three successfully, which is the concrete demonstration: a
- * spec mocks what its unit consumes, and `mockInjector`'s map is `Partial` at
- * the key level for exactly that reason.
- *
- * --------------------------------------------------------------------------
- * 3. WHY THE TWO NEGATIVE ASSERTIONS EXIST
- * --------------------------------------------------------------------------
- * Both guard invariants that fail SILENTLY, which is why they are asserted
- * mechanically instead of being left to review.
- *
- *   - NO DIGEST SURFACE. AAP 0.7.4 is verbatim that React code must "never"
- *     call the root scope's apply method; digest cycles remain AngularJS's
- *     concern and React state updates are driven by React. The AngularJS HTTP
- *     provider already runs its callbacks through `useApplyAsync(true)`
- *     (`app/coffee/app.coffee:604`), so a response arriving from the shared
- *     transport schedules its own digest with no help from React. If a facade
- *     ever exposed one of the three digest entry points, a downstream hook could
- *     call it and the resulting nested-digest error would surface far from its
- *     cause. The three method names are therefore ASSEMBLED FROM PARTS below,
- *     never written as literals -- this folder's convention, stated in
- *     `./AngularBridgeContext.tsx:95-101`, is that the banned identifiers appear
- *     nowhere in these files, not even inside a comment, so that a mechanical
- *     scan of `app/react/**` stays clean.
- *   - NO TRANSPORT. Rule T5, verbatim: "Reuse `$tgResources`; do not build a
- *     parallel HTTP client. New TypeScript files are typed facades over the
- *     existing repository layer." The cost of breaking it is not stylistic:
- *     going through the existing service graph is what makes React INHERIT the
- *     `Authorization: Bearer` header (`app/coffee/modules/base/http.coffee:21-23`),
- *     the `Accept-Language` header (`:26-28`), the `X-Session-Id` header
- *     (`app/coffee/app.coffee:590-602`), the single-flight 401 refresh, the
- *     400-with-`version` VERSION_ERROR toast, the 451 blocking interceptor and
- *     -- most importantly -- `$tgModel`'s changed-fields-only PATCH carrying the
- *     optimistic-concurrency `version` (requirement I7). A bespoke client would
- *     quietly start sending full-object writes, turning every concurrent edit
- *     into a lost update. So this spec issues no request of its own, and it
- *     PROVES the resolution path issues none either.
- *
- * --------------------------------------------------------------------------
- * 4. HOW THIS SPEC IS SHAPED (requirement HR-5)
- * --------------------------------------------------------------------------
- * Browserless by construction: jsdom only, no end-to-end runner imported, no
- * real browser, no network, and no dependency on any generated build output.
- * `npm test` passes with `dist/` deleted and no browser binary installed.
- *
- * The whole AngularJS injector is replaced by `./mockInjector.ts` -- the
- * mandated seam. AngularJS itself is never loaded and no global is touched, so
- * `jest.config.js` needs no `setupFiles` entry for it, and must not gain one.
- *
- * Conventions are carried over from the incumbent suite's
- * `app/modules/components/move-to-sprint/move-to-sprint.controller.spec.coffee`,
- * whose component the Backlog screen consumes and which must keep passing: a
- * MODULE-LEVEL `mocks` object (there at L14) with ONE BUILDER PER DEPENDENCY
- * (L16-L30), NESTED `describe` BLOCKS per behaviour area (L61, L103), fixtures
- * shaped like the real models, and assertions on both the positive and the
- * negative path. Translated for this layer: that file's `provide.value` becomes
- * `mockInjector`'s caller-supplied map, its `sinon.stub()` becomes `jest.fn()`,
- * and its chai assertions become `expect`.
- *
- * ONE CONVENTION IS DELIBERATELY NOT CARRIED OVER: the incumbent builds its
- * fixtures with the `immutable` package's deep-conversion helper (L25, L81, L95)
- * because AngularJS controllers hold persistent collections. React must never
- * receive one of those collections, nor a `$tgModel` instance -- pitfall
- * P-IMMER-1 is that immer rejects class instances. (The `immutable` package
- * itself stays installed for the 124 out-of-scope files that still use it,
- * requirement I5; it is only the two migrated modules that stop.)
- * Flattening happens on the AngularJS side, before the boundary
- * (`app/modules/components/project-menu/project-menu.controller.coffee:27`, with
- * a second precedent at `:21`; generalised as `toPlain`, which falls back to
- * `getAttrs()` -- `app/coffee/modules/base/model.coffee:48-54` returns
- * `_.extend({}, @._attrs, @._modifiedAttrs)`). Every fixture below is therefore
- * a PLAIN OBJECT.
- *
- * Mocks are never reset by hand: `jest.config.js` sets `clearMocks: true` and
- * `restoreMocks: true`, so doing it here would be redundant and would mask a
- * later change to that configuration.
- *
- * --------------------------------------------------------------------------
- * 5. TWO KINDS OF ASSERTION LIVE HERE, and both are load-bearing
- * --------------------------------------------------------------------------
- *   - RUN-TIME assertions, in `it` blocks, checked by Jest.
- *   - COMPILE-TIME assertions, written as type-level equalities that are then
- *     asserted at run time so they can never sit unused. These are the ones
- *     that guarantee the hook does not hand back the unsafe escape-hatch type.
- *     `Equals` below is built from the two-signature trick rather than from
- *     `extends`, because that construction is the one that DISTINGUISHES the
- *     unsafe type from a real type: a plain
- *     `const x: TaigaResources = useAngularService('$tgResources')` would pass
- *     even if the return type degraded, since the unsafe type is assignable to
- *     everything, so it would prove nothing at all. If the return type ever
- *     degrades, `npm run typecheck` and `npm test` both fail here.
- * ========================================================================== */
-
 import type { ReactElement } from 'react';
 import { render, screen } from '@testing-library/react';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 import { AngularBridgeProvider } from './AngularBridgeContext';
 import type { AngularInjector } from './AngularBridgeContext';
 import { mockInjector, withMockInjector } from './mockInjector';
 import type { MockServiceMap } from './mockInjector';
-import { useAngularService, useUntypedAngularService } from './useAngularService';
+import {
+    SANCTIONED_SERVICE_NAMES,
+    useAngularBroadcastListener,
+    useAngularService,
+} from './useAngularService';
 import type {
+    AngularBroadcastListener,
     AngularPromise,
     AngularServices,
     ResourceParams,
@@ -168,51 +32,15 @@ import type {
     TranslateService,
 } from './useAngularService';
 
-/* ==========================================================================
- * TYPE-LEVEL ASSERTION HELPER
- * ========================================================================== */
-
-/**
- * Exact type equality. The two-signature construction is intentional: unlike a
- * mutual-`extends` check, it does NOT consider the unsafe escape-hatch type
- * equal to an arbitrary type, so it is what turns "is this still typed?" into a
- * compile error rather than a silent pass. See section 5 of the header.
- */
 type Equals<A, B> =
     (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
-/* ==========================================================================
- * NAMES THAT MAY NOT APPEAR AS LITERALS
- *
- * Assembled from parts on purpose. The prohibitions this spec asserts are also
- * enforced by a mechanical scan of `app/react/**`, and a scan cannot tell an
- * assertion that a name is ABSENT from a use of that name -- so the convention
- * this folder already documents (`./AngularBridgeContext.tsx:95-101`) is that
- * the banned identifiers never appear in source at all. Composing them at run
- * time keeps the assertions genuine AND the scan clean; it is not obfuscation,
- * and each list is named for what it means.
- * ========================================================================== */
-
-/**
- * The three AngularJS digest entry points. React must never reach one, so no
- * facade a React file can resolve may carry a member under any of these names.
- */
 const DIGEST_ENTRY_POINTS: readonly string[] = ['apply', 'applyAsync', 'digest'].map(
     (method) => `$${method}`,
 );
 
-/**
- * The AngularJS transport service, which is what a bespoke client inside React
- * would most plausibly reach for. Rule T5 keeps it out of the service map: React
- * reaches the backend through the resource and repository namespaces, never
- * through the raw transport.
- */
 const ANGULAR_TRANSPORT_SERVICE = `$${'http'}`;
 
-/**
- * The browser request APIs. Each is probed on the global object rather than
- * assumed present, because jsdom implements some and not others.
- */
 const BROWSER_REQUEST_APIS: readonly string[] = [
     `${'fet'}${'ch'}`,
     `XML${'HttpRequest'}`,
@@ -220,68 +48,21 @@ const BROWSER_REQUEST_APIS: readonly string[] = [
     `Event${'Source'}`,
 ];
 
-/* ==========================================================================
- * TEST DOUBLES -- one builder per dependency, incumbent-style
- *
- * Every double is typed as the REAL facade, so it cannot drift out of
- * conformance without failing `npm run typecheck`. The members this spec drives
- * or asserts on carry explicit `jest.Mock<Return, Args>` signatures; the
- * remainder are plain `jest.fn()` inside an annotated object literal, so the
- * literal as a whole is still checked against the facade and a rename in
- * `useAngularService.ts` breaks compilation here rather than silently at run
- * time in the browser.
- * ========================================================================== */
-
-/**
- * The concrete attribute instantiation used throughout: PLAIN JSON. Never a
- * persistent collection and never a model instance -- see section 4.
- */
 type PlainAttrs = Record<string, unknown>;
 
-/** `listAll`'s resolved value: an array of models, as the resource layer yields. */
 type StoryModels = Array<TaigaModel<PlainAttrs>>;
 
-/**
- * `listAll`'s return type AS THE FACADE DECLARES IT: an AngularJS-promise-shaped
- * thenable over models whose attribute shape is the CALLER's choice.
- *
- * Asserted against at the type level in the "AngularJS-promise-shaped returns"
- * block, which is where the type half of case 9 lives.
- */
 type ListAllReturn = ReturnType<TaigaResources['userstories']['listAll']>;
 
-/**
- * TYPING POLICY FOR THE DOUBLES, stated once because it is the one genuinely
- * non-obvious thing about them.
- *
- * A facade member that is GENERIC in its payload -- `listAll<TAttrs>`,
- * `stats<TStats>`, `attachments.list<TAttachment>` and the rest -- promises to
- * work for EVERY instantiation. No concretely-typed function can promise that,
- * so no concretely-typed double is assignable to such a member, and TypeScript
- * is right to refuse one: producing a value of an arbitrary type parameter is
- * impossible by construction. Those members are therefore doubled with a bare
- * `jest.fn()`, whose behaviour a spec configures and asserts on through a handle.
- * The property's DECLARED type is still the facade's own, because the literal
- * carrying it is annotated `TaigaResources`, so a rename or a signature change in
- * `useAngularService.ts` breaks compilation here rather than silently at run time
- * in the browser.
- *
- * Every NON-GENERIC member is typed precisely -- `jest.Mock<Return, Args>` -- so
- * the looser form is confined to exactly the members where it is unavoidable.
- * The unsafe escape-hatch type is never written anywhere in this file.
- */
 type GetSwimlanesModesMock = jest.Mock<ResourceParams, [number]>;
 
 type StoreShowTagsMock = jest.Mock<void, [number, boolean]>;
 
-/** A `$tgResources` double plus handles on the members the specs drive. */
 interface ResourcesDouble {
     service: TaigaResources;
-    /** Generic facade member -- see the typing policy above. */
     listAll: jest.Mock;
     getSwimlanesModes: GetSwimlanesModesMock;
     storeShowTags: StoreShowTagsMock;
-    /** The fixtures `listAll` resolves with, so a spec can assert on them. */
     storyModels: StoryModels;
 }
 
@@ -292,7 +73,6 @@ type SubscribeMock = jest.Mock<
 
 type UnsubscribeMock = jest.Mock<void, [string]>;
 
-/** A `$tgEvents` double. `connected` is a plain boolean, exactly as on the real service. */
 interface EventsDouble {
     service: TaigaEventsService;
     subscribe: SubscribeMock;
@@ -301,49 +81,24 @@ interface EventsDouble {
 
 type InstantMock = jest.Mock<string, [string, (ResourceParams | undefined)?]>;
 
-/** A `$translate` double. */
 interface TranslateDouble {
     service: TranslateService;
     instant: InstantMock;
 }
 
-/** A `tgResources` double -- the SECOND, distinct resources service. */
 interface Resources2Double {
     service: TaigaResources2;
-    /** Generic facade member -- see the typing policy above. */
     list: jest.Mock;
 }
 
-/**
- * An AngularJS-promise-shaped return value: a bare THENABLE, not a native
- * promise.
- *
- * The facade type deliberately requires BOTH handlers
- * (`./useAngularService.ts:321-326`), which makes a bare single-argument `.then`
- * a compile error in React code and pushes every call site through the sibling
- * `toNativePromise` marshaller. Reproducing that shape here is what keeps the
- * specs honest about what a resource method actually hands back. Marshalling
- * itself is `toNativePromise`'s contract and is covered by its own spec; it is
- * deliberately not re-tested here.
- */
 function angularPromiseOf<T>(value: T): AngularPromise<T> {
     return {
         then(onFulfilled: (resolved: T) => unknown, _onRejected: (reason: unknown) => unknown) {
-            // Synchronous on purpose: a thenable owes no microtask semantics, and
-            // resolving inline keeps these specs free of timers and fake clocks.
             return onFulfilled(value);
         },
     };
 }
 
-/**
- * A user-story fixture shaped like what the repository layer yields -- a model
- * whose ATTRIBUTES are plain JSON.
- *
- * `getAttrs` is what a React caller must go through, and it is the reason a
- * model may cross into a React callback but never into React state or an immer
- * draft (P-IMMER-1).
- */
 function plainStoryModel(id: number, subject: string): TaigaModel<PlainAttrs> {
     const attrs: PlainAttrs = {
         id,
@@ -351,8 +106,6 @@ function plainStoryModel(id: number, subject: string): TaigaModel<PlainAttrs> {
         ref: id,
         version: 1,
         is_blocked: false,
-        // Status, tag and epic colours are DATA (rule T2), never constants, so a
-        // fixture carries them as values just as the API does.
         status: 1,
         tags: [['urgent', '#E44057']],
     };
@@ -372,9 +125,6 @@ function mockTgResources(): ResourcesDouble {
         plainStoryModel(2, 'Fold the DONE column'),
     ];
 
-    // A generic facade member, so a bare `jest.fn()` with a configured return --
-    // see the typing policy above. What it returns is an AngularJS-PROMISE-SHAPED
-    // THENABLE, never a native promise, which is the whole point of case 9.
     const listAll = jest.fn();
 
     listAll.mockReturnValue(angularPromiseOf<StoryModels>(storyModels));
@@ -393,12 +143,24 @@ function mockTgResources(): ResourcesDouble {
             bulkUpdateBacklogOrder: jest.fn(),
             bulkUpdateKanbanOrder: jest.fn(),
             bulkUpdateMilestone: jest.fn(),
+            listValues: jest.fn(),
             storeQueryParams: jest.fn(),
+            // The two storage-backed READS default the way the incumbent does --
+            // an empty object at `resources/userstories.coffee:157` and an empty
+            // array at `:167` -- so a double that returned the nothing-value here
+            // would be a shape the resource layer never produces.
+            getQueryParams: jest.fn(() => ({})),
             storeBacklog: jest.fn(),
+            getBacklog: jest.fn(() => []),
             storeShowTags,
             getShowTags: jest.fn(() => null),
         },
-        sprints: { list: jest.fn() },
+        sprints: {
+            list: jest.fn(),
+            get: jest.fn(),
+            stats: jest.fn(),
+            moveUserStoriesMilestone: jest.fn(),
+        },
         swimlanes: { list: jest.fn() },
         kanban: {
             storeStatusColumnModes: jest.fn(),
@@ -432,9 +194,6 @@ function mockTgEvents(): EventsDouble {
 }
 
 function mockTranslate(): TranslateDouble {
-    // Echoes the key back, which is the cheapest faithful stand-in: it proves a
-    // string came from the translation layer rather than from a hardcoded
-    // literal, without pulling in a translation table.
     const instant: InstantMock = jest.fn((translationId: string) => translationId);
 
     const service: TranslateService = {
@@ -446,13 +205,6 @@ function mockTranslate(): TranslateDouble {
     return { service, instant };
 }
 
-/**
- * The module-level `mocks` object, rebuilt before every test.
- *
- * Mirrors `move-to-sprint.controller.spec.coffee:14`, keyed by the EXACT
- * AngularJS registration name so that `$tgResources` and `tgResources` stay
- * visibly distinct.
- */
 const mocks: {
     $tgResources: ResourcesDouble;
     tgResources: Resources2Double;
@@ -472,10 +224,6 @@ beforeEach(() => {
     mocks.$translate = mockTranslate();
 });
 
-/**
- * The three-service map used by most specs below: THREE of the fifteen
- * resolvable services, which is the point rather than a shortcut (section 2).
- */
 function threeServiceMap(): MockServiceMap {
     return {
         $tgResources: mocks.$tgResources.service,
@@ -484,18 +232,6 @@ function threeServiceMap(): MockServiceMap {
     };
 }
 
-/* ==========================================================================
- * PROBE COMPONENTS
- *
- * A hook can only be observed from inside a component, so each probe resolves
- * what its spec cares about, records it in a caller-owned box, and renders
- * something `screen` can find. Writing to the box during render is safe here
- * because these probes are rendered once per assertion and never inside
- * `StrictMode`; the alternative -- threading an effect -- would delay the
- * capture past the assertion for no gain.
- * ========================================================================== */
-
-/** A caller-owned capture box, so identity can be asserted after render. */
 interface Capture<T> {
     value: T | undefined;
     renders: number;
@@ -512,7 +248,6 @@ function record<T>(box: Capture<T>, value: T): T {
     return value;
 }
 
-/** Resolves `$tgResources` and reports the resolved instance. */
 function ResourcesProbe({
     into,
     testId = 'resources-probe',
@@ -520,8 +255,6 @@ function ResourcesProbe({
     into: Capture<TaigaResources>;
     testId?: string;
 }): ReactElement {
-    // The typed local of the type-inference proof: `rs` is `TaigaResources`, not
-    // the unsafe escape-hatch type, so the member reached below is checked.
     const rs = useAngularService('$tgResources');
 
     record(into, rs);
@@ -529,7 +262,6 @@ function ResourcesProbe({
     return <output data-testid={testId}>{typeof rs.userstories.listAll}</output>;
 }
 
-/** Resolves the three services of {@link threeServiceMap} in ONE component. */
 function ThreeServiceProbe({
     resources,
     events,
@@ -539,8 +271,6 @@ function ThreeServiceProbe({
     events: Capture<TaigaEventsService>;
     translate: Capture<TranslateService>;
 }): ReactElement {
-    // One call per dependency, which is the whole substitution: an opaque list of
-    // 23 (Kanban) or 21 (Backlog) becomes three explicit asks.
     const rs = record(resources, useAngularService('$tgResources'));
     const ev = record(events, useAngularService('$tgEvents'));
     const translateService = record(translate, useAngularService('$translate'));
@@ -553,17 +283,12 @@ function ThreeServiceProbe({
     );
 }
 
-/** Resolves a caller-chosen service name, for the diagnostic specs. */
 function NamedServiceProbe({ name }: { name: keyof AngularServices }): ReactElement {
     useAngularService(name);
 
     return <output data-testid="named-service-probe">resolved</output>;
 }
 
-/**
- * Resolves BOTH resources services, which are genuinely different services on
- * different modules and are injected together by both surviving controllers.
- */
 function BothResourcesProbe({
     first,
     second,
@@ -581,15 +306,6 @@ function BothResourcesProbe({
     );
 }
 
-/**
- * Drives two TYPED members through the resolved facade.
- *
- * This is the run-time half of the type-inference proof: both calls are checked
- * against `TaigaResources`, so a member that does NOT exist on the facade -- say
- * `rs.userstories.listEverything(...)` -- would be a compile error on these
- * lines, and a rename inside `useAngularService.ts` breaks the type gate here
- * rather than silently at run time in the browser.
- */
 function TypedMemberProbe(): ReactElement {
     const rs = useAngularService('$tgResources');
 
@@ -600,13 +316,6 @@ function TypedMemberProbe(): ReactElement {
     return <output data-testid="typed-member-probe">{Object.keys(swimlaneModes).length}</output>;
 }
 
-/**
- * Calls a resource endpoint and reports what it handed back, WITHOUT awaiting it.
- *
- * The attribute shape is stated explicitly at the call site, which is how the
- * facade's generic members are meant to be used: the caller owns the shape, so
- * nothing has to be narrowed downstream.
- */
 function ThenableProbe({ into }: { into: Capture<AngularPromise<StoryModels>> }): ReactElement {
     const rs = useAngularService('$tgResources');
 
@@ -616,59 +325,38 @@ function ThenableProbe({ into }: { into: Capture<AngularPromise<StoryModels>> })
 }
 
 /**
- * Reaches a service through the `unknown`-returning escape hatch, and narrows it
- * before touching it -- which is exactly what `unknown` buys over the unsafe
- * escape-hatch type.
+ * Resolves the root scope's `$on`-only registrar through the ONE named narrow
+ * accessor, and reports what came back.
+ *
+ * The value is `AngularBroadcastListener | null`, never the scope object, so the
+ * probe can register a listener and can name nothing else -- which is the
+ * property the specs below assert.
  */
-function UntypedProbe({ into }: { into: Capture<boolean> }): ReactElement {
-    const candidate = useUntypedAngularService('$tgEvents');
+function BroadcastListenerProbe({
+    into,
+}: {
+    into: Capture<AngularBroadcastListener | null>;
+}): ReactElement {
+    const broadcasts = record(into, useAngularBroadcastListener());
 
-    let connected = false;
-
-    if (
-        typeof candidate === 'object' &&
-        candidate !== null &&
-        'connected' in candidate &&
-        typeof (candidate as TaigaEventsService).connected === 'boolean'
-    ) {
-        connected = (candidate as TaigaEventsService).connected;
-    }
-
-    record(into, connected);
-
-    return <output data-testid="untyped-probe">{String(connected)}</output>;
+    return (
+        <output data-testid="broadcast-listener-probe">
+            {broadcasts === null ? 'none' : 'registrar'}
+        </output>
+    );
 }
 
-/**
- * Resolves a MISSPELLED service name.
- *
- * The deliberate negative type assertion of the type-inference proof: the
- * `@ts-expect-error` below must itself fail to compile if the misspelling ever
- * became acceptable, because an UNUSED `@ts-expect-error` is a compile error.
- * That is the self-check -- it cannot rot into a silenced real error the way
- * a blanket suppression would, which is why a blanket suppression is never used
- * anywhere in this tree.
- */
 function MisspelledServiceProbe(): ReactElement {
-    // @ts-expect-error -- 'tgResourcs' is not a key of `AngularServices`, so the
-    // `K extends keyof AngularServices` narrowing must reject it at compile time.
-    // The name reaching the injector at run time is what the spec then asserts on.
+    // @ts-expect-error -- an unknown service name must not type-check.
     useAngularService('tgResourcs');
 
     return <output data-testid="misspelled-service-probe">unreachable</output>;
 }
 
-/**
- * React logs a component error to the console before rethrowing it. The
- * throwing specs silence exactly that, so a deliberate failure does not look
- * like a broken suite. `restoreMocks: true` in `jest.config.js` puts the real
- * console back, which is why nothing here restores it by hand.
- */
 function silenceReactErrorLog(): void {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
 }
 
-/** Captures the message of whatever `render` threw, or the empty string. */
 function messageThrownBy(mount: () => unknown): string {
     try {
         mount();
@@ -679,11 +367,13 @@ function messageThrownBy(mount: () => unknown): string {
     return '';
 }
 
-/**
- * Every key of the service map, kept exhaustive by the `Missing` check in the
- * type-contract block so that adding a key without extending this list is a
- * compile error.
- */
+/** Resolves whatever name it is given, so the run-time allow list can be probed. */
+function UnsanctionedNameProbe({ name }: { name: string }): ReactElement {
+    useAngularService(name as keyof AngularServices);
+
+    return <output data-testid="unsanctioned-probe">resolved</output>;
+}
+
 const ALL_SERVICE_NAMES = [
     '$tgResources',
     'tgResources',
@@ -702,40 +392,15 @@ const ALL_SERVICE_NAMES = [
     '$tgAnalytics',
 ] as const satisfies readonly (keyof AngularServices)[];
 
-/**
- * A `mockInjector` with a registration oracle grafted on.
- *
- * `mockInjector` deliberately OMITS `has` (its section 4), so that the accurate
- * "you did not supply this" diagnostic stays with the factory. Reaching the
- * hook's OTHER guard -- "AngularJS has no provider registered under this name" --
- * therefore needs a `has`, and this is the one place a spec adds one. The
- * SERVICES still come from `mockInjector`; only the oracle is added, and an
- * oracle is not a service.
- */
 function mockInjectorWithHas(
     services: MockServiceMap,
     registered: readonly string[],
 ): AngularInjector & { has: jest.Mock<boolean, [string]> } {
     const has: jest.Mock<boolean, [string]> = jest.fn((name) => registered.includes(name));
 
-    // Spreading is safe because `mockInjector`'s `get` closes over its own snapshot
-    // rather than reading `this`.
     return { ...mockInjector(services), has };
 }
 
-/**
- * Installs a call-recording stand-in over EVERY browser request API named in
- * {@link BROWSER_REQUEST_APIS}, runs `body`, then restores the previous state
- * exactly -- putting an original back where one existed, and removing the
- * stand-in entirely where none did.
- *
- * All four are always installed, not only the ones jsdom happens to implement,
- * so the assertion has the same strength regardless of the environment's own
- * feature set. Nothing here uses `jest.spyOn`, because a spy cannot be installed
- * over a property that does not exist yet.
- *
- * @returns one probe per API, in the order of {@link BROWSER_REQUEST_APIS}.
- */
 function withRequestApiProbes(body: () => void): Array<jest.Mock<undefined, unknown[]>> {
     const globalBag = globalThis as unknown as Record<string, unknown>;
     const previous = new Map<string, { present: boolean; value: unknown }>();
@@ -765,14 +430,7 @@ function withRequestApiProbes(body: () => void): Array<jest.Mock<undefined, unkn
     return probes;
 }
 
-/* ==========================================================================
- * SPECS
- * ========================================================================== */
-
 describe('useAngularService', () => {
-    /* ----------------------------------------------------------------------
-     * CASE 1 -- resolution
-     * ---------------------------------------------------------------------- */
     describe('resolution', () => {
         it('hands back exactly the instance supplied to mockInjector, by reference', () => {
             const injector = mockInjector({ $tgResources: mocks.$tgResources.service });
@@ -782,21 +440,12 @@ describe('useAngularService', () => {
                 wrapper: withMockInjector(injector),
             });
 
-            // IDENTITY, not equality. No wrapping, no cloning, no proxying and no
-            // partial application: `Object.is` is the assertion because a wrapper
-            // that merely LOOKED equal would still break every effect whose
-            // dependency array relies on the service's reference staying stable,
-            // and would break `expect(double.method).toHaveBeenCalled()` in every
-            // downstream spec.
             expect(Object.is(resolved.value, mocks.$tgResources.service)).toBe(true);
             expect(resolved.value).toBe(mocks.$tgResources.service);
             expect(screen.getByTestId('resources-probe')).toHaveTextContent('function');
         });
 
         it('passes the requested name through unchanged', () => {
-            // Proof without a spy: `mockInjector` resolves from a Map containing ONE
-            // name, so a successful resolution can only mean the hook asked for
-            // exactly that name. Any other string would have taken the throw branch.
             const injector = mockInjector({ $tgConfirm: { askOnDelete: jest.fn(), notify: jest.fn() } });
 
             render(<NamedServiceProbe name="$tgConfirm" />, {
@@ -810,8 +459,6 @@ describe('useAngularService', () => {
             const injector = mockInjector({ $tgResources: mocks.$tgResources.service });
             const resolved = capture<TaigaResources>();
 
-            // `AngularBridgeProvider` is what `ReactHostElement` actually renders, so
-            // one spec mounts it literally rather than through `withMockInjector`.
             render(
                 <AngularBridgeProvider injector={injector}>
                     <ResourcesProbe into={resolved} />
@@ -822,9 +469,6 @@ describe('useAngularService', () => {
         });
 
         it('accepts a minimal `{ get }` double with no `has`', () => {
-            // `has` is optional on the injector type by design
-            // (`./AngularBridgeContext.tsx:229-236`), and `mockInjector` deliberately
-            // omits it so the accurate diagnostic stays with the factory.
             const injector: AngularInjector = mockInjector({
                 $tgAnalytics: { trackEvent: jest.fn() },
             });
@@ -839,9 +483,6 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 2 -- singleton identity
-     * ---------------------------------------------------------------------- */
     describe('singleton identity', () => {
         it('gives two separate probes the same instance for the same name', () => {
             const injector = mockInjector({ $tgResources: mocks.$tgResources.service });
@@ -856,7 +497,6 @@ describe('useAngularService', () => {
                 { wrapper: withMockInjector(injector) },
             );
 
-            // AngularJS services are singletons; the seam must not turn one into two.
             expect(first.value).toBe(second.value);
             expect(first.value).toBe(mocks.$tgResources.service);
             expect(screen.getByTestId('first-probe')).toBeInTheDocument();
@@ -875,8 +515,6 @@ describe('useAngularService', () => {
 
             rerender(<ResourcesProbe into={resolved} />);
 
-            // A pure lookup re-resolves every render, and still yields the same
-            // object -- which is why the hook holds no state and memoises nothing.
             expect(resolved.renders).toBeGreaterThanOrEqual(2);
             expect(resolved.value).toBe(afterFirstRender);
         });
@@ -890,19 +528,12 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 3 -- missing-provider diagnostic
-     * ---------------------------------------------------------------------- */
     describe('missing-provider diagnostic', () => {
         it('throws an Error naming both the hook and the service', () => {
             silenceReactErrorLog();
 
             const resolved = capture<TaigaResources>();
 
-            // The alternative -- silently returning a nullish injector -- is strictly
-            // worse: the symptom would surface much later as an inscrutable
-            // "cannot read property of undefined" deep inside a data hook, with
-            // nothing naming the provider that was missing.
             expect(() => render(<ResourcesProbe into={resolved} />)).toThrow(Error);
             expect(() => render(<ResourcesProbe into={resolved} />)).toThrow(
                 /useAngularService\('\$tgResources'\)/,
@@ -925,9 +556,6 @@ describe('useAngularService', () => {
         it('throws for an explicitly null injector, not only for an absent provider', () => {
             silenceReactErrorLog();
 
-            // A mount that happens before AngularJS has bootstrapped degrades to this
-            // path rather than to a hard failure at the seam, so it is asserted
-            // separately from the no-provider-at-all path above.
             expect(() =>
                 render(<NamedServiceProbe name="tgLoader" />, {
                     wrapper: withMockInjector(null),
@@ -944,13 +572,6 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 4 -- unsupplied-service diagnostic
-     *
-     * This block is the only coverage `./mockInjector.ts` has: no production
-     * module may import it, and no other spec does, so its throw branch would
-     * otherwise never execute.
-     * ---------------------------------------------------------------------- */
     describe('unsupplied-service diagnostic', () => {
         it('throws naming the requested service and listing the ones supplied', () => {
             silenceReactErrorLog();
@@ -975,9 +596,6 @@ describe('useAngularService', () => {
         it('reports "(nothing)" for the default empty map', () => {
             silenceReactErrorLog();
 
-            // The default empty map is genuinely useful -- a component that needs a
-            // provider above it but resolves nothing -- so its diagnostic is asserted
-            // rather than assumed.
             const message = messageThrownBy(() =>
                 render(<NamedServiceProbe name="tgProjectService" />, {
                     wrapper: withMockInjector(mockInjector()),
@@ -1003,10 +621,6 @@ describe('useAngularService', () => {
         it('never resolves an inherited member of the base object prototype', () => {
             silenceReactErrorLog();
 
-            // `mockInjector` looks up through a `Map` rather than by property access
-            // precisely so this cannot happen: property access would happily return
-            // `Object.prototype.constructor` and hand the unit under test a function
-            // that is not a service at all -- an absurd failure to debug.
             const injector = mockInjector({ $tgResources: mocks.$tgResources.service });
 
             expect(() => injector.get<unknown>('constructor')).toThrow(
@@ -1023,8 +637,6 @@ describe('useAngularService', () => {
 
             services.$translate = mocks.$translate.service;
 
-            // Snapshot semantics keep a spec from accidentally depending on
-            // registration order. To vary the services, build another injector.
             expect(() => injector.get<TranslateService>('$translate')).toThrow(Error);
             expect(injector.get<TaigaEventsService>('$tgEvents')).toBe(
                 mocks.$tgEvents.service,
@@ -1034,10 +646,6 @@ describe('useAngularService', () => {
         it('rejects a misspelled service name at compile time and at run time', () => {
             silenceReactErrorLog();
 
-            // The run-time half of the negative type assertion in
-            // {@link MisspelledServiceProbe}: the misspelling is a compile error
-            // there, and the name still reaches the injector verbatim here, which is
-            // what proves the hook does not "helpfully" normalise anything.
             const message = messageThrownBy(() =>
                 render(<MisspelledServiceProbe />, {
                     wrapper: withMockInjector(
@@ -1046,14 +654,19 @@ describe('useAngularService', () => {
                 }),
             );
 
-            expect(message).toContain("service 'tgResourcs'");
-            expect(message).toContain('Supplied: $tgResources');
+            // The refusal now comes from the value-level allow list, which is checked
+            // BEFORE the injector is consulted -- so a name one character away from a
+            // real service cannot resolve anything, and the name is quoted back
+            // VERBATIM, which is what proves the hook does not "helpfully" normalise
+            // it into the neighbouring real name.
+            expect(message).toContain("useAngularService('tgResourcs') is not permitted");
+            expect(message).toContain("'tgResourcs' is not one of the AngularJS services");
+            // The diagnostic still names what IS reachable, so the reader is not left
+            // guessing which spelling was meant.
+            expect(message).toContain('Permitted: $tgResources');
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 5 -- per-hook dependencies, which is why a PARTIAL map suffices
-     * ---------------------------------------------------------------------- */
     describe('per-hook dependencies', () => {
         it('resolves three distinct services independently from a map of three', () => {
             const map = threeServiceMap();
@@ -1075,16 +688,9 @@ describe('useAngularService', () => {
             expect(events.value).toBe(mocks.$tgEvents.service);
             expect(translate.value).toBe(mocks.$translate.service);
 
-            // THE POINT (section 2 of the header): THREE services supplied out of
-            // FIFTEEN resolvable, standing in for the 23 the Kanban controller is
-            // handed and the 21 the Backlog controller is handed. A hook asks for
-            // what it uses, so a spec supplies what the hook asks for -- which is
-            // what makes a browserless unit layer viable at all (requirement I9).
             expect(Object.keys(map)).toHaveLength(3);
             expect(ALL_SERVICE_NAMES).toHaveLength(15);
 
-            // Nothing about the resolution is inert: the copy really did come from
-            // the translation layer rather than from a hardcoded literal.
             expect(mocks.$translate.instant).toHaveBeenCalledWith('BACKLOG.SPRINTS.TITLE');
             expect(screen.getByTestId('three-service-probe')).toHaveAttribute(
                 'data-connected',
@@ -1105,8 +711,6 @@ describe('useAngularService', () => {
                 wrapper: withMockInjector(injector),
             });
 
-            // Two names, two services, two different objects. Collapsing the pair
-            // would silently hand the Backlog screen the wrong `attachments`.
             expect(first.value).toBe(mocks.$tgResources.service);
             expect(second.value).toBe(mocks.tgResources.service);
             expect(first.value).not.toBe(second.value);
@@ -1125,9 +729,6 @@ describe('useAngularService', () => {
             const injector = mockInjector(supplied);
             const suppliedNames: readonly string[] = Object.keys(supplied);
 
-            // Walks all FIFTEEN names so none can quietly acquire special handling:
-            // a supplied name resolves, and an unsupplied one produces a diagnostic
-            // that quotes the name back verbatim.
             for (const name of ALL_SERVICE_NAMES) {
                 const mount = (): unknown =>
                     render(<NamedServiceProbe name={name} />, {
@@ -1143,15 +744,8 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 6 -- type-inference proof (compile-time, asserted at run time)
-     * ---------------------------------------------------------------------- */
     describe('type contract', () => {
         it('returns the mapped service type and NOT the unsafe escape-hatch type', () => {
-            // Each of these fails to compile if the corresponding return type
-            // degrades -- to the unsafe type, to `unknown`, or to anything other
-            // than the exact mapped facade. See section 5 of the header for why
-            // `Equals` is built the way it is.
             const resourcesIsExact: Equals<
                 ReturnType<typeof useAngularService<'$tgResources'>>,
                 TaigaResources
@@ -1175,20 +769,24 @@ describe('useAngularService', () => {
             expect(translateIsExact).toBe(true);
         });
 
-        it('exposes the untyped escape hatch as `unknown`, forcing the caller to narrow', () => {
-            const escapeIsUnknown: Equals<
-                ReturnType<typeof useUntypedAngularService>,
-                unknown
+        it('types the one off-map accessor as the $on-only registrar, never a scope', () => {
+            // The narrow contract IS the boundary: a caller holds something that
+            // can register and deregister a listener, and cannot name apply,
+            // digest, emit, broadcast, watch or child-scope creation. Asserting the
+            // exact return type is what stops that surface widening later.
+            const registrarIsNarrow: Equals<
+                ReturnType<typeof useAngularBroadcastListener>,
+                AngularBroadcastListener | null
             > = true;
+            const isOneMemberOnly: Equals<keyof AngularBroadcastListener, '$on'> = true;
 
-            expect(escapeIsUnknown).toBe(true);
+            expect(registrarIsNarrow).toBe(true);
+            expect(isOneMemberOnly).toBe(true);
         });
 
         it('covers every key of the service map in this spec', () => {
             type Missing = Exclude<keyof AngularServices, (typeof ALL_SERVICE_NAMES)[number]>;
 
-            // Adding a key to `AngularServices` without extending `ALL_SERVICE_NAMES`
-            // is a compile error here, which is what keeps the walk above exhaustive.
             const nothingMissing: Equals<Missing, never> = true;
 
             expect(nothingMissing).toBe(true);
@@ -1207,9 +805,6 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 7 -- no digest surface
-     * ---------------------------------------------------------------------- */
     describe('no digest surface', () => {
         it('exposes no digest entry point on any resolved facade or namespace', () => {
             const injector = mockInjector(threeServiceMap());
@@ -1238,9 +833,6 @@ describe('useAngularService', () => {
                 throw new Error('the probe resolved nothing, so there is nothing to assert');
             }
 
-            // Nested namespaces are included deliberately: a digest entry point
-            // smuggled onto `userstories` would be just as reachable as one on the
-            // aggregate service, and just as damaging.
             const surfaces: object[] = [
                 resolvedResources,
                 resolvedResources.userstories,
@@ -1262,11 +854,6 @@ describe('useAngularService', () => {
         });
 
         it('keeps both scope services and the promise service out of the map', () => {
-            // The three names quoted verbatim from the two `$inject` lists that the
-            // hook deliberately will NOT resolve. Their absence is a correctness
-            // rule: handing React a scope invites the one call AAP 0.7.4 forbids,
-            // and AngularJS promises cross the seam through the sibling marshaller
-            // rather than by handing React the service that creates them.
             type UnreachableByDesign = '$scope' | '$rootScope' | '$q';
 
             const noneReachable: Equals<
@@ -1284,9 +871,6 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 8 -- no transport
-     * ---------------------------------------------------------------------- */
     describe('no transport', () => {
         it('touches no browser request API while resolving', () => {
             const injector = mockInjector(threeServiceMap());
@@ -1314,10 +898,6 @@ describe('useAngularService', () => {
                 wrapper: withMockInjector(injector),
             });
 
-            // Rule T5 keeps every write on the repository layer so React inherits
-            // `$tgModel`'s changed-fields-only PATCH (requirement I7). A resolution
-            // that pre-fetched anything would be the first step towards a parallel
-            // client, so it is asserted against rather than assumed.
             expect(mocks.$tgResources.listAll).not.toHaveBeenCalled();
             expect(
                 mocks.$tgResources.service.userstories.bulkUpdateKanbanOrder,
@@ -1332,24 +912,14 @@ describe('useAngularService', () => {
         it('keeps the raw AngularJS transport service out of the resolvable map', () => {
             expect(ALL_SERVICE_NAMES).not.toContain(ANGULAR_TRANSPORT_SERVICE);
 
-            // Reaching for it is a diagnostic, not a resolution -- the resource and
-            // repository namespaces are the sanctioned path to the backend.
             expect(() =>
                 mockInjector(threeServiceMap()).get<unknown>(ANGULAR_TRANSPORT_SERVICE),
             ).toThrow(Error);
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * CASE 9 -- AngularJS-promise-shaped returns
-     * ---------------------------------------------------------------------- */
     describe('AngularJS-promise-shaped returns', () => {
         it('declares a thenable, not a native promise', () => {
-            // The TYPE half: the facade's own return type is the two-handler
-            // thenable, and it is NOT the native promise type. The second assertion
-            // is expressed as `false` on purpose -- it would stop compiling the day
-            // someone "modernised" the facade to a native promise, which would
-            // silently change what every call site has to do.
             const declaresThenable: Equals<
                 ListAllReturn,
                 AngularPromise<Array<TaigaModel<unknown>>>
@@ -1377,19 +947,12 @@ describe('useAngularService', () => {
             expect(typeof thenable.then).toBe('function');
             expect(thenable).not.toBeInstanceOf(Promise);
 
-            // A `$q` promise is not a native one, and the difference is observable:
-            // the native combinators simply are not there. Marshalling across that
-            // gap is the sibling `toNativePromise`'s contract, covered by its own
-            // spec, and is deliberately not re-tested here.
             expect('catch' in thenable).toBe(false);
             expect('finally' in thenable).toBe(false);
 
             const onFulfilled = jest.fn<undefined, [StoryModels]>(() => undefined);
             const onRejected = jest.fn<undefined, [unknown]>(() => undefined);
 
-            // BOTH handlers are mandatory on the facade type, which is what makes a
-            // bare single-argument `.then(cb)` a compile error in React code and
-            // pushes every real call site through the marshaller.
             thenable.then(onFulfilled, onRejected);
 
             expect(onFulfilled).toHaveBeenCalledTimes(1);
@@ -1401,8 +964,6 @@ describe('useAngularService', () => {
             expect(models).toHaveLength(2);
             expect(models[0].getName()).toBe('userstories');
 
-            // PLAIN attributes: no persistent collection and no model instance ever
-            // reaches React state (P-IMMER-1, section 4 of the header).
             expect(models[0].getAttrs()).toEqual(
                 expect.objectContaining({ id: 1, subject: 'Reorder the sprint', version: 1 }),
             );
@@ -1413,10 +974,6 @@ describe('useAngularService', () => {
         });
     });
 
-    /* ----------------------------------------------------------------------
-     * The hook's OTHER guard: AngularJS reports the name as unregistered.
-     * Reached only when the injector actually offers a registration oracle.
-     * ---------------------------------------------------------------------- */
     describe('unregistered-service diagnostic', () => {
         it('throws before resolving when the oracle reports the name unregistered', () => {
             silenceReactErrorLog();
@@ -1432,9 +989,6 @@ describe('useAngularService', () => {
                 }),
             ).toThrow(/no AngularJS service registered/);
 
-            // Failing FIRST is the point: AngularJS's own
-            // "[$injector:unpr] Unknown provider" says nothing about the React side
-            // that asked, so the hook must never let it be reached.
             expect(injector.has).toHaveBeenCalledWith('$tgNavUrls');
         });
 
@@ -1483,45 +1037,138 @@ describe('useAngularService', () => {
 });
 
 /* ==========================================================================
- * THE ESCAPE HATCH
+ * THE ONE NAMED ACCESSOR OUTSIDE THE SERVICE MAP
+ *
+ * There is deliberately NO arbitrary-name escape hatch. `useAngularBroadcastListener`
+ * is the whole of what lives outside `AngularServices`: it hardcodes `'$rootScope'`,
+ * hands back a contract whose only member is `$on`, and exists because
+ * angular-translate `$emit`s its language event on the root scope, where a listener
+ * on any child scope -- including the one the AngularJS-side bridge's
+ * `onAngularEvent` callback registers -- is never called.
  * ========================================================================== */
 
-describe('useUntypedAngularService', () => {
-    it('resolves by reference and yields a value that must be narrowed first', () => {
-        const injector = mockInjector({ $tgEvents: mocks.$tgEvents.service });
-        const connected = capture<boolean>();
+describe('useAngularBroadcastListener', () => {
+    /** An off-map injector: `mockInjector`'s map cannot carry `$rootScope`, by design. */
+    function injectorWithRootScope(rootScope: unknown): AngularInjector {
+        return {
+            get<T>(name: string): T {
+                return (name === '$rootScope' ? rootScope : undefined) as T;
+            },
+        };
+    }
 
-        render(<UntypedProbe into={connected} />, { wrapper: withMockInjector(injector) });
+    /** The one-member facade the real root scope is narrowed to. */
+    function rootScopeDouble(): {
+        facade: AngularBroadcastListener;
+        $on: jest.Mock<() => void, [string, (event: unknown, payload: unknown) => void]>;
+        deregister: jest.Mock<void, []>;
+    } {
+        const deregister = jest.fn<void, []>();
+        const $on = jest.fn<() => void, [string, (event: unknown, payload: unknown) => void]>(
+            () => deregister,
+        );
 
-        // The narrowing inside the probe is the whole point: without it the value
-        // cannot be dereferenced at all, and every such narrowing is visible in
-        // review -- which is what `unknown` buys over the unsafe escape-hatch type.
-        expect(connected.value).toBe(true);
-        expect(screen.getByTestId('untyped-probe')).toHaveTextContent('true');
+        return { facade: { $on }, $on, deregister };
+    }
+
+    it('resolves the registrar by reference, under the hardcoded root-scope name', () => {
+        const rootScope = rootScopeDouble();
+        const names: string[] = [];
+        const resolved = capture<AngularBroadcastListener | null>();
+
+        render(<BroadcastListenerProbe into={resolved} />, {
+            wrapper: withMockInjector({
+                get<T>(name: string): T {
+                    names.push(name);
+
+                    return (name === '$rootScope' ? rootScope.facade : undefined) as T;
+                },
+            }),
+        });
+
+        // BY REFERENCE, with no proxy and no clone, so an effect may depend on its
+        // identity -- and under exactly one name, because the accessor takes none.
+        expect(resolved.value).toBe(rootScope.facade);
+        expect(names).toEqual(['$rootScope']);
+        expect(screen.getByTestId('broadcast-listener-probe')).toHaveTextContent('registrar');
+    });
+
+    it('registers a listener and hands back AngularJS own deregistration function', () => {
+        const rootScope = rootScopeDouble();
+        const resolved = capture<AngularBroadcastListener | null>();
+
+        render(<BroadcastListenerProbe into={resolved} />, {
+            wrapper: withMockInjector(injectorWithRootScope(rootScope.facade)),
+        });
+
+        const listener = (): undefined => undefined;
+        const deregistration = resolved.value?.$on('$translateChangeEnd', listener);
+
+        expect(rootScope.$on).toHaveBeenCalledWith('$translateChangeEnd', listener);
+        expect(deregistration).toBe(rootScope.deregister);
+    });
+
+    it.each<[string, unknown]>([
+        ['nothing is registered under the name', undefined],
+        ['the resolved value is null', null],
+        ['the resolved value is not an object', 'not-a-scope'],
+        ['the resolved value exposes no $on', { $new: jest.fn() }],
+        ['the resolved value exposes a non-callable $on', { $on: 'nope' }],
+    ])('degrades to null rather than throwing when %s', (_label: string, rootScope: unknown) => {
+        const resolved = capture<AngularBroadcastListener | null>();
+
+        // Degrading matters: the one consumer keeps translating correctly and only
+        // loses LIVE language switching, so a React root mounted before AngularJS
+        // finished bootstrapping still renders its screen.
+        expect(() =>
+            render(<BroadcastListenerProbe into={resolved} />, {
+                wrapper: withMockInjector(injectorWithRootScope(rootScope)),
+            }),
+        ).not.toThrow();
+
+        expect(resolved.value).toBeNull();
+        expect(screen.getByTestId('broadcast-listener-probe')).toHaveTextContent('none');
     });
 
     it('raises the provider diagnostic under its own name', () => {
         silenceReactErrorLog();
 
-        const connected = capture<boolean>();
+        const resolved = capture<AngularBroadcastListener | null>();
 
-        expect(() => render(<UntypedProbe into={connected} />)).toThrow(
-            /useUntypedAngularService\('\$tgEvents'\)/,
+        expect(() => render(<BroadcastListenerProbe into={resolved} />)).toThrow(
+            /useAngularBroadcastListener\('\$rootScope'\) was called outside <AngularBridgeProvider>/,
         );
+    });
+
+    it('returns the SAME registrar across renders', () => {
+        const rootScope = rootScopeDouble();
+        const first = capture<AngularBroadcastListener | null>();
+        const second = capture<AngularBroadcastListener | null>();
+        const wrapper = withMockInjector(injectorWithRootScope(rootScope.facade));
+
+        const { rerender } = render(<BroadcastListenerProbe into={first} />, { wrapper });
+
+        rerender(<BroadcastListenerProbe into={second} />);
+
+        // A pure lookup: no state, no effect, nothing to clean up, and the value is
+        // handed back by reference so an effect may depend on its identity.
+        expect(second.value).toBe(first.value);
     });
 
     it('raises the unregistered diagnostic under its own name', () => {
         silenceReactErrorLog();
 
-        const connected = capture<boolean>();
+        const resolved = capture<AngularBroadcastListener | null>();
 
+        // A registration oracle that positively reports the name as unregistered is
+        // a MISCONFIGURATION, not the timing window above, so it still fails loudly.
         expect(() =>
-            render(<UntypedProbe into={connected} />, {
+            render(<BroadcastListenerProbe into={resolved} />, {
                 wrapper: withMockInjector(
-                    mockInjectorWithHas({ $tgEvents: mocks.$tgEvents.service }, ['tgSomethingElse']),
+                    mockInjectorWithHas({ $tgEvents: mocks.$tgEvents.service }, ['$tgEvents']),
                 ),
             }),
-        ).toThrow(/useUntypedAngularService\('\$tgEvents'\) found no AngularJS service/);
+        ).toThrow(/useAngularBroadcastListener\('\$rootScope'\) found no AngularJS service/);
     });
 });
 
@@ -1532,6 +1179,160 @@ describe('useUntypedAngularService', () => {
  * this file is its only exercise. Covering its wrapper here is what keeps it from
  * sitting at zero coverage while still counting against the 70 % gate.
  * ========================================================================== */
+
+/* ==========================================================================
+ * THE RUN-TIME ALLOW LIST -- THE TRUST BOUNDARY, ENFORCED AFTER TYPE ERASURE
+ *
+ * `keyof AngularServices` constrains a LITERAL argument and nothing else. A name
+ * held in a variable widens to `string`, and a caller that was never type-checked
+ * is not constrained at all, so the map alone left the injector reachable from
+ * React through one ordinary-looking call. These cases pin the value-level list
+ * that closes that gap, and they are security assertions rather than
+ * housekeeping: each name below is a capability the migration must NOT hand to
+ * React.
+ * ========================================================================== */
+
+describe('the run-time allow list', () => {
+    it('is exactly the key set of the service map, with no duplicates', () => {
+        expect([...SANCTIONED_SERVICE_NAMES].sort()).toEqual([...ALL_SERVICE_NAMES].sort());
+        expect(SANCTIONED_SERVICE_NAMES).toHaveLength(15);
+        expect(new Set(SANCTIONED_SERVICE_NAMES).size).toBe(SANCTIONED_SERVICE_NAMES.length);
+    });
+
+    it('is frozen, so nothing holding a reference can widen it at run time', () => {
+        expect(Object.isFrozen(SANCTIONED_SERVICE_NAMES)).toBe(true);
+    });
+
+    it.each([
+        // Both scope services: holding one invites the digest participation the
+        // migration forbids outright.
+        '$rootScope',
+        '$scope',
+        // The promise service: AngularJS promises cross the seam through the
+        // sibling marshaller, never by handing React the factory.
+        '$q',
+        // The injector itself: resolving it would restore, in one step, every
+        // capability this list removes.
+        '$injector',
+        // A raw transport: it would bypass the Authorization and session headers,
+        // the token-refresh, version-conflict and blocking interceptors, and the
+        // changed-fields-only versioned write behaviour React inherits by going
+        // through the resource and repository layers.
+        '$http',
+        '$httpBackend',
+        // Navigation and lifecycle services React has no business driving.
+        '$location',
+        '$route',
+        '$timeout',
+        '$compile',
+        // And an ordinary unknown name, so the rule is a positive allow list
+        // rather than a hand-written deny list.
+        'tgSomethingElse',
+    ])('refuses to resolve %s even when the injector would supply it', (name) => {
+        silenceReactErrorLog();
+
+        // The injector is deliberately WILLING: it reports the name as registered
+        // and would hand a service back. The refusal therefore comes from the hook,
+        // which is the only place it can be guaranteed.
+        const injector: AngularInjector = {
+            get: <T,>(): T => ({ live: true }) as unknown as T,
+            has: (): boolean => true,
+        };
+
+        expect(() =>
+            render(<UnsanctionedNameProbe name={name} />, {
+                wrapper: withMockInjector(injector),
+            }),
+            // A substring match, not a pattern: the name can contain a regex
+            // metacharacter (every AngularJS built-in starts with one), and an
+            // escaping mistake here would weaken the assertion silently.
+        ).toThrow(`useAngularService('${name}') is not permitted`);
+    });
+
+    it('never reaches the injector for an unsanctioned name', () => {
+        silenceReactErrorLog();
+
+        const get = jest.fn(() => ({}));
+        const has = jest.fn(() => true);
+        const injector = { get, has } as unknown as AngularInjector;
+
+        expect(() =>
+            render(<UnsanctionedNameProbe name="$rootScope" />, {
+                wrapper: withMockInjector(injector),
+            }),
+        ).toThrow(/is not permitted/);
+
+        // Refused BEFORE resolution, not after: a hook that resolved first and
+        // complained second would already have handed the caller the service.
+        expect(get).not.toHaveBeenCalled();
+        expect(has).not.toHaveBeenCalled();
+    });
+
+    it('still resolves every sanctioned name', () => {
+        // The allow list must not be a blanket refusal: the fifteen names the map
+        // publishes keep working, which the exhaustive walk above also proves per
+        // service. Asserted here as a set so a typo in the list is caught even if
+        // the walk is ever narrowed.
+        const injector: AngularInjector = {
+            get: <T,>(): T => ({ live: true }) as unknown as T,
+            has: (): boolean => true,
+        };
+
+        for (const name of SANCTIONED_SERVICE_NAMES) {
+            expect(() =>
+                render(<UnsanctionedNameProbe name={name} />, {
+                    wrapper: withMockInjector(injector),
+                }),
+            ).not.toThrow();
+        }
+    });
+});
+
+describe('the allow-list has no general escape', () => {
+    /** This module's source, comments stripped, so prose cannot satisfy a gate. */
+    function executableSource(): string {
+        return readFileSync(join(__dirname, 'useAngularService.ts'), 'utf8')
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/\/\/.*$/gm, '');
+    }
+
+    it('exports no name-taking resolver that returns `unknown`', () => {
+        const executable = executableSource();
+
+        expect(executable.length).toBeGreaterThan(0);
+
+        // The removed accessor by name, and the shape of any replacement for it. An
+        // allow-list with a public `(name: string) => unknown` beside it is not an
+        // allow-list: every exclusion becomes advisory, because any consumer can
+        // resolve any service and narrow the result itself. `unknown` makes one
+        // dereference safe; it says nothing about which services become reachable.
+        expect(executable).not.toContain('useUntypedAngularService');
+        expect(executable).not.toMatch(/export function \w+\(\s*name:\s*string/);
+    });
+
+    it('exports exactly two accessors: the typed one and the narrow off-map one', () => {
+        const exportedFunctions = [...executableSource().matchAll(/export function (\w+)/g)].map(
+            (match) => match[1],
+        );
+
+        expect(exportedFunctions).toEqual(['useAngularService', 'useAngularBroadcastListener']);
+    });
+
+    it('reaches the injector only through the two accessors above', () => {
+        // Every `injector.get` in the module belongs to one of the two accessors, so
+        // the exhaustive map walk above really does describe everything React can
+        // resolve.
+        const getCallCount = [...executableSource().matchAll(/injector\.get</g)].length;
+
+        expect(getCallCount).toBe(2);
+    });
+
+    it('takes NO name, so it cannot be pointed at another service', () => {
+        // A zero-arity accessor is the structural half of the guarantee: there is no
+        // argument through which a caller could reach a service the map excludes.
+        expect(useAngularBroadcastListener).toHaveLength(0);
+    });
+});
 
 describe('withMockInjector', () => {
     it('names its wrapper, so a component stack identifies the seam', () => {
@@ -1559,9 +1360,6 @@ describe('withMockInjector', () => {
 
         const { container } = render(<Wrapper />);
 
-        // A provider carrying nothing is legitimate -- a screen may mount the seam
-        // before it has anything to put beneath it -- and it must render nothing
-        // rather than throw.
         expect(container).toBeEmptyDOMElement();
     });
 });

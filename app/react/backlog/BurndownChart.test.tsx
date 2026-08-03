@@ -54,11 +54,8 @@
 
 import { render } from '@testing-library/react';
 import { act } from '@testing-library/react';
-import type { ReactElement, ReactNode } from 'react';
 
-import { AngularBridgeProvider } from '../bridge/AngularBridgeContext';
-import type { AngularInjector } from '../bridge/AngularBridgeContext';
-import { BurndownChart } from './BurndownChart';
+import { BurndownChart, describeBurndownSeries } from './BurndownChart';
 import type { BurndownChartProps } from './BurndownChart';
 import type { BurndownMilestone, ProjectStats } from './state/types';
 
@@ -259,39 +256,19 @@ function removeFlotStub(): void {
  * hook takes its normal path and logs no degradation warning.
  * -------------------------------------------------------------------------- */
 
-/** The listener shape AngularJS calls: event object first, payload second. */
-type BroadcastListener = (event: unknown, payload: unknown) => void;
-
-interface RootScopeDouble {
-    $on(eventName: string, listener: BroadcastListener): () => void;
-    /** Raises the language-change event the way AngularJS raises it. */
-    changeLanguageTo(language: string): void;
-}
-
-function createRootScopeDouble(): RootScopeDouble {
-    const listeners: BroadcastListener[] = [];
-
-    return {
-        $on(_eventName: string, listener: BroadcastListener): () => void {
-            listeners.push(listener);
-
-            return (): void => {
-                const at = listeners.indexOf(listener);
-
-                if (at !== -1) {
-                    listeners.splice(at, 1);
-                }
-            };
-        },
-        changeLanguageTo(language: string): void {
-            act((): void => {
-                [...listeners].forEach((listener: BroadcastListener): void => {
-                    listener({ name: 'change' }, { language });
-                });
-            });
-        },
-    };
-}
+/*
+ * ⭐ NO ROOT-SCOPE DOUBLE, NO INJECTOR AND NO PROVIDER IN THIS FILE ANY MORE.
+ *
+ * The chart used to resolve translation itself, so its spec had to stand up an
+ * injector carrying `$translate` AND the application root scope -- the latter
+ * only because the translation hook subscribes to the language-change event
+ * through it. None of that described the chart; it was scaffolding for a
+ * dependency the chart should not have had.
+ *
+ * The translator now arrives as a prop, so this spec renders the component with
+ * NO WRAPPER AT ALL. That is an assertion in itself: a component that still
+ * reached the bridge would throw here, because there is no provider above it.
+ */
 
 /**
  * A translation double whose lookup echoes the key and its parameters, so an
@@ -342,43 +319,6 @@ function createTranslateDouble(): TranslateDouble {
         setLanguage(next: string): void {
             active = next;
         },
-    };
-}
-
-/**
- * An injector double over an explicit name-to-service table.
- *
- * The single narrowing assertion mirrors the one the folder's own sanctioned
- * mocking seam makes in `../bridge/mockInjector.ts`, and for the same reason: a
- * caller-chosen return type cannot be produced from a table of mixed values by
- * some other route. That seam is not reused directly here because it resolves
- * only the fifteen typed services, whereas the translation hook additionally
- * reaches the application root scope through the bridge's deliberate escape
- * hatch, and the hook logs a degradation warning when that is missing.
- */
-function createInjector(
-    services: Readonly<Record<string, unknown>>,
-): AngularInjector {
-    return {
-        get<T>(name: string): T {
-            return services[name] as T;
-        },
-    };
-}
-
-function wrapperFor(
-    injector: AngularInjector,
-): (props: { children?: ReactNode }) => ReactElement {
-    return function Wrapper({
-        children,
-    }: {
-        children?: ReactNode;
-    }): ReactElement {
-        return (
-            <AngularBridgeProvider injector={injector}>
-                {children}
-            </AngularBridgeProvider>
-        );
     };
 }
 
@@ -439,30 +379,62 @@ const TWO_SPRINTS: readonly BurndownMilestone[] = [
  * 5. HARNESS
  * -------------------------------------------------------------------------- */
 
+/** Everything the harness supplies for the caller, minus the translator. */
+type ChartProps = Omit<BurndownChartProps, 'translate'>;
+
 interface Harness {
     readonly container: HTMLElement;
     readonly translate: TranslateDouble;
-    readonly rootScope: RootScopeDouble;
-    rerenderWith(props: BurndownChartProps): void;
+    rerenderWith(props: ChartProps): void;
+    /**
+     * Changes the active language the way the OWNER now would: the double's
+     * lookup starts answering in the new language, and the component is
+     * re-rendered with a FRESH function identity, because a real owner's
+     * memoised translator is re-created on a language change.
+     */
+    changeLanguageTo(language: string): void;
     unmount(): void;
 }
 
-function mountChart(props: BurndownChartProps): Harness {
+/**
+ * Renders the chart with a translator PROP and no provider of any kind.
+ *
+ * `translate` is wrapped in a fresh arrow on every render so its identity is
+ * unstable — the pessimistic case. That is deliberate: it is what proves the
+ * component holds the translator in a ref rather than in its effect's dependency
+ * list, since an unstable identity in the list would redraw the chart on every
+ * single render.
+ */
+function mountChart(props: ChartProps): Harness {
     const translate = createTranslateDouble();
-    const rootScope = createRootScopeDouble();
-    const injector = createInjector({
-        $translate: translate,
-        $rootScope: rootScope,
-    });
-    const wrapper = wrapperFor(injector);
-    const view = render(<BurndownChart {...props} />, { wrapper });
+
+    const translateFn = (
+        key: string,
+        interpolateParams?: Record<string, unknown>,
+    ): string => translate.instant(key, interpolateParams);
+
+    const view = render(<BurndownChart {...props} translate={translateFn} />);
 
     return {
         container: view.container,
         translate,
-        rootScope,
-        rerenderWith(next: BurndownChartProps): void {
-            view.rerender(<BurndownChart {...next} />);
+        rerenderWith(next: ChartProps): void {
+            view.rerender(<BurndownChart {...next} translate={translateFn} />);
+        },
+        changeLanguageTo(language: string): void {
+            translate.setLanguage(language);
+
+            act((): void => {
+                view.rerender(
+                    <BurndownChart
+                        {...props}
+                        translate={(
+                            key: string,
+                            interpolateParams?: Record<string, unknown>,
+                        ): string => translate.instant(key, interpolateParams)}
+                    />,
+                );
+            });
         },
         unmount(): void {
             view.unmount();
@@ -500,16 +472,28 @@ afterEach((): void => {
  * ========================================================================== */
 
 describe('the rendered host', () => {
-    it('renders exactly one element, carrying the one class its stylesheet selects', () => {
+    it('renders ONE VISIBLE element, carrying the one class its stylesheet selects', () => {
         const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
-
-        expect(container.childElementCount).toBe(1);
 
         const host = hostOf(container);
 
         expect(host.tagName).toBe('DIV');
+        // Exactly the class its five-line stylesheet selects, and no other: rule T1
+        // means zero stylesheet edits, which only holds while the class contract does.
         expect(host.className).toBe('burndown');
+        // NO CHILDREN. The plugin fills the host at draw time and empties it before
+        // every redraw, so a React child here would be destroyed on the first resize --
+        // which is precisely why the accessible description is a sibling instead. See
+        // the accessibility block below.
         expect(host.childElementCount).toBe(0);
+
+        // The one sibling is that description, and it is `hidden`, so the host remains
+        // the only element that occupies any space.
+        const visible = Array.from(container.children).filter(
+            (child) => !child.hasAttribute('hidden'),
+        );
+
+        expect(visible).toEqual([host]);
     });
 
     it('renders in the light DOM, so the global stylesheet and icon sprite stay reachable', () => {
@@ -521,16 +505,205 @@ describe('the rendered host', () => {
     it('renders the host even before the statistics have arrived', () => {
         const { container } = mountChart({ stats: undefined });
 
-        expect(container.childElementCount).toBe(1);
         expect(hostOf(container).className).toBe('burndown');
     });
 
     it('renders no placeholder and no wrapper of its own', () => {
-        // The collapsible container and the empty-state panel belong to the
-        // screen container, so nothing but the host may appear here.
+        // The collapsible container and the empty-state panel belong to the screen
+        // container, so nothing but the host and its hidden description may appear --
+        // and NO WRAPPER around them, because the container's max-height slide and the
+        // host's `width: 100%` both assume the existing parent-child relationship.
         const { container } = mountChart({ stats: undefined });
 
-        expect(container.querySelectorAll('*')).toHaveLength(1);
+        expect(container.childElementCount).toBe(2);
+        expect(
+            Array.from(container.children).map((child) => child.tagName),
+        ).toEqual(['DIV', 'DIV']);
+        expect(hostOf(container).parentElement).toBe(container);
+    });
+});
+
+/* ==========================================================================
+ * ACCESSIBILITY -- THE CANVAS IS NOT THE ONLY WAY TO READ THIS CHART
+ *
+ * A chart drawn onto a canvas is an empty box to a screen reader. These cases
+ * assert the role, the name and the textual alternative -- and that all of it is
+ * invisible, because every one of them is an ARIA attribute or a `hidden` element,
+ * so nothing here can conflict with the design reference (drift entry D4).
+ * ========================================================================== */
+
+describe('accessibility', () => {
+    /** The hidden sibling the host describes itself with. */
+    function descriptionOf(container: HTMLElement): HTMLElement {
+        const host = hostOf(container);
+        const id = host.getAttribute('aria-describedby');
+
+        expect(id).toBeTruthy();
+
+        const description = container.querySelector(`#${String(id)}`);
+
+        if (description === null) {
+            throw new Error('aria-describedby points at no element');
+        }
+
+        return description as HTMLElement;
+    }
+
+    it('presents the host as a single graphic rather than a container', () => {
+        // Without the role, a reader walks the canvases and absolutely-positioned
+        // label elements the plugin appends, announcing fragments of scaffolding.
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(hostOf(container)).toHaveAttribute('role', 'img');
+    });
+
+    it('NAMES the host from the two existing axis-label keys', () => {
+        // ⭐ NO NEW TRANSLATION KEY. The locale file has no title for this chart, the
+        // locale files are not in scope, and a key added to English alone would leave
+        // every other locale rendering a raw key. Composing the name from the two axis
+        // labels says exactly what the chart plots, in the active locale.
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+
+        expect(hostOf(container)).toHaveAttribute(
+            'aria-label',
+            'en:BACKLOG.CHART.YAXIS_LABEL / en:BACKLOG.CHART.XAXIS_LABEL',
+        );
+    });
+
+    it('describes the host with a SIBLING, never a child', () => {
+        // ⭐ THE CONSTRAINT THAT DECIDES THE MARKUP: `redrawChart` calls
+        // `target.empty()` before every draw, so anything rendered INSIDE the host
+        // would be destroyed by the first redraw and by every resize afterwards --
+        // silently, and only in a real browser.
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+        const host = hostOf(container);
+        const description = descriptionOf(container);
+
+        expect(host.contains(description)).toBe(false);
+        expect(description.parentElement).toBe(host.parentElement);
+        expect(host.childElementCount).toBe(0);
+    });
+
+    it('keeps the description out of the layout entirely', () => {
+        // `hidden` gives it `display: none` from the user-agent stylesheet, and nothing
+        // in scope overrides that: `burndown.scss` is five lines and
+        // `.graphics-container` sets only a max-height slide. A hidden element
+        // referenced by `aria-describedby` is still read, which is what makes this
+        // both invisible and effective.
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+        const description = descriptionOf(container);
+
+        expect(description.hasAttribute('hidden')).toBe(true);
+        expect(description.className).toBe('');
+        expect(description.getAttribute('style')).toBeNull();
+    });
+
+    it('carries one sentence per series point, in the tooltip\u2019s own words', () => {
+        const { container } = mountChart({ stats: statsWith(TWO_SPRINTS) });
+        const sentences = Array.from(
+            descriptionOf(container).querySelectorAll('p'),
+        ).map((paragraph) => paragraph.textContent);
+
+        // Two fully measured sprints, four described series each: optimal, real, and
+        // the two increments. The keys are exactly the four the hover caption uses.
+        expect(sentences).toHaveLength(8);
+        expect(sentences[0]).toContain('BACKLOG.CHART.OPTIMAL');
+        expect(sentences[1]).toContain('BACKLOG.CHART.REAL');
+        expect(sentences[2]).toContain('BACKLOG.CHART.INCREMENT_CLIENT');
+        expect(sentences[3]).toContain('BACKLOG.CHART.INCREMENT_TEAM');
+    });
+
+    it('keeps the description present, and empty, when there is nothing to plot', () => {
+        // The id must always resolve: an `aria-describedby` pointing at a missing
+        // element is a validity error in some tools and announces nothing in others.
+        const { container } = mountChart({ stats: null });
+        const description = descriptionOf(container);
+
+        expect(description.querySelectorAll('p')).toHaveLength(0);
+    });
+
+    it('follows the active language', () => {
+        const { container, changeLanguageTo } = mountChart({
+            stats: statsWith(TWO_SPRINTS),
+        });
+
+        changeLanguageTo('es');
+
+        // Unlike the canvas, which deliberately keeps its captions until the next draw,
+        // the text alternative is ordinary React output and re-renders immediately.
+        expect(hostOf(container)).toHaveAttribute(
+            'aria-label',
+            'es:BACKLOG.CHART.YAXIS_LABEL / es:BACKLOG.CHART.XAXIS_LABEL',
+        );
+    });
+});
+
+/* ==========================================================================
+ * describeBurndownSeries -- THE TEXTUAL MAPPING, ASSERTED DIRECTLY
+ * ========================================================================== */
+
+describe('describeBurndownSeries', () => {
+    /** Echoes the key and its interpolated values, like the harness double. */
+    const echo = (key: string, params?: Record<string, unknown>): string =>
+        params === undefined
+            ? key
+            : `${key}{${Object.keys(params)
+                  .sort()
+                  .map((name) => `${name}=${String(params[name])}`)
+                  .join('|')}}`;
+
+    it('emits optimal, real and both increments for a measured milestone', () => {
+        const sentences = describeBurndownSeries(
+            [milestone('Sprint 1', 392.5, 371.5, 4, 6)],
+            echo,
+        );
+
+        expect(sentences).toEqual([
+            'BACKLOG.CHART.OPTIMAL{sprintName=Sprint 1|value=392.5}',
+            'BACKLOG.CHART.REAL{sprintName=Sprint 1|value=371.5}',
+            // Both increments, from the same negated values the series plots, run back
+            // through the tooltip's own `Math.abs(y * 10) / 10`.
+            'BACKLOG.CHART.INCREMENT_CLIENT{sprintName=Sprint 1|value=10}',
+            'BACKLOG.CHART.INCREMENT_TEAM{sprintName=Sprint 1|value=4}',
+        ]);
+    });
+
+    it('\u2b50 omits the real-points sentence for an UNMEASURED milestone', () => {
+        // The plotted evolution series is COMPACTED, so its index no longer lines up
+        // with the milestone index and the hover caption can name the wrong sprint --
+        // a faithfully preserved incumbent quirk. Text has no such constraint, so the
+        // sentence is emitted if and only if THAT milestone has a measured value.
+        // Copying the misalignment into prose would be copying a bug somewhere it does
+        // not exist.
+        const sentences = describeBurndownSeries(
+            [milestone('Sprint 2', 261.7, null, 3, 2)],
+            echo,
+        );
+
+        expect(sentences).toHaveLength(3);
+        expect(sentences.some((sentence) => sentence.includes('REAL'))).toBe(false);
+    });
+
+    it('does not describe the zero baseline series', () => {
+        // It carries no information -- it IS the axis -- and it is the one series whose
+        // markers the chart also switches off.
+        const sentences = describeBurndownSeries(TWO_SPRINTS, echo);
+
+        expect(sentences).toHaveLength(8);
+    });
+
+    it('walks the milestones in order', () => {
+        const sentences = describeBurndownSeries(THREE_SPRINTS, echo);
+
+        expect(sentences[0]).toContain('Sprint 1');
+        // Sprint 2 is unmeasured, so it contributes three sentences rather than four.
+        expect(sentences[4]).toContain('Sprint 2');
+        expect(sentences[7]).toContain('Sprint 3');
+        expect(sentences).toHaveLength(11);
+    });
+
+    it('describes nothing for an empty milestone list', () => {
+        expect(describeBurndownSeries([], echo)).toEqual([]);
     });
 });
 
@@ -757,7 +930,7 @@ describe('the series handed to the plot', () => {
 });
 
 /* ==========================================================================
- * PRESERVED DEFECT -- the measured series is COMPACTED, which re-indexes it
+ * The measured series is COMPACTED, which re-indexes it
  * ========================================================================== */
 
 describe('the compacted measurement series (a preserved defect)', () => {
@@ -840,7 +1013,7 @@ describe('the compacted measurement series (a preserved defect)', () => {
 });
 
 /* ==========================================================================
- * PRESERVED DEFECT -- zero sprints yields a descending, negative axis
+ * Zero sprints yields a descending, negative axis
  * ========================================================================== */
 
 describe('with no sprints at all (a preserved defect)', () => {
@@ -1244,12 +1417,11 @@ describe('redraw triggers', () => {
         // until the statistics changed. This is what proves the lookup is held
         // in a ref rather than listed as a dependency.
         const stub = createFlotStub(1254);
-        const { translate, rootScope } = mountChart({
+        const { changeLanguageTo } = mountChart({
             stats: statsWith(TWO_SPRINTS),
         });
 
-        translate.setLanguage('es');
-        rootScope.changeLanguageTo('es');
+        changeLanguageTo('es');
 
         expect(stub.draws).toHaveLength(1);
         expect(stub.draws[0]?.options.xaxis.axisLabel).toBe(
@@ -1259,12 +1431,11 @@ describe('redraw triggers', () => {
 
     it('picks the new language up on the NEXT draw, without subscribing itself', () => {
         const stub = createFlotStub(1254);
-        const { translate, rootScope } = mountChart({
+        const { changeLanguageTo } = mountChart({
             stats: statsWith(TWO_SPRINTS),
         });
 
-        translate.setLanguage('es');
-        rootScope.changeLanguageTo('es');
+        changeLanguageTo('es');
         fireWindowResize();
 
         expect(stub.draws).toHaveLength(2);

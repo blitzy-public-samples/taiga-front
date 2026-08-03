@@ -128,6 +128,54 @@ const FALLBACK_MESSAGE = 'Something went wrong while rendering this section.';
 /** Used when a thrown value carries no usable description of its own. */
 const UNKNOWN_FAILURE_DESCRIPTION = 'An unknown error was thrown during render.';
 
+/**
+ * The generic error class name used whenever the real one is not a plain,
+ * obviously-safe identifier.
+ */
+const GENERIC_ERROR_NAME = 'Error';
+
+/**
+ * What an error's `name` must look like before it may be logged.
+ *
+ * A bare class-name identifier and nothing else: at most forty characters of
+ * letters, digits and underscores, starting with a letter. `TypeError`,
+ * `RangeError` and a project's own `VersionError` all pass; anything carrying a
+ * path, a URL, an identifier, a quotation mark or whitespace does not, and is
+ * replaced wholesale by {@link GENERIC_ERROR_NAME}.
+ *
+ * `name` is chosen as the ONE detail worth logging because it is the only field
+ * of an error that is, by convention, a fixed class label rather than a
+ * message composed at the throw site. A message interpolates values -- and on
+ * these two screens the values in scope are story subjects, tag names, epic
+ * names, project slugs, user names and occasionally a request URL.
+ */
+const SAFE_ERROR_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
+
+/**
+ * Reduce a thrown error to a label that cannot carry data.
+ *
+ * Reading `name` is itself done inside a `try`, because a hostile or exotic
+ * throwable can define it as a throwing getter -- and a boundary that threw
+ * while describing a failure would defeat the entire purpose of a bulkhead.
+ *
+ * @param error - the normalised error.
+ * @returns the error's own class name when it is a plain identifier, otherwise
+ *          {@link GENERIC_ERROR_NAME}.
+ */
+function sanitizeErrorName(error: Error): string {
+    try {
+        const { name } = error;
+
+        if (typeof name === 'string' && SAFE_ERROR_NAME_PATTERN.test(name)) {
+            return name;
+        }
+    } catch {
+        // Fall through: a throwing `name` getter is exactly why this is guarded.
+    }
+
+    return GENERIC_ERROR_NAME;
+}
+
 export interface ErrorBoundaryProps {
     /** The React subtree being protected - in practice one whole screen. */
     children?: ReactNode;
@@ -136,6 +184,22 @@ export interface ErrorBoundaryProps {
      * fallback. `null` is honoured and means "render nothing".
      */
     fallback?: ReactNode;
+    /**
+     * Optional PRE-TRANSLATED generic message, rendered in place of
+     * {@link FALLBACK_MESSAGE}.
+     *
+     * Pre-translated, not a key: this component cannot resolve a key, because it
+     * is a class sitting ABOVE the bridge provider, so no translation hook is
+     * reachable from it. The owner resolves it -- `message={t('ERROR.TEXT1')}` --
+     * using the key that already exists for exactly this purpose.
+     *
+     * IT MUST STAY GENERIC. Do not pass an exception message, a stack, a request
+     * URL, an identifier or anything else derived from the failure; that is the
+     * disclosure this component exists to stop. An empty or whitespace-only
+     * string is ignored in favour of the default, so a missing translation
+     * cannot render a blank alert.
+     */
+    message?: string;
     /**
      * Optional reporting hook. Never defaulted, and never wired to anything
      * that reaches AngularJS - see header point 2.
@@ -212,17 +276,47 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     }
 
     /**
-     * Side-effect half of the boundary. Logs; never swallows. `errorInfo`
-     * carries the React component stack, which is the only way to locate the
-     * failing component in a bundled IIFE build.
+     * Side-effect half of the boundary. Reports; never swallows.
+     *
+     * ⭐ THE CONSOLE GETS A LABEL, THE REPORTER GETS THE DETAIL. That split is
+     * the whole design of this method, and it exists because the two sinks have
+     * completely different trust properties:
+     *
+     *   - The console is READABLE BY ANYONE with the page open, and is routinely
+     *     pasted into tickets and screenshots. An error object logged there
+     *     exposes its `message` and its `stack`, and `errorInfo.componentStack`
+     *     exposes the internal component tree. On these two screens the values
+     *     in scope when something throws are story subjects, tag names, epic
+     *     names, project slugs, assignee names and sometimes a request URL, so
+     *     a message composed at the throw site is a data-disclosure channel, not
+     *     a debugging convenience. The component stack additionally maps out the
+     *     application's internal structure for a reader who should not have it.
+     *   - `onError` is supplied BY THE HOST, deliberately (see header point 2).
+     *     It is a controlled sink -- whoever wired it chose where the detail
+     *     goes -- so it still receives the ENTIRE error and the ENTIRE
+     *     `errorInfo`, component stack included. Nothing diagnostic is lost;
+     *     it is routed instead of broadcast.
+     *
+     * So the console line carries exactly one variable, the error's sanitised
+     * CLASS NAME (see {@link sanitizeErrorName}), which is a fixed label rather
+     * than a composed string, plus a pointer to where the detail went. A reader
+     * still learns that a React subtree failed and what kind of failure it was.
      */
     public override componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
-        const componentStack = errorInfo.componentStack ?? '(component stack unavailable)';
+        // React hands over WHATEVER WAS THROWN, typed as an `Error` it may well
+        // not be -- `throw 'boom'` reaches here as a string. Normalising once,
+        // here, is what makes the declared `onError` signature honest: the
+        // reporter is promised an `Error` and now always receives one, and an
+        // error thrown as an `Error` is passed through by identity, so a host
+        // comparing references still sees its own object.
+        const normalized = normalizeThrownValue(error);
 
         console.error(
-            `${LOG_PREFIX} A React subtree failed to render; the surrounding AngularJS shell is unaffected.`,
-            error,
-            componentStack,
+            `${LOG_PREFIX} A React subtree failed to render (${sanitizeErrorName(normalized)}); ` +
+                'the surrounding AngularJS shell is unaffected. The message and the ' +
+                'component stack are withheld from the console because they can carry ' +
+                'user-authored content; they are passed to the configured onError ' +
+                'reporter instead.',
         );
 
         const { onError } = this.props;
@@ -232,20 +326,22 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
         }
 
         try {
-            onError(error, errorInfo);
+            onError(normalized, errorInfo);
         } catch (reportingFailure) {
             // A broken reporter must not take down the boundary that called it.
+            // Sanitised for the same reason as the line above: this one is not even
+            // routed onward, so the label is all the console may have.
             console.error(
-                `${LOG_PREFIX} The onError callback threw while reporting a React failure.`,
-                normalizeThrownValue(reportingFailure),
+                `${LOG_PREFIX} The onError callback threw while reporting a React ` +
+                    `failure (${sanitizeErrorName(normalizeThrownValue(reportingFailure))}).`,
             );
         }
     }
 
     /** `override` required: `React.Component` declares `render`. */
     public override render(): ReactNode {
-        const { children, fallback } = this.props;
-        const { hasError, error } = this.state;
+        const { children, fallback, message } = this.props;
+        const { hasError } = this.state;
 
         if (!hasError) {
             return children ?? null;
@@ -259,12 +355,28 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
         // no raw-markup injection. `role="alert"` is invisible accessibility -
         // it announces the failure to assistive technology with zero visual
         // effect, so it cannot conflict with any design reference.
-        // The error's own message is appended as TEXT (React escapes it), which
-        // is what makes the failure "local and visible" per header point 1.
-        const detail = error !== undefined ? error.message.trim() : '';
-        const message = detail.length > 0 ? `${FALLBACK_MESSAGE} ${detail}` : FALLBACK_MESSAGE;
+        //
+        // ⭐ THE ERROR'S OWN MESSAGE IS NOT RENDERED. An earlier revision
+        // appended it, reasoning that it made the failure "local and visible".
+        // It does the first and overshoots the second: an internal exception
+        // message is written by a developer for a developer, and on these two
+        // screens the values interpolated into one are story subjects, tag names,
+        // epic names, project slugs, assignee names and occasionally a request
+        // URL or an internal identifier. Painting that into the page shows an
+        // end user -- possibly one who should not see the underlying record at
+        // all -- the internals of a failure they cannot act on. The failure stays
+        // local and visible through the generic sentence plus `role="alert"`;
+        // the detail reaches the host's `onError` reporter (see
+        // `componentDidCatch`). `state.error` is still kept, because a host that
+        // supplies its own `fallback` may present whatever it judges appropriate.
+        //
+        // The sentence itself is localisable without weakening any of the above:
+        // an owner may pass a PRE-TRANSLATED generic `message`, which replaces
+        // the built-in English default and nothing else. Whitespace-only copy is
+        // ignored so a missing translation cannot render a blank alert.
+        const supplied = typeof message === 'string' ? message.trim() : '';
 
-        return <div role="alert">{message}</div>;
+        return <div role="alert">{supplied.length > 0 ? supplied : FALLBACK_MESSAGE}</div>;
     }
 }
 

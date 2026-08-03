@@ -26,11 +26,8 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-import type { ReactElement, ReactNode } from 'react';
 import { render } from '@testing-library/react';
 
-import { AngularBridgeProvider } from '../bridge/AngularBridgeContext';
-import type { AngularInjector } from '../bridge/AngularBridgeContext';
 import { Svg } from './Svg';
 import type { SvgProps } from './Svg';
 
@@ -62,54 +59,27 @@ function createTranslateDouble(): {
     };
 }
 
-/**
- * A `$rootScope` double exposing only `$on`, which is all `useTranslate`
- * narrows it to. Returns a deregistration function, as AngularJS does.
- */
-function createRootScopeDouble(): { $on: jest.Mock<() => void, [string, unknown]> } {
-    return {
-        $on: jest.fn<() => void, [string, unknown]>((): (() => void) => (): void => undefined),
-    };
-}
-
-/**
- * An injector double over an explicit name-to-service table.
+/* ⭐ NO INJECTOR, NO PROVIDER AND NO ROOT-SCOPE DOUBLE IN THIS FILE ANY MORE.
  *
- * Deliberately NOT `mockInjector` from `../bridge/mockInjector`: its map is
- * typed `Partial<AngularServices>`, and `$rootScope` is excluded from that map
- * by design, yet `useTranslate` resolves the root scope through the untyped
- * escape hatch. This is the same local shape `../bridge/useTranslate.test.tsx`
- * uses for the same reason. `has` is omitted so resolution takes the path the
- * browser takes.
+ * `Svg` used to resolve translation through a module-private child that called the
+ * bridge's translation hook, so a translated-title spec had to stand up an injector
+ * carrying `$translate` AND the application root scope -- the latter only because
+ * that hook subscribes to the language-change event through it.
+ *
+ * The translator now arrives as an OPTIONAL PROP, so EVERY case in this file renders
+ * with no wrapper at all. That is worth more than the scaffolding it replaces: the
+ * most-rendered leaf on both screens no longer has a latent provider requirement
+ * that appears only when a caller happens to pass a translation key.
  */
-function createInjector(services: Readonly<Record<string, unknown>>): AngularInjector {
-    return {
-        get<T>(name: string): T {
-            return services[name] as T;
-        },
-    };
-}
 
-/** Wraps a subtree in a bridge provider carrying `injector`. */
-function wrapperFor(injector: AngularInjector): (props: { children?: ReactNode }) => ReactElement {
-    return function Wrapper({ children }: { children?: ReactNode }): ReactElement {
-        return <AngularBridgeProvider injector={injector}>{children}</AngularBridgeProvider>;
-    };
-}
+/** The translator prop's own signature, so the double cannot drift from it. */
+type TranslateDouble = jest.Mock<string, [string, (Record<string, unknown> | undefined)?]>;
 
-/** A provider carrying a working `$translate` plus the root scope it needs. */
-function translatingWrapper(): {
-    wrapper: (props: { children?: ReactNode }) => ReactElement;
-    instant: jest.Mock<string, [string, (Record<string, unknown> | undefined)?]>;
-} {
-    const translate = createTranslateDouble();
+/** A translator prop double plus the mock behind it. */
+function translatorProp(): { translate: TranslateDouble; instant: TranslateDouble } {
+    const { instant } = createTranslateDouble();
 
-    return {
-        wrapper: wrapperFor(
-            createInjector({ $translate: translate, $rootScope: createRootScopeDouble() }),
-        ),
-        instant: translate.instant,
-    };
+    return { translate: instant, instant };
 }
 
 /**
@@ -281,11 +251,14 @@ describe('Svg', () => {
             expect(host.querySelectorAll('title')).toHaveLength(0);
         });
 
-        it('resolves svgTitleTranslate through the AngularJS translation service', () => {
-            const { wrapper, instant } = translatingWrapper();
+        it('resolves svgTitleTranslate with the translator the OWNER supplies', () => {
+            const { translate, instant } = translatorProp();
             const { container } = render(
-                <Svg svgIcon="icon-add" svgTitleTranslate="COMMON.CAPSLOCK_WARNING" />,
-                { wrapper },
+                <Svg
+                    svgIcon="icon-add"
+                    svgTitleTranslate="COMMON.CAPSLOCK_WARNING"
+                    translate={translate}
+                />,
             );
 
             expect(instant).toHaveBeenCalledWith('COMMON.CAPSLOCK_WARNING', undefined);
@@ -295,18 +268,32 @@ describe('Svg', () => {
         });
 
         it('forwards svgTitleTranslateValues as interpolation parameters', () => {
-            const { wrapper, instant } = translatingWrapper();
+            const { translate, instant } = translatorProp();
             const { container } = render(
                 <Svg
                     svgIcon="icon-add"
                     svgTitleTranslate="US.TITLE"
                     svgTitleTranslateValues={{ ref: 42 }}
+                    translate={translate}
                 />,
-                { wrapper },
             );
 
             expect(instant).toHaveBeenCalledWith('US.TITLE', { ref: 42 });
             expect(container.querySelector('use > title')?.textContent).toBe('t:US.TITLE(ref=42)');
+        });
+
+        it('⭐ renders the KEY VERBATIM when no translator is supplied', () => {
+            // `$translate.instant` returns the key it cannot resolve, so this is the
+            // incumbent's own missing-translation behaviour rather than a new one. A blank
+            // title would be a different behaviour and a worse outcome.
+            const { host } = renderPlain({
+                svgIcon: 'icon-add',
+                svgTitleTranslate: 'COMMON.CAPSLOCK_WARNING',
+            });
+
+            expect(host.querySelector('use > title')?.textContent).toBe(
+                'COMMON.CAPSLOCK_WARNING',
+            );
         });
 
         it('ignores values when there is no key, as the translate filter does', () => {
@@ -319,14 +306,14 @@ describe('Svg', () => {
         });
 
         it('renders BOTH titles when both props are supplied, svgTitle first', () => {
-            const { wrapper } = translatingWrapper();
+            const { translate } = translatorProp();
             const { container } = render(
                 <Svg
                     svgIcon="icon-add"
                     svgTitle="Literal"
                     svgTitleTranslate="US.TITLE"
+                    translate={translate}
                 />,
-                { wrapper },
             );
 
             const titles = [...container.querySelectorAll('use > title')].map(
@@ -392,27 +379,32 @@ describe('Svg', () => {
             ).not.toThrow();
         });
 
-        it('does not consult the injector unless a translation key is supplied', () => {
-            const injector = createInjector({});
-            const get = jest.spyOn(injector, 'get');
+        it('⭐ needs NO PROVIDER even for a translated title', () => {
+            // The point of the change. Previously this threw, naming `$translate`: the
+            // most-rendered leaf on both screens carried a latent provider requirement
+            // that surfaced only when a caller happened to pass a key. Now the translated
+            // path is as provider-free as every other path.
+            expect(() =>
+                render(<Svg svgIcon="icon-add" svgTitleTranslate="US.TITLE" />),
+            ).not.toThrow();
 
-            render(<Svg svgIcon="icon-add" svgTitle="Add a story" />, {
-                wrapper: wrapperFor(injector),
-            });
+            const { translate } = translatorProp();
 
-            expect(get).not.toHaveBeenCalled();
+            expect(() =>
+                render(
+                    <Svg svgIcon="icon-add" svgTitleTranslate="US.TITLE" translate={translate} />,
+                ),
+            ).not.toThrow();
         });
 
-        it('only then requires a provider, and says so by name', () => {
-            const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        it('calls the translator ONLY when a key is supplied', () => {
+            const { translate, instant } = translatorProp();
 
-            try {
-                expect(() =>
-                    render(<Svg svgIcon="icon-add" svgTitleTranslate="US.TITLE" />),
-                ).toThrow(/\$translate/);
-            } finally {
-                error.mockRestore();
-            }
+            render(<Svg svgIcon="icon-add" svgTitle="Add a story" translate={translate} />);
+
+            // The source evaluates the translate filter only inside the element gated on
+            // the key, so the lookup must not be hoisted out of that branch.
+            expect(instant).not.toHaveBeenCalled();
         });
     });
 
@@ -427,10 +419,13 @@ describe('Svg', () => {
         });
 
         it('escapes a translated svgTitle', () => {
-            const { wrapper } = translatingWrapper();
+            const { translate } = translatorProp();
             const { container } = render(
-                <Svg svgIcon="icon-add" svgTitleTranslate="<script>x</script>" />,
-                { wrapper },
+                <Svg
+                    svgIcon="icon-add"
+                    svgTitleTranslate="<script>x</script>"
+                    translate={translate}
+                />,
             );
 
             expect(container.querySelector('script')).toBeNull();

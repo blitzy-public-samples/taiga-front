@@ -16,9 +16,16 @@ jobs:
     runs-on: ubuntu-latest
 
     # Set node version
+    #
+    # Pinned to the runtime declared by .nvmrc for this project. It is a hard
+    # compatibility constraint rather than a default: every dependency added by
+    # the AngularJS-to-React migration was resolved to a release whose engine
+    # range admits it, and node-sass builds its native binding against it. CI is
+    # the only place that constraint is actually verified, so this value must not
+    # be raised to whatever runtime a local machine happens to provide.
     strategy:
       matrix:
-        node-version: [20.20.2]
+        node-version: [16.19.1]
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -58,9 +65,13 @@ jobs:
     runs-on: ubuntu-latest
 
     # Set node version
+    #
+    # Same pin as the linters job above, and for the same reason: the type-check
+    # and React unit steps added below prove nothing about the required runtime
+    # unless they execute on it.
     strategy:
       matrix:
-        node-version: [20.20.2]
+        node-version: [16.19.1]
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -92,9 +103,8 @@ jobs:
     - name: npm install
       run: npm ci
 
-    # Gates for the new React 18 + TypeScript layer under app/react/.
-    # Both are browserless and need no built dist/, so they run before the
-    # slower step below, which does gulp deploy + headless Chrome.
+    # These two gates cover app/react/ and are browserless: they need neither a
+    # built dist/ nor a browser binary, unlike the CoffeeScript unit step below.
     - name: type check
       run: npm run typecheck
 

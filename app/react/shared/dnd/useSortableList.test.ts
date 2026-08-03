@@ -53,6 +53,8 @@ import {
     indexWithinContainer,
     indexWithinSelector,
     isUnchangedDrop,
+    isValidItemId,
+    parseItemId,
     readDatasetIds,
     useSortableList,
 } from './useSortableList';
@@ -283,6 +285,32 @@ function specsFor(ids: readonly number[]): readonly ItemSpec[] {
     return ids.map((id) => ({ id: String(id) }));
 }
 
+/**
+ * An id no fixture ever renders, and no screen therefore holds.
+ *
+ * Stands in for the three ways an id that names nothing reaches the hook in the
+ * browser: a hand-edited `data-id`, a node left behind by a realtime deletion
+ * between the render and the drop, and an id belonging to another project.
+ */
+const UNKNOWN_ID = 424242;
+
+/**
+ * The fixtures' answer to "is this a story this screen holds?".
+ *
+ * In a real screen the authority is the story map the board renders from. Here
+ * every id a fixture plants names an element that fixture built, so the answer is
+ * yes to all of them and no to {@link UNKNOWN_ID} — which keeps the default
+ * configurations from having to enumerate every literal in the file, a list that
+ * would go stale the first time a case added a card.
+ *
+ * Where the membership check ITSELF is under test, a configuration with an
+ * explicitly enumerated set is built instead, so the predicate is exercised in
+ * both directions rather than only as a rejection.
+ */
+function isKnownFixtureId(id: number): boolean {
+    return id !== UNKNOWN_ID;
+}
+
 beforeEach(() => {
     // `indexWithinSelector` searches the whole document, so every case starts
     // from an empty one or the counts would leak between them.
@@ -443,16 +471,24 @@ describe('computeNeighbours', () => {
             expect(neighbours.nextId).toBeNull();
         });
 
-        it('falls through to the following id when the preceding id is 0', () => {
-            // `if !previousCard` is falsy-checked upstream, so a preceding id of
-            // 0 does NOT stop the following id from being computed. Reproduced
-            // verbatim under T10; ids are positive in this application, so the
-            // branch is unreachable in practice and is asserted here so nobody
-            // "improves" it into a null test.
+        it('refuses a preceding id of 0 and still falls through to the following id', () => {
+            /*
+             * `if !previousCard` is a FALSY test rather than a null test, and it is
+             * kept in that form under T10 — but a preceding `data-id` of `'0'` no
+             * longer reaches it as the number 0. Zero is not a valid identifier
+             * (server primary keys start at 1), so it is refused at the read and
+             * arrives as `null`.
+             *
+             * The two forms therefore now COINCIDE for this path, and that is the
+             * point of asserting it: whichever route the value takes, a `'0'`
+             * attribute must never become a `0` anchor on the wire, and the
+             * fall-through to the following id must still happen so the write is
+             * still positioned.
+             */
             const { cards } = buildColumn(specsFor([0, 20, 30]));
 
             expect(computeNeighbours(cards[1], CARD_SELECTOR)).toEqual({
-                previousId: 0,
+                previousId: null,
                 nextId: 30,
             });
         });
@@ -467,7 +503,7 @@ describe('computeNeighbours', () => {
         });
     });
 
-    describe('TRAP 4 — the id is read only after the attribute is confirmed present', () => {
+    describe('TRAP 4 — an id is used only once it is a CANONICAL identifier', () => {
         it('yields null, never NaN, for an absent attribute', () => {
             const { cards } = buildColumn([{}, { id: '20' }]);
 
@@ -480,22 +516,140 @@ describe('computeNeighbours', () => {
             expect(computeNeighbours(cards[1], CARD_SELECTOR).previousId).toBeNull();
         });
 
-        it('accepts "0" because it is a non-empty attribute value', () => {
-            const { cards } = buildColumn([{ id: '0' }, { id: '20' }]);
-
-            expect(computeNeighbours(cards[1], CARD_SELECTOR).previousId).toBe(0);
-        });
-
-        it('preserves the bare numeric conversion for a non-numeric attribute', () => {
-            // The incumbent applies a plain conversion, so a malformed attribute
-            // produces a not-a-number result there too. Preserved under T10, and
-            // asserted so the behaviour is documented rather than accidental.
-            const { cards } = buildColumn([{ id: 'not-a-number' }, { id: '20' }, { id: '30' }]);
+        /*
+         * ⭐ THE SECURITY CASES. Every value below used to become an anchor, and an
+         * anchor is written as `after_userstory_id` / `before_userstory_id` to a
+         * POSITION-RELATIVE endpoint that cannot detect a wrong one: it does as it
+         * is told and answers 200. `JSON.stringify` additionally turns the
+         * non-finite values into `null`, so the request does not even carry an
+         * obviously broken number — it carries an ABSENT field, and the backlog is
+         * reordered around it. Nothing reports any of that; the user discovers it on
+         * the next page load, as an order they never chose.
+         *
+         * Each case is written as a THREE-CARD column so the assertion also proves
+         * the walk keeps looking outward: a rejected neighbour is skipped exactly as
+         * an id-less one always was, and the following id is then consulted under
+         * TRAP 3. Rejecting the value therefore costs no correct behaviour.
+         */
+        it.each([
+            ['a non-numeric attribute', 'not-a-number'],
+            ['the not-a-number literal', 'NaN'],
+            ['positive infinity', 'Infinity'],
+            ['negative infinity', '-Infinity'],
+            ['a fractional id', '1.5'],
+            ['a negative id', '-7'],
+            ['an explicitly signed id', '+7'],
+            ['zero', '0'],
+            ['a leading-zero id', '007'],
+            ['a hexadecimal id', '0x14'],
+            ['an exponent id', '2e1'],
+            ['a padded id', ' 20 '],
+            ['a trailing-comma id', '20,'],
+            ['a decimal-point-terminated id', '20.'],
+            ['an id with an appended path', '20/../30'],
+            // `Number.MAX_SAFE_INTEGER + 2` as a decimal string: canonical in form,
+            // but beyond the exactly-representable range, where `Number` ROUNDS —
+            // so two different ids can parse to the same value and move the wrong
+            // card.
+            ['an unsafe integer', '9007199254740993'],
+        ])('rejects %s instead of turning it into an anchor', (_label, malformed) => {
+            const { cards } = buildColumn([{ id: malformed }, { id: '20' }, { id: '30' }]);
             const neighbours = computeNeighbours(cards[1], CARD_SELECTOR);
 
-            expect(neighbours.previousId).toBeNaN();
-            // ... and because that result is falsy, the following id is computed too.
+            expect(neighbours.previousId).toBeNull();
+            expect(neighbours.previousId).not.toBeNaN();
+            // The walk continues, so the correct behaviour is unaffected.
             expect(neighbours.nextId).toBe(30);
+        });
+
+        it('still accepts every canonical form', () => {
+            const { cards } = buildColumn([{ id: '10' }, { id: '20' }]);
+
+            expect(computeNeighbours(cards[1], CARD_SELECTOR).previousId).toBe(10);
+        });
+    });
+
+    /* ======================================================================
+     * THE IDENTIFIER RULE ITSELF
+     * ====================================================================== */
+
+    describe('parseItemId and isValidItemId', () => {
+        it.each([
+            ['1', 1],
+            ['20', 20],
+            ['9007199254740991', Number.MAX_SAFE_INTEGER],
+        ])('parses the canonical decimal %s', (raw, expected) => {
+            expect(parseItemId(raw)).toBe(expected);
+        });
+
+        it.each([
+            ['null', null],
+            ['undefined', undefined],
+            ['the empty string', ''],
+        ])('reports %s as no id at all', (_label, raw) => {
+            expect(parseItemId(raw)).toBeNull();
+        });
+
+        it.each([
+            'not-a-number',
+            'NaN',
+            'Infinity',
+            '-Infinity',
+            '1.5',
+            '-7',
+            '+7',
+            '0',
+            '-0',
+            '007',
+            '0x14',
+            '0b101',
+            '0o17',
+            '2e1',
+            '1_000',
+            ' 20',
+            '20 ',
+            '\n20',
+            '20,',
+            '20.',
+            '20px',
+            '2 0',
+            '',
+            '9007199254740993',
+            '1e309',
+        ])('refuses %p', (raw) => {
+            expect(parseItemId(raw)).toBeNull();
+        });
+
+        it('accepts only positive safe integers as values', () => {
+            expect(isValidItemId(1)).toBe(true);
+            expect(isValidItemId(Number.MAX_SAFE_INTEGER)).toBe(true);
+
+            for (const rejected of [
+                0,
+                -0,
+                -1,
+                1.5,
+                Number.NaN,
+                Number.POSITIVE_INFINITY,
+                Number.NEGATIVE_INFINITY,
+                Number.MAX_SAFE_INTEGER + 2,
+                '20',
+                null,
+                undefined,
+                {},
+                [],
+                true,
+            ]) {
+                expect(isValidItemId(rejected)).toBe(false);
+            }
+        });
+
+        it('excludes zero deliberately, because a 0 anchor reads as no anchor', () => {
+            // Server primary keys start at 1, and the neighbour arithmetic tests
+            // anchors for FALSINESS (TRAP 3), so a 0 anchor would read as present in
+            // one place and absent in another.
+            expect(parseItemId('0')).toBeNull();
+            expect(isValidItemId(0)).toBe(false);
         });
     });
 
@@ -782,20 +936,58 @@ describe('readDatasetIds', () => {
         expect(readDatasetIds([cards[1], cards[0], cards[2]])).toEqual([20, 10, 30]);
     });
 
-    it('includes a zero id', () => {
-        const { cards } = buildColumn(specsFor([0, 20]));
-
-        expect(readDatasetIds(cards)).toEqual([0, 20]);
-    });
-
-    it('omits elements whose attribute is absent or empty rather than yielding NaN', () => {
-        const { cards } = buildColumn([{ id: '10' }, {}, { id: '' }, { id: '30' }]);
-
-        expect(readDatasetIds(cards)).toEqual([10, 30]);
-    });
-
     it('returns an empty list for an empty selection', () => {
+        // Nothing was dragged, so there is nothing to refuse. Distinct from `null`,
+        // which means "something was dragged that cannot be identified".
         expect(readDatasetIds([])).toEqual([]);
+    });
+
+    /*
+     * ⭐ ALL OR NOTHING. The predecessor OMITTED an unusable element and returned
+     * the rest, which is the forgiving behaviour and the wrong one: the write is
+     * position-relative, so persisting a SUBSET of a multi-card selection reorders
+     * the board around the survivors and leaves the rest where they were — and the
+     * endpoint answers 200. A single-card selection was worse still: it yielded
+     * `[]`, which reads downstream as "nothing was dragged".
+     */
+    it.each([
+        ['an absent attribute', {}],
+        ['an empty attribute', { id: '' }],
+        ['a non-numeric attribute', { id: 'not-a-number' }],
+        ['the not-a-number literal', { id: 'NaN' }],
+        ['an infinite id', { id: 'Infinity' }],
+        ['a fractional id', { id: '1.5' }],
+        ['a negative id', { id: '-7' }],
+        ['a zero id', { id: '0' }],
+        ['a leading-zero id', { id: '007' }],
+        ['a hexadecimal id', { id: '0x14' }],
+        ['an exponent id', { id: '2e1' }],
+        ['a padded id', { id: ' 20 ' }],
+        ['an unsafe integer', { id: '9007199254740993' }],
+    ])('refuses the WHOLE selection when one element carries %s', (_label, brokenSpec) => {
+        const { cards } = buildColumn([{ id: '10' }, brokenSpec, { id: '30' }]);
+
+        expect(readDatasetIds(cards)).toBeNull();
+    });
+
+    it('refuses a single-element selection rather than returning an empty list', () => {
+        const { cards } = buildColumn([{ id: 'not-a-number' }]);
+
+        // `[]` would read downstream as "nothing was dragged" — TRAP 1's id-less
+        // move — so the refusal has to be distinguishable from it.
+        expect(readDatasetIds(cards)).toBeNull();
+        expect(readDatasetIds(cards)).not.toEqual([]);
+    });
+
+    it('never yields a non-finite or non-integral member', () => {
+        const { cards } = buildColumn(specsFor([10, 20, 30]));
+        const ids = readDatasetIds(cards);
+
+        expect(ids).not.toBeNull();
+
+        for (const id of ids ?? []) {
+            expect(isValidItemId(id)).toBe(true);
+        }
     });
 });
 
@@ -879,9 +1071,66 @@ describe('computeNeighboursFromOrder', () => {
     });
 
     it('applies the same FALSY previous-wins test as the DOM path', () => {
+        // An unusable previous anchor is falsy for the same reason an absent one
+        // is, so the fall-through fires — matching the DOM path exactly, which the
+        // equivalence suite below then asserts on this very arrangement.
         expect(computeNeighboursFromOrder([0, 30], [99], 1)).toEqual({
-            previousId: 0,
+            previousId: null,
             nextId: 30,
+        });
+    });
+
+    it('leaves an unusable entry IN PLACE rather than closing the gap', () => {
+        /*
+         * The refusal happens at the anchor READ, not by removing the value from
+         * the arrangement. Removing it would shift every later index down one and
+         * land the primary a place away from where the caller asked — a silent
+         * off-by-one, which is the exact failure identifier validation exists to
+         * prevent. Here index 2 must still address the entry AFTER the unusable
+         * one, so the previous anchor is 30 and not the refused value.
+         */
+        expect(computeNeighboursFromOrder([0, 30, 40], [99], 2)).toEqual({
+            previousId: 30,
+            nextId: null,
+        });
+    });
+
+    it.each([
+        ['not a number', Number.NaN],
+        ['infinite', Number.POSITIVE_INFINITY],
+        ['fractional', 1.5],
+        ['negative', -7],
+        ['zero', 0],
+        ['beyond the exactly-representable range', 2 ** 53],
+    ])('emits no anchor drawn from a %s entry', (_label, broken) => {
+        expect(computeNeighboursFromOrder([broken, 30], [99], 1)).toEqual({
+            previousId: null,
+            nextId: 30,
+        });
+
+        expect(computeNeighboursFromOrder([10, broken], [99], 1)).toEqual({
+            previousId: 10,
+            nextId: null,
+        });
+    });
+
+    it.each([
+        ['not a number', Number.NaN],
+        ['infinite', Number.NEGATIVE_INFINITY],
+        ['fractional', 2.5],
+        ['negative', -1],
+        ['zero', 0],
+    ])('reports no anchors at all when the PRIMARY id is %s', (_label, broken) => {
+        /*
+         * The one place this path is stricter than the DOM path, and deliberately:
+         * it is handed the moved id, whereas `computeNeighbours` is handed the moved
+         * ELEMENT and never reads that element's own attribute. An anchor pair says
+         * "put THIS story after that one" — with no nameable story there is nothing
+         * for the pair to be about, so none is produced.
+         */
+        expect(computeNeighboursFromOrder([10, 20, 30], [broken], 1)).toEqual({
+            previousId: null,
+            nextId: null,
         });
     });
 
@@ -944,6 +1193,8 @@ describe('computeNeighboursFromOrder agrees with computeNeighbours', () => {
         { name: 'multi-item selection', orderedIds: [10, 20, 30, 40], movedIds: [20, 30], targetIndex: 1 },
         { name: 'multi-item selection landing first', orderedIds: [10, 20, 30], movedIds: [20, 30], targetIndex: 0 },
         { name: 'a zero id immediately before the target', orderedIds: [0, 30], movedIds: [99], targetIndex: 1 },
+        { name: 'a zero id two places before the target', orderedIds: [0, 30, 40], movedIds: [99], targetIndex: 2 },
+        { name: 'a zero id immediately after the target', orderedIds: [10, 0], movedIds: [99], targetIndex: 1 },
         { name: 'target index clamped to the front', orderedIds: [10, 20], movedIds: [99], targetIndex: -3 },
         { name: 'target index clamped to the back', orderedIds: [10, 20], movedIds: [99], targetIndex: 12 },
     ];
@@ -994,6 +1245,10 @@ const boardConfig: UseSortableListConfig<ColumnIdentity> = {
         swimlane: Number(container.dataset.swimlane),
     }),
     isSameContainer: (from, to) => from.status === to.status && from.swimlane === to.swimlane,
+    // Every id these fixtures build cards from. A real screen answers this from
+    // its own story map; a fixture answers it from the ids it planted, which is
+    // the same guarantee: an id the screen never rendered is not a member.
+    isKnownItemId: isKnownFixtureId,
 };
 
 /** The list's container identity: whether it is the backlog, and which sprint otherwise. */
@@ -1025,6 +1280,7 @@ function buildListConfig(siblingIndexFallback: boolean): UseSortableListConfig<T
             from.isBacklog || to.isBacklog
                 ? from.isBacklog === to.isBacklog
                 : from.sprintId === to.sprintId,
+        isKnownItemId: isKnownFixtureId,
     };
 }
 
@@ -1433,12 +1689,39 @@ describe('useSortableList — CROSS-CONTAINER drops on the board', () => {
         expect(result.current.endDrag(origin.cards[1], [], twin.column)).toBeNull();
     });
 
-    it('emits an id of 0 as 0, dropping nothing and coercing nothing', () => {
+    it('passes every canonical id through with no coercion and no filtering', () => {
         // Which key eventually reaches the wire is the api layer's decision, not
         // this layer's: `resources/userstories.coffee` adds `milestone_id` (L96)
         // and `swimlane_id` (L126) only when truthy while `status_id` is ALWAYS
-        // sent. So every id has to arrive up here exactly as the attribute spelled
-        // it, with no filtering of falsy values on the way.
+        // sent. So every id this layer DOES accept has to arrive up here exactly as
+        // the attribute spelled it, with nothing normalised on the way.
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        const dropped = result.current.endDrag(origin.cards[0], [], destination.column);
+
+        expect(dropped?.ids).toEqual([101]);
+        expect(dropped?.ids[0]).toBe(101);
+        expect(dropped?.nextId).toBe(201);
+    });
+
+    it('REFUSES a drop whose dragged card carries a data-id of 0', () => {
+        /*
+         * The predecessor of this case asserted the opposite — that a `'0'`
+         * attribute travelled through as the number 0 — on the reasoning that this
+         * layer must not filter falsy values because the api layer decides which
+         * keys reach the wire. That reasoning is sound for a REAL id and wrong for
+         * this one: no story has id 0, so a `'0'` attribute is a malformed
+         * attribute, and forwarding it asks a position-relative endpoint to move a
+         * story that does not exist. The refusal travels through the same `null`
+         * channel as the unchanged-drop guard, so the caller persists nothing and
+         * the card returns to where the state says it belongs.
+         */
         const origin = buildColumn([{ id: '0' }, { id: '102' }], {
             status: '7',
             swimlane: '3',
@@ -1450,11 +1733,7 @@ describe('useSortableList — CROSS-CONTAINER drops on the board', () => {
         relocate(origin.cards[0], destination.column, 0);
         result.current.recordNeighbours(origin.cards[0]);
 
-        const dropped = result.current.endDrag(origin.cards[0], [], destination.column);
-
-        expect(dropped?.ids).toEqual([0]);
-        expect(dropped?.ids[0]).toBe(0);
-        expect(dropped?.nextId).toBe(201);
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
     });
 
     it('anchors on the destination’s FIRST id when a cross-container drop lands at the HEAD', () => {
@@ -1662,6 +1941,7 @@ describe('useSortableList — the raw and the fallback swimlane readings', () =>
             };
         },
         isSameContainer: (from, to) => from.status === to.status && from.swimlane === to.swimlane,
+        isKnownItemId: isKnownFixtureId,
     };
 
     it('reports a flat-mode no-op reorder as a CHANGE under the raw reading', () => {
@@ -1840,6 +2120,385 @@ describe('useSortableList — R-DND-3: no dependence on visibility or geometry',
     });
 });
 
+/* ==========================================================================
+ * IDENTITY — THE ONE CHECK THE WRITE ENDPOINT CANNOT MAKE FOR ITSELF
+ * ==========================================================================
+ * `data-id` is an ordinary DOM attribute. It is authored by a template, but by
+ * the time this hook reads it, it has passed through a browser in which it is
+ * editable, through a realtime stream that can retire the story it names, and
+ * through whatever else shares the document. Everything read from it travels
+ * into `bulk-update-us-kanban-order` / `bulk-update-us-backlog-order` as
+ * `after_userstory_id`, `before_userstory_id` or a member of the moved list.
+ *
+ * THAT ENDPOINT IS POSITION-RELATIVE, so it cannot detect a wrong value: it does
+ * what it is told and answers 200. And `JSON.stringify` turns `NaN` and
+ * `Infinity` into `null`, so a malformed attribute does not even arrive as an
+ * obviously broken number — it arrives as an ABSENT FIELD, and the ordering is
+ * recomputed around it. No error, no toast, no console warning; the corruption
+ * surfaces on the next page load as an order the user never chose.
+ *
+ * So the hook establishes identity BEFORE it reports anything, in two independent
+ * steps, and this section asserts both together with the shape of each refusal:
+ *
+ *   FORM       — the attribute has to spell a canonical positive integer.
+ *   MEMBERSHIP — the id it spells has to name a story the screen actually holds.
+ *                The form check cannot establish this, and neither can the
+ *                endpoint.
+ *
+ * The two failures are graded differently on purpose. A DRAGGED id that fails
+ * either check refuses the whole drop, because a card whose identity is unknown
+ * must not be written. An ANCHOR that fails is discarded, because an anchor is an
+ * optimisation of POSITION rather than a statement of identity: dropping it costs
+ * a less precise placement, whereas refusing the drop over it would lose a move
+ * the user actually made.
+ * ========================================================================== */
+
+describe('useSortableList — identity of the dragged ids', () => {
+    it.each([
+        ['a non-numeric attribute', 'not-a-number'],
+        ['the not-a-number literal', 'NaN'],
+        ['an infinite attribute', 'Infinity'],
+        ['a fractional attribute', '1.5'],
+        ['a negative attribute', '-101'],
+        ['a signed attribute', '+101'],
+        ['a zero attribute', '0'],
+        ['a leading-zero attribute', '0101'],
+        ['a hexadecimal attribute', '0x65'],
+        ['an exponent attribute', '1.01e2'],
+        ['a padded attribute', ' 101 '],
+        ['an empty attribute', ''],
+        ['an unsafe integer attribute', '9007199254740993'],
+    ])('refuses the drop when the dragged card carries %s', (_label, raw) => {
+        const origin = buildColumn([{ id: raw }, { id: '102' }], {
+            status: '7',
+            swimlane: '3',
+        });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
+    });
+
+    it('refuses the drop when the dragged card carries NO id at all', () => {
+        const origin = buildColumn([{}, { id: '102' }], { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
+    });
+
+    it('refuses the drop when the id is well formed but names NO story the screen holds', () => {
+        /*
+         * The form check passes — `424242` is a perfectly canonical identifier — and
+         * that is exactly why membership has to be checked separately. This is the
+         * hand-edited attribute, the node left behind by a realtime deletion, and
+         * the id from another project; all three arrive looking impeccable.
+         */
+        const origin = buildColumn(specsFor([UNKNOWN_ID, 102]), {
+            status: '7',
+            swimlane: '3',
+        });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
+    });
+
+    it('consults the CURRENT membership predicate, not the one the hook first rendered with', () => {
+        // A realtime deletion retires a story mid-gesture. The predicate is read
+        // through the configuration ref, so the drop is judged against the state as
+        // it is at the drop rather than as it was at mount.
+        const retired = new Set<number>([101, 102, 201]);
+        const { result, rerender } = renderHook(
+            (config: UseSortableListConfig<ColumnIdentity>) => useSortableList(config),
+            { initialProps: { ...boardConfig, isKnownItemId: (id: number) => retired.has(id) } },
+        );
+
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        retired.delete(101);
+        rerender({ ...boardConfig, isKnownItemId: (id: number) => retired.has(id) });
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
+    });
+
+    it('refuses the WHOLE multi-card selection when ONE member cannot be identified', () => {
+        /*
+         * ⭐ NO PARTIAL WRITE. Persisting the identifiable members would reorder the
+         * destination around them and leave the rest behind — and the endpoint would
+         * answer 200, because a position-relative write of a shorter list is a
+         * perfectly valid request. The user would see one arrangement and the
+         * database would hold another.
+         */
+        const origin = buildColumn([{ id: '101' }, { id: 'tampered' }, { id: '103' }], {
+            status: '7',
+            swimlane: '3',
+        });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        const selection = [origin.cards[0], origin.cards[1], origin.cards[2]];
+
+        result.current.beginDrag(origin.cards[0], selection);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], selection, destination.column)).toBeNull();
+    });
+
+    it('refuses the whole selection when one member is well formed but UNKNOWN', () => {
+        const origin = buildColumn(specsFor([101, UNKNOWN_ID]), {
+            status: '7',
+            swimlane: '3',
+        });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        const selection = [origin.cards[0], origin.cards[1]];
+
+        result.current.beginDrag(origin.cards[0], selection);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], selection, destination.column)).toBeNull();
+    });
+
+    it('resolves the identical gesture once every member IS identifiable', () => {
+        // The control for the two cases above: the refusals are caused by the id and
+        // by nothing else about the arrangement.
+        const origin = buildColumn(specsFor([101, 103]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        const selection = [origin.cards[0], origin.cards[1]];
+
+        result.current.beginDrag(origin.cards[0], selection);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+
+        expect(result.current.endDrag(origin.cards[0], selection, destination.column)).toEqual({
+            previousId: null,
+            nextId: 201,
+            index: 0,
+            oldIndex: 0,
+            unchanged: false,
+            ids: [101, 103],
+        });
+    });
+
+    it('refuses through the SAME channel as the unchanged-drop guard, so no caller needs a new branch', () => {
+        const unchanged = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const tampered = buildColumn([{ id: 'tampered' }], { status: '7', swimlane: '3' });
+        const elsewhere = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(unchanged.cards[0], []);
+        result.current.recordNeighbours(unchanged.cards[0]);
+        const guarded = result.current.endDrag(unchanged.cards[0], [], unchanged.column);
+
+        result.current.beginDrag(tampered.cards[0], []);
+        relocate(tampered.cards[0], elsewhere.column, 0);
+        result.current.recordNeighbours(tampered.cards[0]);
+        const refused = result.current.endDrag(tampered.cards[0], [], elsewhere.column);
+
+        expect(guarded).toBeNull();
+        expect(refused).toBeNull();
+        expect(refused).toEqual(guarded);
+    });
+
+    it('reports and persists nothing of its own when it refuses', () => {
+        // A refusal is a decision not to write, so it must not become a write of a
+        // different kind: no DOM edit, no event, no class change.
+        const origin = buildColumn([{ id: 'tampered' }], { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        const before = document.body.innerHTML;
+        const dispatched: string[] = [];
+
+        document.addEventListener('click', () => dispatched.push('click'));
+
+        result.current.beginDrag(origin.cards[0], []);
+        relocate(origin.cards[0], destination.column, 0);
+        result.current.recordNeighbours(origin.cards[0]);
+        const relocated = document.body.innerHTML;
+
+        expect(result.current.endDrag(origin.cards[0], [], destination.column)).toBeNull();
+
+        // The relocation was performed by the fixture, not by the hook; what matters
+        // is that the refusal added nothing to it and undid nothing either.
+        expect(document.body.innerHTML).toBe(relocated);
+        expect(document.body.innerHTML).not.toBe(before);
+        expect(dispatched).toEqual([]);
+    });
+});
+
+describe('useSortableList — identity of the ANCHORS', () => {
+    it('DISCARDS a preceding anchor the screen does not hold, keeping the drop', () => {
+        /*
+         * An anchor is an optimisation of position, not a statement of identity, so
+         * an unusable one degrades to "no anchor" and the write still happens —
+         * placed less precisely, but placed. Refusing the drop instead would lose a
+         * move the user actually made over a neighbour they never touched.
+         *
+         * The fall-through does NOT fire here: TRAP 2 gives the preceding anchor
+         * priority, and it is computed FIRST. Once it has been refused the value is
+         * `null`, which is falsy, so the following id is consulted — and there is
+         * none, because the dragged card landed last.
+         */
+        const column = buildColumn(specsFor([UNKNOWN_ID, 101]), {
+            status: '7',
+            swimlane: '3',
+        });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(column.cards[1], []);
+        result.current.recordNeighbours(column.cards[1]);
+
+        expect(result.current.recordNeighbours(column.cards[1])).toEqual({
+            previousId: null,
+            nextId: null,
+        });
+    });
+
+    it('does NOT substitute the following id for a discarded preceding anchor', () => {
+        /*
+         * ⭐ THE ONE ASYMMETRY IN THIS MODULE, AND IT IS DELIBERATE. Compare with
+         * the case below: a preceding neighbour whose attribute is MALFORMED does
+         * promote the following id, and one whose id is merely UNKNOWN does not.
+         * The distinction is which behaviour the incumbent already had.
+         *
+         *   FORM — an unreadable attribute was already indistinguishable from an
+         *   absent one, and the incumbent's own falsy `!previousCard` test promotes
+         *   the following id in that case. That promotion is INCUMBENT BEHAVIOUR,
+         *   so it is preserved verbatim under T10.
+         *
+         *   MEMBERSHIP — the incumbent has no such case: it would read `424242` and
+         *   send it as `after_userstory_id` without a second thought. The minimal
+         *   correction is therefore to WITHHOLD that anchor, and only that. Sending
+         *   `before_userstory_id: 102` instead would be a request the incumbent
+         *   would never have made — a behaviour change smuggled in behind a security
+         *   fix, which T10 forbids.
+         *
+         * Withholding both anchors is safe rather than merely conservative: the api
+         * layer adds `after_userstory_id` and `before_userstory_id` only when truthy
+         * (`resources/userstories.coffee` L98-L104 and L121-L126), so the write is
+         * still well formed and the endpoint places the story at its default
+         * position. The cost is precision of placement; the alternative cost is a
+         * wrong `data-id` deciding where somebody else's story goes.
+         */
+        const column = buildColumn(specsFor([UNKNOWN_ID, 101, 102]), {
+            status: '7',
+            swimlane: '3',
+        });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        expect(result.current.recordNeighbours(column.cards[1])).toEqual({
+            previousId: null,
+            nextId: null,
+        });
+    });
+
+    it('DOES promote the following id when the preceding attribute is malformed, as the incumbent does', () => {
+        // The contrast that makes the asymmetry above legible: same shape of
+        // fixture, unusable for a different reason, and the incumbent's own
+        // fall-through applies because an unreadable attribute was always treated
+        // as an absent one.
+        const { column, cards } = buildColumn([{ id: 'tampered' }, { id: '101' }, { id: '102' }], {
+            status: '7',
+            swimlane: '3',
+        });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        expect(column.isConnected).toBe(true);
+        expect(result.current.recordNeighbours(cards[1])).toEqual({
+            previousId: null,
+            nextId: 102,
+        });
+    });
+
+    it('DISCARDS a following anchor the screen does not hold', () => {
+        const column = buildColumn(specsFor([101, UNKNOWN_ID]), {
+            status: '7',
+            swimlane: '3',
+        });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        expect(result.current.recordNeighbours(column.cards[0])).toEqual({
+            previousId: null,
+            nextId: null,
+        });
+    });
+
+    it('re-filters the STORED anchors at the drop, because state can move between the two calls', () => {
+        /*
+         * The anchors are reset only inside `recordNeighbours` — the incumbent
+         * protocol, asserted in the cleanup section below — so the value read at the
+         * drop can predate the current state by a whole gesture. A realtime deletion
+         * arriving in that window would otherwise send a retired story as
+         * `after_userstory_id`.
+         */
+        const live = new Set<number>([101, 102, 201]);
+        const { result, rerender } = renderHook(
+            (config: UseSortableListConfig<ColumnIdentity>) => useSortableList(config),
+            { initialProps: { ...boardConfig, isKnownItemId: (id: number) => live.has(id) } },
+        );
+
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+
+        result.current.beginDrag(origin.cards[1], []);
+        relocate(origin.cards[1], destination.column, 1);
+
+        // Recorded while 201 is still live, so the stored anchor is 201.
+        expect(result.current.recordNeighbours(origin.cards[1])).toEqual({
+            previousId: 201,
+            nextId: null,
+        });
+
+        live.delete(201);
+        rerender({ ...boardConfig, isKnownItemId: (id: number) => live.has(id) });
+
+        const dropped = result.current.endDrag(origin.cards[1], [], destination.column);
+
+        expect(dropped).not.toBeNull();
+        expect(dropped?.previousId).toBeNull();
+        expect(dropped?.nextId).toBeNull();
+        expect(dropped?.ids).toEqual([102]);
+    });
+
+    it('keeps a valid anchor untouched, so the filtering costs nothing in the normal case', () => {
+        const origin = buildColumn(specsFor([101, 102]), { status: '7', swimlane: '3' });
+        const destination = buildColumn(specsFor([201]), { status: '9', swimlane: '3' });
+        const { result } = renderHook(() => useSortableList(boardConfig));
+
+        result.current.beginDrag(origin.cards[1], []);
+        relocate(origin.cards[1], destination.column, 1);
+        result.current.recordNeighbours(origin.cards[1]);
+
+        expect(result.current.endDrag(origin.cards[1], [], destination.column)?.previousId).toBe(
+            201,
+        );
+    });
+});
+
 describe('useSortableList — the anchor protocol and cleanup', () => {
     it('resets and recomputes the anchors on every recordNeighbours call', () => {
         const { column, cards } = buildColumn(specsFor([10, 20, 30]), {
@@ -1933,8 +2592,14 @@ describe('useSortableList — performs no write of any kind', () => {
         // write anything.
         const resolveContainer = jest.fn(boardConfig.resolveContainer);
         const isSameContainer = jest.fn(boardConfig.isSameContainer);
+        const isKnownItemId = jest.fn(boardConfig.isKnownItemId);
         const { result } = renderHook(() =>
-            useSortableList({ itemSelector: CARD_SELECTOR, resolveContainer, isSameContainer }),
+            useSortableList({
+                itemSelector: CARD_SELECTOR,
+                resolveContainer,
+                isSameContainer,
+                isKnownItemId,
+            }),
         );
 
         const beforeBeginDrag = document.body.innerHTML;

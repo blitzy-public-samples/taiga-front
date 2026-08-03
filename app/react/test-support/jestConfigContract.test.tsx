@@ -19,7 +19,7 @@
  *   - TSX compiled through the automatic jsx runtime, so components need no
  *     React import even though ts-jest overrides the module format;
  *   - the DOM matchers registered on `expect`;
- *   - stylesheet imports resolved to an inert stub;
+ *   - stylesheet imports resolved to the inert mock at `app/react/styleMock.ts`;
  *   - mocks cleared between tests, so ordering cannot leak state;
  *   - user-authored content rendered as text and never as markup.
  *
@@ -80,9 +80,15 @@ describe('jest.config.js contract', () => {
         expect(window.location.href).toBe('http://localhost/');
     });
 
-    it('resolves stylesheet imports to the inert stub', () => {
-        expect(coLocatedStylesheet).toEqual({});
-        expect(existingStylesheet).toEqual({});
+    it('resolves stylesheet imports to the inert mock, whatever their path', () => {
+        // Both specifiers are mapped onto the same module, an ES module compiled
+        // by ts-jest, so `require()` hands back the module namespace and the inert
+        // value sits behind its `default` key. A stylesheet import in production
+        // code is always a side-effect import whose value is discarded, so this
+        // shape matters only here, where the wiring itself is under test.
+        expect(coLocatedStylesheet).toEqual(existingStylesheet);
+        expect((coLocatedStylesheet as { default: unknown }).default).toEqual({});
+        expect((existingStylesheet as { default: unknown }).default).toEqual({});
     });
 
     it('compiles TSX through the automatic jsx runtime with no React import', () => {

@@ -43,10 +43,7 @@
  * ========================================================================== */
 
 import { render } from '@testing-library/react';
-import type { ReactElement, ReactNode } from 'react';
 
-import { AngularBridgeProvider } from '../bridge/AngularBridgeContext';
-import type { AngularInjector } from '../bridge/AngularBridgeContext';
 import type { Status } from '../shared/types/status';
 import { ArchivedColumn, ArchivedColumnIntro } from './ArchivedColumn';
 import type { ArchivedColumnIntroProps, ArchivedColumnProps } from './ArchivedColumn';
@@ -72,7 +69,12 @@ const ARCHIVED_COPY = '(Archived)';
 /** The host element of the ported counter, whose styling hangs off this tag. */
 const COUNTER_HOST = 'tg-animated-counter';
 
-type InstantMock = jest.Mock<string, [key: string]>;
+/**
+ * The translator double's signature — BOTH parameters of `TranslateFn`, so a case
+ * can assert that no interpolation values are bound (the source binds none
+ * either).
+ */
+type InstantMock = jest.Mock<string, [key: string, params?: Record<string, unknown>]>;
 
 /**
  * A `$translate` double. `instant` resolves the archived key to the shipped
@@ -84,58 +86,24 @@ function createTranslateDouble(): { readonly instant: InstantMock } {
         (key: string): string => (key === ARCHIVED_KEY ? ARCHIVED_COPY : `UNEXPECTED:${key}`),
     );
 
+
     return { instant };
 }
 
-/**
- * A root-scope double exposing a callable `$on` that hands back a
- * deregistration function.
+/* --------------------------------------------------------------------------
+ * ⭐ NO INJECTOR, NO PROVIDER AND NO ROOT-SCOPE DOUBLE IN THIS FILE.
  *
- * Supplied so the translate hook can install and remove its language-change
- * listener on the path the browser actually takes. Without it the hook degrades
- * gracefully but logs a warning, which would pollute every archived-branch spec
- * in this file with noise unrelated to what it asserts.
- */
-function createRootScopeDouble(): { readonly $on: jest.Mock<() => void, [string, unknown]> } {
-    return {
-        $on: jest.fn<() => void, [string, unknown]>((): (() => void) => (): void => undefined),
-    };
-}
-
-/**
- * An injector double over an explicit name-to-service table.
+ * The rail used to resolve translation itself, so this spec had to stand up an
+ * injector carrying `$translate` AND the application root scope -- the latter only
+ * because the translation hook installs a language-change listener through it, and
+ * without it the hook logged a degradation warning that would have polluted every
+ * archived-branch case here with noise unrelated to what it asserts.
  *
- * Deliberately untyped at the value level, and `has` deliberately omitted, which
- * is the shape the sibling bridge specs already use: the accessors reject a name
- * only when `has` is present and returns exactly `false`, so omitting it
- * exercises the resolution path the browser takes.
- */
-function createInjector(services: Readonly<Record<string, unknown>>): AngularInjector {
-    return {
-        get<T>(name: string): T {
-            return services[name] as T;
-        },
-    };
-}
-
-/**
- * An injector that throws for EVERY name.
- *
- * Used to prove a negative that no call-count assertion can: that a code path
- * resolves no AngularJS service at all. If the unit reached the injector on that
- * path, the render would fail loudly instead of passing quietly.
- */
-const EXPLODING_INJECTOR: AngularInjector = {
-    get<T>(name: string): T {
-        throw new Error(`ArchivedColumn.test: the unit resolved '${name}', which it must not.`);
-    },
-};
-
-function wrapperFor(injector: AngularInjector): (props: { children?: ReactNode }) => ReactElement {
-    return function Wrapper({ children }: { children?: ReactNode }): ReactElement {
-        return <AngularBridgeProvider injector={injector}>{children}</AngularBridgeProvider>;
-    };
-}
+ * The translator now arrives as a prop, so every case below renders the rail with
+ * NO WRAPPER AT ALL. That is the strongest available form of the assertion the old
+ * "exploding injector" case made by hand: a component that reached the bridge would
+ * throw for want of a provider, on every single case rather than on one.
+ * -------------------------------------------------------------------------- */
 
 /**
  * A status record shaped like the ones the board actually holds.
@@ -175,25 +143,32 @@ function childClassList(parent: Element): readonly string[] {
     return Array.from(parent.children).map((child: Element): string => child.className);
 }
 
+/** Everything the caller supplies, minus the translator the harness owns. */
+type RailProps = Omit<ArchivedColumnProps, 'translate'>;
+
 interface RailHarness {
     readonly container: HTMLElement;
     readonly instant: InstantMock;
-    rerender(next: ArchivedColumnProps): void;
+    rerender(next: RailProps): void;
 }
 
-function renderRail(props: ArchivedColumnProps): RailHarness {
+/** Renders the rail with a translator PROP and no provider of any kind. */
+function renderRail(props: RailProps): RailHarness {
     const translate = createTranslateDouble();
-    const wrapper = wrapperFor(
-        createInjector({ $translate: translate, $rootScope: createRootScopeDouble() }),
-    );
 
-    const { container, rerender } = render(<ArchivedColumn {...props} />, { wrapper });
+    /* Forwards BOTH arguments, so the "no interpolation values" case stays honest. */
+    const translateFn = (key: string, params?: Record<string, unknown>): string =>
+        translate.instant(key, params);
+
+    const { container, rerender } = render(
+        <ArchivedColumn {...props} translate={translateFn} />,
+    );
 
     return {
         container,
         instant: translate.instant,
-        rerender(next: ArchivedColumnProps): void {
-            rerender(<ArchivedColumn {...next} />);
+        rerender(next: RailProps): void {
+            rerender(<ArchivedColumn {...next} translate={translateFn} />);
         },
     };
 }
@@ -471,11 +446,24 @@ describe('ArchivedColumn', () => {
             expect(harness.instant).not.toHaveBeenCalled();
         });
 
-        it('renders a non-archived rail without resolving ANY AngularJS service', () => {
-            const wrapper = wrapperFor(EXPLODING_INJECTOR);
+        it('renders WITHOUT ANY PROVIDER ABOVE IT, archived or not', () => {
+            // Proves a negative no call-count assertion can: the rail resolves no
+            // AngularJS service on either branch. A component that reached the bridge
+            // would throw for want of a provider, so a passing render IS the assertion.
+            const translate = (key: string): string => key;
 
             expect(() =>
-                render(<ArchivedColumn status={statusOf()} count={3} />, { wrapper }),
+                render(<ArchivedColumn status={statusOf()} count={3} translate={translate} />),
+            ).not.toThrow();
+
+            expect(() =>
+                render(
+                    <ArchivedColumn
+                        status={statusOf({ is_archived: true })}
+                        count={3}
+                        translate={translate}
+                    />,
+                ),
             ).not.toThrow();
         });
 
@@ -644,17 +632,10 @@ describe('ArchivedColumnIntro', () => {
     });
 
     describe('purity (requirement I9)', () => {
-        it('resolves no AngularJS service', () => {
-            const wrapper = wrapperFor(EXPLODING_INJECTOR);
-
-            expect(() =>
-                render(<ArchivedColumnIntro status={statusOf({ is_archived: true })} />, {
-                    wrapper,
-                }),
-            ).not.toThrow();
-        });
-
-        it('renders with no bridge provider at all', () => {
+        it('renders with no bridge provider at all, so it resolves no AngularJS service', () => {
+            // Rendering with NO provider is the stronger form of the assertion an
+            // exploding-injector wrapper used to make: there is no injector to reach at
+            // all, so a unit that tried would throw rather than pass quietly.
             expect(() =>
                 render(<ArchivedColumnIntro status={statusOf({ is_archived: true })} />),
             ).not.toThrow();

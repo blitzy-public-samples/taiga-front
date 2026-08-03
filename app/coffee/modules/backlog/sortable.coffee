@@ -14,51 +14,17 @@ module = angular.module("taigaBacklog")
 #############################################################################
 ## Sortable Directive
 #############################################################################
-
-## RETIRED (React coexistence migration): the `tgBacklogSortable` directive
-## registration is removed. Drag-and-drop for the backlog story table and the
-## sprint sidebar is now owned by React, which replaces `dragula`,
-## `dom-autoscroller` and `window.dragMultiple` with:
-##
-##   app/react/shared/dnd/DndProvider.tsx    -- the single @dnd-kit/core DndContext
-##   app/react/shared/dnd/useSortableList.ts -- manual ordering from collision data
-##   app/react/shared/dnd/multiDrag.ts       -- hand-built multi-select drag
-##   app/react/backlog/hooks/useStoryDrag.ts -- the `pendingDrag` FIFO queue
-##
-## The `deleteElement` helper and the `BacklogSortableDirective` factory below are
-## INTENTIONALLY RETAINED, unregistered, as the authoritative behavioural
-## specification for those four files (AAP section 0.6.2). Nothing registers them,
-## so the factory is never instantiated. DO NOT DELETE IT and DO NOT "clean it
-## up": every locator in it is cited by the React implementation brief, and the
-## dead locals and typos it carries are pre-existing and preserved deliberately so
-## the reference stays faithful to the behaviour being reproduced.
-##
-## The contracts most easily broken while porting it:
-##
-##  * There are FOUR drop targets, not one -- `div.backlog-table-body`, BOTH
-##    elements of the `$('.js-empty-backlog')` collection, and every `.sprint-table`
-##    matched dynamically by `isContainer`. Miss the empty-backlog pair or the
-##    sprint tables and dropping there silently stops working, with no error.
-##  * Only elements carrying `row` are draggable (`moves`), and every row must
-##    carry `data-id` -- it is the positional anchor for the whole write API.
-##  * Three handlers cooperate through the closure: 'drag' captures `initIsBacklog`
-##    and `oldIndex`, 'drop' derives `previousUs`/`nextUs` from POST-move DOM, and
-##    'dragend' consumes all four and issues `ctrl.moveUs`. They are reset only
-##    inside 'drop', so a cancelled drag -- which never fires 'drop' -- keeps the
-##    previous drop's values; the `index == oldIndex && sameContainer` no-op return
-##    is what absorbs that. Reproduce this protocol; do not tidy it into one
-##    handler that resets on drag start, which would be a behaviour change.
-##  * `previousUs` and `nextUs` are MUTUALLY EXCLUSIVE: `nextUs` is computed only
-##    when `previousUs` is falsy, so `bulk-update-us-backlog-order` receives either
-##    `after_userstory_id` or `before_userstory_id` -- never both.
-##  * Starting a drag while velocity forecasting is on turns it OFF, and 'dragend'
-##    removes the doom line document-wide. Both are load-bearing, not incidental.
-##  * @dnd-kit emits none of dragula's classes, so React must add `gu-transit`,
-##    `gu-mirror`, `multiple-drag-mirror` and the `drag-active` body class itself,
-##    or the existing SCSS silently stops applying (rule T1 keeps stylesheet edits
-##    at zero).
-##  * The autoscroll options here are backlog-specific -- `[window]`, margin 20,
-##    pixels 30 -- and differ from kanban's. Do not unify the two.
+## The factory below is intentionally unregistered: drag-and-drop for the story
+## table and the sprint sidebar is owned by React, and this body is the
+## authoritative reference for the behaviour it has to reproduce. The parts most
+## easily lost: there are FOUR drop targets, not one -- the table body, BOTH empty
+## backlog elements, and every sprint table matched dynamically; only rows carrying
+## `data-id` are draggable, because that id is the anchor for the whole write API;
+## and `previousUs` and `nextUs` are mutually exclusive, so the position-relative
+## write receives one neighbour, never both. The three handlers cooperate through
+## the closure and reset only inside `drop`, so a cancelled drag keeps the previous
+## values and the same-index no-op return is what absorbs that. The autoscroll
+## options are backlog-specific and deliberately differ from the board's.
 
 deleteElement = (el) ->
     $(el).scope().$destroy()
@@ -200,15 +166,3 @@ BacklogSortableDirective = () ->
                 drake.destroy()
 
     return {link: link}
-
-## RETIRED (React coexistence migration): the `tgBacklogSortable` directive
-## registration that stood here, binding the name to `BacklogSortableDirective`,
-## is removed. It is superseded by `app/react/shared/dnd/**` and
-## `app/react/backlog/hooks/useStoryDrag.ts`; the factory above is retained as
-## their behavioural reference, as explained at the top of this file. This file now
-## registers nothing, which is deliberate. The `tg-backlog-sortable` attribute left
-## on `app/partials/includes/modules/backlog-table.jade` is simply ignored by
-## AngularJS. Note that `taigaBacklog` is still RETRIEVED above with no second
-## argument: passing one would reset the module and silently detach
-## `tgTaskboardSortable`, which attaches to it later in the build order from the
-## out-of-scope `app/coffee/modules/taskboard/sortable.coffee`.

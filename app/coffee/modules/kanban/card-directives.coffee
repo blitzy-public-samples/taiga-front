@@ -10,52 +10,14 @@ taiga = @.taiga
 
 module = angular.module("taigaKanban")
 
-#############################################################################
-## Shared card directives -- MOVED HERE VERBATIM, NOT NEW BEHAVIOUR
-#############################################################################
-## `tgCardAssignedTo`, `tgCardData` and `tgCardActions` -- together with the
-## `_.template`-compiled SVG heredoc all three of them share -- were relocated out
-## of `app/coffee/modules/kanban/main.coffee` (source block L855-L1126) when that
-## file's AngularJS kanban view layer was superseded by the React board. Not one
-## line of their bodies, signatures, DI arrays, isolate-scope bindings or template
-## paths changed, and they stay registered on this SAME `taigaKanban` module under
-## identical names, so NO consumer anywhere needs an edit. Requirement I2.
+## These three directives render the shared `tg-card` component, which the
+## out-of-scope taskboard also uses, so they stay registered on `taigaKanban`
+## under these names and keep reading `item` as an Immutable structure.
 ##
-## WHY THEY SURVIVE THE RETIREMENT. They render the SHARED `tg-card` component
-## under `app/modules/components/card/**`, which rule T4 marks MUST NOT CHANGE:
-## `card.jade` emits `tg-card-actions` (L16-L20), `tg-card-assigned-to` (L26-L30)
-## and `tg-card-data` (L31-L36). That component is ALSO rendered by the
-## OUT-OF-SCOPE taskboard at `app/partials/includes/modules/taskboard-table.jade`
-## L135 and L186, so retiring these three would silently strip the kebab menu, the
-## assigned-user avatar and the card body from every taskboard card.
-##
-## WHY THE SVG HEREDOC TRAVELLED WITH THEM. The Gulp `coffee` task compiles each
-## `.coffee` file INDIVIDUALLY (`gulpfile.js` L515) and only afterwards
-## concatenates the results into `app.js` (L520); CoffeeScript wraps every compiled
-## file in its own `(function(){...}).call(this)` IIFE, so file-scope variables do
-## NOT cross file boundaries in the bundle. Leaving the heredoc behind in
-## `main.coffee` would have raised a `ReferenceError` on the first card render,
-## taking the taskboard down along with the board.
-##
-## WHY THE MODULE IS RETRIEVED, NOT DECLARED. The lookup above passes NO second
-## argument, deliberately. Passing one would re-declare `taigaKanban` and reset it,
-## wiping `tgTaskboardIssues` (`taskboard/taskboard-issues.coffee` L81) and
-## `tgTaskboardTasks` (`taskboard/taskboard-tasks.coffee` L157), because
-## `paths.coffee_order` concatenates `coffee/modules/taskboard/*.coffee`
-## (`gulpfile.js` L146) BEFORE `coffee/modules/kanban/*.coffee` (L147). The one
-## declaring call stays at `app/coffee/modules/kanban.coffee` L9. Requirement I1.
-##
-## WHY `item` IS STILL IMMUTABLE HERE. The `tg-card` contract hands `item` in as an
-## Immutable structure and these bodies read it with `.get()`, `.getIn([...])`,
-## `.size` and `.forEach`. That is deliberately NOT converted: plain objects and
-## `immer` drafts live only in the new React state layer under
-## `app/react/kanban/state/`, fed by data flattened at the `react-bridge.coffee`
-## seam. Flattening it here would break the must-not-change shared component, and
-## the out-of-scope taskboard with it.
-##
-## NO BUILD CHANGE IS NEEDED: `paths.coffee` already matches this path
-## (`gulpfile.js` L133) and `paths.coffee_order` already orders it (L147).
-#############################################################################
+## The SVG template lives in this file rather than beside its former neighbours
+## because the Gulp `coffee` task compiles each file individually before
+## concatenating, and CoffeeScript wraps every compiled file in its own IIFE --
+## file-scope variables do not cross file boundaries in the bundle.
 
 CardSvgTemplate = """
     <tg-svg>
@@ -145,11 +107,27 @@ CardDataDirective = ($template, $translate, avatarService, projectService, dueDa
 
     render = (vm) =>
         avatars = {}
+        invalidAssignedUsers = 0
         (vm.item.get('assigned_users') || []).forEach (user) =>
             if user
                 avatars[user.get('id')] = avatarService.getAvatar(user, 'avatar')
             else
-                console.error 'invalid assigned_users', vm.item.get('assigned_users').toJS()
+                # DIAGNOSTIC, SANITISED. The upstream form of this line was
+                # `console.error 'invalid assigned_users', vm.item.get('assigned_users').toJS()`,
+                # which serialised the ENTIRE assigned-user collection into the
+                # browser console on a single malformed entry. Those user objects
+                # carry full names, usernames, avatar URLs and other profile
+                # metadata, so one nullish array slot published the personal data of
+                # every assignee on the card to anyone with the console open -- and
+                # console output is routinely pasted into tickets and screenshots.
+                # A count answers the only question the log can usefully answer
+                # ("did the server send a hole in this array, and how many?"), and
+                # the offending payload is inspectable from the network response or
+                # the database by whoever is entitled to see it.
+                invalidAssignedUsers += 1
+
+        if invalidAssignedUsers > 0
+            console.error("invalid assigned_users: #{invalidAssignedUsers} entry/entries were empty")
 
         return template({
             vm: vm,
@@ -328,4 +306,3 @@ module.directive("tgCardActions", [
     "$translate",
     "tgProjectService",
     CardActionsDirective])
-

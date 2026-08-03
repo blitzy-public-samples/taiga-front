@@ -153,7 +153,17 @@ function thenableFor<T>(outcome: Outcome): AngularPromise<T> {
     };
 }
 
-/** One entry of the story-move payload -- an id AND that story's sprint order. */
+/**
+ * One entry of the story-move payload -- an id AND that story's sprint order.
+ *
+ * The ASSERTION shape, not the double's parameter type. The frozen namespace
+ * types that parameter as the generic parameter bag the resource layer forwards
+ * (`../../bridge/useAngularService.ts`, matching how the sibling milestone bulk
+ * write is typed), so the double below accepts the same bag and the specs narrow
+ * to this shape when they read what was forwarded. Narrowing the double's own
+ * parameter instead would make it UNASSIGNABLE to the facade's member view under
+ * `strictFunctionTypes`, which is contravariant in parameters.
+ */
 type MoveEntry = {
     readonly us_id: number;
     readonly order: number;
@@ -212,7 +222,7 @@ function sprintsDouble(outcomes: Outcomes = {}): {
             ...args: [number, (ResourceParams | undefined)?]
         ): AngularPromise<ListEnvelope<TAttrs>>;
         moveUserStoriesMilestone<TResult>(
-            ...args: [number, number, number | null, readonly MoveEntry[]]
+            ...args: [number, number, number | null, ResourceParams[]]
         ): AngularPromise<AngularHttpResponse<TResult>>;
     };
     log: CallLog;
@@ -241,7 +251,7 @@ function sprintsDouble(outcomes: Outcomes = {}): {
         },
 
         moveUserStoriesMilestone<TResult>(
-            ...args: [number, number, number | null, readonly MoveEntry[]]
+            ...args: [number, number, number | null, ResourceParams[]]
         ): AngularPromise<AngularHttpResponse<TResult>> {
             log.moveUserStoriesMilestone.push(args);
 

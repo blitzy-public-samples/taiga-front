@@ -38,6 +38,10 @@ var config = {
     //     browserName: 'internet explorer',
     //     version: '11'
     // },
+    // The Kanban and the Backlog / sprint-planning screens have no entry here:
+    // they render through React roots mounted inside the AngularJS shell, which
+    // this runner cannot drive. Browser coverage for those two screens is owned
+    // by the Playwright layer configured in playwright.config.ts.
     suites: {
         auth: "e2e/suites/auth/*.e2e.js",
         public: "e2e/suites/public/**/*.e2e.js",
