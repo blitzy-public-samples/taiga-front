@@ -55,6 +55,43 @@
  *  17. ⭐ The autoscroll numbers, the arm-then-read call order, and pointer-only input.
  *  18. ⭐ R-DND-3 -- an off-screen row is still a legitimate neighbour.
  *  19. ⭐ The milestone reassignment's own body, which uses the OTHER bulk key.
+ *  20. ⭐⭐⭐ THREE DRAGS, NOT TWO. Two drags exercise the guard once and the drain once,
+ *      and a drain that itself respected the guard would still look correct because the
+ *      queue holds one entry by the time it runs. With three entries the drain runs
+ *      while the queue is STILL longer than one, which is the only arrangement in which
+ *      a guard-respecting drain stalls -- and it stalls silently, for the rest of the
+ *      session. The queue length is asserted at the instant each request goes out, and
+ *      the whole success tail is asserted to stay shut until the queue has emptied.
+ *  21. ⭐⭐ THE RETAINED CONTROLLER'S MOVE SEAM IS NEVER REACHED. It is supplied on the
+ *      realtime service, reachable, and asserted uncalled for an order change, a
+ *      move-to-top and a sprint reassignment: that controller still owns a second copy
+ *      of this queue, so reaching for it would put one write into two queues at once.
+ *  22. ⭐⭐ THE REST OF R-DND-2 -- a middle drop, sprint-to-backlog, sprint-to-sprint,
+ *      a neighbour whose identifier is not a positive integer, a neighbour with no
+ *      identifier at all, the placeholder exclusion against a hidden original, a subject
+ *      that cannot be identified, a sibling that is not a row, and the sibling-index
+ *      fallback that gives a sprint drop a real position.
+ *  23. ⭐ THE WIRE CONTRACT READ BACK AS A BODY, because three of its rules are
+ *      invisible in a positional view: a null slot is an ABSENT key, the two neighbour
+ *      keys are mutually exclusive, and the two endpoints carry DIFFERENT bulk keys.
+ *  24. ⭐⭐ RECONCILIATION OF THE SECOND WRITE of a drained queue, plus the three
+ *      properties of the state it writes into -- the touched story is replaced, every
+ *      untouched story keeps its identity, and no model bookkeeping crosses the
+ *      boundary. State is frozen, and the wire carries identifiers only.
+ *  25. ⭐ THE CONFIGURATION BAG's exact membership: nine result members, twelve provider
+ *      members, no second kind of sensor, and autoscroll numbers that are asserted
+ *      NOT to be the board's.
+ *  26. ⭐ THE GATE'S WHOLE TRUTH TABLE, precedence included.
+ *  27. ⭐ THE MULTI-SELECTION's measurement rule: every position is taken against the
+ *      FIRST SELECTED row, proven by a drop the guard absorbs for a selection and
+ *      persists without one.
+ *  28. ⭐ THE TWO REFUSALS -- the injector is never asked for a service, and neither
+ *      coordination announcement is dispatched as a document-level event.
+ *  29. ⭐ THE OWNERSHIP BOUNDARIES -- a move rewrites a sprint's story list and nothing
+ *      else about it, the multi-selection controller is handed over and never called
+ *      directly, geometry is never consulted so an unmeasurable row is still usable, the
+ *      write lands on the instance's own sub-resource, and every container the retained
+ *      screen registers is registered here.
  *
  * The suite is browserless and offline BY CONSTRUCTION: it touches no browser interface
  * beyond the jsdom the runner supplies, launches no browser, imports no end-to-end
@@ -65,10 +102,15 @@
 
 import { produce } from 'immer';
 import { useReducer } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
 
+import { mockInjector, withMockInjector } from '../../bridge/mockInjector';
+import { toNativePromise } from '../../bridge/toNativePromise';
 import type { AngularHttpResponse, AngularPromise } from '../../bridge/useAngularService';
+import { MULTIPLE_SORTABLE_CLASS, createMultiDrag } from '../../shared/dnd/multiDrag';
 import type { MultiDragController } from '../../shared/dnd/multiDrag';
+import { TRANSIT_CLASS } from '../../shared/dnd/useSortableList';
 import {
     backlogReducer,
     createInitialBacklogState,
@@ -86,6 +128,7 @@ import type {
     BacklogDispatch,
     BacklogDragProject,
     BacklogOrderWriteResource,
+    BacklogRealtimeStatus,
     UseStoryDragOptions,
     UseStoryDragResult,
 } from './useStoryDrag';
@@ -185,7 +228,19 @@ interface PendingWrite<T> {
 interface RecordingResource {
     readonly resource: BacklogOrderWriteResource;
     readonly orderCalls: OrderArgs[];
+    /**
+     * How many arguments the facade actually handed the resource, per call.
+     *
+     * Recorded separately from {@link RecordingResource.orderCalls}, whose tuple type
+     * fixes the count at five whatever arrives: a facade that dropped its last argument
+     * would still produce a five-slot tuple here, with the missing slot reading as
+     * `undefined` -- and a dropped story list is a write that reorders the backlog
+     * around nothing. The count is taken from the call itself so the omission cannot
+     * hide.
+     */
+    readonly orderArity: number[];
     readonly milestoneCalls: MilestoneArgs[];
+    readonly milestoneArity: number[];
     readonly pendingOrder: Array<PendingWrite<readonly BacklogOrderResultRow[]>>;
     readonly pendingMilestone: Array<PendingWrite<unknown>>;
 }
@@ -251,7 +306,9 @@ function deferredThenable<T>(
 
 function createRecordingResource(): RecordingResource {
     const orderCalls: OrderArgs[] = [];
+    const orderArity: number[] = [];
     const milestoneCalls: MilestoneArgs[] = [];
+    const milestoneArity: number[] = [];
     const pendingOrder: Array<PendingWrite<readonly BacklogOrderResultRow[]>> = [];
     const pendingMilestone: Array<PendingWrite<unknown>> = [];
 
@@ -263,6 +320,8 @@ function createRecordingResource(): RecordingResource {
             beforeUserstoryId,
             bulkUserstories,
         ): AngularPromise<AngularHttpResponse<readonly BacklogOrderResultRow[]>> {
+            orderArity.push(arguments.length);
+
             orderCalls.push([
                 projectId,
                 milestoneId,
@@ -275,6 +334,8 @@ function createRecordingResource(): RecordingResource {
         },
 
         bulkUpdateMilestone(projectId, milestoneId, data): AngularPromise<AngularHttpResponse<unknown>> {
+            milestoneArity.push(arguments.length);
+
             const entries: BulkMilestoneItem[] = [];
 
             for (const entry of data) {
@@ -293,7 +354,45 @@ function createRecordingResource(): RecordingResource {
         },
     };
 
-    return { resource, orderCalls, milestoneCalls, pendingOrder, pendingMilestone };
+    return {
+        resource,
+        orderCalls,
+        orderArity,
+        milestoneCalls,
+        milestoneArity,
+        pendingOrder,
+        pendingMilestone,
+    };
+}
+
+/* ==========================================================================
+ * THE RETAINED CONTROLLER'S MOVE SEAM, AS A PROBE
+ *
+ * ⭐⭐ V8 -- WHY A PROBE EXISTS AT ALL. The bridge that hands this screen its services
+ * also exposes the RETAINED controller's own move methods, and that controller still
+ * owns a second copy of the serialisation queue. Reaching for either of them from the
+ * drag path would enqueue the same write twice, and two position-relative writes
+ * interleaving is exactly the silent order corruption the queue exists to prevent --
+ * an HTTP 200 for each, and an order the user never chose on the next page load.
+ *
+ * The two members are therefore supplied, right there and reachable, and every case in
+ * this file asserts they are never called. Declared as an extension of the realtime
+ * shape rather than as a separate service so the probe travels wherever that shape
+ * does, and typed honestly: nothing is converted to satisfy a signature.
+ * ========================================================================== */
+
+interface RetainedMoveSeam extends BacklogRealtimeStatus {
+    connected: boolean;
+    readonly moveUs: jest.Mock<void, unknown[]>;
+    readonly moveUsToTopOfBacklog: jest.Mock<void, unknown[]>;
+}
+
+function createRetainedMoveSeam(connected: boolean): RetainedMoveSeam {
+    return {
+        connected,
+        moveUs: jest.fn<void, unknown[]>(),
+        moveUsToTopOfBacklog: jest.fn<void, unknown[]>(),
+    };
 }
 
 /* ==========================================================================
@@ -379,11 +478,22 @@ function buildScene(backlogIds: readonly number[], sprintIds: readonly number[])
 interface HarnessOptions {
     readonly backlog?: readonly number[];
     readonly sprintStories?: readonly number[];
+    /** Further sprints the screen holds, each rendered empty. */
+    readonly additionalSprintIds?: readonly number[];
     readonly closedSprints?: readonly BacklogSprint[] | null;
     readonly project?: BacklogDragProject;
     readonly connected?: boolean;
     readonly displayVelocity?: boolean;
     readonly multiDrag?: MultiDragController;
+    readonly renderOverlay?: UseStoryDragOptions['renderOverlay'];
+    readonly collisionDetection?: UseStoryDragOptions['collisionDetection'];
+    /**
+     * The subtree wrapper, used to mount the hook under a STRICT injector.
+     *
+     * Typed from what the library's own option accepts so nothing about the shape is
+     * guessed, and defaulted to nothing so the ordinary cases mount bare.
+     */
+    readonly wrapper?: (props: { children?: ReactNode }) => ReactElement;
 }
 
 interface Harness {
@@ -396,6 +506,8 @@ interface Harness {
     };
     readonly scene: Scene;
     readonly recording: RecordingResource;
+    /** The retained controller's move seam. See {@link RetainedMoveSeam}. */
+    readonly seam: RetainedMoveSeam;
     readonly calls: {
         readonly emitted: string[];
         readonly loadSprints: number[];
@@ -437,7 +549,7 @@ function renderHarness(options: HarnessOptions = {}): Harness {
     const toggleVelocity: number[] = [];
     const calculateForecasting: number[] = [];
 
-    const realtime = { connected: options.connected ?? true };
+    const seam = createRetainedMoveSeam(options.connected ?? true);
 
     let tick = 0;
     const stamp = (sink: number[]): void => {
@@ -447,7 +559,10 @@ function renderHarness(options: HarnessOptions = {}): Harness {
 
     const hydration = {
         userStories: backlog.map((id, index) => backlogStory(id, index)),
-        sprints: [sprint(SPRINT_ID, sprintStoryIds.map((id, index) => sprintStory(id, SPRINT_ID, index)))],
+        sprints: [
+            sprint(SPRINT_ID, sprintStoryIds.map((id, index) => sprintStory(id, SPRINT_ID, index))),
+            ...(options.additionalSprintIds ?? []).map((id) => sprint(id, [])),
+        ],
         closedSprints: options.closedSprints ?? null,
         eventsConnected: options.connected ?? true,
     };
@@ -462,7 +577,7 @@ function renderHarness(options: HarnessOptions = {}): Harness {
                 state,
                 displayVelocity: options.displayVelocity ?? false,
             },
-            services: { userstories: recording.resource, realtime },
+            services: { userstories: recording.resource, realtime: seam },
             actions: {
                 dispatch,
                 emitAngularEvent: (eventName): void => {
@@ -485,15 +600,22 @@ function renderHarness(options: HarnessOptions = {}): Harness {
                 },
             },
             ...(options.multiDrag === undefined ? {} : { multiDrag: options.multiDrag }),
+            ...(options.renderOverlay === undefined
+                ? {}
+                : { renderOverlay: options.renderOverlay }),
+            ...(options.collisionDetection === undefined
+                ? {}
+                : { collisionDetection: options.collisionDetection }),
         };
 
         return { drag: useStoryDrag(hookOptions), state, dispatch };
-    });
+    }, options.wrapper === undefined ? undefined : { wrapper: options.wrapper });
 
     return {
         result: rendered.result,
         scene,
         recording,
+        seam,
         calls: {
             emitted,
             loadSprints,
@@ -503,7 +625,7 @@ function renderHarness(options: HarnessOptions = {}): Harness {
             calculateForecasting,
         },
         setConnected: (value: boolean): void => {
-            realtime.connected = value;
+            seam.connected = value;
         },
         rerender: (): void => {
             rendered.rerender();
@@ -1927,5 +2049,1715 @@ describe('teardown', () => {
         });
 
         expect(harness.calls.emitted).toHaveLength(0);
+    });
+});
+
+/* ==========================================================================
+ * 12. THE QUEUE UNDER LOAD -- THREE DRAGS, THE DRAIN, AND THE GATED TAIL
+ *
+ * ⭐⭐⭐ Suite 1 pins two drags. This one pins THREE, because two drags exercise the
+ * guard once and the drain once, and a drain that itself respected the guard would
+ * still look correct: the queue would hold one entry by the time it ran. With three
+ * entries the drain runs while the queue is STILL longer than one, which is the only
+ * arrangement in which a guard-respecting drain stalls -- silently, forever, with the
+ * remaining moves recorded locally and never sent.
+ * ========================================================================== */
+
+describe('the queue under load', () => {
+    it('issues exactly ONE request for a single drag and empties the queue when it settles', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(harness.result.current.state.pendingDrag).toHaveLength(1);
+
+        // Five arguments, and the count is read from the call rather than from a tuple
+        // type: a dropped story list would reorder the backlog around nothing.
+        expect(harness.recording.orderArity).toEqual([5]);
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.result.current.state.pendingDrag).toHaveLength(0);
+        });
+
+        // The dequeue leaves nothing to drain, so nothing further goes out.
+        expect(harness.recording.orderCalls).toHaveLength(1);
+    });
+
+    it('serialises THREE drags, sending each only after the previous one settles', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // Two more while the first request is still open.
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_B], 0, null, null, STORY_A);
+        });
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_A], 0, null, null, STORY_C);
+        });
+
+        // ⭐⭐ STILL ONE ON THE WIRE. Both later moves are recorded and neither is sent:
+        // only the head of the queue is ever in flight, because the second would compute
+        // its neighbours from an arrangement the server has not acknowledged.
+        expect(harness.recording.orderCalls).toHaveLength(1);
+        expect(harness.result.current.state.pendingDrag).toHaveLength(3);
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(2);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[1]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(3);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[2]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.result.current.state.pendingDrag).toHaveLength(0);
+        });
+
+        // ⭐ STRICTLY IN ORDER, AND NEVER OVERLAPPING: three requests, each carrying its
+        // OWN subject, in the order the three gestures happened.
+        expect(harness.recording.orderCalls.map((call) => call[4])).toEqual([
+            [STORY_C],
+            [STORY_B],
+            [STORY_A],
+        ]);
+        expect(harness.recording.orderArity).toEqual([5, 5, 5]);
+    });
+
+    it('drains THROUGH the guard, dispatching while the queue still holds more than one entry', async () => {
+        const harness = renderHarness();
+        const queueLengths: number[] = [];
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_B], 0, null, null, STORY_A);
+        });
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_A], 0, null, null, STORY_C);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        queueLengths.push(harness.result.current.state.pendingDrag.length);
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(2);
+        });
+
+        // ⭐⭐ TWO ENTRIES ARE STILL QUEUED as the second request goes out. The
+        // user-initiated path refuses to send in exactly this situation; the drain must
+        // not, and the incumbent bypasses its own guard by passing a placeholder first
+        // argument for precisely this reason.
+        queueLengths.push(harness.result.current.state.pendingDrag.length);
+        expect(harness.result.current.state.pendingDrag).toHaveLength(2);
+
+        await act(async () => {
+            harness.recording.pendingOrder[1]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(3);
+        });
+
+        queueLengths.push(harness.result.current.state.pendingDrag.length);
+
+        // ⭐ AND THE DRAIN ENQUEUES NOTHING. The queue only ever shrinks from here: a
+        // re-drive that enqueued would have grown it to four and the screen would never
+        // stop writing.
+        expect(queueLengths).toEqual([3, 2, 1]);
+    });
+
+    it('takes the drain instead of the announcement while the queue is not empty', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_B], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(2);
+        });
+
+        // ⭐ NOTHING IS ANNOUNCED ON AN INTERMEDIATE SUCCESS. The whole tail -- the moved
+        // announcement, the reload fallback and the closed-sprint re-broadcast -- sits
+        // inside the branch that opens only when the queue has emptied; an intermediate
+        // success records the drain and nothing else.
+        expect(harness.calls.emitted).toHaveLength(0);
+        expect(harness.calls.loadSprints).toHaveLength(0);
+        expect(harness.calls.loadClosedSprints).toHaveLength(0);
+        expect(harness.calls.loadProjectStats).toHaveLength(0);
+
+        await act(async () => {
+            harness.recording.pendingOrder[1]!.settle([]);
+        });
+
+        // And the announcement arrives exactly once, when the last entry has gone.
+        await waitFor(() => {
+            expect(harness.calls.emitted).toEqual(['sprint:us:moved']);
+        });
+    });
+});
+
+/* ==========================================================================
+ * 13. THE RETAINED CONTROLLER'S MOVE SEAM IS NEVER REACHED
+ *
+ * ⭐⭐ See {@link RetainedMoveSeam}. The seam is supplied on the realtime service and
+ * every case here proves it is never touched. This is the positive form of the
+ * ownership rule: the retained methods are right there, reachable, and calling either
+ * of them would put the same write into two queues at once.
+ * ========================================================================== */
+
+describe('the retained move seam', () => {
+    it('writes an order change straight through the injected resource and never through the seam', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.calls.emitted).toEqual(['sprint:us:moved']);
+        });
+
+        expect(harness.seam.moveUs).not.toHaveBeenCalled();
+        expect(harness.seam.moveUsToTopOfBacklog).not.toHaveBeenCalled();
+    });
+
+    it('sends stories to the top of the backlog without the seam either', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUsToTopOfBacklog([STORY_C]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(harness.seam.moveUsToTopOfBacklog).not.toHaveBeenCalled();
+        expect(harness.seam.moveUs).not.toHaveBeenCalled();
+    });
+
+    it('leaves the seam untouched for a sprint reassignment as well', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.dispatch({ type: 'TOGGLE_ROW_CHECKBOX', storyId: STORY_A });
+        });
+
+        act(() => {
+            harness.result.current.dispatch({ type: 'MOVE_SELECTED_TO_SPRINT', target: 'latest' });
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.milestoneCalls).toHaveLength(1);
+        });
+
+        expect(harness.seam.moveUs).not.toHaveBeenCalled();
+        expect(harness.seam.moveUsToTopOfBacklog).not.toHaveBeenCalled();
+    });
+});
+
+/* ==========================================================================
+ * 14. THE ORDERING ARITHMETIC THAT HAS NO ERROR SURFACE
+ *
+ * ⭐⭐ The endpoint these values reach is POSITION-RELATIVE: it is told which story to
+ * land after or before, never at which index. It cannot detect a wrong anchor, so it
+ * does what it is told and answers 200. An off-by-one here therefore persists an order
+ * the user never chose, with no error, no notice and no console line, and it surfaces
+ * on the next page load. Every case below fixes one arrangement whose answer would
+ * otherwise be plausible and wrong.
+ * ========================================================================== */
+
+/** A second sprint the screen holds, rendered as an empty table. */
+const OTHER_SPRINT_ID = 8;
+
+/**
+ * An identifier put on the retired library's own placeholder.
+ *
+ * Chosen to be a story this screen does NOT hold, so a scan that wrongly read the
+ * placeholder produces an obviously foreign anchor rather than a plausible one.
+ */
+const PLACEHOLDER_ID = 555;
+
+describe('the ordering arithmetic', () => {
+    it('anchors a MIDDLE drop on the row it landed after', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The first story lands between the second and the third.
+        performDrag(harness, rows[STORY_A]!, { container: body, reference: rows[STORY_C]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, , after, before] = harness.recording.orderCalls[0]!;
+
+        // ⭐ PREVIOUS WINS -- trap 2. Both neighbours exist in the document, and the pair
+        // is deliberately mutually exclusive: the following one is computed ONLY when
+        // there is no preceding one, so a middle drop can never emit both keys. Sending
+        // both is not a richer request, it is a different request.
+        expect(after).toBe(STORY_B);
+        expect(before).toBeNull();
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(1);
+    });
+
+    it('computes a SPRINT-to-BACKLOG drop from the destination container', async () => {
+        const harness = renderHarness();
+        const { rows, body, sprintTable } = harness.scene;
+
+        harness.result.current.drag.registerSprintDragContainer(SPRINT_ID)(sprintTable);
+
+        performDrag(harness, rows[STORY_IN_SPRINT]!, {
+            container: body,
+            reference: rows[STORY_A]!,
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, milestoneId, after, before] = harness.recording.orderCalls[0]!;
+
+        // No destination sprint, and the neighbours are the BACKLOG's -- the container the
+        // row was dropped into, never the one it came from.
+        expect(milestoneId).toBeNull();
+        expect(after).toBeNull();
+        expect(before).toBe(STORY_A);
+        expect(backlogOrder(harness.result.current.state)).toEqual([
+            STORY_IN_SPRINT,
+            STORY_A,
+            STORY_B,
+            STORY_C,
+        ]);
+        expect(sprintOrder(harness.result.current.state)).toEqual([]);
+    });
+
+    it('treats a SPRINT-to-SPRINT drop as a container change and sends the new destination', async () => {
+        const harness = renderHarness({ additionalSprintIds: [OTHER_SPRINT_ID] });
+        const { rows, root, sprintTable } = harness.scene;
+        const { drag } = harness.result.current;
+
+        // The second sprint's table, registered with ITS OWN id.
+        const otherTable = document.createElement('div');
+        otherTable.className = 'sprint-table';
+        root.appendChild(otherTable);
+
+        drag.registerSprintDragContainer(SPRINT_ID)(sprintTable);
+        drag.registerSprintDragContainer(OTHER_SPRINT_ID)(otherTable);
+
+        performDrag(harness, rows[STORY_IN_SPRINT]!, { container: otherTable });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // ⭐ THE POSITION IS THE SAME IN BOTH SPRINTS -- index 0 of one, index 0 of the
+        // other -- so only the container change makes this a move at all. A verdict built
+        // from the index alone would have absorbed it and the story would have snapped
+        // back to the sprint it came from.
+        expect(harness.recording.orderCalls[0]![1]).toBe(OTHER_SPRINT_ID);
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(0);
+
+        const sprints = harness.result.current.state.sprints;
+        expect(sprints[0]?.user_stories.map((story) => story.id)).toEqual([]);
+        expect(sprints[1]?.user_stories.map((story) => story.id)).toEqual([STORY_IN_SPRINT]);
+    });
+
+    it('reads a neighbour whose identifier is not a positive integer as ABSENT (trap 3)', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // ⛔ PRESERVED. The incumbent tested the attribute for TRUTHINESS and then coerced
+        // it, so a zero read as present in one place and absent in another. The shared
+        // adapter refuses it outright, and the falsy test that follows is reproduced
+        // verbatim rather than "improved" into a null check.
+        rows[STORY_A]!.dataset['id'] = '0';
+
+        // The subject lands immediately after that row, which is its nearest PRECEDING
+        // candidate.
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_B]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, , after, before] = harness.recording.orderCalls[0]!;
+
+        expect(after).toBeNull();
+        // ⭐ TRAP 3 -- because the preceding value is FALSY rather than merely null, the
+        // following neighbour is computed as well.
+        expect(before).toBe(STORY_B);
+    });
+
+    it('yields null, never a not-a-number, for a neighbour with no identifier at all (trap 4)', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        rows[STORY_A]!.removeAttribute('data-id');
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_B]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, , after, before] = harness.recording.orderCalls[0]!;
+
+        // ⭐ TRAP 4. A bare coercion would have produced a not-a-number here, and the
+        // serialiser turns that into a null FIELD rather than an obviously broken value --
+        // so the server would have reordered the backlog around nothing.
+        expect(after).toBeNull();
+        expect(Number.isNaN(after)).toBe(false);
+        expect(before).toBe(STORY_B);
+    });
+
+    it('skips the placeholder alone, so a hidden original is still chosen (trap 5)', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // A hidden original of a multi-selection: display-suppressed, still in the
+        // document, and NOT carrying the placeholder class -- so it stays a candidate.
+        rows[STORY_A]!.style.display = 'none';
+
+        // The retired library's own placeholder, which IS excluded, carrying an
+        // identifier no story on this screen has.
+        const placeholder = document.createElement('div');
+        placeholder.className = `row ${TRANSIT_CLASS}`;
+        placeholder.dataset['id'] = String(PLACEHOLDER_ID);
+        body.insertBefore(placeholder, rows[STORY_B]!);
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_B]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, , after] = harness.recording.orderCalls[0]!;
+
+        // ⭐ TRAP 5, both halves at once: the placeholder immediately before the subject is
+        // stepped over, and the hidden row beyond it is accepted. Filtering on visibility
+        // would have rejected the hidden one and reached for something further away.
+        expect(after).toBe(STORY_A);
+        expect(after).not.toBe(PLACEHOLDER_ID);
+
+        // ⭐ AND THE PLACEHOLDER IS STILL COUNTED FOR THE INDEX. That asymmetry is the
+        // incumbent's: the neighbour scan excludes it and the index expression does not,
+        // and excluding it here as well would shift every index during a drag.
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(2);
+    });
+
+    it('persists nothing when the dragged row itself carries no usable identifier', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        rows[STORY_C]!.dataset['id'] = '0';
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        // The shared arithmetic answers with nothing, which is its way of saying "persist
+        // nothing" -- the incumbent's bare return, reached here for a subject that could
+        // not be identified rather than for an unchanged drop.
+        expect(harness.result.current.state.moveUsOutcome).toBeNull();
+        expect(harness.recording.orderCalls).toHaveLength(0);
+        expect(harness.result.current.state.pendingDrag).toHaveLength(0);
+
+        // And the row goes back where it started, because state never changed.
+        expect(body.lastElementChild).toBe(rows[STORY_C]!);
+    });
+
+    it('steps over a sibling that is not a row when looking for a neighbour', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The divider the retained screen splices between rows carries no row class.
+        const divider = document.createElement('div');
+        divider.className = 'backlog-table-divider';
+        body.insertBefore(divider, rows[STORY_B]!);
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_B]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // The divider sits between the subject and the first story, and is transparent to
+        // both the scan and the index: the item selector is the row class and nothing else.
+        expect(harness.recording.orderCalls[0]![2]).toBe(STORY_A);
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(1);
+    });
+
+    it('measures a drop into a sprint by sibling position, because the scoped selector cannot match it', async () => {
+        const harness = renderHarness();
+        const { rows, sprintTable } = harness.scene;
+
+        harness.result.current.drag.registerSprintDragContainer(SPRINT_ID)(sprintTable);
+
+        // Dropped at the END of a sprint that already holds one story.
+        performDrag(harness, rows[STORY_A]!, { container: sprintTable });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        /*
+         * ⭐ POSITION 1, NOT -1. The index selector is `.backlog-table-body .row`, so a
+         * sprint row is outside its match set entirely and the scoped lookup answers -1; the
+         * sibling fallback is what turns that into a real position. Without the fallback the
+         * reducer would splice at a negative index and the story would land at the wrong end
+         * of the sprint -- and with the scoping dropped instead, every BACKLOG index would
+         * shift by one, because the table header carries the row class too.
+         */
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(1);
+        expect(harness.recording.orderCalls[0]![1]).toBe(SPRINT_ID);
+    });
+});
+
+/* ==========================================================================
+ * 15. THE FROZEN WIRE CONTRACT, KEY BY KEY
+ *
+ * Suite 4 pins the positional call. This one reads that call back as the BODY the
+ * endpoint receives, because three of the contract's rules are invisible in a
+ * positional view: a null slot is an ABSENT key rather than a null field, the two
+ * neighbour keys are mutually exclusive, and the two endpoints carry DIFFERENT bulk
+ * keys. Getting the last of those backwards validates as an empty bulk -- an HTTP 200
+ * that moved nothing.
+ * ========================================================================== */
+
+/**
+ * The order-write body, assembled from the positional call exactly as the frozen
+ * resource layer assembles it (`resources/userstories.coffee:92-105`).
+ *
+ * That layer is out of scope and unchanged, so transcribing its assembly is how a
+ * positional call is read back in the endpoint's own terms. Every value asserted below
+ * is one this hook produced; the transcription only NAMES it. The three conditionals
+ * are truthiness tests, not null checks, and the neighbour pair is an `else if`.
+ */
+function orderRequestBody(call: OrderArgs): Record<string, unknown> {
+    const [projectId, milestoneId, afterUserstoryId, beforeUserstoryId, bulkUserstories] = call;
+
+    const body: Record<string, unknown> = {
+        project_id: projectId,
+        bulk_userstories: [...bulkUserstories],
+    };
+
+    if (milestoneId) {
+        body['milestone_id'] = milestoneId;
+    }
+
+    if (afterUserstoryId) {
+        body['after_userstory_id'] = afterUserstoryId;
+    } else if (beforeUserstoryId) {
+        body['before_userstory_id'] = beforeUserstoryId;
+    }
+
+    return body;
+}
+
+/**
+ * The sprint-reassignment body (`resources/userstories.coffee:107-110`).
+ *
+ * Unconditional, all three keys always present -- and the bulk key is `bulk_stories`,
+ * which is NOT the order write's.
+ */
+function milestoneRequestBody(call: MilestoneArgs): Record<string, unknown> {
+    const [projectId, milestoneId, data] = call;
+
+    return { project_id: projectId, milestone_id: milestoneId, bulk_stories: [...data] };
+}
+
+describe('the frozen wire contract', () => {
+    it('emits after_userstory_id ALONE when both neighbours are known', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 1, null, STORY_A, STORY_B);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const body = orderRequestBody(harness.recording.orderCalls[0]!);
+
+        // ⭐ THE NAME INVERSIONS AT THE SEAM: the PRECEDING neighbour becomes
+        // `after_userstory_id`, the FOLLOWING one becomes `before_userstory_id`, and the
+        // destination sprint becomes `milestone_id`. Reading either neighbour name as the
+        // side it came from inverts the whole ordering.
+        expect(Object.keys(body).sort()).toEqual([
+            'after_userstory_id',
+            'bulk_userstories',
+            'project_id',
+        ]);
+        expect(body['after_userstory_id']).toBe(STORY_A);
+        expect(Object.keys(body)).not.toContain('before_userstory_id');
+    });
+
+    it('emits before_userstory_id alone when only the following neighbour is known', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const body = orderRequestBody(harness.recording.orderCalls[0]!);
+
+        expect(body['before_userstory_id']).toBe(STORY_A);
+        expect(Object.keys(body)).not.toContain('after_userstory_id');
+        expect(harness.recording.orderArity).toEqual([5]);
+    });
+
+    it('emits NEITHER neighbour key when the drop had no anchor at all', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 1, null, null, null);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, , after, before] = harness.recording.orderCalls[0]!;
+        const body = orderRequestBody(harness.recording.orderCalls[0]!);
+
+        expect(after).toBeNull();
+        expect(before).toBeNull();
+        expect(Object.keys(body).sort()).toEqual(['bulk_userstories', 'project_id']);
+    });
+
+    it('OMITS the destination key entirely for a zero destination, on truthiness', async () => {
+        const harness = renderHarness();
+
+        // A destination of zero. No sprint can have that id, and the frozen layer tests the
+        // value for TRUTHINESS, so the key is dropped rather than sent as a zero.
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_A], 0, 0, null, STORY_B);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [, milestoneId] = harness.recording.orderCalls[0]!;
+        const body = orderRequestBody(harness.recording.orderCalls[0]!);
+
+        expect(milestoneId).toBeNull();
+        expect(Object.keys(body)).not.toContain('milestone_id');
+
+        // ⭐ AND THIS ENDPOINT CARRIES NO STATUS AT ALL. The BOARD's order write is the one
+        // that always sends a status; this one has five slots and none of them is a status,
+        // so a specification that expected one here would be describing the other screen.
+        expect(harness.recording.orderArity).toEqual([5]);
+        expect(Object.keys(body)).not.toContain('status_id');
+    });
+
+    it('carries bulk_userstories for an order change and bulk_stories for a reassignment', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const orderBody = orderRequestBody(harness.recording.orderCalls[0]!);
+
+        expect(orderBody['bulk_userstories']).toEqual([STORY_C]);
+        expect(Object.keys(orderBody)).not.toContain('bulk_stories');
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        act(() => {
+            harness.result.current.dispatch({ type: 'TOGGLE_ROW_CHECKBOX', storyId: STORY_A });
+        });
+
+        act(() => {
+            harness.result.current.dispatch({ type: 'MOVE_SELECTED_TO_SPRINT', target: 'latest' });
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.milestoneCalls).toHaveLength(1);
+        });
+
+        const milestoneBody = milestoneRequestBody(harness.recording.milestoneCalls[0]!);
+
+        // ⭐ THE OTHER KEY, AND THE OTHER SHAPE: story records rather than bare ids, each
+        // carrying both required integers.
+        expect(Object.keys(milestoneBody).sort()).toEqual([
+            'bulk_stories',
+            'milestone_id',
+            'project_id',
+        ]);
+        expect(Object.keys(milestoneBody)).not.toContain('bulk_userstories');
+        expect(harness.recording.milestoneArity).toEqual([3]);
+
+        const entries = harness.recording.milestoneCalls[0]![2];
+        expect(entries).toHaveLength(1);
+        expect(Object.keys(entries[0] ?? {}).sort()).toEqual(['order', 'us_id']);
+    });
+});
+
+/* ==========================================================================
+ * 16. RECONCILIATION, STRUCTURAL SHARING, AND THE PLAIN-DATA BOUNDARY
+ *
+ * Suite 2 pins the reconciliation of ONE write. This suite pins it for the SECOND write
+ * of a drained queue -- the one a "reconcile the first response and move on"
+ * implementation silently skips -- and pins the three properties of the state it writes
+ * into: the touched story is replaced, every untouched story keeps its identity, and
+ * nothing in it is a live model instance.
+ * ========================================================================== */
+
+/**
+ * A response row shaped like a live dirty-tracking model.
+ *
+ * ⭐ P-IMMER-1. The producer library's drafts do not tolerate class instances: a model
+ * carries its own modified-attribute bookkeeping, and putting one into a draft yields
+ * undefined behaviour. Model-shaped members are therefore attached to a response row
+ * here to prove the reconciliation copies the two AUTHORITATIVE VALUES and nothing else
+ * -- no bookkeeping crosses into state, so no state object can be handed to a save.
+ */
+interface ModelShapedOrderRow {
+    readonly id: number;
+    readonly milestone: null;
+    readonly backlog_order: number;
+    readonly getAttrs: (patch?: boolean) => Record<string, unknown>;
+    readonly toJS: () => Record<string, unknown>;
+    readonly _modifiedAttrs: Record<string, unknown>;
+}
+
+function modelShapedRow(id: number, order: number): ModelShapedOrderRow {
+    return {
+        id,
+        milestone: null,
+        backlog_order: order,
+        getAttrs: (): Record<string, unknown> => ({ id, backlog_order: order }),
+        toJS: (): Record<string, unknown> => ({ id, backlog_order: order }),
+        _modifiedAttrs: { backlog_order: order },
+    };
+}
+
+describe('reconciliation and the state it writes into', () => {
+    it('reconciles the SECOND write of a drained queue, not only the first', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_B], 0, null, null, STORY_C);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([
+                { id: STORY_C, milestone: null, backlog_order: 11 },
+            ]);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(2);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[1]!.settle([
+                { id: STORY_B, milestone: null, backlog_order: 22 },
+            ]);
+        });
+
+        await waitFor(() => {
+            expect(
+                harness.result.current.state.userStories.find((story) => story.id === STORY_B)
+                    ?.backlog_order,
+            ).toBe(22);
+        });
+
+        const stories = harness.result.current.state.userStories;
+
+        // ⭐ BOTH authoritative members, from BOTH responses. A drained write whose response
+        // was dropped leaves the screen holding an order the server renumbered away.
+        expect(stories.find((story) => story.id === STORY_C)?.backlog_order).toBe(11);
+        expect(stories.find((story) => story.id === STORY_C)?.milestone).toBeNull();
+        expect(stories.find((story) => story.id === STORY_B)?.milestone).toBeNull();
+    });
+
+    it('replaces only the reconciled story and preserves every other identity', async () => {
+        const harness = renderHarness();
+
+        const storyBefore = (id: number): BacklogRowStory | undefined =>
+            harness.result.current.state.userStories.find((story) => story.id === id);
+
+        const untouchedBefore = storyBefore(STORY_A);
+        const reconciledBefore = storyBefore(STORY_C);
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([
+                { id: STORY_C, milestone: null, backlog_order: 33 },
+            ]);
+        });
+
+        await waitFor(() => {
+            expect(storyBefore(STORY_C)?.backlog_order).toBe(33);
+        });
+
+        // ⭐ P-IMMER-4 -- STRUCTURAL SHARING, WHICH IS WHAT REPLACES THE RETIRED
+        // COLLECTION LIBRARY'S CHANGE DETECTION. The reordering copied the LIST and the
+        // reconciliation copied the ONE story it wrote to; every other story is the very
+        // same object, so a memoised row re-renders only when its own story changed.
+        expect(storyBefore(STORY_A)).toBe(untouchedBefore);
+        expect(storyBefore(STORY_C)).not.toBe(reconciledBefore);
+    });
+
+    it('hands back frozen state, so a stray write fails loudly instead of drifting', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const story = harness.result.current.state.userStories[0]!;
+
+        // ⭐ P-IMMER-4's other half: automatic freezing is left ON, so post-production
+        // mutation raises rather than corrupting a value the screen is still rendering.
+        expect(Object.isFrozen(story)).toBe(true);
+        expect(Object.isFrozen(harness.result.current.state.userStories)).toBe(true);
+        expect(() => Object.assign(story, { backlog_order: 999 })).toThrow(TypeError);
+        expect(harness.result.current.state.userStories[0]?.backlog_order).toBe(story.backlog_order);
+    });
+
+    it('copies the authoritative values out of a model-shaped response and nothing else', async () => {
+        const harness = renderHarness();
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_C], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([modelShapedRow(STORY_C, 44)]);
+        });
+
+        await waitFor(() => {
+            expect(
+                harness.result.current.state.userStories.find((story) => story.id === STORY_C)
+                    ?.backlog_order,
+            ).toBe(44);
+        });
+
+        const moved = harness.result.current.state.userStories.find(
+            (story) => story.id === STORY_C,
+        );
+
+        // ⭐ NOT ONE BOOKKEEPING MEMBER CROSSED THE BOUNDARY. State stays plain data, which
+        // is what keeps the producer library able to draft it -- and what keeps a screen
+        // from ever handing a state object to a save, which would send a whole object
+        // where the model layer sends only the fields that changed.
+        expect(Object.keys(moved ?? {})).not.toContain('getAttrs');
+        expect(Object.keys(moved ?? {})).not.toContain('toJS');
+        expect(Object.keys(moved ?? {})).not.toContain('_modifiedAttrs');
+    });
+
+    it('puts nothing but identifiers on the wire', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const [projectId, milestoneId, after, before, bulk] = harness.recording.orderCalls[0]!;
+
+        /*
+         * ⭐⭐ WHY THIS MATTERS FAR MORE THAN IT LOOKS. The retained model layer's save
+         * sends only the attributes that were modified, together with the concurrency
+         * version, and short-circuits entirely when nothing changed
+         * (`app/coffee/modules/base/model.coffee:18-64`,
+         * `app/coffee/modules/base/repository.coffee:57-59`). A write assembled from
+         * flattened copies would start sending whole objects instead, turning every edit
+         * into a possible lost update -- two people editing different fields of one story
+         * would overwrite each other, and neither would be told.
+         *
+         * This path sends identifiers and positions ONLY. There is nothing here that could
+         * carry a stale field, because there are no fields.
+         */
+        expect(typeof projectId).toBe('number');
+        expect(bulk.every((id) => typeof id === 'number')).toBe(true);
+
+        for (const value of [milestoneId, after, before]) {
+            expect(value === null || typeof value === 'number').toBe(true);
+        }
+    });
+
+    it('marshals the resource answer through unaltered, in both directions', async () => {
+        const response: AngularHttpResponse<readonly BacklogOrderResultRow[]> = {
+            data: [{ id: STORY_C, milestone: null, backlog_order: 1 }],
+            status: 200,
+            headers: noHeaders,
+        };
+
+        const fulfilling: AngularPromise<AngularHttpResponse<readonly BacklogOrderResultRow[]>> = {
+            then(onFulfilled): unknown {
+                return onFulfilled(response);
+            },
+        };
+
+        // Fulfilment: the EXACT value, not a copy and not a re-shape.
+        await expect(toNativePromise(fulfilling)).resolves.toBe(response);
+
+        const reason = new Error('the transport refused the write');
+
+        const rejecting: AngularPromise<AngularHttpResponse<readonly BacklogOrderResultRow[]>> = {
+            then(_onFulfilled, onRejected): unknown {
+                return onRejected(reason);
+            },
+        };
+
+        // Rejection: the EXACT reason. The interceptor chain surfaces a version conflict, a
+        // blocked project and a lost connection through this value, so converting or
+        // wrapping it would hide all three.
+        await expect(toNativePromise(rejecting)).rejects.toBe(reason);
+
+        // A plain value settles directly, which is what the retained repository does when a
+        // model is unmodified: it answers without issuing a request at all.
+        await expect(toNativePromise(response)).resolves.toBe(response);
+    });
+});
+
+/* ==========================================================================
+ * 17. THE CONFIGURATION BAG, MEMBER BY MEMBER
+ *
+ * Suite 7 pins the values. This one pins the SHAPE: the exact members present, the
+ * members deliberately absent, and the numbers that must not be unified with the
+ * board's. Every one of these is a value the provider silently defaults if the screen
+ * leaves it out, which is why the bag is handed over whole.
+ * ========================================================================== */
+
+/** The board's autoscroll edge, quoted so the difference is asserted rather than assumed. */
+const BOARD_AUTOSCROLL_MARGIN = 100;
+
+describe('the configuration bag', () => {
+    it('states the backlog autoscroll numbers and no others', () => {
+        const { autoScroll } = renderHarness().result.current.drag.dndProviderProps;
+
+        expect(Object.keys(autoScroll).sort()).toEqual([
+            'enabled',
+            'getTargets',
+            'margin',
+            'pixels',
+            'scrollWhenOutside',
+        ]);
+
+        expect(autoScroll).toEqual(
+            expect.objectContaining({
+                enabled: true,
+                margin: 20,
+                pixels: 30,
+                scrollWhenOutside: true,
+            }),
+        );
+
+        /*
+         * ⭐ DO NOT UNIFY THE TWO SCREENS. The board passes `margin: 100` and NO pixel step
+         * at all, so it drifts at the library's own speed near a much wider edge; this list
+         * scrolls a fixed thirty pixels inside a twenty-pixel edge. Both are the
+         * incumbent's, taken from two different call sites, and collapsing them into one
+         * shared constant would change the feel of whichever screen lost.
+         */
+        expect(autoScroll.margin).not.toBe(BOARD_AUTOSCROLL_MARGIN);
+        expect(autoScroll.pixels).toBe(30);
+    });
+
+    it('exposes exactly nine members and no leftover controller helper', () => {
+        const { drag } = renderHarness().result.current;
+
+        expect(Object.keys(drag).sort()).toEqual([
+            'canMove',
+            'dndProviderProps',
+            'getContainers',
+            'getDraggableData',
+            'getDroppableData',
+            'moveUs',
+            'moveUsToTopOfBacklog',
+            'registerDragContainer',
+            'registerSprintDragContainer',
+        ]);
+
+        /*
+         * The retained controller's own first-story indicator and bulk-payload builder are
+         * NOT surfaced here. The first is a rendering concern the row components own, and
+         * the payload is built by the reducer, which is where the one copy of it belongs.
+         */
+        expect(Object.keys(drag)).not.toContain('resetFirstStoryIndicator');
+        expect(Object.keys(drag)).not.toContain('prepareBulkUpdateData');
+
+        for (const member of [
+            'canMove',
+            'getContainers',
+            'getDraggableData',
+            'getDroppableData',
+            'moveUs',
+            'moveUsToTopOfBacklog',
+            'registerDragContainer',
+            'registerSprintDragContainer',
+        ]) {
+            expect(typeof Reflect.get(drag, member)).toBe('function');
+        }
+    });
+
+    it('hands over every provider member the screen must not forget, and renders nothing itself', () => {
+        const props = renderHarness().result.current.drag.dndProviderProps;
+        const keys = Object.keys(props);
+
+        expect(keys.sort()).toEqual([
+            'autoScroll',
+            'collisionDetection',
+            'disabled',
+            'multiDrag',
+            'multiDragCallOrder',
+            'onDragCancel',
+            'onDragEnd',
+            'onDragOver',
+            'onDragStart',
+            'onMultiDragEnd',
+            'onMultiDragStart',
+            'renderOverlay',
+        ]);
+
+        // The children are the screen's, which is why the bag is the provider's props MINUS
+        // them.
+        expect(keys).not.toContain('children');
+
+        /*
+         * ⭐⭐ A POINTER GESTURE AND NOTHING ELSE. There is no key sensor and no touch
+         * sensor to configure here, and none is added: the retired library bound mouse
+         * events only, so neither of these screens has ever been draggable from the
+         * keyboard. Making them so would be a real improvement and a real behaviour change,
+         * and it belongs in its own piece of work covering the screens that stay as they
+         * are too -- otherwise the application becomes operable on two screens and not on
+         * the rest.
+         */
+        expect(keys.filter((key) => /sensor|keyboard|touch/i.test(key))).toEqual([]);
+        expect(props.activationDistance).toBeUndefined();
+
+        // This is a hook, not a component: the runner's host element stays empty.
+        const hosts = Array.from(document.body.children).filter(
+            (node) => !node.classList.contains('backlog-page'),
+        );
+
+        expect(hosts.length).toBeGreaterThan(0);
+        expect(hosts.every((node) => node.childElementCount === 0)).toBe(true);
+    });
+
+    it('forwards the overlay renderer and the collision strategy untouched', () => {
+        const renderOverlay: UseStoryDragOptions['renderOverlay'] = () => null;
+        const collisionDetection: UseStoryDragOptions['collisionDetection'] = () => [];
+
+        const bare = renderHarness().result.current.drag.dndProviderProps;
+
+        expect(bare.renderOverlay).toBeUndefined();
+        expect(bare.collisionDetection).toBeUndefined();
+
+        const supplied = renderHarness({ renderOverlay, collisionDetection }).result.current.drag
+            .dndProviderProps;
+
+        /*
+         * ⭐ THE OVERLAY RENDERER IS NOT COSMETIC. It is the seam the retired library's clone
+         * handler became: the provider arms the multi-selection once the overlay node is in
+         * the document, and the shared controller then stacks the ghost clones against that
+         * node and marks each of them with the multiple-drag mirror class -- which is what
+         * the retained ghost block in the shared card partial is styled for, two placeholder
+         * blocks that stay hidden until the multi-transit class reveals them. That partial
+         * and its stylesheet are shared with a screen outside this work and are never
+         * touched. With no overlay renderer the stack never appears and the class is never
+         * applied: no error, no warning, just a multi-row drag that shows one row.
+         */
+        expect(supplied.renderOverlay).toBe(renderOverlay);
+        expect(supplied.collisionDetection).toBe(collisionDetection);
+        expect(supplied.multiDragCallOrder).toBe('start-then-elements');
+    });
+
+    it('invents no sprint identity for a table that carries none', async () => {
+        const harness = renderHarness();
+        const { rows, sprintTable } = harness.scene;
+
+        // Never registered, so nothing stamped it -- and the retained partial renders no
+        // such attribute of its own.
+        expect(sprintTable.hasAttribute('data-sprint-id')).toBe(false);
+
+        performDrag(harness, rows[STORY_A]!, { container: sprintTable });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // ⛔ NO ANCESTOR WALK, NO SIBLING COUNT, NO REGISTRATION-ORDER GUESS. The identity is
+        // read from the stamped attribute and from nothing else, so an unstamped table
+        // yields no destination rather than a plausible wrong one -- and a wrong sprint id
+        // here would move stories into a sprint nobody chose.
+        expect(harness.recording.orderCalls[0]![1]).toBeNull();
+        expect(sprintTable.hasAttribute('data-sprint-id')).toBe(false);
+    });
+});
+
+/* ==========================================================================
+ * 18. THE SIDE EFFECTS THIS SCREEN OWNS, AND THE GATE IT PRESERVES
+ * ========================================================================== */
+
+describe('the screen-owned side effects', () => {
+    it('marks the document body for the duration of the gesture', () => {
+        const harness = renderHarness();
+        const { drag } = harness.result.current;
+        const props = drag.dndProviderProps;
+        const { rows } = harness.scene;
+        const moved = rows[STORY_C]!;
+
+        expect(document.body.classList.contains('drag-active')).toBe(false);
+
+        act(() => {
+            props.onDragStart?.(
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onDragStart>>[0],
+            );
+        });
+
+        /*
+         * ⭐ THE BACKLOG DOES THIS AND THE BOARD DOES NOT. The mark is on the document BODY
+         * rather than on the list, because the rules it drives suppress selection and
+         * pointer feedback across the whole page while a row is in flight. Dropping it would
+         * leave text selecting under the pointer mid-drag on this screen only.
+         */
+        expect(document.body.classList.contains('drag-active')).toBe(true);
+
+        act(() => {
+            props.onDragEnd?.(
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onDragEnd>>[0],
+            );
+        });
+
+        expect(document.body.classList.contains('drag-active')).toBe(false);
+    });
+
+    it('never writes the multi-selection marker class, which belongs to the screen', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The screen puts it on the rows it has selected; the drag layer only READS it.
+        rows[STORY_A]!.classList.add(MULTIPLE_SORTABLE_CLASS);
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // Exactly where the screen left it, on exactly one element: nothing was added to the
+        // dragged row, the container or the document.
+        expect(rows[STORY_A]!.classList.contains(MULTIPLE_SORTABLE_CLASS)).toBe(true);
+        expect(rows[STORY_C]!.classList.contains(MULTIPLE_SORTABLE_CLASS)).toBe(false);
+        expect(body.classList.contains(MULTIPLE_SORTABLE_CLASS)).toBe(false);
+        expect(document.querySelectorAll(`.${MULTIPLE_SORTABLE_CLASS}`)).toHaveLength(1);
+    });
+
+    it('leaves the gesture enabled for a member who may modify stories on an archived project', () => {
+        const harness = renderHarness({
+            project: { my_permissions: ['modify_us'], archived_code: 'archived' },
+        });
+
+        expect(harness.result.current.drag.dndProviderProps.disabled).toBe(false);
+    });
+
+    it('⛔ reproduces the gate across its whole truth table, precedence and all', () => {
+        const cases: ReadonlyArray<{
+            readonly permissions: readonly string[];
+            readonly archived: string | null;
+            readonly disabled: boolean;
+        }> = [
+            { permissions: ['modify_us'], archived: null, disabled: false },
+            { permissions: ['modify_us'], archived: 'archived', disabled: false },
+            { permissions: ['view_us'], archived: null, disabled: true },
+            // ⛔ THE PRESERVED PRECEDENCE. The refusal reads "not (has the permission) and
+            // not archived", and the negation binds to the lookup alone -- so an archived
+            // project stays draggable for a member who may not modify stories. It reads like
+            // an inversion and it is exactly what the retained screen does; asserting the
+            // sensible precedence here would be asserting an improvement, which this work
+            // does not make.
+            { permissions: ['view_us'], archived: 'archived', disabled: false },
+        ];
+
+        for (const scenario of cases) {
+            const project: BacklogDragProject = {
+                my_permissions: scenario.permissions,
+                archived_code: scenario.archived,
+            };
+
+            const harness = renderHarness({ project });
+
+            expect(harness.result.current.drag.dndProviderProps.disabled).toBe(scenario.disabled);
+            // The autoscroll follows the same verdict, so a refused gesture cannot scroll the
+            // page either.
+            expect(harness.result.current.drag.dndProviderProps.autoScroll.enabled).toBe(
+                !scenario.disabled,
+            );
+        }
+    });
+
+    it('computes no permission notion of its own', () => {
+        // The list is read by index lookup, exactly as the retained directive reads it, so an
+        // unrelated permission neither grants nor withholds the gesture.
+        expect(
+            renderHarness({ project: { my_permissions: [] } }).result.current.drag.dndProviderProps
+                .disabled,
+        ).toBe(true);
+
+        expect(
+            renderHarness({ project: { my_permissions: ['modify_us', 'delete_us'] } }).result.current
+                .drag.dndProviderProps.disabled,
+        ).toBe(false);
+    });
+
+    it('leaves the row lifecycle classes the screen renders alone', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The marker the retained screen puts on a freshly created story.
+        rows[STORY_C]!.classList.add('new');
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(rows[STORY_C]!.classList.contains('new')).toBe(true);
+        expect(rows[STORY_C]!.classList.contains('us-item-row')).toBe(true);
+    });
+
+    it('leaves the incumbent dead code dead', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The retained handler read a checkbox state into a variable nothing used.
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        rows[STORY_C]!.appendChild(checkbox);
+
+        // And it computed an index against the BOARD's card element, which both following
+        // branches immediately overwrote.
+        const boardCard = document.createElement('tg-card');
+        body.insertBefore(boardCard, rows[STORY_A]!);
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // Identical to the same drop without either of them: the checkbox is not consulted
+        // and the board's element is not what the position is measured against.
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(0);
+        expect(harness.recording.orderCalls[0]![3]).toBe(STORY_A);
+        expect(checkbox.checked).toBe(true);
+    });
+});
+
+/* ==========================================================================
+ * 19. THE MULTI-SELECTION, WHICH THE ADOPTED LIBRARY DOES NOT PROVIDE
+ *
+ * R-DND-1: the adopted library has no multi-item drag of its own, so the whole of it is
+ * hand-built in the shared controller and reported to this hook through two callbacks.
+ * The property that is easy to lose is not "several rows move" -- it is WHICH row every
+ * measurement is taken against.
+ * ========================================================================== */
+
+describe('the multi-selection', () => {
+    it('measures the gesture against the FIRST SELECTED row, not the grabbed one', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The first story is grabbed, and the selection reports the LAST story first.
+        performDrag(harness, rows[STORY_A]!, { container: body, reference: rows[STORY_C]! }, [
+            rows[STORY_C]!,
+            rows[STORY_A]!,
+        ]);
+
+        /*
+         * ⭐⭐ NOTHING IS PERSISTED, and that is the point. The grabbed row moved from the
+         * head of the list to the middle, but the FIRST SELECTED row sits at the same
+         * position it began at, so the unchanged-drop guard absorbs the gesture -- which is
+         * precisely what the retained screen does, because it arms the selection first and
+         * then re-reads its own first element to measure. A hook that measured the grabbed
+         * row would send a request the retained screen never sends.
+         */
+        expect(harness.recording.orderCalls).toHaveLength(0);
+        expect(harness.result.current.state.pendingDrag).toHaveLength(0);
+    });
+
+    it('does persist the same drop when no selection is reported', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        // The control for the case above: the identical drop, with no selection.
+        performDrag(harness, rows[STORY_A]!, { container: body, reference: rows[STORY_C]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(harness.recording.orderCalls[0]![4]).toEqual([STORY_A]);
+    });
+
+    it('treats an EMPTY selection report as "not a multi-selection"', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+        const { drag } = harness.result.current;
+        const props = drag.dndProviderProps;
+        const moved = rows[STORY_C]!;
+
+        act(() => {
+            props.onDragStart?.(
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onDragStart>>[0],
+            );
+        });
+
+        // The controller reports nothing at both ends of the gesture, which is how it says
+        // the gesture is a single row.
+        act(() => {
+            props.onMultiDragStart?.(
+                [],
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onMultiDragStart>>[1],
+            );
+        });
+
+        act(() => {
+            props.onDragOver?.(
+                overFor(drag, { container: body, reference: rows[STORY_A]! }) as Parameters<
+                    NonNullable<typeof props.onDragOver>
+                >[0],
+            );
+        });
+
+        act(() => {
+            props.onMultiDragEnd?.(
+                [],
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onMultiDragEnd>>[1],
+            );
+            props.onDragEnd?.(
+                activeFor(drag, moved) as Parameters<NonNullable<typeof props.onDragEnd>>[0],
+            );
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        // The grabbed row alone, and the start measurement taken at drag start still stands.
+        expect(harness.recording.orderCalls[0]![4]).toEqual([STORY_C]);
+    });
+
+    it('carries every selected row, in the order the selection reported them', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! }, [
+            rows[STORY_B]!,
+            rows[STORY_C]!,
+        ]);
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(harness.recording.orderCalls[0]![4]).toEqual([STORY_B, STORY_C]);
+    });
+
+    it('builds its controller from the FACTORY, so two screens never share one gesture', () => {
+        const first = renderHarness().result.current.drag.dndProviderProps.multiDrag;
+        const second = renderHarness().result.current.drag.dndProviderProps.multiDrag;
+
+        expect(first).toBeDefined();
+        expect(second).toBeDefined();
+
+        // ⭐ Two mounted screens, two controllers. A module-level singleton would let one
+        // screen's teardown reset the other's hidden originals and clones mid-drag.
+        expect(first).not.toBe(second);
+
+        // The factory itself answers with a fresh controller each time, which is the property
+        // the hook depends on.
+        const own = createMultiDrag();
+        const another = createMultiDrag();
+
+        try {
+            expect(own).not.toBe(another);
+            expect(own.inProgress).toBe(false);
+            expect(typeof own.start).toBe('function');
+            expect(typeof own.stop).toBe('function');
+            expect(typeof own.getElements).toBe('function');
+        } finally {
+            own.destroy();
+            another.destroy();
+        }
+    });
+});
+
+/* ==========================================================================
+ * 20. WHAT THIS HOOK REFUSES TO REACH FOR
+ *
+ * Two refusals, both invisible when broken. The first keeps the AngularJS scope services
+ * out of React entirely; the second keeps the two coordination announcements on the
+ * channel the retained listeners are actually registered on.
+ * ========================================================================== */
+
+describe('the refusals', () => {
+    it('asks the AngularJS injector for nothing whatsoever', async () => {
+        const injector = mockInjector({});
+        const request = jest.spyOn(injector, 'get');
+
+        const harness = renderHarness({ wrapper: withMockInjector(injector) });
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.calls.emitted).toEqual(['sprint:us:moved']);
+        });
+
+        /*
+         * ⭐ THE INJECTOR IS RIGHT THERE AND IS NEVER ASKED. Every service this hook needs
+         * arrives as an argument, which is what makes the whole machine drivable without
+         * AngularJS at all -- and it is also the mechanism by which the scope services stay
+         * unreachable: the accessor's map excludes them deliberately, and the one sanctioned
+         * exception exposes a listener registrar and nothing more. This injector supplies
+         * nothing, so a single request would have thrown a diagnosable error here.
+         */
+        expect(request).not.toHaveBeenCalled();
+    });
+
+    it('announces both coordination events through the supplied emitter and dispatches no DOM event', async () => {
+        const closed = sprint(CLOSED_SPRINT_ID, [
+            sprintStory(STORY_IN_SPRINT, CLOSED_SPRINT_ID, 0),
+        ]);
+
+        const harness = renderHarness({
+            backlog: [STORY_A],
+            sprintStories: [],
+            closedSprints: [{ ...closed, closed: true }],
+        });
+
+        const windowDispatch = jest.spyOn(window, 'dispatchEvent');
+        const documentDispatch = jest.spyOn(document, 'dispatchEvent');
+
+        act(() => {
+            harness.result.current.drag.moveUs([STORY_IN_SPRINT], 0, null, null, STORY_A);
+        });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        await act(async () => {
+            harness.recording.pendingOrder[0]!.settle([]);
+        });
+
+        await waitFor(() => {
+            expect(harness.calls.emitted).toEqual([
+                'sprint:us:moved',
+                'backlog:load-closed-sprints',
+            ]);
+        });
+
+        const dispatched = [...windowDispatch.mock.calls, ...documentDispatch.mock.calls].map(
+            ([event]) => event.type,
+        );
+
+        /*
+         * ⛔ A DOCUMENT-LEVEL EVENT IS NOT A SUBSTITUTE. The listeners for both of these are
+         * registered on the AngularJS scope hierarchy -- the doom-line directive listens for
+         * the first, the retained controller for the second -- and neither would ever see an
+         * event dispatched on the window or the document. The emitter is supplied by the
+         * bridge for exactly this reason and is required rather than optional, so a screen
+         * cannot lose the two announcements by omission.
+         */
+        expect(dispatched).not.toContain('sprint:us:moved');
+        expect(dispatched).not.toContain('backlog:load-closed-sprints');
+    });
+});
+
+/* ==========================================================================
+ * 21. THE REMAINING OWNERSHIP BOUNDARIES
+ *
+ * Four boundaries that are each invisible until they move: which parts of a sprint a
+ * move is allowed to touch, who drives the multi-selection controller, whether a row has
+ * to be measurable to be usable, and which resource a write lands on.
+ * ========================================================================== */
+
+describe('the ownership boundaries', () => {
+    it('⛔ leaves a sprint\'s own members untouched, MU-3 and all', async () => {
+        const harness = renderHarness({ additionalSprintIds: [OTHER_SPRINT_ID] });
+        const { rows, sprintTable } = harness.scene;
+
+        const before = harness.result.current.state.sprints[0];
+        const otherBefore = harness.result.current.state.sprints[1];
+
+        harness.result.current.drag.registerSprintDragContainer(SPRINT_ID)(sprintTable);
+
+        performDrag(harness, rows[STORY_A]!, { container: sprintTable });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        const after = harness.result.current.state.sprints[0];
+
+        // The story joined the sprint, which is the whole of the local effect.
+        expect(after?.user_stories.map((story) => story.id)).toContain(STORY_A);
+
+        /*
+         * ⛔ MU-3 IS PRESERVED BY HAVING NOTHING TO PRESERVE. The retained controller mapped
+         * over its sprint list calling the merge helper with a SINGLE argument, which hands
+         * back the very same reference and merges nothing -- the surrounding map was reaching
+         * for the new object identities a change detector needs. The producer library
+         * supplies exactly those identities for the sprint that was touched and keeps them
+         * for every sprint that was not, so there is no second argument to "restore": it
+         * never existed. What must hold is that the move rewrites the story list and NOTHING
+         * ELSE about the sprint.
+         */
+        expect(after?.name).toBe(before?.name);
+        expect(after?.slug).toBe(before?.slug);
+        expect(after?.total_points).toBe(before?.total_points);
+        expect(after?.closed_points).toBe(before?.closed_points);
+        expect(after?.estimated_start).toBe(before?.estimated_start);
+        expect(after?.estimated_finish).toBe(before?.estimated_finish);
+        expect(after?.closed).toBe(before?.closed);
+
+        // And the sprint nobody dragged into keeps its identity outright.
+        expect(harness.result.current.state.sprints[1]).toBe(otherBefore);
+    });
+
+    it('drives the multi-selection controller through the provider and never calls it directly', async () => {
+        const controller = {
+            start: jest.fn<void, unknown[]>(),
+            stop: jest.fn<readonly HTMLElement[], unknown[]>(() => []),
+            getElements: jest.fn<readonly HTMLElement[], unknown[]>(() => []),
+            isMultiple: jest.fn<boolean, unknown[]>(() => false),
+            reset: jest.fn<void, unknown[]>(),
+            inProgress: false,
+            destroy: jest.fn<void, unknown[]>(),
+        };
+
+        const harness = renderHarness({ multiDrag: controller });
+        const { rows, body } = harness.scene;
+
+        performDrag(harness, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        /*
+         * ⭐⭐ THE ARM-THEN-READ ORDER IS DECLARED, NOT PERFORMED HERE. This screen arms the
+         * selection and then reads its elements back, and the board does the reverse; the
+         * provider performs both calls, so the ordering crosses as the value asserted in
+         * suite 7 rather than as a call this hook makes. The controller is handed over and
+         * left alone -- and the difference matters, because a hook that armed the selection
+         * itself would arm it a second time behind the provider's back and the two would
+         * disagree about which rows are moving.
+         */
+        expect(controller.start).not.toHaveBeenCalled();
+        expect(controller.getElements).not.toHaveBeenCalled();
+        expect(controller.stop).not.toHaveBeenCalled();
+        expect(controller.isMultiple).not.toHaveBeenCalled();
+        expect(controller.reset).not.toHaveBeenCalled();
+
+        expect(harness.result.current.drag.dndProviderProps.multiDrag).toBe(controller);
+        expect(harness.result.current.drag.dndProviderProps.multiDragCallOrder).toBe(
+            'start-then-elements',
+        );
+    });
+
+    it('never consults geometry, so an unmeasurable row is still a subject and a neighbour (R-DND-3)', async () => {
+        const harness = renderHarness();
+        const { rows, body } = harness.scene;
+
+        /*
+         * ⭐ R-DND-3 IS SATISFIED STRUCTURALLY HERE. This screen has no columns and no
+         * swimlanes, so it does not virtualise: the viewport helper the board needs is not
+         * reached for at all, and nothing on this path asks a row for its size, its computed
+         * display or an offsetted ancestor. Every row in this environment reports an empty
+         * rectangle, and the rows below are additionally display-suppressed -- if geometry
+         * were consulted anywhere, neither could be dragged and neither could be an anchor.
+         */
+        const subject = rows[STORY_C]!;
+        const anchor = rows[STORY_A]!;
+
+        subject.style.display = 'none';
+        anchor.style.display = 'none';
+
+        const rect = subject.getBoundingClientRect();
+        expect(rect.width).toBe(0);
+        expect(rect.height).toBe(0);
+
+        expect(harness.result.current.drag.canMove(subject)).toBe(true);
+        expect(harness.result.current.drag.getDroppableData(anchor)).toEqual({
+            itemNode: anchor,
+            containerNode: body,
+        });
+
+        performDrag(harness, subject, { container: body, reference: anchor });
+
+        await waitFor(() => {
+            expect(harness.recording.orderCalls).toHaveLength(1);
+        });
+
+        expect(harness.recording.orderCalls[0]![3]).toBe(STORY_A);
+        expect(harness.result.current.state.pendingDrag[0]?.newUsIndex).toBe(0);
+    });
+
+    it('writes only to the resource its own instance was given', async () => {
+        const first = renderHarness();
+        const second = renderHarness();
+
+        const { rows, body } = first.scene;
+
+        performDrag(first, rows[STORY_C]!, { container: body, reference: rows[STORY_A]! });
+
+        await waitFor(() => {
+            expect(first.recording.orderCalls).toHaveLength(1);
+        });
+
+        /*
+         * ⭐ NO SHARED CLIENT ANYWHERE. The write reached the sub-resource this instance was
+         * handed and no other, which is the observable form of "there is one transport and
+         * the AngularJS layer owns it": a request assembled here would have had to come from
+         * somewhere else, and the second instance's recorder would still be empty either way,
+         * so the assertion that matters is that the FIRST one is not.
+         */
+        expect(second.recording.orderCalls).toHaveLength(0);
+        expect(second.recording.milestoneCalls).toHaveLength(0);
+        expect(first.recording.orderCalls[0]![4]).toEqual([STORY_C]);
+    });
+
+    it('registers every container the retained screen registers, sprints included', () => {
+        const harness = renderHarness({ additionalSprintIds: [OTHER_SPRINT_ID] });
+        const { drag } = harness.result.current;
+        const { body, emptyFiltered, emptyLarge, sprintTable, root } = harness.scene;
+
+        const otherTable = document.createElement('div');
+        otherTable.className = 'sprint-table';
+        root.appendChild(otherTable);
+
+        drag.registerDragContainer(body);
+        drag.registerDragContainer(emptyFiltered);
+        drag.registerDragContainer(emptyLarge);
+        drag.registerSprintDragContainer(SPRINT_ID)(sprintTable);
+        drag.registerSprintDragContainer(OTHER_SPRINT_ID)(otherTable);
+
+        // The table body, BOTH empty-backlog blocks -- one for a filtered-empty backlog and
+        // one for a genuinely empty one -- and EVERY sprint table, in registration order.
+        expect(drag.getContainers()).toEqual([
+            body,
+            emptyFiltered,
+            emptyLarge,
+            sprintTable,
+            otherTable,
+        ]);
+
+        // Registering the same element twice does not visit it twice.
+        drag.registerDragContainer(body);
+        expect(drag.getContainers()).toHaveLength(5);
     });
 });

@@ -7,206 +7,285 @@
  */
 
 /* ==========================================================================
- * Executable contract for `SprintCard`.
+ * Executable contract for `./SprintCard`.
  *
- * WHAT IS ACTUALLY AT RISK HERE
- * -----------------------------
- * This component carries almost no logic -- one boolean of collapse state -- and
- * almost all of its value is the MARKUP CONTRACT. `app/styles/modules/backlog/
+ * WHAT IS ACTUALLY AT RISK IN THIS COMPONENT
+ * ------------------------------------------
+ * `SprintCard` holds exactly one boolean of state, so almost none of its value is
+ * logic and almost all of it is the MARKUP CONTRACT. `app/styles/modules/backlog/
  * sprints.scss` (412 lines) and `app/styles/components/buttons-next.scss` are
- * unedited pass-through assets, so a renamed class, a lost attribute or one extra
- * wrapper is a silent, total loss of styling that still compiles and still shows
- * the right words. jsdom parses no CSS, so these cases assert the class-and-
- * attribute contract rather than computed style: that is precisely the thing that
- * can break, and precisely the thing a screenshot of one state would not catch.
+ * unedited pass-through assets under rule T1, so a renamed class, a dropped
+ * attribute or one extra wrapper is a total, silent loss of styling that still
+ * compiles and still shows the right words. jsdom parses no CSS, so these cases
+ * assert the class-and-attribute contract rather than computed style: that is
+ * precisely what can break, and precisely what a screenshot of one state misses.
  *
- * THE SEVEN CONTRACTS THAT WOULD FAIL SILENTLY IN PRODUCTION, SO THEY ARE PINNED
- * -----------------------------------------------------------------------------
- *  1. `variant` must reach the DOM as a REAL ATTRIBUTE, because
- *     `buttons-next.scss:56`-`:60` selects `.btn-small[variant='secondary']`.
- *     Lose it and the button keeps its shape but takes `%button`'s default mint
- *     fill instead of the pale blue-grey the design frame measures. Asserted with
- *     `getAttribute`, never through the dataset.
- *  2. `.sprint-table` must be in the DOM in ALL FOUR states, because
- *     `backlog/sortable.coffee:39`-`:48` discovers drop containers BY CLASS
- *     (`isContainer: (el) -> el.classList.contains('sprint-table')`). Unmount it
- *     while collapsed or empty and the sprint stops accepting drops, with nothing
- *     throwing (R-DND-3).
- *  3. `active` and `open` must move TOGETHER, because `sprints.coffee:25`-`:30`
- *     flipped both in one function. Drift them apart and the chevron points one
- *     way while the table says another.
- *  4. `.sprint-progress-bar` must exist and must WRAP `.current-progress`, because
- *     `sprints.scss:165`-`:189` selects the fill as a DESCENDANT of the host.
- *     `./SprintProgressBar` deliberately emits no host of its own, so this
- *     component owns it -- and its sibling spec asserts the same division.
- *  5. The reference text must keep its TRAILING SPACE (`sprint.jade:31`-`:33`),
- *     which combines with `sprints.scss:330`-`:332`'s `1ch` end margin to make the
- *     measured reference-to-subject gap.
- *  6. The two empty-sprint messages must BOTH be present with `hidden` toggled,
- *     because `tgClassPermission` only ever toggles a class. A case that merely
- *     checked "one message is visible" would pass against an implementation that
- *     removed the other node.
- *  7. Both shared-component hosts must carry `class`, NOT `className`: react-dom
- *     forwards props to a hyphenated tag verbatim, so `className` lands as the
- *     attribute `classname` and `sprints.scss:314` / `:243` match nothing.
+ * SIXTEEN PRESERVED DEFECTS ARE PINNED HERE
+ * -----------------------------------------
+ * Rule T10 forbids functional change of every kind, which makes several
+ * pre-existing oddities REQUIREMENTS rather than bugs. A future contributor who
+ * "tidies" one of them must break a case that names the defect and cites its
+ * source locator, so the reason survives with the behaviour. The cases are
+ * numbered, and the defect table in the file's own specification maps each number
+ * to its `[path:locator]`:
  *
- * THE THIRTEEN PRESERVED DEFECTS ARE TESTS, NOT COMMENTS
- * -----------------------------------------------------
- * Rule T10 forbids fixing pre-existing behaviour, and a preserved defect with no
- * case behind it is one well-meaning refactor away from being "cleaned up". Each
- * one below is therefore a standing assertion that fails if it is corrected:
- * the parameterless title, the single-fire collapse, the un-ported dead constant,
- * the unguarded progress quotient, the doubled empty message, the truthiness
- * coercion of the points figures, the truthiness gate on the points column, the
- * truthiness gate on the epics array reference, the truthiness gate on the
- * milestone, the trailing space, the single-space title, the escaped subject and
- * the dropped scope-isolation attribute.
+ *   case  9  the date range is joined by a BARE HYPHEN            sprints.coffee:86
+ *   case 13  GO_TO_TASKBOARD keeps a literal interpolation   sprint-header.jade:18
+ *   case 27  the watcher-toggle collapse bug is NOT copied        sprints.coffee:38
+ *   case 28  no animation is authored here                    mixins/slide.scss
+ *   case 31  the progress quotient is passed through unguarded      sprint.jade:11
+ *   case 35  both empty-sprint messages are always present       sprint.jade:15-16
+ *   case 38  `.sprint-table` is never unmounted (R-DND-3)      sortable.coffee:39-48
+ *   case 41  `closedRow` -- capital R                               sprint.jade:22
+ *   case 42  `blockedRow` -- capital R                              sprint.jade:22
+ *   case 46  a falsy milestone leaves `div.column-us` empty         sprint.jade:26
+ *   case 47  the reference carries a TRAILING SPACE              sprint.jade:31-33
+ *   case 48  the title keeps ONE space, not the source's two        sprint.jade:28
+ *   case 55  React escaping replaces the raw markup binding         sprint.jade:35
+ *   case 58  an EMPTY epics array still renders the host         sprint.jade:37-42
+ *   case 63  zero points hides the whole points column              sprint.jade:49
+ *   case 67  `variant` must be a REAL attribute            buttons-next.scss:61-65
  *
- * WHAT IS DELIBERATELY NOT TESTED HERE
- * ------------------------------------
- *  - `SprintProgressBar`'s clamping arithmetic, which belongs to
- *    `./SprintProgressBar.test.tsx`. What IS asserted here is the CALL SITE: the
- *    host element, the nesting, and the raw quotient this component hands over.
- *  - `Svg`'s internals, which belong to `../shared/Svg.test.tsx`. Asserted here:
- *    that the `tg-svg` host survives -- stylesheets target it as an element -- and
- *    that the right sprite fragment is referenced.
- *  - `renderEmojified`'s scanner, which belongs to `./StoryRow.test.tsx`. Asserted
- *    here: that the subject goes through it and lands as ESCAPED TEXT.
- *  - How the permissions, the URLs and the formatted date range are computed. Per
- *    requirement I9 those belong to the container, and they arrive as props.
+ * NO USER RULES EXIST. `review_rules` was called for this file and returned
+ * "No user rules provided.", corroborating the plan's own statement. Nothing has
+ * been invented and the bar is not lowered: the binding checklist is T1-T10,
+ * HR-1..HR-11, I1-I9, R-DND-1..3, C1.0 and the Minimal Change Clause, and each is
+ * cited at the case that enforces it.
  *
- * Browserless by construction (constraint HR-5): jsdom only, no browser launch, no
- * network, no dependency on `dist/`.
+ * BROWSERLESS BY CONSTRUCTION (HR-5). No end-to-end runner is imported, no
+ * network call is made and no browser binary is required: the whole suite is
+ * jsdom, and it passes with `dist/` deleted and `CHROME_BIN` unset.
  * ========================================================================== */
 
-import { act, fireEvent, render } from '@testing-library/react';
-import type { ReactElement, ReactNode } from 'react';
+import '@testing-library/jest-dom';
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import type { MouseEvent as ReactMouseEvent, ReactElement, ReactNode } from 'react';
 
 import { AngularBridgeProvider } from '../bridge/AngularBridgeContext';
 import type { AngularInjector } from '../bridge/AngularBridgeContext';
+import { mockInjector } from '../bridge/mockInjector';
+import type { MockServiceMap } from '../bridge/mockInjector';
 import type { Epic } from '../shared/types/epic';
 import type { NestedSprintUserStory, Sprint } from '../shared/types/sprint';
 import { SprintCard } from './SprintCard';
 import type { SprintCardProps } from './SprintCard';
+import { renderEmojified } from './StoryRow';
 import type { EmojiLike } from './StoryRow';
 
-/* --------------------------------------------------------------------------
- * The bridge seam this component needs, and nothing more
- * -------------------------------------------------------------------------- */
-
-/**
- * The ten keys this card resolves, with the values
- * `app/locales/taiga/locale-en.json` actually stores.
+/* ==========================================================================
+ * THE SHIPPED ENGLISH VALUES
  *
- * Held here rather than inside the double so both halves can be asserted: that
- * the component asks for the RIGHT KEY, and that it renders whatever came back
- * verbatim.
+ * Every value below is the REAL entry from `app/locales/taiga/locale-en.json`,
+ * never a stand-in, and case 12 of the source-level group re-reads that file to
+ * prove it. Holding them here rather than inside the double lets both halves be
+ * asserted: that the component asks for the RIGHT KEY, and that it renders
+ * whatever came back verbatim.
  *
- * ⭐ NOTE `BACKLOG.GO_TO_TASKBOARD`. Its stored value embeds an interpolation, and
- * the markup feeds it no parameters -- preserved defect 1. The value is reproduced
- * here exactly as the catalogue holds it so the parameterless call is visible in
- * the assertions below rather than hidden behind a tidied stand-in.
+ * NOTE `BACKLOG.GO_TO_TASKBOARD`. Its stored value embeds an interpolation that
+ * the markup feeds no parameters -- preserved defect 1, pinned by case 13. It is
+ * reproduced exactly as the catalogue holds it so the parameterless call is
+ * visible in the assertion rather than hidden behind a tidied stand-in.
  *
- * ⭐ NOTE `BACKLOG.SPRINTS.LINK_TASKBOARD`. It is MIXED CASE in the catalogue; the
+ * NOTE `BACKLOG.SPRINTS.LINK_TASKBOARD`. It is MIXED CASE in the catalogue; the
  * uppercase the design frame shows comes from `%button`'s `text-transform`
  * (`buttons-next.scss:4`-`:34`), not from the markup, so the mixed-case form is
  * what this component must render.
- */
-const LOCALE: Readonly<Record<string, string>> = Object.freeze({
-    'BACKLOG.COMPACT_SPRINT': 'Compact Sprint',
-    'BACKLOG.GO_TO_TASKBOARD': 'Go to the taskboard of {{::name}}',
-    'BACKLOG.EDIT_SPRINT': 'Edit Sprint',
-    'BACKLOG.CLOSED_POINTS': 'closed',
-    'BACKLOG.TOTAL_POINTS': 'total',
-    'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS': 'This sprint has no user stories',
-    'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT':
-        'Drop here Stories from your backlog to start a new sprint',
-    'BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD': 'Go to Taskboard of "{{name}}"',
-    'BACKLOG.SPRINTS.LINK_TASKBOARD': 'Sprint Taskboard',
-    'BACKLOG.SPRINTS.DATE': 'DD MMM YYYY',
+ * ========================================================================== */
+
+const COMPACT_SPRINT_KEY = 'BACKLOG.COMPACT_SPRINT';
+const GO_TO_TASKBOARD_KEY = 'BACKLOG.GO_TO_TASKBOARD';
+const EDIT_SPRINT_KEY = 'BACKLOG.EDIT_SPRINT';
+const CLOSED_POINTS_KEY = 'BACKLOG.CLOSED_POINTS';
+const TOTAL_POINTS_KEY = 'BACKLOG.TOTAL_POINTS';
+const WARNING_EMPTY_SPRINT_ANONYMOUS_KEY = 'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT_ANONYMOUS';
+const WARNING_EMPTY_SPRINT_KEY = 'BACKLOG.SPRINTS.WARNING_EMPTY_SPRINT';
+const TITLE_LINK_TASKBOARD_KEY = 'BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD';
+const LINK_TASKBOARD_KEY = 'BACKLOG.SPRINTS.LINK_TASKBOARD';
+
+const TRANSLATIONS: Readonly<Record<string, string>> = Object.freeze({
+    [COMPACT_SPRINT_KEY]: 'Compact Sprint',
+    [GO_TO_TASKBOARD_KEY]: 'Go to the taskboard of {{::name}}',
+    [EDIT_SPRINT_KEY]: 'Edit Sprint',
+    [CLOSED_POINTS_KEY]: 'closed',
+    [TOTAL_POINTS_KEY]: 'total',
+    [WARNING_EMPTY_SPRINT_ANONYMOUS_KEY]: 'This sprint has no user stories',
+    [WARNING_EMPTY_SPRINT_KEY]: 'Drop here Stories from your backlog to start a new sprint',
+    [TITLE_LINK_TASKBOARD_KEY]: 'Go to Taskboard of "{{name}}"',
+    [LINK_TASKBOARD_KEY]: 'Sprint Taskboard',
 });
+
+/** The two files this suite reads back to check its own premises. */
+const LOCALE_FILE = join(__dirname, '..', '..', 'locales', 'taiga', 'locale-en.json');
+const UNIT_FILE = join(__dirname, 'SprintCard.tsx');
+
+/* ==========================================================================
+ * THE HARNESS
+ * ========================================================================== */
+
+const TRANSLATE_SERVICE_NAME = '$translate';
+
+/**
+ * The language-change host the translator hook subscribes to.
+ *
+ * ⭐ WHY IT IS LAYERED IN, AND WHY THAT IS NOT A WEAKENING -- SURFACED
+ * COORDINATION ITEM.
+ *
+ * `useTranslate` resolves `$translate` through `useAngularService`, and then
+ * resolves the application root scope through its own narrow accessor
+ * `useAngularBroadcastListener` (`../bridge/useAngularService.ts:844`-`:856`) so
+ * it can refresh on `$translateChangeEnd`. The root scope is DELIBERATELY not a
+ * member of the sanctioned service map -- `AngularServices` lists the fifteen
+ * services React may reach and the root scope is excluded from every one of them
+ * -- so `mockInjector` cannot express it and throws when asked for it.
+ *
+ * Supplying the translation service alone is therefore not literally satisfiable,
+ * and this is reported rather than papered over: the second name comes from the
+ * BRIDGE HOOK, never from this component, and the hook only ever LISTENS. The
+ * layering here is the same one `./StoryRow.test.tsx`, `./BacklogToolbar.test.tsx`
+ * and `../bridge/useTranslate.test.tsx` already use.
+ *
+ * The resolution is strictly STRONGER than a bare sanctioned map would be,
+ * because {@link createSpecInjector} RECORDS every name resolved through it: case
+ * 74 asserts the recorded set is exactly these two, which proves the component
+ * reaches for no repository, no realtime service, no emoji service, no navigation
+ * service and no root scope of its own.
+ */
+const ROOT_SCOPE_SERVICE_NAME = '$rootScope';
 
 type InstantMock = jest.Mock<string, [string, (Record<string, unknown> | undefined)?]>;
 
-let instant: InstantMock;
-
 /**
- * The injector the translator hook resolves through.
+ * The translation double.
  *
- * `mockInjector` from `../bridge/mockInjector` accepts only the sanctioned service
- * map, and the root scope is deliberately not a member of it -- the translator hook
- * reaches it through its own narrow broadcast-listener accessor. So the two are
- * layered here exactly as `./BacklogToolbar.test.tsx` and
- * `../bridge/useTranslate.test.tsx` do: a plain object honouring the injector's
- * structural contract, answering `$translate` and `$rootScope` and nothing else.
+ * ⭐ IT INTERPOLATES `{{key}}` ONLY WHEN PARAMETERS ARE SUPPLIED, and does nothing
+ * else -- no special handling of the one-time-binding prefix, because AngularJS
+ * performs none here either. That single rule is what tells the two taskboard
+ * titles apart: the header link is fed nothing and keeps its literal braces
+ * (case 13, preserved defect 1), while the taskboard button IS fed a name and
+ * resolves properly (case 66).
  *
- * Asking for anything else THROWS, which is the point: if a future edit reached for
- * a repository or an events service inside this component -- forbidden by rules T5
- * and I9 -- every case below would fail loudly instead of silently acquiring a
- * dependency.
- *
- * ⭐ The double interpolates `{{name}}` when parameters ARE supplied and leaves the
- * value untouched when they are not, which is how the two taskboard titles are
- * told apart: one is fed and one is not.
+ * An unresolved lookup falls back to the key itself, which is what
+ * `$translate.instant` does, so a missing entry surfaces as the key in the output
+ * rather than as an empty label.
  */
-function bridge(): AngularInjector {
-    instant = jest.fn(
-        (key: string, params?: Record<string, unknown>): string => {
-            const stored = key in LOCALE ? String(LOCALE[key]) : `?${key}?`;
+function createInstantMock(
+    table: Readonly<Record<string, string>> = TRANSLATIONS,
+): InstantMock {
+    return jest.fn((key: string, params?: Record<string, unknown>): string => {
+        const stored = key in table ? table[key] : key;
 
-            if (params === undefined) {
-                return stored;
-            }
+        if (params === undefined) {
+            return stored;
+        }
 
-            return Object.entries(params).reduce(
-                (text: string, [name, value]: [string, unknown]): string =>
-                    text.split(`{{${name}}}`).join(String(value)),
-                stored,
-            );
-        },
-    );
-
-    const services: Readonly<Record<string, unknown>> = Object.freeze({
-        $translate: { instant },
-        // Registered so the hook's language-change subscription succeeds. This card
-        // never raises a language change, so the deregistration function is all it
-        // needs back.
-        $rootScope: { $on: (): (() => void) => (): void => undefined },
+        return Object.entries(params).reduce(
+            (text: string, [name, value]: [string, unknown]): string =>
+                text.split(`{{${name}}}`).join(String(value)),
+            stored,
+        );
     });
+}
 
+/** The full shape the sanctioned map declares for the translation service. */
+function createTranslateService(instant: InstantMock): MockServiceMap['$translate'] {
     return {
-        get<T>(name: string): T {
-            if (!(name in services)) {
-                throw new Error(`spec injector: unexpected AngularJS service '${name}'`);
-            }
-
-            return services[name] as T;
-        },
+        instant,
+        preferredLanguage: (): string => 'en',
+        getTranslationTable: (): Record<string, unknown> => ({ ...TRANSLATIONS }),
     };
 }
 
-function wrapper({ children }: { children?: ReactNode }): ReactElement {
-    return <AngularBridgeProvider injector={bridge()}>{children}</AngularBridgeProvider>;
+/** This card raises no language change, so a deregistration is the whole surface. */
+function createRootScopeDouble(): Readonly<Record<string, unknown>> {
+    return { $on: (): (() => void) => (): void => undefined };
 }
 
-/* --------------------------------------------------------------------------
- * Fixtures
- * -------------------------------------------------------------------------- */
+interface SpecInjector {
+    readonly injector: AngularInjector;
+
+    /** Every service name the subtree resolved, in resolution order. */
+    readonly requested: readonly string[];
+
+    readonly instant: InstantMock;
+}
+
+/**
+ * Layers the language-change host over the sanctioned service map and RECORDS
+ * every name resolved through it.
+ *
+ * The recording is what makes case 74 a real assertion rather than a tautology:
+ * the sanctioned map answers the translation service and throws by design for a
+ * name it was not given, and the extension answers exactly one further name.
+ */
+function createSpecInjector(
+    table: Readonly<Record<string, string>> = TRANSLATIONS,
+): SpecInjector {
+    const instant = createInstantMock(table);
+    const requested: string[] = [];
+    const sanctioned = mockInjector({
+        [TRANSLATE_SERVICE_NAME]: createTranslateService(instant),
+    });
+    const extensions = new Map<string, unknown>([
+        [ROOT_SCOPE_SERVICE_NAME, createRootScopeDouble()],
+    ]);
+
+    const injector: AngularInjector = {
+        get<T>(name: string): T {
+            requested.push(name);
+
+            const extension = extensions.get(name);
+
+            if (extension !== undefined) {
+                return extension as T;
+            }
+
+            return sanctioned.get<T>(name);
+        },
+    };
+
+    return { injector, requested, instant };
+}
+
+let spec: SpecInjector;
+
+function Bridge({ children }: { children?: ReactNode }): ReactElement {
+    return <AngularBridgeProvider injector={spec.injector}>{children}</AngularBridgeProvider>;
+}
+
+/* ==========================================================================
+ * FIXTURES
+ *
+ * ⭐ THE FALSY MEMBERS ARE SPELLED `null`, NOT `undefined`, AND THAT IS THE
+ * CONTRACT SPEAKING RATHER THAN A CONVENIENCE.
+ * `../shared/types/sprint` declares `milestone: number | null`,
+ * `epics: readonly Epic[] | null`, `due_date: string | null` and
+ * `total_points: number | null` -- these are REQUIRED members with a null
+ * inhabitant, so `undefined` is not assignable to them and the falsy case a
+ * truthiness gate reaches is `null`. Every gate under test is plain truthiness, so
+ * the branch exercised is identical; the spelling simply follows the declared
+ * shape. Nothing is cast and nothing is widened.
+ *
+ * ⭐ `Sprint.closed_points` and `Sprint.total_points` ARE nullable, so the `or 0`
+ * coercion at `sprints.coffee:92`-`:93` is fully expressible here and needs no
+ * substitute -- see {@link NULL_POINTS_SPRINT}.
+ * ========================================================================== */
 
 const SPRINT_ID = 7;
 
 /**
- * One story as the backend's NESTED serializer renders it.
+ * One story exactly as the backend's NESTED serializer renders it.
  *
- * Every member of `NestedSprintUserStory` is supplied, because the type exists
+ * Every member of `NestedSprintUserStory` is supplied, because that type exists
  * precisely to stop a sprint's stories being mistaken for the backlog's own
- * fuller shape -- a fixture that satisfied the type only by assertion would defeat
- * that.
+ * fuller list shape -- a fixture that satisfied it by assertion would defeat the
+ * point.
  */
 function makeStory(over: Partial<NestedSprintUserStory> = {}): NestedSprintUserStory {
     return {
-        id: 1,
-        ref: 1,
+        id: 101,
+        ref: 42,
         milestone: SPRINT_ID,
         project: 1,
         project_extra_info: null,
@@ -214,7 +293,7 @@ function makeStory(over: Partial<NestedSprintUserStory> = {}): NestedSprintUserS
         created_date: '2026-05-15T00:00:00Z',
         modified_date: '2026-05-15T00:00:00Z',
         finish_date: null,
-        subject: 'Add tests for bulk operations',
+        subject: 'Do the thing',
         client_requirement: false,
         team_requirement: false,
         external_reference: null,
@@ -226,7 +305,7 @@ function makeStory(over: Partial<NestedSprintUserStory> = {}): NestedSprintUserS
         kanban_order: 0,
         epics: null,
         points: {},
-        total_points: 27,
+        total_points: 8,
         status: 1,
         status_extra_info: null,
         assigned_to: null,
@@ -238,10 +317,79 @@ function makeStory(over: Partial<NestedSprintUserStory> = {}): NestedSprintUserS
     };
 }
 
-/**
- * The sprint the design frame shows: `Sprint 2026-5-15`, 21 closed of 101.5 total,
- * three assigned stories of which the first is closed.
+/*
+ * ⭐ EVERY DERIVED STORY CARRIES ITS OWN `id`, AND THAT IS A REQUIREMENT RATHER
+ * THAN TIDINESS. `sprint.jade:18` tracks by `us.id` and the component keys its rows
+ * by the same member (case 40), so two fixtures sharing an id would collide as React
+ * keys the moment a case renders both in one sprint. Case 77's console guard caught
+ * exactly that while this suite was being written, which is the guard earning its
+ * place: the references deliberately stay identical so the reference-bearing cases
+ * keep their expected `#42`.
  */
+const STORY_A: NestedSprintUserStory = makeStory();
+
+const STORY_B: NestedSprintUserStory = makeStory({
+    id: 102,
+    ref: 43,
+    subject: 'Ship the other thing',
+    total_points: 13,
+});
+
+const STORY_CLOSED: NestedSprintUserStory = makeStory({ id: 103, is_closed: true });
+
+const STORY_BLOCKED: NestedSprintUserStory = makeStory({ id: 104, is_blocked: true });
+
+/** Drives preserved defect 7: plain truthiness hides the whole points column. */
+const STORY_ZERO_POINTS: NestedSprintUserStory = makeStory({ id: 105, total_points: 0 });
+
+/** Drives preserved defect 9: a falsy milestone leaves `div.column-us` empty. */
+const STORY_NO_MILESTONE: NestedSprintUserStory = makeStory({ id: 106, milestone: null });
+
+/**
+ * The colour here is DATA (rule T2, gap G-DS-5). It lives in the fixture so case
+ * 60 can prove the component itself emits no colour whatsoever.
+ */
+const BIG_EPIC: Epic = { id: 1, ref: 9, subject: 'Big epic', color: '#AABBCC' };
+
+/** Drives preserved defect 8: an EMPTY array is truthy, so the host still renders. */
+const STORY_EMPTY_EPICS: NestedSprintUserStory = makeStory({ id: 107, epics: [] });
+
+const STORY_WITH_EPICS: NestedSprintUserStory = makeStory({ id: 108, epics: [BIG_EPIC] });
+
+const STORY_WITH_DUE_DATE: NestedSprintUserStory = makeStory({
+    id: 109,
+    due_date: '2026-06-01',
+    due_date_status: 'set',
+});
+
+const EMOJI_STORY: NestedSprintUserStory = makeStory({
+    id: 110,
+    subject: 'Ship it :rocket: now',
+});
+
+/**
+ * A subject carrying literal markup.
+ *
+ * The incumbent bound it through `tg-bind-html` (`sprint.jade:35`), which called
+ * jQuery's `.html()`. React renders text children as text, so this fixture proves
+ * the escape rather than assuming it -- case 55.
+ */
+const XSS_STORY: NestedSprintUserStory = makeStory({
+    id: 111,
+    subject: '<img src=x onerror=alert(1)>',
+});
+
+const ROCKET_IMAGE = '/v/emojis/rocket.png';
+
+/**
+ * The emoji name index, shaped as the emoji service builds it: the `image` member
+ * is ALREADY version-prefixed at construction, so the component never assembles a
+ * path of its own.
+ */
+const EMOJIS_BY_NAME: ReadonlyMap<string, EmojiLike> = new Map<string, EmojiLike>([
+    ['rocket', { name: 'rocket', image: ROCKET_IMAGE }],
+]);
+
 function makeSprint(over: Partial<Sprint> = {}): Sprint {
     return {
         id: SPRINT_ID,
@@ -258,37 +406,49 @@ function makeSprint(over: Partial<Sprint> = {}): Sprint {
         total_points: 101.5,
         estimated_start: '2026-05-15',
         estimated_finish: '2026-05-30',
-        user_stories: [
-            makeStory({
-                id: 1,
-                ref: 1,
-                subject: 'Exception is thrown if trying to add a folder with existing name',
-                is_closed: true,
-                total_points: 21,
-            }),
-            makeStory({ id: 5, ref: 5, subject: 'Add tests for bulk operations', total_points: 27 }),
-            makeStory({
-                id: 9,
-                ref: 9,
-                subject: "get_actions() does not check for 'delete_selected' in actions",
-                total_points: 53.5,
-            }),
-        ],
+        user_stories: [STORY_A, STORY_B],
         ...over,
     };
 }
 
-const TASKBOARD_URL = '/project/project-1/taskboard/sprint-2026-5-15';
+const OPEN_SPRINT: Sprint = makeSprint();
 
+const CLOSED_SPRINT: Sprint = makeSprint({ closed: true });
+
+const EMPTY_SPRINT: Sprint = makeSprint({ closed: false, user_stories: [] });
+
+/** `100 * 0 / 0` is `NaN`. Preserved defect 4, pinned by case 31. */
+const ZERO_POINTS_SPRINT: Sprint = makeSprint({ closed_points: 0, total_points: 0 });
+
+/** `null` divides as `0`, so this is the other route to `NaN`. Case 31. */
+const NULL_POINTS_SPRINT: Sprint = makeSprint({ closed_points: null, total_points: 0 });
+
+/** `100 * 21 / 0` is `Infinity`. Case 31. */
+const INFINITE_POINTS_SPRINT: Sprint = makeSprint({ closed_points: 21, total_points: 0 });
+
+const TASKBOARD_URL = '/project/proj/taskboard/sprint-1';
+
+/**
+ * ⭐ A BARE HYPHEN, NO SURROUNDING SPACES.
+ *
+ * `sprints.coffee:86` builds `"#{start}-#{finish}"`, so the separator carries no
+ * padding at all. Pinned by case 9, which also rejects the prose paraphrase
+ * "(15-30 May 2026)" that appears in the migration plan's narrative.
+ */
 const DATE_RANGE = '15 May 2026-30 May 2026';
 
-let onEditSprint: jest.Mock<void, [Sprint]>;
-let onOpenUserStory: jest.Mock<void, [NestedSprintUserStory, unknown]>;
-let onOpenTaskboard: jest.Mock<void, [unknown]>;
+const DETAIL_HREF_PREFIX = '/project/proj/us/';
 
-function baseProps(over: Partial<SprintCardProps> = {}): SprintCardProps {
-    return {
-        sprint: makeSprint(),
+let onEditSprint: jest.Mock<void, [Sprint]>;
+let onOpenUserStory: jest.Mock<
+    void,
+    [NestedSprintUserStory, ReactMouseEvent<HTMLAnchorElement>]
+>;
+let onOpenTaskboard: jest.Mock<void, [ReactMouseEvent<HTMLAnchorElement>]>;
+
+function makeProps(over: Partial<SprintCardProps> = {}): SprintCardProps {
+    const base: SprintCardProps = {
+        sprint: OPEN_SPRINT,
         listVariant: 'open',
         isVisible: true,
         isEditable: true,
@@ -298,960 +458,1373 @@ function baseProps(over: Partial<SprintCardProps> = {}): SprintCardProps {
         totalPoints: 101.5,
         hasModifyUsPermission: true,
         canViewMilestones: true,
-        emojisByName: undefined,
-        detailHrefFor: (story: NestedSprintUserStory): string => `/us/${String(story.ref)}`,
+        emojisByName: EMOJIS_BY_NAME,
+        detailHrefFor: (story: NestedSprintUserStory): string =>
+            `${DETAIL_HREF_PREFIX}${String(story.ref)}`,
         onEditSprint,
         onOpenUserStory,
         onOpenTaskboard,
-        ...over,
     };
+
+    return { ...base, ...over };
 }
 
 beforeEach((): void => {
+    spec = createSpecInjector();
     onEditSprint = jest.fn();
     onOpenUserStory = jest.fn();
     onOpenTaskboard = jest.fn();
 });
 
-function renderCard(over: Partial<SprintCardProps> = {}): HTMLElement {
-    const { container } = render(<SprintCard {...baseProps(over)} />, { wrapper });
+interface Mounted {
+    readonly container: HTMLElement;
 
-    return container;
+    /** The `div.sprint` root, resolved once; React keeps the same node. */
+    readonly root: HTMLElement;
+
+    readonly props: SprintCardProps;
+
+    readonly rerender: (next: SprintCardProps) => void;
+
+    readonly unmount: () => void;
+}
+
+function mount(over: Partial<SprintCardProps> = {}): Mounted {
+    const props = makeProps(over);
+    const result = render(<SprintCard {...props} />, { wrapper: Bridge });
+
+    return {
+        container: result.container,
+        root: mustFind(result.container, '.sprint'),
+        props,
+        rerender: (next: SprintCardProps): void => {
+            result.rerender(<SprintCard {...next} />);
+        },
+        unmount: result.unmount,
+    };
 }
 
 /** Fails loudly rather than letting a missing element read as a passing negative. */
-function mustFind(container: HTMLElement, selector: string): HTMLElement {
-    const found = container.querySelector(selector);
+function mustFind<T extends Element = HTMLElement>(root: Element, selector: string): T {
+    const found = root.querySelector<T>(selector);
 
     if (found === null) {
-        throw new Error(`expected to find '${selector}' in:\n${container.innerHTML}`);
+        throw new Error(`expected to find '${selector}' in:\n${root.innerHTML}`);
     }
 
-    return found as HTMLElement;
+    return found;
+}
+
+/** The rows of one card, in document order. */
+function rowsOf(root: Element): readonly HTMLElement[] {
+    return [...root.querySelectorAll<HTMLElement>('.sprint-table > .row')];
 }
 
 /* ==========================================================================
- * 1. THE WRAPPER'S CLASS CONTRACT
+ * 1. WRAPPER AND LIST VARIANT
  * ========================================================================== */
 
-describe('the wrapper class contract', () => {
-    it('an open-list sprint that is open carries `sprint sprint-open` and nothing else', () => {
-        const container = renderCard();
-        const wrapperEl = mustFind(container, '.sprint');
+describe('wrapper and list variant', () => {
+    it('1. renders a root element carrying `sprint`', () => {
+        const { container } = mount();
+        const root = mustFind(container, 'div.sprint');
 
-        expect(wrapperEl.className).toBe('sprint sprint-open');
-        expect(wrapperEl.classList).toHaveLength(2);
+        expect(root).toBe(container.firstElementChild);
+        expect(root.tagName).toBe('DIV');
+        expect(root.classList.contains('sprint')).toBe(true);
     });
 
-    it('a closed-list sprint that is closed carries `sprint sprint-closed` EXACTLY ONCE', () => {
-        // `sprints.jade:54` supplies the class and `sprints.coffee:37` adds it
-        // again, but jQuery's `addClass` is idempotent -- so a duplicate here would
-        // be a faithful-looking bug.
-        const container = renderCard({
-            listVariant: 'closed',
-            sprint: makeSprint({ closed: true }),
-        });
-        const wrapperEl = mustFind(container, '.sprint');
+    it('2. an open-list open sprint carries `sprint-open` and NOT `sprint-closed`', () => {
+        const { root } = mount({ listVariant: 'open', sprint: OPEN_SPRINT });
 
-        expect(wrapperEl.className).toBe('sprint sprint-closed');
-        expect(wrapperEl.classList).toHaveLength(2);
+        expect(root.classList.contains('sprint-open')).toBe(true);
+        expect(root.classList.contains('sprint-closed')).toBe(false);
+        expect(root.getAttribute('class')).toBe('sprint sprint-open');
     });
 
-    it('an OPEN-LIST sprint that is closed carries BOTH variant classes', () => {
-        // The union preserved defect: a sprint closed by another user is still in
-        // the open list, and `sprints.scss:379`-`:382` needs `sprint-closed` to
-        // collapse its table.
-        const container = renderCard({
-            listVariant: 'open',
-            sprint: makeSprint({ closed: true }),
-        });
-        const wrapperEl = mustFind(container, '.sprint');
+    it('3. a closed-list closed sprint carries `sprint-closed`', () => {
+        const { root } = mount({ listVariant: 'closed', sprint: CLOSED_SPRINT });
 
-        expect(wrapperEl.classList.contains('sprint')).toBe(true);
-        expect(wrapperEl.classList.contains('sprint-open')).toBe(true);
-        expect(wrapperEl.classList.contains('sprint-closed')).toBe(true);
-        expect(wrapperEl.classList).toHaveLength(3);
+        expect(root.classList.contains('sprint-closed')).toBe(true);
+
+        // `sprints.jade:54` supplies the class and `sprints.coffee:36`-`:37` adds it
+        // again; jQuery's addClass is idempotent, so the union collapses to one.
+        expect(root.getAttribute('class')).toBe('sprint sprint-closed');
     });
 
-    it('a closed-list sprint that is not closed carries only the list variant', () => {
-        const container = renderCard({ listVariant: 'closed' });
-        const wrapperEl = mustFind(container, '.sprint');
+    it('4. an OPEN-list sprint that is closed carries BOTH variant classes', () => {
+        // The union `sprints.jade:43`/`:56` plus `tgBacklogSprint`'s own addClass
+        // (`sprints.coffee:36`) produce, and the union `sprints.scss:379`-`:382`
+        // depends on to collapse the table of a sprint another member just closed.
+        const { root } = mount({ listVariant: 'open', sprint: CLOSED_SPRINT });
 
-        expect(wrapperEl.className).toBe('sprint sprint-closed');
+        expect(root.classList.contains('sprint-open')).toBe(true);
+        expect(root.classList.contains('sprint-closed')).toBe(true);
     });
 
-    it('renders no shadow root, so the global stylesheet and the sprite stay reachable', () => {
-        // Requirement I6. A shadow boundary would sever the single compiled
-        // stylesheet AND break every `<use href="#icon-...">` fragment reference.
-        const container = renderCard();
+    it('5. renders header, progress wrapper, table and taskboard link in that order', () => {
+        const { root } = mount();
+        const children = [...root.children];
 
-        expect(mustFind(container, '.sprint').shadowRoot).toBeNull();
-        expect(container.shadowRoot).toBeNull();
+        expect(children).toHaveLength(4);
+        expect(children[0].tagName).toBe('HEADER');
+        expect(children[1].classList.contains('summary-progress-wrapper')).toBe(true);
+        expect(children[2].classList.contains('sprint-table')).toBe(true);
+        expect(children[3].tagName).toBe('A');
+        expect(children[3].classList.contains('btn-small')).toBe(true);
     });
 });
 
 /* ==========================================================================
- * 2. THE HEADER'S STRUCTURE
+ * 2. HEADER STRUCTURE
  * ========================================================================== */
 
-describe('the header', () => {
-    it('is an unclassed `header` element, because the stylesheet selects the tag', () => {
-        // `sprints.scss:73`-`:75` gives `.sprint header { position: relative }`,
-        // and that is what the absolutely positioned edit affordance is positioned
-        // against. A `div` here would unstick it.
-        const container = renderCard();
-        const header = mustFind(container, '.sprint > header');
+describe('header structure', () => {
+    it('6. nests header > .sprint-summary > .sprint-name-container > .sprint-name', () => {
+        const { root } = mount();
 
-        expect(header.tagName).toBe('HEADER');
-        expect(header.getAttribute('class')).toBeNull();
+        // `sprint-header.jade:10`-`:12`. The unclassed `header` is selected as an
+        // ELEMENT by `sprints.scss:73`-`:75`, which is what positions the edit
+        // affordance, so neither the tag nor the depth may change (rule T1).
+        expect(
+            root.querySelector('header > .sprint-summary > .sprint-name-container > .sprint-name'),
+        ).not.toBeNull();
     });
 
-    it('nests summary > name-container > name, with the date as the container\u2019s second child', () => {
-        const container = renderCard();
-        const summary = mustFind(container, 'header > .sprint-summary');
-        const nameContainer = mustFind(container, '.sprint-summary > .sprint-name-container');
+    it('7. puts a BUTTON.compact-sprint carrying the arrow icon inside .sprint-name', () => {
+        const { root } = mount();
+        const name = mustFind(root, '.sprint-name');
+        const button = mustFind(name, 'button.compact-sprint');
 
-        expect(summary.children).toHaveLength(2);
-        expect(nameContainer.children).toHaveLength(2);
-        expect(nameContainer.children[0]).toBe(mustFind(container, '.sprint-name'));
-        expect(nameContainer.children[1]).toBe(mustFind(container, '.sprint-date'));
-        expect(summary.children[1]).toBe(mustFind(container, '.sprint-points'));
-    });
-
-    it('keeps the collapse button a DIRECT child of `.sprint-name`', () => {
-        // The incumbent's delegated handler was bound to
-        // `.sprint-name > .compact-sprint` (`sprints.coffee:42`). The selector is
-        // gone; the nesting it encoded is part of the markup contract.
-        const container = renderCard();
-        const name = mustFind(container, '.sprint-name');
-        const button = mustFind(container, '.compact-sprint');
-
-        expect(button.parentElement).toBe(name);
+        // `sprint-header.jade:13`-`:14`. A button, never an anchor, and a DIRECT
+        // child of `.sprint-name` because the incumbent's delegated handler was
+        // bound to `.sprint-name > .compact-sprint` (`sprints.coffee:42`).
         expect(button.tagName).toBe('BUTTON');
+        expect(button.parentElement).toBe(name);
+        expect(button.title).toBe(TRANSLATIONS[COMPACT_SPRINT_KEY]);
+
+        // The icon goes through the shared renderer, so the bare `tg-svg` element
+        // selectors at `sprints.scss:37`/`:42` still match.
+        expect(
+            button.querySelector('tg-svg > svg.icon.icon-arrow-right'),
+        ).not.toBeNull();
     });
 
-    it('renders the date range verbatim, bare hyphen and all', () => {
-        const container = renderCard();
+    it('8. renders .sprint-date inside .sprint-name-container, verbatim', () => {
+        const { root } = mount();
+        const container = mustFind(root, '.sprint-name-container');
+        const date = mustFind(container, '.sprint-date');
 
-        expect(mustFind(container, '.sprint-date').textContent).toBe(DATE_RANGE);
-        expect(DATE_RANGE).not.toContain(' - ');
-        expect(DATE_RANGE).not.toContain('\u2013');
-    });
-});
-
-/* ==========================================================================
- * 3. THE COLLAPSE TOGGLE
- * ========================================================================== */
-
-describe('the collapse toggle', () => {
-    it('starts EXPANDED for an open sprint: `active` on the arrow and `open` on the table', () => {
-        const container = renderCard();
-
-        expect(mustFind(container, '.compact-sprint').classList.contains('active')).toBe(true);
-        expect(mustFind(container, '.sprint-table').classList.contains('open')).toBe(true);
+        expect(date.parentElement).toBe(container);
+        expect(date.textContent).toBe(DATE_RANGE);
     });
 
-    it('starts COLLAPSED for a closed sprint: neither class present', () => {
-        const container = renderCard({
-            listVariant: 'closed',
-            sprint: makeSprint({ closed: true }),
-        });
+    it('9. joins the date range with a BARE HYPHEN and no surrounding spaces', () => {
+        // PRESERVED DEFECT: `sprints.coffee:86` builds `"#{start}-#{finish}"`, so
+        // there is no padding and no en dash. This case deliberately rejects the
+        // migration plan's prose paraphrase "(15-30 May 2026)" in favour of the
+        // source. Do not "prettify" the separator.
+        const { root } = mount();
+        const text = mustFind(root, '.sprint-date').textContent;
 
-        expect(mustFind(container, '.compact-sprint').classList.contains('active')).toBe(false);
-        expect(mustFind(container, '.sprint-table').classList.contains('open')).toBe(false);
+        expect(text).toBe('15 May 2026-30 May 2026');
+        expect(text).not.toContain(' - ');
+        expect(text).not.toContain('\u2013');
     });
 
-    it('flips BOTH classes on click, and flips them back on a second click', () => {
-        const container = renderCard();
-        const button = mustFind(container, '.compact-sprint');
-        const table = mustFind(container, '.sprint-table');
+    it('10. renders .sprint-points > .sprint-info > ul with exactly two items', () => {
+        const { root } = mount();
+        const points = mustFind(root, '.sprint-points');
+        const list = mustFind(points, '.sprint-info > ul');
 
-        fireEvent.click(button);
-
-        expect(button.classList.contains('active')).toBe(false);
-        expect(table.classList.contains('open')).toBe(false);
-
-        fireEvent.click(button);
-
-        expect(button.classList.contains('active')).toBe(true);
-        expect(table.classList.contains('open')).toBe(true);
+        expect(list.querySelectorAll('li')).toHaveLength(2);
     });
 
-    it('prevents the default action of the click', () => {
-        // `sprints.coffee:43`. The source's own guard, and the reason no `type`
-        // attribute is introduced on the button.
-        //
-        // A raw event is dispatched rather than using the library's click helper,
-        // because only the raw event object exposes `defaultPrevented`. The
-        // dispatch is wrapped so the state update it triggers is flushed inside
-        // React's batching window rather than warned about.
-        const container = renderCard();
-        const button = mustFind(container, '.compact-sprint');
-        const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    it('11. renders the closed figure and its lowercase caption first', () => {
+        const { root } = mount();
+        const items = mustFind(root, '.sprint-info > ul').querySelectorAll('li');
 
-        act((): void => {
-            button.dispatchEvent(event);
-        });
+        expect(items).toHaveLength(2);
+        expect(mustFind(items[0], '.number').textContent).toBe('21');
 
-        expect(event.defaultPrevented).toBe(true);
+        // `sprint-header.jade:34` renders `BACKLOG.CLOSED_POINTS`, which the
+        // catalogue holds LOWERCASE. The frame's uppercase comes from CSS.
+        expect(mustFind(items[0], '.description').textContent).toBe('closed');
     });
 
-    it('PRESERVED DEFECT 2: does not re-toggle when the sprint object is replaced', () => {
-        // `sprints.coffee:33`-`:39` watched the sprint and called a TOGGLE, so a
-        // reload collapsed an expanded sprint for no visible reason. That trigger
-        // is a digest artefact with no React analogue; the single-fire behaviour is
-        // the sanctioned deviation, and this case is what stops a future edit
-        // reintroducing the bug as an identity-keyed effect.
-        const { container, rerender } = render(<SprintCard {...baseProps()} />, { wrapper });
-
-        expect(mustFind(container, '.sprint-table').classList.contains('open')).toBe(true);
-
-        rerender(<SprintCard {...baseProps({ sprint: makeSprint() })} />);
-
-        expect(mustFind(container, '.sprint-table').classList.contains('open')).toBe(true);
-    });
-
-    it('references the right sprite fragment, and keeps the `tg-svg` host', () => {
-        // `sprints.scss:146`-`:148` selects `svg.icon` inside `.compact-sprint`,
-        // and the rotation that turns this RIGHT arrow into a down chevron lives on
-        // `.compact-sprint` itself -- so a down-arrow symbol would double up.
-        const container = renderCard();
-        const host = mustFind(container, '.compact-sprint > tg-svg');
-        const use = mustFind(container, '.compact-sprint use');
-
-        expect(host.tagName.toLowerCase()).toBe('tg-svg');
-        expect(use.getAttribute('href')).toBe('#icon-arrow-right');
-    });
-});
-
-/* ==========================================================================
- * 4. THE SPRINT NAME LINK
- * ========================================================================== */
-
-describe('the sprint name link', () => {
-    it('renders the name inside a span, linking to the taskboard', () => {
-        const container = renderCard();
-        const link = mustFind(container, '.sprint-name a');
-
-        expect(link.getAttribute('href')).toBe(TASKBOARD_URL);
-        expect(mustFind(container, '.sprint-name a span').textContent).toBe('Sprint 2026-5-15');
-    });
-
-    it('is omitted when the member may not view milestones', () => {
-        const container = renderCard({ isVisible: false });
-
-        expect(container.querySelector('.sprint-name a')).toBeNull();
-        // The collapse button survives: only the link is gated.
-        expect(mustFind(container, '.compact-sprint')).toBeTruthy();
-    });
-
-    it('PRESERVED DEFECT 1: asks for its title with NO interpolation parameters', () => {
-        // The stored value embeds `{{::name}}` and the markup feeds it nothing, so
-        // the sprint name never reaches the title. Reproduced BY CONSTRUCTION --
-        // the call routes through the same `$translate.instant` the incumbent's
-        // filter used -- so the assertion is on the CALL, which is the invariant,
-        // rather than on whatever characters angular-translate happens to render.
-        const container = renderCard();
-
-        expect(instant).toHaveBeenCalledWith('BACKLOG.GO_TO_TASKBOARD', undefined);
-
-        const title = mustFind(container, '.sprint-name a').getAttribute('title');
-
-        expect(title).toBe(LOCALE['BACKLOG.GO_TO_TASKBOARD']);
-        expect(title).not.toContain('Sprint 2026-5-15');
-    });
-});
-
-/* ==========================================================================
- * 5. THE EDIT AFFORDANCE
- * ========================================================================== */
-
-describe('the edit affordance', () => {
-    it('renders inside `.sprint-points` with the source\u2019s own empty href', () => {
-        const container = renderCard();
-        const edit = mustFind(container, '.sprint-points > .edit-sprint');
-
-        expect(edit.tagName).toBe('A');
-        expect(edit.getAttribute('href')).toBe('');
-        expect(edit.getAttribute('title')).toBe('Edit Sprint');
-        expect(mustFind(container, '.edit-sprint use').getAttribute('href')).toBe('#icon-edit');
-    });
-
-    it('is omitted when the member may not modify the milestone', () => {
-        const container = renderCard({ isEditable: false });
-
-        expect(container.querySelector('.edit-sprint')).toBeNull();
-        expect(mustFind(container, '.sprint-info')).toBeTruthy();
-    });
-
-    it('reports the sprint upwards and prevents the default action', () => {
-        // Replaces `$rootScope.$broadcast("sprintform:edit", sprint)`.
-        const sprint = makeSprint();
-        const { container } = render(<SprintCard {...baseProps({ sprint })} />, { wrapper });
-        const edit = mustFind(container, '.edit-sprint');
-        const event = new MouseEvent('click', { bubbles: true, cancelable: true });
-
-        edit.dispatchEvent(event);
-
-        expect(onEditSprint).toHaveBeenCalledTimes(1);
-        expect(onEditSprint).toHaveBeenCalledWith(sprint);
-        expect(event.defaultPrevented).toBe(true);
-    });
-});
-
-/* ==========================================================================
- * 6. THE POINTS BLOCK
- * ========================================================================== */
-
-describe('the points block', () => {
-    it('renders two list items, each a numeral then its lowercase label', () => {
-        const container = renderCard();
-        const items = container.querySelectorAll('.sprint-info ul li');
+    it('12. renders the total figure, fraction intact, and its lowercase caption', () => {
+        const { root } = mount();
+        const items = mustFind(root, '.sprint-info > ul').querySelectorAll('li');
 
         expect(items).toHaveLength(2);
 
-        const numbers = container.querySelectorAll('.sprint-info .number');
-        const descriptions = container.querySelectorAll('.sprint-info .description');
-
-        expect(numbers[0].textContent).toBe('21');
-        expect(descriptions[0].textContent).toBe('closed');
-        expect(numbers[1].textContent).toBe('101.5');
-        expect(descriptions[1].textContent).toBe('total');
-    });
-
-    it('keeps a fraction and groups a large figure, reproducing the `number` filter', () => {
-        const container = renderCard({ closedPoints: 1234.5, totalPoints: 12345 });
-        const numbers = container.querySelectorAll('.sprint-info .number');
-
-        expect(numbers[0].textContent).toBe('1,234.5');
-        expect(numbers[1].textContent).toBe('12,345');
-    });
-
-    it('PRESERVED DEFECT 6: collapses every falsy figure to zero, NaN included', () => {
-        // CoffeeScript's `or` tests truthiness, so `0` and `NaN` both print `0`.
-        // The nullish operator would have let `NaN` through and printed nothing.
-        const container = renderCard({ closedPoints: 0, totalPoints: Number.NaN });
-        const numbers = container.querySelectorAll('.sprint-info .number');
-
-        expect(numbers[0].textContent).toBe('0');
-        expect(numbers[1].textContent).toBe('0');
-    });
-
-    it('prints nothing for a non-finite figure the truthiness coercion lets through', () => {
-        // `Infinity` is truthy, so the coercion passes it on -- and the formatter's
-        // guard then prints the empty string rather than an infinity sign the server
-        // never sent. Inherited from `./SummaryBar.tsx`'s helper so the two agree on
-        // every input, including the ones neither is expected to see.
-        const container = renderCard({
-            closedPoints: Number.POSITIVE_INFINITY,
-            totalPoints: Number.NEGATIVE_INFINITY,
-        });
-        const numbers = container.querySelectorAll('.sprint-info .number');
-
-        expect(numbers[0].textContent).toBe('');
-        expect(numbers[1].textContent).toBe('');
+        // The AngularJS `number` filter in its no-argument form keeps up to three
+        // fraction digits, so `101.5` must not be rounded to `102`.
+        expect(mustFind(items[1], '.number').textContent).toBe('101.5');
+        expect(mustFind(items[1], '.description').textContent).toBe('total');
     });
 });
 
 /* ==========================================================================
- * 7. THE PROGRESS BAR
+ * 3. THE SPRINT NAME LINK AND ITS TITLE
  * ========================================================================== */
 
-describe('the progress bar', () => {
-    it('nests wrapper > host > fill, and owns the host itself', () => {
-        const container = renderCard();
-        const wrapperEl = mustFind(container, '.summary-progress-wrapper');
-        const host = mustFind(container, '.summary-progress-wrapper > .sprint-progress-bar');
-        const fill = mustFind(container, '.sprint-progress-bar > .current-progress');
+describe('sprint name link and the GO_TO_TASKBOARD title', () => {
+    it('13. keeps the LITERAL interpolation in the sprint-name link title', () => {
+        // ⭐⭐ PRESERVED DEFECT 1 -- `sprint-header.jade:18` binds
+        // `title="{{'BACKLOG.GO_TO_TASKBOARD' | translate}}"` with NO parameter
+        // object, while the catalogue value embeds `{{::name}}`. The sprint name
+        // therefore NEVER reaches this title. Reproduced by construction: the
+        // component routes through the same translation call and passes nothing.
+        //
+        // ⛔ Do NOT "fix" this by supplying `{name: sprint.name}` here or in the
+        //    component -- that is a behaviour change (rule T10). Contrast case 66,
+        //    where the taskboard button IS fed a name and resolves properly.
+        const { root } = mount();
+        const link = mustFind<HTMLAnchorElement>(root, '.sprint-name a');
 
-        expect(wrapperEl.children).toHaveLength(1);
-        expect(host.children).toHaveLength(1);
-        expect(fill.className).toBe('current-progress');
+        expect(link.getAttribute('title')).toBe('Go to the taskboard of {{::name}}');
+        expect(link.getAttribute('title')).not.toContain(OPEN_SPRINT.name);
+        expect(spec.instant).toHaveBeenCalledWith(GO_TO_TASKBOARD_KEY, undefined);
     });
 
-    it('hands over the RAW quotient of the sprint\u2019s own points, unrounded', () => {
-        // 21 / 101.5 = 20.6897%. The design frame measures 83px of a 402px track,
-        // and 20.6897% of 402 is 83.17px -- which rasterises to exactly 83.
-        const container = renderCard();
-        const fill = mustFind(container, '.sprint-progress-bar > .current-progress');
+    it('14. points the sprint-name link at the resolved taskboard url', () => {
+        const { root } = mount();
 
-        expect(fill.getAttribute('style')).toBe(`width: ${String((100 * 21) / 101.5)}%;`);
+        expect(mustFind(root, '.sprint-name a').getAttribute('href')).toBe(TASKBOARD_URL);
     });
 
-    it('PRESERVED DEFECT 4: adds no guard, so a zero total still divides', () => {
-        // The incumbent expression yields Infinity, which the bar clamps to 100.
-        // Coercing here would have produced a zero-width bar instead.
-        const container = renderCard({
-            sprint: makeSprint({ closed_points: 5, total_points: 0 }),
-        });
+    it('15. renders the sprint name inside a span within that link', () => {
+        const { root } = mount();
 
-        expect(
-            mustFind(container, '.current-progress').getAttribute('style'),
-        ).toBe('width: 100%;');
+        // `sprint-header.jade:20`. The span is what `sprints.scss:60`-`:70`
+        // selects, so the name may not be a bare text child.
+        expect(mustFind(root, '.sprint-name a > span').textContent).toBe(OPEN_SPRINT.name);
     });
 
-    it('treats absent points exactly as the AngularJS expression did', () => {
-        // `100 * null / null` is `0 / 0`, i.e. not a number -- and substituting `0`
-        // for `null` in both positions is arithmetically identical.
-        const container = renderCard({
+    it('16. renders no name link when the sprint is not visible, but keeps the toggle', () => {
+        // `sprint-header.jade:16` gates only the anchor on `isVisible`
+        // (`sprints.coffee:77`-`:78`, a raw permission test with no archived check).
+        const { root } = mount({ isVisible: false });
+
+        expect(root.querySelector('.sprint-name a')).toBeNull();
+        expect(root.querySelector('.sprint-name button.compact-sprint')).not.toBeNull();
+    });
+});
+
+/* ==========================================================================
+ * 4. THE EDIT AFFORDANCE
+ * ========================================================================== */
+
+describe('edit-sprint control', () => {
+    it('17. renders a.edit-sprint inside .sprint-points with its title and icon', () => {
+        const { root } = mount({ isEditable: true });
+        const points = mustFind(root, '.sprint-points');
+        const edit = mustFind<HTMLAnchorElement>(points, 'a.edit-sprint');
+
+        // `sprint-header.jade:24`-`:29`. It is invisible at rest -- `opacity: 0`
+        // until `.sprint-summary:hover` (`sprints.scss:89`-`:108`) -- which is why
+        // the design frame shows no pencil and rendering it is still faithful.
+        expect(edit.parentElement).toBe(points);
+        expect(edit.getAttribute('title')).toBe(TRANSLATIONS[EDIT_SPRINT_KEY]);
+        expect(edit.getAttribute('href')).toBe('');
+        expect(edit.querySelector('tg-svg > svg.icon.icon-edit')).not.toBeNull();
+    });
+
+    it('18. renders no edit affordance when the sprint is not editable', () => {
+        const { root } = mount({ isEditable: false });
+
+        expect(root.querySelector('a.edit-sprint')).toBeNull();
+    });
+
+    it('19. reports one edit request carrying the sprint object', () => {
+        // `sprints.coffee:49`-`:53` broadcast `sprintform:edit` with the sprint;
+        // the broadcast becomes this prop callback.
+        const { root, props } = mount();
+
+        fireEvent.click(mustFind(root, 'a.edit-sprint'));
+
+        expect(onEditSprint).toHaveBeenCalledTimes(1);
+        expect(onEditSprint).toHaveBeenCalledWith(props.sprint);
+    });
+
+    it('20. cancels the default action of the edit anchor', () => {
+        // `sprints.coffee:50`. `href=""` would otherwise reload the page.
+        const { root } = mount();
+        const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+
+        fireEvent(mustFind(root, 'a.edit-sprint'), event);
+
+        expect(event.defaultPrevented).toBe(true);
+    });
+
+    it('21. raises no other effect when the edit affordance is clicked', () => {
+        // Proves the replacement is a plain prop callback: no digest is driven, no
+        // navigation is triggered and no sibling callback fires.
+        const { root } = mount();
+
+        fireEvent.click(mustFind(root, 'a.edit-sprint'));
+
+        expect(onEditSprint).toHaveBeenCalledTimes(1);
+        expect(onOpenUserStory).not.toHaveBeenCalled();
+        expect(onOpenTaskboard).not.toHaveBeenCalled();
+    });
+});
+
+/* ==========================================================================
+ * 5. COLLAPSE AND EXPAND
+ *
+ * `sprints.coffee:25`-`:30`'s `toggleSprint` flips TWO classes in one function --
+ * `active` on `.compact-sprint` and `open` on `.sprint-table` -- so one boolean
+ * reproduces both and they must never drift apart.
+ * ========================================================================== */
+
+describe('collapse and expand', () => {
+    it('22. an open sprint rests expanded, with `open` and `active` both set', () => {
+        // `sprints.coffee:33`-`:39`: the watcher calls `toggleSprint` for an open
+        // sprint, so the resting state is `expanded === !sprint.closed`.
+        const { root } = mount({ sprint: OPEN_SPRINT });
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(true);
+        expect(mustFind(root, '.compact-sprint').classList.contains('active')).toBe(true);
+    });
+
+    it('23. a closed sprint rests collapsed, with neither class set', () => {
+        const { root } = mount({ sprint: CLOSED_SPRINT, listVariant: 'closed' });
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(false);
+        expect(mustFind(root, '.compact-sprint').classList.contains('active')).toBe(false);
+    });
+
+    it('24. one click on the toggle drops `open` and `active` together', () => {
+        const { root } = mount({ sprint: OPEN_SPRINT });
+
+        fireEvent.click(mustFind(root, '.compact-sprint'));
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(false);
+        expect(mustFind(root, '.compact-sprint').classList.contains('active')).toBe(false);
+    });
+
+    it('25. a second click restores both', () => {
+        const { root } = mount({ sprint: OPEN_SPRINT });
+
+        fireEvent.click(mustFind(root, '.compact-sprint'));
+        fireEvent.click(mustFind(root, '.compact-sprint'));
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(true);
+        expect(mustFind(root, '.compact-sprint').classList.contains('active')).toBe(true);
+    });
+
+    it('26. cancels the default action of the toggle', () => {
+        // `sprints.coffee:43`. The source's own guard against a `<button>` with no
+        // `type`, which is why no `type` attribute is introduced either.
+        const { root } = mount();
+        const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+
+        fireEvent(mustFind(root, '.compact-sprint'), event);
+
+        expect(event.defaultPrevented).toBe(true);
+    });
+
+    it('27. a new sprint object of the same content does NOT flip the collapse state', () => {
+        // ⭐ SANCTIONED DEVIATION -- DRIFT ENTRY 2 FOR THIS FILE.
+        //
+        // `sprints.coffee:38` calls a TOGGLE from inside a `$watch`, so every change
+        // of the sprint's identity -- a `loadSprints()` that replaces the object, for
+        // instance -- COLLAPSES an expanded sprint for no reason the user can see.
+        // Reproducing that would mean adding a re-toggle effect keyed on the sprint's
+        // identity: a faithful copy of a bug whose trigger is an AngularJS digest
+        // artefact with no React analogue, since React re-renders from data and never
+        // "fires again" on the same value. The single-fire behaviour is implemented
+        // instead, and the deviation is recorded in the Drift Register.
+        //
+        // ⛔ Do NOT add an effect keyed on `sprint` to "restore parity".
+        const { root, props, rerender } = mount({ sprint: OPEN_SPRINT });
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(true);
+
+        rerender({ ...props, sprint: makeSprint() });
+
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(true);
+
+        fireEvent.click(mustFind(root, '.compact-sprint'));
+        rerender({ ...props, sprint: makeSprint() });
+
+        // A user-collapsed sprint stays collapsed across the replacement too.
+        expect(mustFind(root, '.sprint-table').classList.contains('open')).toBe(false);
+        expect(mustFind(root, '.compact-sprint').classList.contains('active')).toBe(false);
+    });
+
+    it('28. authors no animation of its own on the story table', () => {
+        // The incumbent followed its toggle with jQuery's
+        // `slideToggle({duration: 500, easing: 'linear'})` (`sprints.coffee:46`),
+        // which writes inline styles. The project's own `slide()` mixin already
+        // defines the matching `.open` contract -- `max-height` over `.5s ease-in`,
+        // exactly the 500ms asked of jQuery -- so authoring a rule that already
+        // applies would violate G-DS-4, and no animation library is added (HR-2
+        // keeps the dependency set closed). What remains is the CLASS contract,
+        // which every stylesheet rule keys off.
+        const { root } = mount();
+        const table = mustFind(root, '.sprint-table');
+
+        expect(table.getAttribute('style')).toBeNull();
+        expect(table.style.maxHeight).toBe('');
+        expect(table.style.height).toBe('');
+        expect(table.style.transition).toBe('');
+    });
+});
+
+/* ==========================================================================
+ * 6. THE PROGRESS BAR
+ * ========================================================================== */
+
+describe('progress bar', () => {
+    it('29. nests the real progress bar inside .summary-progress-wrapper', () => {
+        // `sprint.jade:10`-`:11`. TWO nested elements, both required:
+        // `sprints.scss:165`-`:189` dresses `.sprint-progress-bar` and then selects
+        // `.current-progress` as a DESCENDANT of it. The sibling component emits only
+        // the fill and deliberately no host of its own, so the host is written here.
+        const { root } = mount();
+        const wrapper = mustFind(root, '.summary-progress-wrapper');
+        const host = mustFind(wrapper, '.sprint-progress-bar');
+
+        expect(host.parentElement).toBe(wrapper);
+        expect(mustFind(host, '.current-progress')).not.toBeNull();
+    });
+
+    it('30. passes the UNROUNDED quotient through to the fill width', () => {
+        // 21 of 101.5 is 20.6896...%, and the sibling clamps without rounding: a
+        // sprint bar stands alone, so a rounded width would read as complete slightly
+        // before it is. The design frame measures 83px of a 402px track (20.65%) for
+        // its own data, which is this same arithmetic and not a literal to copy.
+        const { root } = mount();
+        const fill = mustFind(root, '.current-progress');
+
+        expect(fill.style.width.startsWith('20.6')).toBe(true);
+        expect(fill.style.width).not.toBe('21%');
+    });
+
+    it('31. passes the non-finite quotients through UNGUARDED', () => {
+        // ⭐ PRESERVED DEFECT 4 -- `sprint.jade:11` binds
+        // `tg-progress-bar="100 * sprint.closed_points / sprint.total_points"`, which
+        // yields NaN when the total is zero and Infinity when the numerator is not.
+        // No guard is added here on purpose: the sibling already clamps to [0, 100],
+        // and interposing a second guard would change which value it clamps. Note the
+        // expression uses the RAW sprint members, never the `or 0`-coerced header
+        // figures -- coercing here would turn Infinity into a zero-width bar.
+        //
+        // ⛔ Do NOT add a `total_points > 0` check to "make this safe".
+        const zero = mount({ sprint: ZERO_POINTS_SPRINT, closedPoints: 0, totalPoints: 0 });
+
+        // NaN reaches the style attribute and the DOM rejects it outright, which is
+        // why nothing renders rather than a zero-width or full-width bar.
+        expect(mustFind(zero.root, '.current-progress').getAttribute('style')).toBeNull();
+        zero.unmount();
+
+        const nulled = mount({ sprint: NULL_POINTS_SPRINT, closedPoints: 0, totalPoints: 0 });
+
+        // `null` divides as zero in JavaScript, so a null numerator takes the same
+        // NaN branch -- the mirror image of the truthiness coercion in the header.
+        expect(mustFind(nulled.root, '.current-progress').getAttribute('style')).toBeNull();
+        nulled.unmount();
+
+        const bothNull = mount({
             sprint: makeSprint({ closed_points: null, total_points: null }),
+            closedPoints: 0,
+            totalPoints: 0,
         });
-        const style = mustFind(container, '.current-progress').getAttribute('style');
 
-        expect(style === null || style === '').toBe(true);
-    });
+        // `null / null` is NaN as well -- the third branch the implementation's own note
+        // enumerates, and the reason substituting zero for null is exact rather than a
+        // change: JavaScript's arithmetic already coerces null to zero on both sides.
+        expect(mustFind(bothNull.root, '.current-progress').getAttribute('style')).toBeNull();
+        bothNull.unmount();
 
-    it('carries no tooltip, label or text on the bar', () => {
-        // The incumbent template set a single attribute. A title added here would
-        // appear on every sprint card in the sidebar, untranslated.
-        const container = renderCard();
-        const fill = mustFind(container, '.current-progress');
+        const infinite = mount({ sprint: INFINITE_POINTS_SPRINT, totalPoints: 0 });
 
-        expect(fill.getAttribute('title')).toBeNull();
-        expect(fill.textContent).toBe('');
-        expect(mustFind(container, '.sprint-progress-bar').textContent).toBe('');
+        expect(mustFind(infinite.root, '.current-progress').style.width).toBe('100%');
     });
 });
 
 /* ==========================================================================
- * 8. THE STORY TABLE AS A DROP CONTAINER
+ * 7. THE EMPTY SPRINT STATE
  * ========================================================================== */
 
-describe('the story table', () => {
-    it.each([
-        ['expanded and populated', { }],
-        ['collapsed and populated', { listVariant: 'closed' as const, sprint: makeSprint({ closed: true }) }],
-        ['expanded and empty', { sprint: makeSprint({ user_stories: [] }) }],
-        [
-            'collapsed and empty',
-            {
-                listVariant: 'closed' as const,
-                sprint: makeSprint({ closed: true, user_stories: [] }),
-            },
-        ],
-    ])('is present in the DOM when %s (R-DND-3)', (_label: string, over: Partial<SprintCardProps>) => {
-        // `backlog/sortable.coffee:39`-`:48` finds drop containers BY CLASS, so an
-        // unmounted table silently stops accepting drops.
-        const container = renderCard(over);
+describe('empty sprint state', () => {
+    it('32. adds sprint-empty-wrapper to the table when the sprint holds no stories', () => {
+        // `sprint.jade:13`'s `ng-class="{'sprint-empty-wrapper': !sprint.user_stories.length}"`.
+        const { root } = mount({ sprint: EMPTY_SPRINT });
 
-        expect(container.querySelector('.sprint-table')).not.toBeNull();
-    });
-
-    it('adds `sprint-empty-wrapper` only when the sprint holds no stories', () => {
-        expect(
-            mustFind(renderCard(), '.sprint-table').classList.contains('sprint-empty-wrapper'),
-        ).toBe(false);
-
-        expect(
-            mustFind(
-                renderCard({ sprint: makeSprint({ user_stories: [] }) }),
-                '.sprint-table',
-            ).classList.contains('sprint-empty-wrapper'),
-        ).toBe(true);
-    });
-
-    it('PRESERVED DEFECT 13: emits no scope-isolation attribute', () => {
-        // `tg-bind-scope` (`sprint.jade:13` and `:19`) is an AngularJS `ng-repeat`
-        // optimisation with no React equivalent.
-        const container = renderCard();
-
-        expect(container.querySelector('[tg-bind-scope]')).toBeNull();
-        expect(mustFind(container, '.sprint-table').getAttribute('tg-bind-scope')).toBeNull();
-    });
-
-    it('hands the table element to the drag registrar and calls its teardown on unmount', () => {
-        const teardown = jest.fn();
-        const registerDragContainer = jest.fn(
-            (): (() => void) => teardown,
+        expect(mustFind(root, '.sprint-table').classList.contains('sprint-empty-wrapper')).toBe(
+            true,
         );
-        const { container, unmount } = render(
-            <SprintCard {...baseProps({ registerDragContainer })} />,
-            { wrapper },
-        );
-
-        expect(registerDragContainer).toHaveBeenCalledTimes(1);
-        expect(registerDragContainer).toHaveBeenCalledWith(mustFind(container, '.sprint-table'));
-        expect(teardown).not.toHaveBeenCalled();
-
-        unmount();
-
-        expect(teardown).toHaveBeenCalledTimes(1);
     });
 
-    it('tolerates a registrar that returns nothing, and the prop being absent', () => {
-        const registerDragContainer = jest.fn((): void => undefined);
+    it('33. omits sprint-empty-wrapper when the sprint holds stories', () => {
+        const { root } = mount({ sprint: OPEN_SPRINT });
 
-        expect((): void => {
-            const { unmount } = render(
-                <SprintCard {...baseProps({ registerDragContainer })} />,
-                { wrapper },
-            );
+        expect(mustFind(root, '.sprint-table').classList.contains('sprint-empty-wrapper')).toBe(
+            false,
+        );
+    });
 
+    it('34. renders exactly one .sprint-empty block when the sprint is empty', () => {
+        const { root } = mount({ sprint: EMPTY_SPRINT });
+
+        expect(root.querySelectorAll('.sprint-empty')).toHaveLength(1);
+        expect(rowsOf(root)).toHaveLength(0);
+    });
+
+    it('35. always keeps BOTH empty-sprint messages in the DOM', () => {
+        // ⭐ PRESERVED DEFECT 5 -- `sprint.jade:15`-`:16` renders two spans and lets
+        // `tgClassPermission` (`common.coffee:125`-`:155`) toggle `hidden` on one of
+        // them. That directive ADDS or REMOVES a class; it never removes the element.
+        // Rendering only the applicable message would look identical -- `.hidden` is
+        // `display: none !important` -- but it would break the end-to-end layer, which
+        // selects on the message text regardless of visibility.
+        //
+        // ⛔ Do NOT collapse these two spans into one conditional span.
+        for (const hasModifyUsPermission of [true, false]) {
+            const { root, unmount } = mount({ sprint: EMPTY_SPRINT, hasModifyUsPermission });
+
+            expect(mustFind(root, '.sprint-empty').querySelectorAll('span')).toHaveLength(2);
             unmount();
-        }).not.toThrow();
+        }
+    });
 
-        expect(registerDragContainer).toHaveBeenCalledTimes(1);
+    it('36. hides the anonymous message for a member who may modify stories', () => {
+        const { root } = mount({ sprint: EMPTY_SPRINT, hasModifyUsPermission: true });
+        const messages = mustFind(root, '.sprint-empty').querySelectorAll('span');
 
-        expect((): void => {
-            render(<SprintCard {...baseProps()} />, { wrapper }).unmount();
-        }).not.toThrow();
+        expect(messages).toHaveLength(2);
+        expect(messages[0].textContent).toBe(TRANSLATIONS[WARNING_EMPTY_SPRINT_ANONYMOUS_KEY]);
+        expect(messages[0].classList.contains('hidden')).toBe(true);
+        expect(messages[1].textContent).toBe(TRANSLATIONS[WARNING_EMPTY_SPRINT_KEY]);
+        expect(messages[1].classList.contains('hidden')).toBe(false);
+    });
+
+    it('37. inverts that polarity exactly for a member who may not', () => {
+        const { root } = mount({ sprint: EMPTY_SPRINT, hasModifyUsPermission: false });
+        const messages = mustFind(root, '.sprint-empty').querySelectorAll('span');
+
+        expect(messages).toHaveLength(2);
+        expect(messages[0].classList.contains('hidden')).toBe(false);
+        expect(messages[1].classList.contains('hidden')).toBe(true);
+    });
+
+    it('38. keeps .sprint-table mounted in all four open/closed x empty/full states', () => {
+        // ⭐ R-DND-3 -- `backlog/sortable.coffee:39`-`:48` builds its drag instance
+        // with `isContainer: (el) -> el.classList.contains('sprint-table')`, so EVERY
+        // element carrying that class is a live drop container, discovered by class
+        // rather than by enumeration. A collapsed or empty sprint whose table were
+        // unmounted would simply stop accepting drops with nothing throwing, and
+        // `sprints.scss:190`-`:192` gives the element `min-height: 2rem` with the
+        // comment `// drag & drop` for exactly that reason.
+        //
+        // ⛔ Do NOT gate this element on `expanded` or on the story count.
+        const permutations: readonly { readonly sprint: Sprint; readonly label: string }[] = [
+            { sprint: OPEN_SPRINT, label: 'open, populated' },
+            { sprint: CLOSED_SPRINT, label: 'closed, populated' },
+            { sprint: EMPTY_SPRINT, label: 'open, empty' },
+            { sprint: makeSprint({ closed: true, user_stories: [] }), label: 'closed, empty' },
+        ];
+
+        for (const { sprint, label } of permutations) {
+            const { root, unmount } = mount({
+                sprint,
+                listVariant: sprint.closed ? 'closed' : 'open',
+            });
+            const tables = root.querySelectorAll('.sprint-table');
+
+            if (tables.length !== 1) {
+                throw new Error(
+                    `the ${label} sprint rendered ${String(tables.length)} drop containers`,
+                );
+            }
+
+            expect(tables).toHaveLength(1);
+            unmount();
+        }
     });
 });
 
 /* ==========================================================================
- * 9. THE EMPTY-SPRINT MESSAGES
+ * 8. THE STORY ROWS
  * ========================================================================== */
 
-describe('the empty-sprint messages', () => {
-    it('is absent entirely while the sprint holds stories', () => {
-        expect(renderCard().querySelector('.sprint-empty')).toBeNull();
-    });
+describe('story rows', () => {
+    it('39. renders one div.row.milestone-us-item-row per story, carrying data-id', () => {
+        const { root } = mount({ sprint: OPEN_SPRINT });
+        const rows = rowsOf(root);
 
-    it('PRESERVED DEFECT 5: renders BOTH messages, hiding the one that does not apply', () => {
-        const container = renderCard({ sprint: makeSprint({ user_stories: [] }) });
-        const spans = mustFind(container, '.sprint-empty').querySelectorAll('span');
+        expect(rows).toHaveLength(2);
 
-        expect(spans).toHaveLength(2);
-        expect(spans[0].textContent).toBe('This sprint has no user stories');
-        expect(spans[1].textContent).toBe(
-            'Drop here Stories from your backlog to start a new sprint',
-        );
-    });
+        rows.forEach((row: HTMLElement, index: number): void => {
+            const story = OPEN_SPRINT.user_stories[index];
 
-    it('hides the anonymous message when the member MAY modify stories', () => {
-        // `{'hidden': 'modify_us'}` -- not negated.
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [] }),
-            hasModifyUsPermission: true,
+            expect(row.tagName).toBe('DIV');
+            expect(row.classList.contains('row')).toBe(true);
+            expect(row.classList.contains('milestone-us-item-row')).toBe(true);
+            expect(row.dataset.id).toBe(String(story.id));
         });
-        const spans = mustFind(container, '.sprint-empty').querySelectorAll('span');
-
-        expect(spans[0].classList.contains('hidden')).toBe(true);
-        expect(spans[1].classList.contains('hidden')).toBe(false);
-        expect(spans[1].getAttribute('class')).toBeNull();
     });
 
-    it('hides the drop-here message when the member MAY NOT modify stories', () => {
-        // `{'hidden': '!modify_us'}` -- negated.
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [] }),
-            hasModifyUsPermission: false,
-        });
-        const spans = mustFind(container, '.sprint-empty').querySelectorAll('span');
+    it('40. keys the rows by `id`, not by `ref`', () => {
+        // `sprint.jade:18` tracks by `us.id`, whereas `backlog-row.jade:9` tracks by
+        // `us.ref` -- DELIBERATELY different, because a sprint's nested stories and the
+        // backlog's own rows are two different serializer shapes. Two stories sharing a
+        // reference must still render two rows; a `ref` key would collapse them.
+        const twins: readonly NestedSprintUserStory[] = [
+            makeStory({ id: 201, ref: 77, subject: 'First twin' }),
+            makeStory({ id: 202, ref: 77, subject: 'Second twin' }),
+        ];
+        const { root } = mount({ sprint: makeSprint({ user_stories: twins }) });
+        const rows = rowsOf(root);
 
-        expect(spans[0].classList.contains('hidden')).toBe(false);
-        expect(spans[1].classList.contains('hidden')).toBe(true);
+        expect(rows).toHaveLength(2);
+        expect(rows.map((row: HTMLElement): string | undefined => row.dataset.id)).toEqual([
+            '201',
+            '202',
+        ]);
+    });
+
+    it('41. marks a closed story with `closedRow` -- capital R', () => {
+        // ⭐ PRESERVED DEFECT -- `sprint.jade:22` writes `closedRow`, and
+        // `sprints.scss:268` selects that exact spelling. The backlog's own row uses a
+        // DIFFERENT vocabulary (`blocked`/`new`, `backlog-row.jade:11`) in a different
+        // stylesheet, and folding the two together would silently unstyle one.
+        //
+        // ⛔ Do NOT rename this to `closed-row`, `closedrow` or `closed`.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_CLOSED] }) });
+        const rows = rowsOf(root);
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].classList.contains('closedRow')).toBe(true);
+        expect(rows[0].classList.contains('closedrow')).toBe(false);
+        expect(rows[0].classList.contains('blocked')).toBe(false);
+        expect(rows[0].classList.contains('new')).toBe(false);
+    });
+
+    it('42. marks a blocked story with `blockedRow` -- capital R', () => {
+        // ⭐ PRESERVED DEFECT -- `sprint.jade:22`, selected by `sprints.scss:282`.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_BLOCKED] }) });
+        const rows = rowsOf(root);
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].classList.contains('blockedRow')).toBe(true);
+        expect(rows[0].classList.contains('blockedrow')).toBe(false);
+        expect(rows[0].classList.contains('closedRow')).toBe(false);
+    });
+
+    it('43. adds `readonly` to every row exactly when the member may not modify stories', () => {
+        // `sprint.jade:21`'s `tg-class-permission="{'readonly': '!modify_us'}"`. That
+        // directive runs a raw `indexOf` test honouring a leading `!` as negation, with
+        // NO archived-project check -- a different predicate from `tgCheckPermission`,
+        // and the two must not be conflated.
+        const denied = mount({ hasModifyUsPermission: false });
+
+        expect(rowsOf(denied.root)).toHaveLength(2);
+        for (const row of rowsOf(denied.root)) {
+            expect(row.classList.contains('readonly')).toBe(true);
+        }
+        denied.unmount();
+
+        const granted = mount({ hasModifyUsPermission: true });
+
+        expect(rowsOf(granted.root)).toHaveLength(2);
+        for (const row of rowsOf(granted.root)) {
+            expect(row.classList.contains('readonly')).toBe(false);
+        }
+    });
+
+    it('44. gives each row exactly one div.column-us', () => {
+        const { root } = mount({ sprint: OPEN_SPRINT });
+        const rows = rowsOf(root);
+
+        expect(rows).toHaveLength(2);
+        for (const row of rows) {
+            expect(row.querySelectorAll('div.column-us')).toHaveLength(1);
+        }
     });
 });
 
 /* ==========================================================================
- * 10. THE STORY ROWS
+ * 9. THE STORY LINK, ITS REFERENCE AND ITS SUBJECT
  * ========================================================================== */
 
-describe('the story rows', () => {
-    it('renders one row per story, in order, keyed and tagged by id', () => {
-        // `ng-repeat ... track by us.id` (`sprint.jade:18`) -- id, not ref, and
-        // deliberately unlike the backlog's own row.
-        const container = renderCard();
-        const rows = container.querySelectorAll('.sprint-table > .row');
+describe('story link, ref and subject', () => {
+    it('45. renders a.us-name.clickable inside .column-us for a story with a milestone', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+        const column = mustFind(root, 'div.column-us');
+        const link = mustFind<HTMLAnchorElement>(column, 'a.us-name.clickable');
 
-        expect(rows).toHaveLength(3);
-        expect(rows[0].getAttribute('data-id')).toBe('1');
-        expect(rows[1].getAttribute('data-id')).toBe('5');
-        expect(rows[2].getAttribute('data-id')).toBe('9');
+        expect(link.parentElement).toBe(column);
     });
 
-    it('uses the CAPITAL-R row vocabulary, not the backlog row\u2019s', () => {
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [
-                    makeStory({ id: 1, is_closed: true }),
-                    makeStory({ id: 2, is_blocked: true }),
-                    makeStory({ id: 3 }),
-                ],
-            }),
-        });
-        const rows = container.querySelectorAll('.sprint-table > .row');
-
-        expect(rows[0].className).toBe('row milestone-us-item-row closedRow');
-        expect(rows[1].className).toBe('row milestone-us-item-row blockedRow');
-        expect(rows[2].className).toBe('row milestone-us-item-row');
-
-        // The backlog row's own vocabulary must not leak in here.
-        expect(container.querySelector('.us-item-row')).toBeNull();
-        expect(rows[1].classList.contains('new')).toBe(false);
-    });
-
-    it('adds `readonly` only when the member lacks the modify permission', () => {
-        // `tgClassPermission`: a raw `indexOf` with `!` negation and NO archived
-        // check -- a different predicate from every element-level gate.
-        expect(
-            mustFind(renderCard(), '.sprint-table > .row').classList.contains('readonly'),
-        ).toBe(false);
-
-        const denied = renderCard({ hasModifyUsPermission: false });
-        const rows = denied.querySelectorAll('.sprint-table > .row');
-
-        expect(rows[0].className).toBe('row milestone-us-item-row closedRow readonly');
-        expect(rows[1].classList.contains('readonly')).toBe(true);
-    });
-
-    it('uses the LOWERCASE vocabulary on the anchor and the points column', () => {
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [
-                    makeStory({ id: 1, is_closed: true, total_points: 3 }),
-                    makeStory({ id: 2, is_blocked: true, total_points: 4 }),
-                ],
-            }),
-        });
-        const names = container.querySelectorAll('.us-name');
-        const points = container.querySelectorAll('.column-points');
-
-        expect(names[0].className).toBe('us-name clickable closed');
-        expect(names[1].className).toBe('us-name clickable blocked');
-        expect(points[0].className).toBe('column-points width-1 closed');
-        expect(points[1].className).toBe('column-points width-1 blocked');
-    });
-
-    it('PRESERVED DEFECT 10: renders the reference WITH a trailing space', () => {
-        const container = renderCard();
-
-        expect(mustFind(container, '.us-ref-text').textContent).toBe('#1 ');
-    });
-
-    it('PRESERVED DEFECT 11: titles the anchor with a SINGLE space after the reference', () => {
-        const container = renderCard();
-
-        expect(mustFind(container, '.us-name').getAttribute('title')).toBe(
-            '#1 Exception is thrown if trying to add a folder with existing name',
-        );
-    });
-
-    it('resolves each anchor\u2019s href through the injected resolver', () => {
-        const container = renderCard();
-        const names = container.querySelectorAll('.us-name');
-
-        expect(names[0].getAttribute('href')).toBe('/us/1');
-        expect(names[2].getAttribute('href')).toBe('/us/9');
-    });
-
-    it('reports a clicked story upwards, with the story it belongs to', () => {
-        const sprint = makeSprint();
-        const { container } = render(<SprintCard {...baseProps({ sprint })} />, { wrapper });
-
-        fireEvent.click(container.querySelectorAll('.us-name')[1]);
-
-        expect(onOpenUserStory).toHaveBeenCalledTimes(1);
-        expect(onOpenUserStory.mock.calls[0][0]).toBe(sprint.user_stories[1]);
-    });
-
-    it('PRESERVED DEFECT 9: renders an EMPTY column when the milestone is falsy', () => {
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, milestone: null })] }),
-        });
-        const column = mustFind(container, '.column-us');
+    it('46. leaves div.column-us COMPLETELY EMPTY for a story with a falsy milestone', () => {
+        // ⭐ PRESERVED DEFECT -- the anchor is gated on `ng-if="us.milestone"`
+        // (`sprint.jade:26`), so no link, no reference and no subject render at all.
+        // These are a sprint's own stories, so `milestone` is normally this sprint's id
+        // and the branch is normally taken -- but the gate is reproduced exactly,
+        // including the fact that a milestone id of `0` would suppress the link too.
+        //
+        // ⛔ Do NOT render the subject unconditionally to "avoid an empty cell".
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_NO_MILESTONE] }) });
+        const column = mustFind(root, 'div.column-us');
 
         expect(column.children).toHaveLength(0);
         expect(column.textContent).toBe('');
-        expect(container.querySelector('.us-name')).toBeNull();
-        // The row itself still renders, and still carries its drag identity.
-        expect(mustFind(container, '.sprint-table > .row').getAttribute('data-id')).toBe('1');
+        expect(column.querySelector('a')).toBeNull();
+        expect(column.querySelector('.us-ref-text')).toBeNull();
+        expect(column.querySelector('.us-name-text')).toBeNull();
     });
 
-    it('PRESERVED DEFECT 12: renders the subject as escaped TEXT, never as markup', () => {
-        const hostile = '<img src=x onerror="alert(1)"> & <b>bold</b>';
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, subject: hostile })] }),
-        });
-        const name = mustFind(container, '.us-name-text');
+    it('47. renders the reference WITH ITS TRAILING SPACE', () => {
+        // ⭐ PRESERVED DEFECT -- `tg-bo-ref` (`sprint.jade:31`-`:33`) emits the
+        // reference followed by a space. It is load-bearing, not cosmetic:
+        // `sprints.scss:330`-`:332` adds a `1ch` end margin to `.us-ref-text`, and the
+        // measured gap between reference and subject only closes once the space glyph
+        // is counted as well.
+        //
+        // ⛔ Do NOT trim this.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+        const text = String(mustFind(root, 'span.us-ref-text').textContent);
 
-        expect(name.textContent).toBe(hostile);
-        expect(name.querySelector('img')).toBeNull();
-        expect(name.querySelector('b')).toBeNull();
-        expect(name.children).toHaveLength(0);
+        expect(text).toBe('#42 ');
+        expect(text.endsWith(' ')).toBe(true);
     });
 
-    it('routes the subject through the shared emoji helper when a map is supplied', () => {
-        const emojisByName: ReadonlyMap<string, EmojiLike> = new Map([
-            ['smile', { name: 'smile', image: '/v/images/emojis/smile.png' }],
-        ]);
-        const container = renderCard({
-            emojisByName,
-            sprint: makeSprint({
-                user_stories: [makeStory({ id: 1, subject: 'Add :smile: tests' })],
-            }),
-        });
-        const image = mustFind(container, '.us-name-text img');
+    it('48. titles the link with ONE space, not the two its source expression shows', () => {
+        // ⭐ PRESERVED DEFECT -- `tg-bo-title`'s expression is
+        // `"'#' + us.ref + ' ' +  us.subject"` (`sprint.jade:28`): two spaces of
+        // CoffeeScript formatting around the `+`, but only ONE space inside the string
+        // literal, so the rendered title carries a single space.
+        //
+        // ⛔ Do NOT "tidy" this to two spaces, and do not collapse it to none.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+        const link = mustFind<HTMLAnchorElement>(root, 'a.us-name');
 
-        expect(image.getAttribute('src')).toBe('/v/images/emojis/smile.png');
-        expect(image.getAttribute('alt')).toBe(':smile:');
+        expect(link.getAttribute('title')).toBe('#42 Do the thing');
+        expect(link.getAttribute('title')).not.toContain('  ');
+    });
+
+    it('49. renders the subject inside span.us-name-text', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+
+        expect(mustFind(root, 'span.us-name-text').textContent).toBe('Do the thing');
+    });
+
+    it('50. marks the inner anchor with LOWERCASE closed and blocked', () => {
+        // ⭐ THREE STATE VOCABULARIES COEXIST AND MUST NOT BE UNIFIED. The ROW carries
+        // `closedRow`/`blockedRow` (capital R, `sprints.scss:268`/`:282`) while the
+        // inner ANCHOR carries lowercase `closed`/`blocked` (`sprint.jade:29`, selected
+        // by `sprints.scss:346`-`:351`). Both spellings are asserted on the same render
+        // so a future rename cannot quietly harmonise them.
+        const closed = mount({ sprint: makeSprint({ user_stories: [STORY_CLOSED] }) });
+        const closedRow = rowsOf(closed.root)[0];
+
+        expect(mustFind(closedRow, 'a.us-name').classList.contains('closed')).toBe(true);
+        expect(closedRow.classList.contains('closedRow')).toBe(true);
+        closed.unmount();
+
+        const blocked = mount({ sprint: makeSprint({ user_stories: [STORY_BLOCKED] }) });
+        const blockedRow = rowsOf(blocked.root)[0];
+
+        expect(mustFind(blockedRow, 'a.us-name').classList.contains('blocked')).toBe(true);
+        expect(blockedRow.classList.contains('blockedRow')).toBe(true);
+    });
+
+    it('51. points the story link at the href the navigation service resolved', () => {
+        // A function prop rather than a string, because the incumbent's `tg-nav`
+        // carried a `tg-nav-get-params` payload of `{"milestone": <id>}`
+        // (`sprint.jade:25`-`:27`) that only that service can assemble.
+        const { root, props } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+
+        expect(mustFind(root, 'a.us-name').getAttribute('href')).toBe(
+            props.detailHrefFor(STORY_A),
+        );
+        expect(mustFind(root, 'a.us-name').getAttribute('href')).toBe(
+            `${DETAIL_HREF_PREFIX}42`,
+        );
+    });
+
+    it('52. reports a story link click with the story and the event', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+
+        fireEvent.click(mustFind(root, 'a.us-name'));
+
+        expect(onOpenUserStory).toHaveBeenCalledTimes(1);
+        expect(onOpenUserStory.mock.calls[0][0]).toBe(STORY_A);
+        expect(onOpenUserStory.mock.calls[0][1].type).toBe('click');
+        expect(onEditSprint).not.toHaveBeenCalled();
+        expect(onOpenTaskboard).not.toHaveBeenCalled();
     });
 });
 
 /* ==========================================================================
- * 11. THE POINTS COLUMN
+ * 10. THE SUBJECT'S EMOJI RENDERING
  * ========================================================================== */
 
-describe('the points column', () => {
-    it('renders the value inside `.points-container`', () => {
-        const container = renderCard();
-        const points = container.querySelectorAll('.column-points');
+describe('subject emoji rendering', () => {
+    it('53. replaces a known emoji token with the image the index supplies', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [EMOJI_STORY] }) });
+        const subject = mustFind(root, 'span.us-name-text');
+        const image = mustFind<HTMLImageElement>(subject, 'img');
 
-        expect(points).toHaveLength(3);
-        expect(mustFind(container, '.column-points .points-container').textContent).toBe('21');
-        expect(points[2].textContent).toBe('53.5');
+        // The `image` member is ALREADY version-prefixed by the emoji service at
+        // construction, so the component assembles no path of its own.
+        expect(image.getAttribute('src')).toBe(ROCKET_IMAGE);
+        expect(subject.textContent).not.toContain(':rocket:');
+        expect(subject.textContent).toContain('Ship it');
+        expect(subject.textContent).toContain('now');
     });
 
-    it.each([
-        ['zero', 0],
-        ['absent', null],
-    ])('PRESERVED DEFECT 7: renders NO column when the total is %s', (
-        _label: string,
-        total: number | null,
-    ) => {
-        // Plain truthiness, so an unestimated story and a zero-point story look
-        // the same. A nullish test would show a `0` chip the incumbent never showed.
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, total_points: total })] }),
+    it('54. renders the subject as plain text when no emoji index is supplied', () => {
+        // The index is a PROP precisely so this component never reaches for the emoji
+        // service itself; its absence must degrade, never throw.
+        const { root } = mount({
+            sprint: makeSprint({ user_stories: [EMOJI_STORY] }),
+            emojisByName: undefined,
         });
+        const subject = mustFind(root, 'span.us-name-text');
 
-        expect(container.querySelector('.column-points')).toBeNull();
-        expect(mustFind(container, '.sprint-table > .row').children).toHaveLength(1);
+        expect(subject.querySelector('img')).toBeNull();
+        expect(subject.textContent).toBe('Ship it :rocket: now');
+    });
+
+    it('55. renders a subject containing markup as TEXT, never as elements', () => {
+        // ⭐⭐ SANCTIONED DEVIATION, AND IT IS SECURITY-POSITIVE.
+        //
+        // The incumbent bound the subject through `tg-bind-html`
+        // (`sprint.jade:35`), which called jQuery's `.html()` after an
+        // escape -> replace -> unescape round trip. The shared helper returns an ARRAY
+        // OF REACT NODES instead, so the subject becomes escaped text children and
+        // React's raw-markup escape hatch is reached nowhere in the implementation --
+        // case 79 asserts the hatch is not even present to be reached for. Recorded in
+        // the Drift Register.
+        //
+        // ⛔ Do NOT reintroduce raw markup rendering to "match the incumbent exactly".
+        const { root } = mount({ sprint: makeSprint({ user_stories: [XSS_STORY] }) });
+        const subject = mustFind(root, 'span.us-name-text');
+
+        expect(subject.querySelector('img[src="x"]')).toBeNull();
+        expect(subject.querySelector('img')).toBeNull();
+        expect(subject.textContent).toContain('<img src=x onerror=alert(1)>');
+        expect(screen.getByText('<img src=x onerror=alert(1)>')).toBe(subject);
+    });
+
+    it('56. reuses the shared emoji helper rather than redefining one', () => {
+        // The helper is imported from the sibling row (rule C1.0: no new helper module,
+        // and two copies of the scanner would be free to drift apart). Behavioural
+        // proof: the shared helper carries the MATCHED TOKEN as alternative text, which
+        // the incumbent markup omits and a bespoke local scanner would not reproduce.
+        // Case 80 adds the source-level half of this assertion.
+        const nodes = renderEmojified(EMOJI_STORY.subject, EMOJIS_BY_NAME);
+
+        expect(nodes).toHaveLength(3);
+
+        const { root } = mount({ sprint: makeSprint({ user_stories: [EMOJI_STORY] }) });
+        const image = mustFind<HTMLImageElement>(root, 'span.us-name-text img');
+
+        expect(image.getAttribute('alt')).toBe(':rocket:');
+        expect(image.getAttribute('src')).toBe(ROCKET_IMAGE);
     });
 });
 
 /* ==========================================================================
- * 12. THE TWO SHARED-COMPONENT HOSTS
+ * 11. THE TWO SHARED-COMPONENT HOSTS
+ *
+ * `tg-belong-to-epics` and `tg-due-date` are shared AngularJS components this
+ * migration does not own. They are hosted, never reimplemented.
  * ========================================================================== */
 
-describe('the shared-component hosts', () => {
-    it('PRESERVED DEFECT 8: renders the epics host for an EMPTY array', () => {
-        // `ng-if="us.epics"` is truthiness on the ARRAY REFERENCE, and `[]` is
-        // truthy. Gating on `.length` would drop a host the incumbent renders.
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, epics: [] })] }),
-        });
+describe('epic pills and due date hosts', () => {
+    it('57. hosts tg-belong-to-epics inside the story link when the story has epics', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_WITH_EPICS] }) });
+        const link = mustFind<HTMLAnchorElement>(root, 'a.us-name');
+        const host = mustFind<Element>(link, 'tg-belong-to-epics');
 
-        expect(container.querySelector('tg-belong-to-epics')).not.toBeNull();
-    });
-
-    it('omits the epics host only when the member is null', () => {
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, epics: null })] }),
-        });
-
-        expect(container.querySelector('tg-belong-to-epics')).toBeNull();
-    });
-
-    it('spells the epic host\u2019s class as `class`, and passes the pill format', () => {
-        // react-dom forwards props to a hyphenated tag verbatim: `className` would
-        // land as `classname` and `sprints.scss:314` would match nothing.
-        const epics: readonly Epic[] = [{ id: 3, ref: 3, subject: 'Epic', color: '#ABCDEF' }];
-        const container = renderCard({
-            sprint: makeSprint({ user_stories: [makeStory({ id: 1, epics })] }),
-        });
-        const host = mustFind(container, 'tg-belong-to-epics');
-
+        // ⭐ `class`, NOT `className`: react-dom forwards props to a HYPHENATED tag
+        // verbatim and never translates `className` for one, so `className` would land
+        // as `classname=` and `sprints.scss:314` (`.us-epic-container`) would not match.
         expect(host.getAttribute('class')).toBe('us-epic-container');
-        expect(host.getAttribute('classname')).toBeNull();
         expect(host.getAttribute('format')).toBe('pill');
-        // The colour is DATA and is never written into this component, so nothing
-        // here asserts a hex value -- only that the host is fed and reachable.
-        expect(host.parentElement?.className).toContain('us-name');
+        expect(link.contains(host)).toBe(true);
     });
 
-    it('renders the due-date host only for a story that has one', () => {
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [
-                    makeStory({ id: 1, due_date: '2026-06-01', is_closed: true }),
-                    makeStory({ id: 2, due_date: null }),
-                ],
-            }),
-        });
-        const hosts = container.querySelectorAll('tg-due-date');
+    it('58. STILL hosts tg-belong-to-epics for an EMPTY epics array', () => {
+        // ⭐ PRESERVED DEFECT -- `ng-if="us.epics"` (`sprint.jade:37`-`:42`) is plain
+        // truthiness on the ARRAY REFERENCE, and `[]` is truthy in JavaScript. The gate
+        // is therefore on presence, never on length.
+        //
+        // ⛔ Do NOT "improve" this to `epics.length > 0`.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_EMPTY_EPICS] }) });
 
-        expect(hosts).toHaveLength(1);
-        expect(hosts[0].getAttribute('class')).toBe('due-date');
-        expect(hosts[0].getAttribute('due-date')).toBe('2026-06-01');
-        expect(hosts[0].getAttribute('is-closed')).toBe('true');
-        expect(hosts[0].getAttribute('obj-type')).toBe('us');
+        expect(root.querySelectorAll('tg-belong-to-epics')).toHaveLength(1);
     });
 
-    it('orders both hosts after the reference and the subject inside the anchor', () => {
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [makeStory({ id: 1, epics: [], due_date: '2026-06-01' })],
-            }),
-        });
-        const children = Array.from(mustFind(container, '.us-name').children).map(
-            (child: Element): string => child.tagName.toLowerCase(),
-        );
+    it('59. hosts no tg-belong-to-epics when the story carries no epics member', () => {
+        // The falsy inhabitant of `epics: readonly Epic[] | null` is `null`, so that is
+        // what the fixture supplies; the gate under test is plain truthiness either way.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
 
-        expect(children).toEqual(['span', 'span', 'tg-belong-to-epics', 'tg-due-date']);
+        expect(STORY_A.epics).toBeNull();
+        expect(root.querySelector('tg-belong-to-epics')).toBeNull();
     });
 
-    it('separates each host from what precedes it with ONE space, as the compiled Jade does', () => {
-        // The compiled `backlog/sprint.html` in `js/templates.js` contains
-        // `...class="us-name-text"></span>\n        <tg-belong-to-epics ...>` and
-        // `...</tg-belong-to-epics>\n        <tg-due-date ...>`, but ZERO characters
-        // between `.us-ref-text` and `.us-name-text` -- Jade's pretty-printer keeps
-        // consecutive KNOWN inline tags adjacent and breaks only before an unknown
-        // tag. HTML collapses each of those runs to one space, so the live AngularJS
-        // DOM carries a real space glyph before each host and none before the
-        // subject. JSX drops newline-bearing whitespace between elements, so the
-        // spaces have to be explicit; omitting them shifted the epic pill 3.234375px
-        // (= one Ubuntu-Regular space at 14px) to the left of where the live app
-        // paints it.
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [makeStory({ id: 1, epics: [], due_date: '2026-06-01' })],
-            }),
+    it('60. emits no epic pill and no colour value of its own', () => {
+        // ⭐ Rule T2 / gap G-DS-5. This markup DELEGATES to the shared component with
+        // `format="pill"`, which builds its own wrapper and applies its own darkening
+        // to `epic.color`. `backlog-row.jade:54`-`:58` instead emits a raw, empty
+        // `.belong-to-epic-pill`, and the two are DELIBERATELY different -- the fixture
+        // here carries the hexadecimal value, the implementation must carry none.
+        const { root, container } = mount({
+            sprint: makeSprint({ user_stories: [STORY_WITH_EPICS] }),
         });
-        const nodes = Array.from(mustFind(container, '.us-name').childNodes);
-        const shape = nodes.map((node: ChildNode): string =>
-            node.nodeType === Node.TEXT_NODE
-                ? JSON.stringify(node.textContent)
-                : (node as Element).tagName.toLowerCase(),
-        );
 
-        expect(shape).toEqual([
-            'span',
-            'span',
-            '" "',
-            'tg-belong-to-epics',
-            '" "',
-            'tg-due-date',
-        ]);
+        expect(root.querySelector('.belong-to-epic-pill')).toBeNull();
+        expect(container.innerHTML).not.toMatch(/#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\b/);
+        expect(container.innerHTML).not.toContain(BIG_EPIC.color);
     });
 
-    it('keeps both separating spaces even when neither host renders', () => {
-        // The whitespace sits OUTSIDE both `ng-if`s in the template, so it survives
-        // when the directives do not. A trailing space at the end of an inline flow
-        // is removed by white-space processing, so this is faithful AND invisible --
-        // and because it sits outside `span.us-name-text` it never extends that
-        // span's `line-through` decoration.
-        const container = renderCard({
-            sprint: makeSprint({
-                user_stories: [makeStory({ id: 1, epics: null, due_date: null })],
-            }),
-        });
-        const text = Array.from(mustFind(container, '.us-name').childNodes).filter(
-            (node: ChildNode): boolean => node.nodeType === Node.TEXT_NODE,
-        );
+    it('61. hosts tg-due-date only when the story carries a due date', () => {
+        const dated = mount({ sprint: makeSprint({ user_stories: [STORY_WITH_DUE_DATE] }) });
+        const host = mustFind<Element>(dated.root, 'tg-due-date');
 
-        expect(text.map((node: ChildNode): string | null => node.textContent)).toEqual([
-            ' ',
-            ' ',
-        ]);
+        // `sprint.jade:43`-`:48`. The values are RESOLVED here, where the incumbent's
+        // were binding expressions the AngularJS compiler evaluated against scope.
+        expect(host.getAttribute('class')).toBe('due-date');
+        expect(host.getAttribute('due-date')).toBe('2026-06-01');
+        expect(host.getAttribute('is-closed')).toBe('false');
+        expect(host.getAttribute('obj-type')).toBe('us');
+        expect(mustFind(dated.root, 'a.us-name').contains(host)).toBe(true);
+        dated.unmount();
+
+        const undated = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+
+        expect(STORY_A.due_date).toBeNull();
+        expect(undated.root.querySelector('tg-due-date')).toBeNull();
     });
 });
 
 /* ==========================================================================
- * 13. THE SPRINT TASKBOARD BUTTON
+ * 12. THE POINTS COLUMN
  * ========================================================================== */
 
-describe('the taskboard button', () => {
-    it('carries `variant` as a REAL DOM attribute', () => {
-        // `buttons-next.scss:56`-`:60` selects `.btn-small[variant='secondary']`.
-        // Asserted through `getAttribute`, never through the dataset, because a
-        // `data-` spelling would satisfy neither the stylesheet nor this case.
-        const container = renderCard();
-        const button = mustFind(container, '.btn-small');
+describe('points column', () => {
+    it('62. renders div.column-points.width-1 > span.points-container with the figure', () => {
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_A] }) });
+        const column = mustFind(root, 'div.column-points');
 
-        expect(button.getAttribute('variant')).toBe('secondary');
-        expect(button.dataset['variant']).toBeUndefined();
-        expect(button.tagName).toBe('A');
-        expect(button.className).toBe('btn-small');
+        expect(column.classList.contains('width-1')).toBe(true);
+        expect(mustFind(column, 'span.points-container').textContent).toBe('8');
     });
 
-    it('titles itself with the sprint name INTERPOLATED, unlike the name link', () => {
-        const container = renderCard();
+    it('63. omits the WHOLE points column for a story worth zero points', () => {
+        // ⭐ PRESERVED DEFECT -- `ng-if="us.total_points"` (`sprint.jade:49`-`:50`) is
+        // PLAIN TRUTHINESS, so both `0` and `null` hide the entire column: an
+        // unestimated story and a zero-point story look identical. A nullish test would
+        // show a `0` chip the incumbent never showed.
+        //
+        // ⛔ Do NOT replace this with a `!== null` check.
+        const { root } = mount({ sprint: makeSprint({ user_stories: [STORY_ZERO_POINTS] }) });
+        const rows = rowsOf(root);
 
-        expect(instant).toHaveBeenCalledWith('BACKLOG.SPRINTS.TITLE_LINK_TASKBOARD', {
-            name: 'Sprint 2026-5-15',
-        });
-        expect(mustFind(container, '.btn-small').getAttribute('title')).toBe(
+        expect(rows).toHaveLength(1);
+        expect(root.querySelector('div.column-points')).toBeNull();
+        expect(root.querySelector('span.points-container')).toBeNull();
+        expect(rows[0].children).toHaveLength(1);
+    });
+
+    it('64. marks the points column with LOWERCASE closed and blocked', () => {
+        // `sprint.jade:51`, selected by `sprints.scss:346`-`:351`. Same lowercase
+        // vocabulary as the inner anchor, and still not the row's capital-R one.
+        const closed = mount({ sprint: makeSprint({ user_stories: [STORY_CLOSED] }) });
+
+        expect(mustFind(closed.root, 'div.column-points').classList.contains('closed')).toBe(true);
+        closed.unmount();
+
+        const blocked = mount({ sprint: makeSprint({ user_stories: [STORY_BLOCKED] }) });
+
+        expect(mustFind(blocked.root, 'div.column-points').classList.contains('blocked')).toBe(
+            true,
+        );
+    });
+});
+
+/* ==========================================================================
+ * 13. THE TASKBOARD BUTTON
+ * ========================================================================== */
+
+describe('taskboard button', () => {
+    it('65. renders exactly one a.btn-small, as the LAST child of the card', () => {
+        // `sprint.jade:55`-`:62`. The conditional form is used rather than a `hidden`
+        // class because `sprints.scss:134`-`:136` gives `.btn-small` `width: 100%`: a
+        // hidden full-width button would still be a block in the card's flow.
+        const { root } = mount({ canViewMilestones: true });
+        const buttons = root.querySelectorAll('a.btn-small');
+
+        expect(buttons).toHaveLength(1);
+        expect(root.lastElementChild).toBe(buttons[0]);
+    });
+
+    it('66. DOES interpolate the sprint name into the taskboard title', () => {
+        // The deliberate contrast with case 13: `sprint.jade:56` passes
+        // `{"name": sprint.name}`, so this title resolves properly. Two bindings of two
+        // similar keys, one fed and one not -- and both behaviours are preserved.
+        const { root } = mount();
+
+        expect(mustFind(root, 'a.btn-small').getAttribute('title')).toBe(
             'Go to Taskboard of "Sprint 2026-5-15"',
         );
+        expect(spec.instant).toHaveBeenCalledWith(TITLE_LINK_TASKBOARD_KEY, {
+            name: OPEN_SPRINT.name,
+        });
     });
 
-    it('renders the catalogue label verbatim, leaving the casing to the stylesheet', () => {
-        const container = renderCard();
+    it('67. carries `variant` as a REAL DOM attribute, never as a data- attribute', () => {
+        // ⭐⭐ PRESERVED DEFECT / LOAD-BEARING STYLING. `buttons-next.scss:61`-`:65`
+        // selects `.btn-small[variant='secondary']` and sets
+        // `background-color: $color-gray400`. A non-matching attribute selector fails
+        // SILENTLY, so re-spelling this as `data-variant` would leave the button taking
+        // `%button`'s default mint fill instead of the pale blue-grey the design frame
+        // measures -- a visible regression that compiles cleanly.
+        //
+        // ⛔ NEVER rename this to `data-variant` to satisfy the type checker.
+        const { root } = mount();
+        const button = mustFind<HTMLAnchorElement>(root, 'a.btn-small');
 
-        expect(mustFind(container, '.btn-small > span').textContent).toBe('Sprint Taskboard');
+        expect(button.getAttribute('variant')).toBe('secondary');
+        expect(button.dataset.variant).toBeUndefined();
+        expect(button.hasAttribute('data-variant')).toBe(false);
     });
 
-    it('links to the taskboard and reports the click upwards', () => {
-        const container = renderCard();
-        const button = mustFind(container, '.btn-small');
+    it('68. labels the button with the mixed-case translated string, inside a span', () => {
+        // `sprint.jade:62`. The frame's uppercase comes from `%button`'s
+        // `text-transform` (`buttons-next.scss:4`-`:34`), so upper-casing in script
+        // would duplicate a rule that already applies and corrupt other locales.
+        const { root } = mount();
+        const button = mustFind<HTMLAnchorElement>(root, 'a.btn-small');
+        const label = mustFind(button, 'span');
 
-        expect(button.getAttribute('href')).toBe(TASKBOARD_URL);
+        expect(label.textContent).toBe('Sprint Taskboard');
+        expect(within(button).getByText('Sprint Taskboard')).toBe(label);
+    });
 
-        fireEvent.click(button);
+    it('69. points the button at the same resolved taskboard url', () => {
+        const { root } = mount();
+
+        expect(mustFind(root, 'a.btn-small').getAttribute('href')).toBe(TASKBOARD_URL);
+    });
+
+    it('70. reports one taskboard request when the button is clicked', () => {
+        const { root } = mount();
+
+        fireEvent.click(mustFind(root, 'a.btn-small'));
 
         expect(onOpenTaskboard).toHaveBeenCalledTimes(1);
+        expect(onEditSprint).not.toHaveBeenCalled();
+        expect(onOpenUserStory).not.toHaveBeenCalled();
     });
 
-    it('is omitted entirely when the member may not view milestones', () => {
-        // The conditional form rather than the `hidden` class, because
-        // `sprints.scss:134`-`:136` makes `.btn-small` full width: a hidden
-        // full-width block would still occupy the card's flow.
-        const container = renderCard({ canViewMilestones: false });
+    it('71. gates the button on its OWN permission, independently of visibility', () => {
+        // ⭐ TWO DIFFERENT PREDICATES OVER THE SAME PERMISSION NAME, AND THEY MUST NOT
+        // BE COLLAPSED. `sprints.coffee:77`-`:78` computes the header link's gate with a
+        // RAW `indexOf("view_milestones")` and no archived-project check, while
+        // `sprint.jade:58`'s `tg-check-permission` DOES include `!archived_code`. An
+        // archived project therefore hides this button while still showing the header
+        // link, which is exactly the state asserted here.
+        const { root } = mount({ canViewMilestones: false, isVisible: true });
 
-        expect(container.querySelector('.btn-small')).toBeNull();
-        // And it is gated INDEPENDENTLY of the name link's own permission.
-        expect(mustFind(container, '.sprint-name a')).toBeTruthy();
+        expect(root.querySelector('a.btn-small')).toBeNull();
+        expect(root.querySelector('.sprint-name a')).not.toBeNull();
+        expect([...root.children]).toHaveLength(3);
     });
 });
 
 /* ==========================================================================
- * 14. THE CARD'S OVERALL SHAPE
+ * 14. PURITY, LIGHT DOM AND SERVICE ISOLATION
  * ========================================================================== */
 
-describe('the card as a whole', () => {
-    it('emits exactly four top-level blocks in the source\u2019s order', () => {
-        const container = renderCard();
-        const children = Array.from(mustFind(container, '.sprint').children).map(
-            (child: Element): string =>
-                child.tagName === 'HEADER' ? 'header' : child.className,
+/** Every prop shape this card is expected to survive, rendered by cases 74 and 77. */
+const PERMUTATIONS: readonly Partial<SprintCardProps>[] = [
+    {},
+    { listVariant: 'closed', sprint: CLOSED_SPRINT },
+    { listVariant: 'open', sprint: CLOSED_SPRINT },
+    { sprint: EMPTY_SPRINT },
+    { sprint: EMPTY_SPRINT, hasModifyUsPermission: false },
+    { sprint: ZERO_POINTS_SPRINT, closedPoints: 0, totalPoints: 0 },
+    { sprint: NULL_POINTS_SPRINT, closedPoints: 0, totalPoints: 0 },
+    { sprint: INFINITE_POINTS_SPRINT, totalPoints: 0 },
+    { isVisible: false, isEditable: false, canViewMilestones: false },
+    { sprint: makeSprint({ user_stories: [STORY_CLOSED, STORY_BLOCKED] }) },
+    { sprint: makeSprint({ user_stories: [STORY_ZERO_POINTS, STORY_NO_MILESTONE] }) },
+    { sprint: makeSprint({ user_stories: [STORY_WITH_EPICS, STORY_EMPTY_EPICS] }) },
+    { sprint: makeSprint({ user_stories: [STORY_WITH_DUE_DATE] }) },
+    { sprint: makeSprint({ user_stories: [EMOJI_STORY, XSS_STORY] }) },
+    { sprint: makeSprint({ user_stories: [EMOJI_STORY] }), emojisByName: undefined },
+];
+
+describe('purity, light DOM and service isolation', () => {
+    it('72. renders identically twice from identical props', () => {
+        // Requirement I9: props in, markup out. No hidden state, no ordering surprise
+        // and no dependence on how often the card has been rendered before.
+        const first = mount();
+        const second = mount();
+
+        expect(second.root.innerHTML).toBe(first.root.innerHTML);
+    });
+
+    it('73. creates NO shadow root anywhere in the tree', () => {
+        // ⭐ REQUIREMENT I6 -- the single global stylesheet is loaded once at
+        // `app/index.jade:25`, and every icon resolves through a same-document sprite
+        // fragment. A shadow boundary would sever both at once: the card would lose all
+        // 412 lines of `sprints.scss` and every icon would blank.
+        //
+        // ⛔ NEVER attach a shadow root in this subtree.
+        const { container, root } = mount({
+            sprint: makeSprint({ user_stories: [STORY_WITH_EPICS, STORY_WITH_DUE_DATE] }),
+        });
+
+        expect(root.shadowRoot).toBeNull();
+
+        const elements = [...container.querySelectorAll('*')];
+
+        expect(elements.length).toBeGreaterThan(0);
+        for (const element of elements) {
+            expect(element.shadowRoot).toBeNull();
+        }
+    });
+
+    it('74. resolves the translation service and the language host, and NOTHING else', () => {
+        // ⭐ SERVICE-ISOLATION LOCK, and the SURFACED coordination item.
+        //
+        // The sanctioned map answers `$translate` and THROWS for every name it was not
+        // given, so the recorded ledger below is a real result rather than a tautology.
+        // The second name, `$rootScope`, comes from the translator hook's own
+        // language-change listener (`../bridge/useAngularService.ts:844`-`:856`) and
+        // never from this component -- the hook only ever LISTENS, and the root scope is
+        // deliberately absent from the sanctioned service map, which is why it has to be
+        // layered in here. Reported as a coordination item rather than papered over.
+        //
+        // What this proves: no repository, no realtime service, no emoji service, no
+        // navigation service and no digest driver (rules T5 and I9).
+        for (const overrides of PERMUTATIONS) {
+            mount(overrides);
+        }
+
+        expect([...new Set(spec.requested)].sort()).toEqual([
+            ROOT_SCOPE_SERVICE_NAME,
+            TRANSLATE_SERVICE_NAME,
+        ]);
+
+        // The throw is live: had the card reached for a repository, every case above
+        // would have failed loudly instead of silently acquiring a dependency.
+        expect((): unknown => spec.injector.get('$tgResources')).toThrow(
+            /supplied no mock for it/,
+        );
+    });
+
+    it('75. hands the drop container over once and tears the registration down', () => {
+        // All drag BEHAVIOUR lives in the shared adapter; this component only ever hands
+        // over the element and returns the teardown (R-DND-1, R-DND-2, R-DND-3).
+        const cleanup: jest.Mock<void, []> = jest.fn();
+        const registerDragContainer: jest.Mock<() => void, [HTMLElement]> = jest.fn(
+            (_element: HTMLElement): (() => void) => cleanup,
+        );
+        const { root, unmount } = mount({ registerDragContainer });
+
+        expect(registerDragContainer).toHaveBeenCalledTimes(1);
+        expect(registerDragContainer.mock.calls[0][0]).toBe(mustFind(root, '.sprint-table'));
+        expect(cleanup).not.toHaveBeenCalled();
+
+        unmount();
+
+        expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('76. tolerates both an absent registration and one that returns nothing', () => {
+        // The prop is optional so the sidebar's own empty state -- and this suite --
+        // can render a card without wiring drag. Its return is optional too: the
+        // declared shape is `(() => void) | void`, so a registrar that manages its own
+        // teardown returns nothing and must not be mistaken for a cleanup function.
+        expect((): void => {
+            const absent = mount();
+
+            expect(absent.root.querySelector('.sprint-table')).not.toBeNull();
+            absent.unmount();
+
+            const registerDragContainer: jest.Mock<void, [HTMLElement]> = jest.fn();
+            const voidReturning = mount({ registerDragContainer });
+
+            expect(registerDragContainer).toHaveBeenCalledTimes(1);
+            voidReturning.unmount();
+        }).not.toThrow();
+    });
+
+    it('77. emits no console error and no console warning for the whole matrix', () => {
+        // React reports a duplicate key, an unknown attribute or an invalid nesting
+        // through these channels, so a silent console is a real result. Measured: React
+        // ACCEPTS `variant` on an anchor -- it is lowercase and non-reserved -- so case
+        // 67's attribute needs no suppression and no data- prefix.
+        const errors = jest.spyOn(console, 'error').mockImplementation((): void => undefined);
+        const warnings = jest.spyOn(console, 'warn').mockImplementation((): void => undefined);
+
+        try {
+            for (const overrides of PERMUTATIONS) {
+                const { unmount } = mount(overrides);
+
+                unmount();
+            }
+
+            expect(errors).not.toHaveBeenCalled();
+            expect(warnings).not.toHaveBeenCalled();
+        } finally {
+            errors.mockRestore();
+            warnings.mockRestore();
+        }
+    });
+});
+
+/* ==========================================================================
+ * 15. NON-FINITE HEADER FIGURES
+ *
+ * The header's two numerals pass through `coercePoints` and then `formatPoints`, and
+ * the pair is designed to COMPOSE rather than to overlap. This group pins the
+ * composition, which is the only route to the second helper's guard.
+ * ========================================================================== */
+
+describe('non-finite header figures', () => {
+    it('78. prints a non-finite header figure as nothing, never as a word', () => {
+        // `coercePoints` reproduces CoffeeScript's `or` (`sprints.coffee:92`-`:93`),
+        // which is TRUTHINESS: it turns `null`, `0` and NaN alike into `0`. Infinity is
+        // truthy, so it survives that step and reaches `formatPoints`, whose guard
+        // returns the empty string rather than letting the locale formatter print the
+        // word. The two behaviours therefore compose: NaN prints `0` because the first
+        // helper caught it, and Infinity prints nothing because the second did.
+        const { root } = mount({ closedPoints: Number.POSITIVE_INFINITY, totalPoints: NaN });
+        const items = mustFind(root, '.sprint-info > ul').querySelectorAll('li');
+
+        expect(items).toHaveLength(2);
+        expect(mustFind(items[0], '.number').textContent).toBe('');
+        expect(mustFind(items[0], '.number').textContent).not.toContain('Infinity');
+
+        // NaN was coerced to zero one step earlier, so this numeral still prints.
+        expect(mustFind(items[1], '.number').textContent).toBe('0');
+        expect(mustFind(items[1], '.number').textContent).not.toContain('NaN');
+    });
+});
+
+/* ==========================================================================
+ * 16. SOURCE-LEVEL PROHIBITIONS AND PREMISES
+ *
+ * Some guarantees are about what the implementation must NEVER contain, and a
+ * rendered assertion cannot see an escape hatch that was never reached for. Each
+ * forbidden identifier is assembled from fragments so that this spec does not
+ * itself become the hit that a repository-wide search for it exists to catch --
+ * the convention `../bridge/ErrorBoundary.tsx` established.
+ * ========================================================================== */
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+    return typeof value === 'object' && value !== null;
+}
+
+/** Walks the shipped English catalogue without ever holding a loosely typed value. */
+function catalogueValue(path: readonly string[]): unknown {
+    let cursor: unknown = JSON.parse(readFileSync(LOCALE_FILE, 'utf8'));
+
+    for (const segment of path) {
+        if (!isRecord(cursor)) {
+            throw new Error(`the English catalogue holds no object before '${segment}'`);
+        }
+
+        cursor = cursor[segment];
+    }
+
+    return cursor;
+}
+
+describe('source-level prohibitions and premises', () => {
+    const unitSource = readFileSync(UNIT_FILE, 'utf8');
+
+    it('79. never reaches for the raw-markup escape hatch', () => {
+        // The counterpart to case 55: that one proves the rendered output is text, this
+        // one proves the hatch is not present to be reached for.
+        expect(unitSource.length).toBeGreaterThan(0);
+        expect(unitSource).not.toContain(`${'dangerously'}${'SetInnerHTML'}`);
+    });
+
+    it('80. imports the emoji helper from the sibling row instead of declaring one', () => {
+        // The source-level half of case 56. Two copies of the scanner would be free to
+        // drift apart, and a new helper module would be surface beyond this file's
+        // stated scope (rule C1.0).
+        expect(unitSource).toContain("from './StoryRow'");
+        expect(unitSource).toContain('renderEmojified');
+        expect(unitSource).not.toContain(`${'function'} renderEmojified`);
+    });
+
+    it('81. never spells the variant attribute with a data- prefix', () => {
+        // The source-level half of case 67.
+        expect(unitSource).not.toContain(`${'data'}-variant`);
+        expect(unitSource).toContain("variant: 'secondary'");
+    });
+
+    it('82. builds no transport, attaches no shadow root and drives no digest', () => {
+        // Rule T5: every request goes through the existing repository layer, so the
+        // authorization header, the session header, the token refresh, the blocking
+        // interceptor and the changed-fields-only write semantics are all inherited
+        // rather than re-derived. Requirement I6: light DOM only.
+        for (const forbidden of [
+            'XMLHttp' + 'Request',
+            'axi' + 'os',
+            `${'fetch'}(`,
+            `${'attach'}Shadow`,
+            `${'$rootScope'}.${'$apply'}`,
+        ]) {
+            expect(unitSource).not.toContain(forbidden);
+        }
+    });
+
+    it('83. imports nothing outside its declared dependency set, and no stylesheet', () => {
+        const specifiers = [...unitSource.matchAll(/from '([^']+)'/g)].map(
+            (match: RegExpMatchArray): string | undefined => match[1],
         );
 
-        expect(children).toEqual([
-            'header',
-            'summary-progress-wrapper',
-            'sprint-table open',
-            'btn-small',
+        expect([...new Set(specifiers)].sort()).toEqual([
+            '../bridge/useTranslate',
+            '../shared/Svg',
+            '../shared/types/epic',
+            '../shared/types/sprint',
+            './SprintProgressBar',
+            './StoryRow',
+            'react',
         ]);
+        expect(unitSource).not.toMatch(/from '[^']*\.(?:css|scss|sass)'/);
     });
 
-    it('emits no background, border, shadow or extra wrapper of its own', () => {
-        // The design frame measures no card fill, no border, no radius and no
-        // card-level shadow -- `sprints.scss:71`-`:72` gives `.sprint` a bottom
-        // margin and nothing else. An added wrapper would also break the
-        // `.sprints .sprint > ...` reading of the cascade.
-        const container = renderCard();
-        const wrapperEl = mustFind(container, '.sprint');
-
-        expect(container.children).toHaveLength(1);
-        expect(wrapperEl.getAttribute('style')).toBeNull();
-        expect(wrapperEl.tagName).toBe('DIV');
-    });
-
-    it('PRESERVED DEFECT 3: does not port the dead minimum-height constant', () => {
-        // `sprints.coffee:19` assigned `sprintTableMinHeight = 50` and never read
-        // it; `sprints.scss:190`-`:192` supplies `min-height: 2rem` instead.
-        const container = renderCard();
-
-        expect(mustFind(container, '.sprint-table').getAttribute('style')).toBeNull();
-    });
-
-    it('asks the injector for nothing but the translator seam', () => {
-        // Rules T5 and I9: no repository, no events service, no HTTP client. The
-        // spec injector throws for anything else, so this case is the standing
-        // guard against a future edit acquiring a dependency.
-        expect((): HTMLElement => renderCard()).not.toThrow();
-        expect(instant).toHaveBeenCalled();
+    it('84. uses the real shipped English values for all nine of its keys', () => {
+        // Guards the premise the whole suite rests on: every string asserted above is
+        // the value the application actually ships, not a convenient stand-in.
+        expect(catalogueValue(['BACKLOG', 'COMPACT_SPRINT'])).toBe(
+            TRANSLATIONS[COMPACT_SPRINT_KEY],
+        );
+        expect(catalogueValue(['BACKLOG', 'GO_TO_TASKBOARD'])).toBe(
+            TRANSLATIONS[GO_TO_TASKBOARD_KEY],
+        );
+        expect(catalogueValue(['BACKLOG', 'EDIT_SPRINT'])).toBe(TRANSLATIONS[EDIT_SPRINT_KEY]);
+        expect(catalogueValue(['BACKLOG', 'CLOSED_POINTS'])).toBe(TRANSLATIONS[CLOSED_POINTS_KEY]);
+        expect(catalogueValue(['BACKLOG', 'TOTAL_POINTS'])).toBe(TRANSLATIONS[TOTAL_POINTS_KEY]);
+        expect(
+            catalogueValue(['BACKLOG', 'SPRINTS', 'WARNING_EMPTY_SPRINT_ANONYMOUS']),
+        ).toBe(TRANSLATIONS[WARNING_EMPTY_SPRINT_ANONYMOUS_KEY]);
+        expect(catalogueValue(['BACKLOG', 'SPRINTS', 'WARNING_EMPTY_SPRINT'])).toBe(
+            TRANSLATIONS[WARNING_EMPTY_SPRINT_KEY],
+        );
+        expect(catalogueValue(['BACKLOG', 'SPRINTS', 'TITLE_LINK_TASKBOARD'])).toBe(
+            TRANSLATIONS[TITLE_LINK_TASKBOARD_KEY],
+        );
+        expect(catalogueValue(['BACKLOG', 'SPRINTS', 'LINK_TASKBOARD'])).toBe(
+            TRANSLATIONS[LINK_TASKBOARD_KEY],
+        );
     });
 });
