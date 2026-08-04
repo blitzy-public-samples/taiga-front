@@ -9,22 +9,53 @@
 /**
  * Specs for `useKanbanData`.
  *
- * Browserless by construction: jsdom, no network, no AngularJS bootstrap, no
- * Playwright, no snapshots, no Immutable fixture. Every AngularJS service is a
- * structural double supplied through `mockInjector`, which THROWS for any name the
- * spec did not supply — so "this hook resolves nothing else" is asserted by the
- * doubles that are absent rather than by prose.
+ * Browserless by construction: jsdom only. No network, no AngularJS bootstrap, no
+ * browser-automation runner, no snapshot, no persistent-structure fixture, and no
+ * dependency on the built distribution. Every AngularJS service is a structural
+ * double supplied through `mockInjector`, which THROWS for any name the spec did not
+ * supply — so "this hook resolves nothing else" is asserted by the doubles that are
+ * ABSENT rather than by prose.
  *
- * The gates that would otherwise be untestable are covered by a source scan of the
- * unit with comments stripped, so documentation prose can neither satisfy nor
- * violate a prohibition.
+ * ===========================================================================
+ * WHAT EACH LAYER OF THE HARNESS EXISTS TO CATCH
+ * ===========================================================================
+ * The hook is a data SEAM, so almost every way it can break is a boundary that still
+ * type-checks. Each layer below is aimed at one of those:
+ *
+ *   - A RECORDING INJECTOR (`renderKanbanData`) counts the service names resolved, so
+ *     "the resource bag is resolved exactly once per render" is counted rather than
+ *     inferred, and a fourth resolution throws instead of being tolerated.
+ *   - FACADE SPIES (`spyOnFacades`) observe the one mistake the request itself cannot
+ *     show: handing a facade the WRONG SUB-RESOURCE of `$tgResources`. They also
+ *     observe the frozen order write's argument COUNT, which is seven rather than six
+ *     because the service comes first. `jest.spyOn` passes through, so the real
+ *     facade still runs.
+ *   - MODEL DOUBLES with NON-ENUMERABLE ACCESSOR attributes reproduce `$tgModel`'s own
+ *     shape, so an implementation that spread a model instead of calling `getAttrs()`
+ *     fails these specs rather than passing by accident.
+ *   - A PLAIN-DATA WALK (`nonPlainDataFindings`) refuses any wrapper, thenable, DOM
+ *     node or non-plain prototype in the values React receives, and self-tests
+ *     against each of those so it cannot pass vacuously.
+ *   - OBSERVER STUBS installed and removed per test keep this file's footprint on the
+ *     shared jsdom global exactly zero.
+ *
+ * The gates that no run-time call can express — "never imports a transport", "never
+ * touches a digest" — are covered by a source scan of the unit WITH COMMENTS
+ * STRIPPED, so documentation prose can neither satisfy nor violate a prohibition. The
+ * one deliberate exception reads the prose on purpose, and says why.
+ *
+ * Mock state needs no hand-written teardown: `clearMocks` and `restoreMocks` are set
+ * in jest.config.js, so no whole-registry clear, reset or restore call appears
+ * anywhere in this file — every double is cleared, and every spy restored, between
+ * tests by the runner.
  */
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-import { renderHook } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 
+import type { AngularInjector } from '../../bridge/AngularBridgeContext';
 import { mockInjector, withMockInjector } from '../../bridge/mockInjector';
 import type {
     AngularHttpResponse,
@@ -37,6 +68,10 @@ import type {
     TaigaModel,
     TaigaResources,
 } from '../../bridge/useAngularService';
+import * as kanbanStorageApi from '../../shared/api/kanbanStorage';
+import * as projectsApi from '../../shared/api/projects';
+import * as swimlanesApi from '../../shared/api/swimlanes';
+import * as userstoriesApi from '../../shared/api/userstories';
 import type { UserStory } from '../../shared/types/userStory';
 import { UNCLASSIFIED_SWIMLANE_ID } from '../state/boardReducer';
 import {
@@ -71,6 +106,92 @@ const INCUMBENT_VALID_QUERY_PARAMS: readonly string[] = [
 const PROJECT_ID = 42;
 
 /* ==========================================================================
+ * THE BROWSERLESS ENVIRONMENT
+ *
+ * jsdom implements neither observer API, and this hook instantiates neither: it
+ * performs no measurement and mounts no element. The stubs are installed anyway,
+ * for two reasons that outlive the current implementation.
+ *
+ *   1. The board's virtualisation seam (`../../shared/useInViewport`) is an
+ *      `IntersectionObserver` consumer, and the container that renders this hook
+ *      renders that one. If a future edit moved an observer behind this data seam,
+ *      the failure without a stub is `IntersectionObserver is not defined` thrown
+ *      from inside a React render — which names the environment rather than the
+ *      regression.
+ *   2. An absent global is a LEAK RISK IN REVERSE: a spec that installed one and
+ *      forgot to remove it would hand the next file in the same worker a global the
+ *      browser would not have. Installing and removing per test keeps this file's
+ *      environmental footprint exactly zero, which is what makes the suite's file
+ *      order irrelevant.
+ *
+ * Both are structural implementations of the DOM interfaces rather than casts, so
+ * a signature change in the lib types is a compile error here.
+ * ========================================================================== */
+
+class IntersectionObserverStub implements IntersectionObserver {
+    readonly root: Element | Document | null = null;
+
+    readonly rootMargin: string = '0px';
+
+    readonly thresholds: readonly number[] = [0];
+
+    constructor(_callback: IntersectionObserverCallback, _init?: IntersectionObserverInit) {}
+
+    observe(): void {}
+
+    unobserve(): void {}
+
+    disconnect(): void {}
+
+    takeRecords(): IntersectionObserverEntry[] {
+        return [];
+    }
+}
+
+class ResizeObserverStub implements ResizeObserver {
+    constructor(_callback: ResizeObserverCallback) {}
+
+    observe(): void {}
+
+    unobserve(): void {}
+
+    disconnect(): void {}
+}
+
+/**
+ * Whatever the environment provided before this file ran, captured once at module
+ * scope so the restore is to the ORIGINAL value rather than to a guess. `undefined`
+ * is the expected reading under jsdom, and it is why the teardown deletes rather
+ * than assigns in that case — assigning `undefined` would leave a defined global
+ * holding nothing, which is a third state neither jsdom nor a browser has.
+ */
+const nativeIntersectionObserver: typeof IntersectionObserver | undefined =
+    globalThis.IntersectionObserver;
+
+const nativeResizeObserver: typeof ResizeObserver | undefined = globalThis.ResizeObserver;
+
+beforeEach(() => {
+    globalThis.IntersectionObserver = IntersectionObserverStub;
+    globalThis.ResizeObserver = ResizeObserverStub;
+});
+
+afterEach(() => {
+    if (nativeIntersectionObserver === undefined) {
+        // `Reflect.deleteProperty` rather than `delete`, because the lib declares the
+        // global as required and a non-optional operand is a compile error.
+        Reflect.deleteProperty(globalThis, 'IntersectionObserver');
+    } else {
+        globalThis.IntersectionObserver = nativeIntersectionObserver;
+    }
+
+    if (nativeResizeObserver === undefined) {
+        Reflect.deleteProperty(globalThis, 'ResizeObserver');
+    } else {
+        globalThis.ResizeObserver = nativeResizeObserver;
+    }
+});
+
+/* ==========================================================================
  * DOUBLES
  * ========================================================================== */
 
@@ -101,14 +222,21 @@ interface ModelDouble<TAttrs> {
 }
 
 /**
- * A live-model stand-in whose ONLY own enumerable members are its methods.
+ * A live-model stand-in whose ONLY own ENUMERABLE members are its methods, and
+ * whose attributes are NON-ENUMERABLE ACCESSORS.
  *
- * That shape is what makes the flattening gate real: a unit that spread the model
- * instead of calling `getAttrs()` would produce an object of functions and no
- * attributes, so every "flattens" expectation below fails for a spread
- * implementation rather than passing by accident. `getAttrs` hands back a FRESH
- * shallow copy, exactly as `_.extend({}, …)` does at
- * app/coffee/modules/base/model.coffee:48-54.
+ * ⭐ THE SHAPE IS THE ASSERTION. `$tgModel` installs one accessor pair per
+ * attribute with `Object.defineProperty` (app/coffee/modules/base/model.coffee:
+ * 67-101), and a property defined that way is non-enumerable by default — so
+ * `{...model}` on a real model yields the prototype-free husk of whatever WAS
+ * enumerable and NONE of the data. Reproducing that here is what makes every
+ * "flattens" expectation below fail for a spread implementation instead of passing
+ * by accident: a spread produces an object of functions, `model.id` still reads
+ * correctly (so nothing looks broken while writing the code), and only the
+ * assertions catch it.
+ *
+ * `getAttrs` hands back a FRESH shallow copy, exactly as `_.extend({}, @._attrs,
+ * @._modifiedAttrs)` does at `:48-54`.
  */
 function modelDoubleOf<TAttrs extends object>(
     name: string,
@@ -124,7 +252,82 @@ function modelDoubleOf<TAttrs extends object>(
         clone: jest.fn(() => model),
     };
 
+    for (const attribute of Object.keys(attrs)) {
+        // `Reflect.get` rather than an index read, because the attribute shape is a
+        // type parameter and has no index signature to read through.
+        const value: unknown = Reflect.get(attrs, attribute);
+
+        Object.defineProperty(model, attribute, {
+            get: (): unknown => value,
+            enumerable: false,
+            configurable: true,
+        });
+    }
+
     return { model, getAttrs, attrs };
+}
+
+/**
+ * Every reason a value would be unfit for React state or an immer draft, as a list
+ * of located findings rather than a boolean.
+ *
+ * ⛔ WHAT THIS CLOSES, AND WHY A `toEqual` ON THE HAPPY PATH DOES NOT. Jest's
+ * structural matchers compare the members they find: a live `$tgModel` whose
+ * attributes are non-enumerable accessors, an AngularJS `$q` promise, a callback
+ * left on a payload, a detached DOM node — every one of those can sit inside a value
+ * that still satisfies `toEqual` against the attributes it wraps. Each is also a
+ * concrete hazard rather than an aesthetic one: immer refuses to draft a class
+ * instance (pitfall P-IMMER-1), `autoFreeze` would freeze a structure AngularJS
+ * still holds (P-IMMER-4), and a thenable in a state slot makes every property read
+ * on it `undefined`.
+ *
+ * The walk is recursive, reports the PATH of each finding so a failure names the
+ * member rather than the object, and treats only `Object.prototype`,
+ * `Array.prototype` and a null prototype as plain — which is exactly the set immer
+ * drafts.
+ *
+ * @param value - the value the hook handed back.
+ * @param path - the location of `value` within the original result, for the message.
+ * @returns one description per finding; an empty array means the value is plain.
+ */
+function nonPlainDataFindings(value: unknown, path: string = 'result'): readonly string[] {
+    if (value === null || typeof value !== 'object') {
+        return typeof value === 'function' ? [`${path} is a function`] : [];
+    }
+
+    if (value instanceof Promise) {
+        return [`${path} is a native promise`];
+    }
+
+    const then: unknown = Reflect.get(value, 'then');
+
+    if (typeof then === 'function') {
+        return [`${path} is a thenable, e.g. an AngularJS $q promise`];
+    }
+
+    if (value instanceof Node) {
+        return [`${path} is a DOM node`];
+    }
+
+    const prototype: unknown = Object.getPrototypeOf(value);
+
+    if (
+        prototype !== Object.prototype &&
+        prototype !== Array.prototype &&
+        prototype !== null
+    ) {
+        return [`${path} has a non-plain prototype, e.g. a $tgModel or a persistent structure`];
+    }
+
+    if (Array.isArray(value)) {
+        return value.flatMap((entry: unknown, index: number) =>
+            nonPlainDataFindings(entry, `${path}[${index}]`),
+        );
+    }
+
+    return Object.keys(value).flatMap((key) =>
+        nonPlainDataFindings(Reflect.get(value, key), `${path}.${key}`),
+    );
 }
 
 type StoryAttrs = Pick<UserStory, 'id' | 'ref' | 'subject' | 'status' | 'version'> & {
@@ -175,7 +378,7 @@ function headersGetterOf(headers: Record<string, string>): HttpHeadersGetter {
     return getter;
 }
 
-/** One `$http` response, as the repository's raw write path resolves it. */
+/** One HTTP response envelope, as the repository's raw write path resolves it. */
 function httpResponseOf<TData>(data: TData): AngularHttpResponse<TData> {
     return { data, status: 200, headers: headersGetterOf({}) };
 }
@@ -200,11 +403,30 @@ type FoldModesReadMock = jest.Mock<ResourceParams, [number]>;
 
 type FoldModesWriteMock = jest.Mock<void, [number, ResourceParams]>;
 
-/** The recorded arguments of one call, narrowed from jest's untyped record. */
-function callArgsOf(mock: jest.Mock, callIndex: number = 0): readonly unknown[] {
-    const calls: readonly unknown[][] = mock.mock.calls;
+/**
+ * Anything that records its calls: a plain `jest.fn` double or a `jest.spyOn` spy.
+ *
+ * Declared structurally because the two are unrelated types — `jest.Mock` is
+ * callable, `jest.SpyInstance` is not — and every reader below needs only the
+ * recorded argument lists.
+ */
+interface CallRecorder {
+    readonly mock: { readonly calls: readonly (readonly unknown[])[] };
+}
 
-    return calls[callIndex] ?? [];
+/** The recorded arguments of one call, narrowed from jest's untyped record. */
+function callArgsOf(recorder: CallRecorder, callIndex: number = 0): readonly unknown[] {
+    return recorder.mock.calls[callIndex] ?? [];
+}
+
+/** Anything that records what its calls returned. Structural, for the same reason. */
+interface ResultRecorder {
+    readonly mock: { readonly results: readonly { readonly value: unknown }[] };
+}
+
+/** What one recorded call returned, as `unknown` so every assertion stays checked. */
+function callResultOf(recorder: ResultRecorder, callIndex: number = 0): unknown {
+    return recorder.mock.results[callIndex]?.value;
 }
 
 interface ResourcesDouble {
@@ -352,6 +574,10 @@ interface Harness {
     readonly api: KanbanDataApi;
     readonly resources: ResourcesDouble;
     readonly projectService: ProjectServiceDouble;
+
+    /** Every service name the hook asked the injector for, in call order. */
+    readonly resolvedNames: readonly string[];
+
     readonly errorHandling: ErrorHandlingDouble;
     readonly rerender: () => void;
     readonly currentApi: () => KanbanDataApi;
@@ -360,7 +586,14 @@ interface Harness {
 /**
  * Mounts the hook with the three services it is allowed to resolve AND NOTHING
  * ELSE. `mockInjector` throws for an unsupplied name, so a fourth resolution — a
- * scope, `$q`, `$http`, `tgResources` — would fail every spec in this file.
+ * scope, the promise service, a raw transport, `tgResources` — would fail every spec
+ * in this file.
+ *
+ * The injector is `mockInjector`'s, reached through a recording `get` that keeps the
+ * generic signature the bridge declares. A `jest.fn` cannot inhabit `<T>(name:
+ * string) => T` without a cast, and a cast in the harness would be the one place a
+ * spec could quietly stop describing the real contract — so the recorder is an
+ * ordinary generic method that appends the name and delegates.
  */
 function renderKanbanData(options: {
     readonly payload?: Record<string, unknown> | null;
@@ -369,12 +602,21 @@ function renderKanbanData(options: {
     const resources = resourcesDouble();
     const projectService = projectServiceDouble(options);
     const errorHandling = errorHandlingDouble();
+    const resolvedNames: string[] = [];
 
-    const injector = mockInjector({
+    const supplied = mockInjector({
         $tgResources: resources.service,
         tgProjectService: projectService.service,
         tgErrorHandlingService: errorHandling.service,
     });
+
+    const injector: AngularInjector = {
+        get<TService>(name: string): TService {
+            resolvedNames.push(name);
+
+            return supplied.get<TService>(name);
+        },
+    };
 
     const rendered = renderHook(() => useKanbanData(), {
         wrapper: withMockInjector(injector),
@@ -384,10 +626,69 @@ function renderKanbanData(options: {
         api: rendered.result.current,
         resources,
         projectService,
+        resolvedNames,
         errorHandling,
         rerender: () => rendered.rerender(),
         currentApi: () => rendered.result.current,
     };
+}
+
+/* ==========================================================================
+ * FACADE SPIES
+ *
+ * ⭐ WHY SPY ON THE FACADES AT ALL, when the resource doubles already record every
+ * request. Because ONE routing mistake is invisible at the resource layer: handing a
+ * facade the WRONG SUB-RESOURCE. `$tgResources.userstories`, `.swimlanes`,
+ * `.projects` and `.kanban` are four distinct objects behind one bag, and each facade
+ * takes its own as an argument.
+ *
+ * Passing an outright sibling — `listSwimlanes(resources.userstories, …)` — is a
+ * compile error, because the member sets differ. What the compiler CANNOT see is a
+ * value that satisfies the same structural view without BEING the live namespace: a
+ * spread, a clone, a re-wrapped bag or a memoised copy. Every one of those type-checks
+ * and every one of them silently detaches the resource from the state the AngularJS
+ * layer keeps on it. Spying on the facade is the only place the IDENTITY of that first
+ * argument is observable.
+ *
+ * It is also the only place the frozen order write's argument COUNT is observable:
+ * the endpoint takes six values, the facade takes seven because the service comes
+ * first, and four of those values are consecutive numbers that transpose silently.
+ *
+ * `jest.spyOn` PASSES THROUGH to the real implementation by default, so every
+ * behavioural expectation in this file still exercises the genuine facade rather
+ * than a stand-in, and `restoreMocks` in jest.config.js removes each spy after its
+ * test with no hand-written teardown.
+ * ========================================================================== */
+
+function spyOnFacades(): {
+    readonly listAllUserstories: jest.SpyInstance;
+    readonly getUserStoryByRef: jest.SpyInstance;
+    readonly getUserstoriesFiltersData: jest.SpyInstance;
+    readonly bulkUpdateKanbanOrder: jest.SpyInstance;
+    readonly listSwimlanes: jest.SpyInstance;
+    readonly getProjectTagsColors: jest.SpyInstance;
+    readonly getStatusColumnModes: jest.SpyInstance;
+    readonly storeStatusColumnModes: jest.SpyInstance;
+    readonly getSwimlanesModes: jest.SpyInstance;
+    readonly storeSwimlanesModes: jest.SpyInstance;
+} {
+    return {
+        listAllUserstories: jest.spyOn(userstoriesApi, 'listAllUserstories'),
+        getUserStoryByRef: jest.spyOn(userstoriesApi, 'getUserStoryByRef'),
+        getUserstoriesFiltersData: jest.spyOn(userstoriesApi, 'getUserstoriesFiltersData'),
+        bulkUpdateKanbanOrder: jest.spyOn(userstoriesApi, 'bulkUpdateKanbanOrder'),
+        listSwimlanes: jest.spyOn(swimlanesApi, 'listSwimlanes'),
+        getProjectTagsColors: jest.spyOn(projectsApi, 'getProjectTagsColors'),
+        getStatusColumnModes: jest.spyOn(kanbanStorageApi, 'getStatusColumnModes'),
+        storeStatusColumnModes: jest.spyOn(kanbanStorageApi, 'storeStatusColumnModes'),
+        getSwimlanesModes: jest.spyOn(kanbanStorageApi, 'getSwimlanesModes'),
+        storeSwimlanesModes: jest.spyOn(kanbanStorageApi, 'storeSwimlanesModes'),
+    };
+}
+
+/** The first argument of one facade call: the sub-resource it was handed. */
+function facadeServiceOf(spy: CallRecorder): unknown {
+    return callArgsOf(spy)[0];
 }
 
 /** A project payload with both taxonomies, as the serializer sends them. */
@@ -491,6 +792,13 @@ const UNIT_PROHIBITIONS: readonly Prohibition[] = [
     { description: 'a defect marker', needle: `${'FIX'}${'ME'}` },
     { description: 'a synchronous read wrapped in a promise', needle: `${'Promise.'}${'resolve'}` },
     { description: 'a default React import', needle: `${'import Rea'}${'ct from'}` },
+    { description: 'the AngularJS global', needle: `${'angu'}${'lar.'}` },
+    { description: 'an AngularJS import', needle: `${'from \''}${'angular'}` },
+    { description: 'the jQuery global', needle: `${'jQ'}${'uery'}` },
+    { description: 'a jQuery import', needle: `${'from \''}${'jquery'}` },
+    { description: 'a disabled immer freeze', needle: `${'setAuto'}${'Freeze'}` },
+    { description: 'a legacy board script', needle: `${'boards'}${'.js'}` },
+    { description: 'a direct DOM write', needle: `${'document.'}${'querySelector'}` },
 ];
 
 /* ==========================================================================
@@ -504,9 +812,52 @@ describe('service acquisition', () => {
         expect(() => renderKanbanData()).not.toThrow();
     });
 
-    it('resolves the dollar-prefixed resource service exactly once', () => {
+    it('resolves the resource bag exactly once per hook instance, and nothing else', () => {
+        const harness = renderKanbanData({ payload: projectPayload() });
+
+        // The RUN-TIME half of the single-resolution rule. The injector records every
+        // name the hook asked for, so "exactly once" is counted rather than inferred.
+        expect(harness.resolvedNames).toEqual([
+            '$tgResources',
+            'tgProjectService',
+            'tgErrorHandlingService',
+        ]);
+        expect(
+            harness.resolvedNames.filter((name) => name === '$tgResources'),
+        ).toHaveLength(1);
+    });
+
+    it('resolves three DISTINCT services, so the project and error services are not the bag', () => {
+        const harness = renderKanbanData({ payload: projectPayload() });
+
+        expect(new Set(harness.resolvedNames).size).toBe(3);
+
+        // Distinct names AND distinct objects: the gate reads the project off one
+        // service and reports denial through another, and conflating them would make
+        // the deactivated-project path unobservable.
+        expect(harness.projectService.service).not.toBe(harness.errorHandling.service);
+        expect(harness.projectService.service).not.toBe(harness.resources.service);
+    });
+
+    it('resolves each service once more on a re-render, and never twice in one render', () => {
+        const harness = renderKanbanData({ payload: projectPayload() });
+
+        harness.rerender();
+
+        // `useAngularService` reads the injector on every render by design, so the
+        // invariant is one resolution PER NAME PER RENDER — never a second bag lookup
+        // inside a single render, which is what a stray duplicate hook call would add.
+        expect(harness.resolvedNames.filter((name) => name === '$tgResources')).toHaveLength(
+            2,
+        );
+        expect(harness.resolvedNames).toHaveLength(6);
+    });
+
+    it('resolves the dollar-prefixed resource service exactly once in the source, too', () => {
+        // Quote-agnostic on purpose: single, double and template quoting all reach the
+        // same service, so the gate must not be evaded by a formatting change.
         const resolutions = Array.from(
-            UNIT_CODE.matchAll(/useAngularService\('([^']+)'\)/g),
+            UNIT_CODE.matchAll(/useAngularService\(\s*['"`]([^'"`]+)['"`]\s*\)/g),
             (match) => match[1],
         );
 
@@ -515,6 +866,7 @@ describe('service acquisition', () => {
             'tgProjectService',
             'tgErrorHandlingService',
         ]);
+        expect(resolutions.filter((name) => name === '$tgResources')).toHaveLength(1);
     });
 
     it('never resolves the attachments resource service, which is a different service', () => {
@@ -523,7 +875,36 @@ describe('service acquisition', () => {
         expect(UNIT_CODE).not.toContain(`${"'tgReso"}${"urces'"}`);
     });
 
-    it('reaches each facade through its own sub-resource', async () => {
+    it('hands every facade the exact sub-resource it takes, never a sibling', async () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData({ payload: projectPayload() });
+        const { userstories, swimlanes, projects, kanban } = harness.resources.service;
+
+        await harness.api.listUserstories(PROJECT_ID);
+        await harness.api.getUserstoryByRef(PROJECT_ID, 137);
+        await harness.api.loadFiltersData({ project: PROJECT_ID });
+        await harness.api.listSwimlanes(PROJECT_ID);
+        await harness.api.loadTagsColors(PROJECT_ID);
+        harness.api.getStatusColumnModes(PROJECT_ID);
+        harness.api.getSwimlanesModes(PROJECT_ID);
+        harness.api.storeStatusColumnModes(PROJECT_ID, {});
+        harness.api.storeSwimlanesModes(PROJECT_ID, {});
+
+        // IDENTITY, member by member. Four sibling objects live behind one bag, and
+        // handing a facade the wrong one is the single routing mistake no assertion on
+        // the request itself can see.
+        expect(facadeServiceOf(facades.listAllUserstories)).toBe(userstories);
+        expect(facadeServiceOf(facades.getUserStoryByRef)).toBe(userstories);
+        expect(facadeServiceOf(facades.getUserstoriesFiltersData)).toBe(userstories);
+        expect(facadeServiceOf(facades.listSwimlanes)).toBe(swimlanes);
+        expect(facadeServiceOf(facades.getProjectTagsColors)).toBe(projects);
+        expect(facadeServiceOf(facades.getStatusColumnModes)).toBe(kanban);
+        expect(facadeServiceOf(facades.getSwimlanesModes)).toBe(kanban);
+        expect(facadeServiceOf(facades.storeStatusColumnModes)).toBe(kanban);
+        expect(facadeServiceOf(facades.storeSwimlanesModes)).toBe(kanban);
+    });
+
+    it('invokes each resource member AS A MEMBER of its own sub-resource', async () => {
         const harness = renderKanbanData({ payload: projectPayload() });
 
         await harness.api.listUserstories(PROJECT_ID);
@@ -535,6 +916,23 @@ describe('service acquisition', () => {
         expect(harness.resources.swimlanesList).toHaveBeenCalledTimes(1);
         expect(harness.resources.tagsColors).toHaveBeenCalledTimes(1);
         expect(harness.resources.getStatusColumnModes).toHaveBeenCalledTimes(1);
+
+        // The receiver each member was called on, which is the second, independent
+        // proof of the routing above: the AngularJS resource layer reads `@` off its
+        // own namespace, so a member invoked detached would break at run time even
+        // where the type checker was satisfied.
+        expect(harness.resources.listAll.mock.contexts[0]).toBe(
+            harness.resources.service.userstories,
+        );
+        expect(harness.resources.swimlanesList.mock.contexts[0]).toBe(
+            harness.resources.service.swimlanes,
+        );
+        expect(harness.resources.tagsColors.mock.contexts[0]).toBe(
+            harness.resources.service.projects,
+        );
+        expect(harness.resources.getStatusColumnModes.mock.contexts[0]).toBe(
+            harness.resources.service.kanban,
+        );
     });
 
     it('never calls the project-values endpoint, whose statuses are in the project', async () => {
@@ -544,6 +942,30 @@ describe('service acquisition', () => {
         await harness.api.listUserstories(PROJECT_ID);
 
         expect(harness.resources.listValues).not.toHaveBeenCalled();
+    });
+
+    it('fails loudly, not silently, when a service it needs was not supplied', () => {
+        // React logs a render-phase throw through `console.error`; silenced so the
+        // expected failure does not read as a suite defect. `restoreMocks` in
+        // jest.config.js restores the spy, so there is no hand-written teardown.
+        jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const withoutErrorService = mockInjector({
+            $tgResources: resourcesDouble().service,
+            tgProjectService: projectServiceDouble({}).service,
+        });
+
+        const mount = (): unknown =>
+            renderHook(() => useKanbanData(), {
+                wrapper: withMockInjector(withoutErrorService),
+            });
+
+        // `mockInjector` NAMES the service and lists what was supplied instead of
+        // answering `undefined` — an undefined service would surface much later as an
+        // unreadable property-of-undefined failure with nothing pointing at the cause.
+        expect(mount).toThrow(Error);
+        expect(mount).toThrow(/tgErrorHandlingService/);
+        expect(mount).toThrow(/supplied no mock for it/i);
     });
 });
 
@@ -642,6 +1064,37 @@ describe('loadProject', () => {
 
         expect(project?.points.map((point) => point.id)).toEqual([2, 3]);
         expect(project?.usStatusList.map((status) => status.id)).toEqual([5, 7]);
+    });
+
+    it('⛔ sorts by ORDER and not by id, which is the backlog key, not the board key', () => {
+        // Every id here ASCENDS AS THE ORDER DESCENDS, so sorting by `id` and sorting by
+        // `order` cannot agree. That separation is the whole point: the board's column
+        // sequence is the administrator's configured `order`
+        // (`_.sortBy(project.us_statuses, "order")`, main.coffee:576), while the
+        // backlog's status list is keyed differently — and an implementation that
+        // sorted by `id` would reorder every board column while still looking sorted.
+        const harness = renderKanbanData({
+            payload: projectPayload({
+                us_statuses: [
+                    { id: 11, name: 'NEW', order: 40 },
+                    { id: 12, name: 'READY', order: 30 },
+                    { id: 13, name: 'IN PROGRESS', order: 20 },
+                    { id: 14, name: 'DONE', order: 10 },
+                ],
+                points: [
+                    { id: 21, name: '?', value: null, order: 30 },
+                    { id: 22, name: '1', value: 1, order: 20 },
+                    { id: 23, name: '2', value: 2, order: 10 },
+                ],
+            }),
+        });
+
+        const project = harness.api.loadProject();
+
+        expect(project?.usStatusList.map((status) => status.id)).toEqual([14, 13, 12, 11]);
+        expect(project?.usStatusList.map((status) => status.order)).toEqual([10, 20, 30, 40]);
+        expect(project?.points.map((point) => point.id)).toEqual([23, 22, 21]);
+        expect(project?.points.map((point) => point.order)).toEqual([10, 20, 30]);
     });
 
     it('places an entry with no order last, as lodash orders undefined', () => {
@@ -806,6 +1259,45 @@ describe('listUserstories', () => {
         expect(stories[0]).not.toBe(first.model);
     });
 
+    it('returns a FRESH plain array carrying none of the model surface', async () => {
+        const harness = renderKanbanData();
+        const story = storyModelOf(13, 'Expand the archived column', 2);
+
+        harness.resources.listAll.mockReturnValue(angularPromiseOf([story.model]));
+
+        const stories = await harness.api.listUserstories(PROJECT_ID);
+
+        // `version` is REQUIRED downstream: it is the optimistic-concurrency token the
+        // changed-fields-only PATCH carries (base/model.coffee:48-54), so losing it in
+        // the crossing turns a rejected conflict into a silent overwrite.
+        expect(stories[0].version).toBe(2);
+
+        for (const member of ['getAttrs', 'setAttr', 'isModified', 'getName', 'clone']) {
+            expect(stories[0]).not.toHaveProperty(member);
+        }
+
+        expect(nonPlainDataFindings(stories)).toEqual([]);
+    });
+
+    it('⛔ would not have been served by a spread, which is why getAttrs is called', async () => {
+        const harness = renderKanbanData();
+        const story = storyModelOf(14, 'Collapse the swimlane', 1);
+
+        harness.resources.listAll.mockReturnValue(angularPromiseOf([story.model]));
+
+        const stories = await harness.api.listUserstories(PROJECT_ID);
+
+        // The model's attributes are NON-ENUMERABLE ACCESSORS, exactly as
+        // `Object.defineProperty` installs them at base/model.coffee:67-101 — so a
+        // spread yields the methods and NONE of the data while `model.id` goes on
+        // reading correctly. This is the difference `getAttrs()` makes, asserted rather
+        // than described.
+        expect({ ...story.model }).not.toHaveProperty('id');
+        expect({ ...story.model }).toHaveProperty('getAttrs');
+        expect(stories[0]).toHaveProperty('id', 14);
+        expect(stories[0]).toEqual(story.attrs);
+    });
+
     it('expects a bare array, never a data envelope or a pagination tuple', async () => {
         const harness = renderKanbanData();
 
@@ -925,6 +1417,32 @@ describe('loadTagsColors', () => {
         expect(resolved).not.toHaveProperty('getAttrs');
     });
 
+    it('⛔ proves a spread would NOT have produced the dictionary', async () => {
+        const harness = renderKanbanData();
+        const colors = modelDoubleOf<TagsColorsAttrs>('projects', {
+            urgent: '#E44057',
+            uncoloured: null,
+        });
+
+        harness.resources.tagsColors.mockReturnValue(angularPromiseOf(colors.model));
+
+        const resolved = await harness.api.loadTagsColors(PROJECT_ID);
+
+        // The incumbent read the private slot directly (`tags_colors._attrs` at
+        // main.coffee:370) precisely BECAUSE the public surface is not spreadable. A
+        // `{...model}` here would hand the board an object of jest mocks and no tags —
+        // every pill would render with the default fill and nothing would throw.
+        expect(Object.keys({ ...colors.model })).not.toContain('urgent');
+        expect(Object.keys(resolved).sort()).toEqual(['uncoloured', 'urgent']);
+
+        // A NULL COLOUR IS DATA, not an absent entry: an uncoloured tag renders with the
+        // default pill fill, and dropping the key would make it indistinguishable from a
+        // tag the project does not define (rule T2, Drift Register D3).
+        expect(resolved.uncoloured).toBeNull();
+        expect(resolved).toHaveProperty('uncoloured');
+        expect(nonPlainDataFindings(resolved)).toEqual([]);
+    });
+
     it('hardcodes no colour of its own', () => {
         expect(UNIT_CODE).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
         expect(UNIT_CODE).not.toMatch(/\brgba?\(/);
@@ -968,6 +1486,28 @@ describe('loadFiltersData', () => {
         expect(resolved.tags[0]).not.toHaveProperty('id');
     });
 
+    it('returns the facade promise ITSELF, so nothing is marshalled a second time', async () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData();
+
+        const returned = harness.api.loadFiltersData({ project: PROJECT_ID });
+
+        /*
+         * ⭐ WHY IDENTITY IS THE RIGHT ASSERTION HERE. Every facade under
+         * `../../shared/api/**` already marshals its `$q` promise with
+         * `toNativePromise`, so a second conversion in the hook would not break anything
+         * — it would add a microtask hop and, worse, obscure which values in this file
+         * are genuinely raw. The member is written as a straight return of the facade's
+         * promise, so the promise the caller receives IS the facade's; a re-wrap, an
+         * `async` keyword or a `Promise.resolve` would each replace it with a new object
+         * and fail this line.
+         */
+        expect(returned).toBe(callResultOf(facades.getUserstoriesFiltersData));
+        expect(facades.getUserstoriesFiltersData).toHaveBeenCalledTimes(1);
+
+        await expect(returned).resolves.toEqual({});
+    });
+
     it('passes a rejection through untouched', async () => {
         const harness = renderKanbanData();
         const reason = { status: 0 };
@@ -975,6 +1515,92 @@ describe('loadFiltersData', () => {
         harness.resources.filtersData.mockReturnValue(angularRejectionOf(reason));
 
         await expect(harness.api.loadFiltersData({})).rejects.toBe(reason);
+    });
+});
+
+/* ==========================================================================
+ * THE FLATTENING BOUNDARY
+ *
+ * One place that asks the same question of every read: is what came back safe to put
+ * in React state and in an immer draft?
+ * ========================================================================== */
+
+describe('the data boundary', () => {
+    it('detects each wrapper it exists to exclude, so the gate cannot pass vacuously', () => {
+        const element = document.createElement('div');
+
+        expect(nonPlainDataFindings(modelDoubleOf('userstories', { id: 1 }).model)).toEqual([
+            'result.getAttrs is a function',
+            'result.setAttr is a function',
+            'result.isModified is a function',
+            'result.getName is a function',
+            'result.clone is a function',
+        ]);
+        expect(nonPlainDataFindings(angularPromiseOf(1))).toEqual([
+            'result is a thenable, e.g. an AngularJS $q promise',
+        ]);
+        expect(nonPlainDataFindings(Promise.resolve(1))).toEqual([
+            'result is a native promise',
+        ]);
+        expect(nonPlainDataFindings(element)).toEqual(['result is a DOM node']);
+        expect(nonPlainDataFindings(new Map([['5', true]]))).toEqual([
+            'result has a non-plain prototype, e.g. a $tgModel or a persistent structure',
+        ]);
+        expect(nonPlainDataFindings({ rows: [{ onDrop: (): void => undefined }] })).toEqual([
+            'result.rows[0].onDrop is a function',
+        ]);
+    });
+
+    it('hands back plain data from every read, with no wrapper, promise or node', async () => {
+        const harness = renderKanbanData({ payload: projectPayload() });
+        const story = storyModelOf(31, 'Move to READY', 6);
+        const swimlane = swimlaneModelOf(4, 'quos');
+        const colors = modelDoubleOf<TagsColorsAttrs>('projects', { urgent: '#E44057' });
+
+        harness.resources.listAll.mockReturnValue(angularPromiseOf([story.model]));
+        harness.resources.getByRef.mockReturnValue(angularPromiseOf(story.model));
+        harness.resources.swimlanesList.mockReturnValue(angularPromiseOf([swimlane.model]));
+        harness.resources.tagsColors.mockReturnValue(angularPromiseOf(colors.model));
+
+        /*
+         * `act` because these settlements happen while a React tree is mounted: it
+         * flushes the queued work inside React's batching, so every assertion below reads
+         * a settled tree. Nothing here schedules an update today — the hook holds no
+         * state of its own — and that is exactly why the flush is cheap insurance rather
+         * than a workaround for one.
+         */
+        await act(async () => {
+            expect(
+                nonPlainDataFindings(await harness.api.listUserstories(PROJECT_ID)),
+            ).toEqual([]);
+            expect(
+                nonPlainDataFindings(await harness.api.getUserstoryByRef(PROJECT_ID, 131)),
+            ).toEqual([]);
+            expect(
+                nonPlainDataFindings(await harness.api.listSwimlanes(PROJECT_ID)),
+            ).toEqual([]);
+            expect(
+                nonPlainDataFindings(await harness.api.loadTagsColors(PROJECT_ID)),
+            ).toEqual([]);
+        });
+
+        expect(nonPlainDataFindings(harness.api.loadProject())).toEqual([]);
+        expect(nonPlainDataFindings(harness.api.getStatusColumnModes(PROJECT_ID))).toEqual([]);
+        expect(nonPlainDataFindings(harness.api.getSwimlanesModes(PROJECT_ID))).toEqual([]);
+    });
+
+    it('never lets the persistent project structure itself through', () => {
+        const harness = renderKanbanData({ payload: projectPayload() });
+
+        const project = harness.api.loadProject();
+
+        // `.toJS()` is the ONE flattening of the project, and the structure it was read
+        // from must not be reachable from the result: `autoFreeze` would otherwise freeze
+        // a value AngularJS still holds (pitfalls P-IMMER-1 and P-IMMER-4).
+        expect(project).not.toBe(harness.projectService.service.project);
+        expect(project).not.toHaveProperty('toJS');
+        expect(project).not.toHaveProperty('get');
+        expect(Object.getPrototypeOf(project)).toBe(Object.prototype);
     });
 });
 
@@ -1004,6 +1630,91 @@ describe('submitKanbanOrder', () => {
             null,
             [21, 22],
         );
+    });
+
+    it('reaches the facade with exactly SEVEN arguments: the service and the six values', async () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData();
+        const bulkUserstories = [21, 22];
+
+        await harness.api.submitKanbanOrder({
+            projectId: PROJECT_ID,
+            statusId: 5,
+            swimlaneId: 3,
+            afterUserstoryId: 11,
+            beforeUserstoryId: null,
+            bulkUserstories,
+        });
+
+        const call = callArgsOf(facades.bulkUpdateKanbanOrder);
+
+        /*
+         * ⛔ THE COUNT IS PART OF THE CONTRACT. Four of the six values are consecutive
+         * numbers — status, swimlane, after, before — so dropping or transposing one
+         * type-checks perfectly and persists a wrong board behind an HTTP 200, visible
+         * only on the next page load. Asserting the LENGTH as well as each position
+         * catches the argument that is silently absent, which a positional assertion on
+         * its own does not: a missing sixth argument would leave the seventh reading
+         * `undefined` here and `[]` on the wire.
+         */
+        expect(call).toHaveLength(7);
+        expect(facades.bulkUpdateKanbanOrder.mock.calls[0].length).toBe(7);
+        expect(call[0]).toBe(harness.resources.service.userstories);
+        expect(call[1]).toBe(PROJECT_ID);
+        expect(call[2]).toBe(5);
+        expect(call[3]).toBe(3);
+        expect(call[4]).toBe(11);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(bulkUserstories);
+    });
+
+    it('forwards BOTH neighbours to the facade, which owns the AFTER-wins rule', async () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData();
+
+        await harness.api.submitKanbanOrder({
+            projectId: PROJECT_ID,
+            statusId: 5,
+            swimlaneId: 3,
+            afterUserstoryId: 11,
+            beforeUserstoryId: 12,
+            bulkUserstories: [21],
+        });
+
+        const facadeCall = callArgsOf(facades.bulkUpdateKanbanOrder);
+
+        // The hook does NOT pre-resolve the precedence: it hands both anchors over and
+        // the facade drops the loser when it builds the body. Reproducing the rule here
+        // as well would give it two homes, and two homes are how it drifts.
+        expect(facadeCall[4]).toBe(11);
+        expect(facadeCall[5]).toBe(12);
+
+        // …and only one of them survives onto the request.
+        expect(callArgsOf(harness.resources.bulkUpdateKanbanOrder)[3]).toBe(11);
+        expect(callArgsOf(harness.resources.bulkUpdateKanbanOrder)[4]).toBeNull();
+    });
+
+    it('translates the unclassified sentinel BEFORE the facade, on a local only', async () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData();
+        const write = {
+            projectId: PROJECT_ID,
+            statusId: 5,
+            swimlaneId: UNCLASSIFIED_SWIMLANE_ID,
+            afterUserstoryId: null,
+            beforeUserstoryId: null,
+            bulkUserstories: [31],
+        };
+
+        await harness.api.submitKanbanOrder(write);
+
+        // `-1` is a legitimate GROUPING key and an illegitimate stored reference, so the
+        // sentinel is spelled `null` for the API — and the caller's own object still
+        // carries `-1`, because the same value may still be travelling to the reducer,
+        // which performs its own independent translation.
+        expect(callArgsOf(facades.bulkUpdateKanbanOrder)[3]).toBeNull();
+        expect(write.swimlaneId).toBe(UNCLASSIFIED_SWIMLANE_ID);
+        expect(write.swimlaneId).toBe(-1);
     });
 
     it('⭐ lets AFTER win when both neighbours are supplied, as the frozen body does', async () => {
@@ -1180,6 +1891,52 @@ describe('the persisted fold maps', () => {
         expect(swimlanes).toEqual({ '2': true });
     });
 
+    it('⛔ would silently lose every fold if either reader returned a promise', () => {
+        const harness = renderKanbanData();
+
+        harness.resources.getStatusColumnModes.mockReturnValue({ '5': true, '7': false });
+        harness.resources.getSwimlanesModes.mockReturnValue({ '2': true });
+
+        const columns = harness.api.getStatusColumnModes(PROJECT_ID);
+        const swimlanes = harness.api.getSwimlanesModes(PROJECT_ID);
+
+        /*
+         * THE REGRESSION THIS TEST EXISTS TO MAKE LOUD, stated once so nobody has to
+         * rediscover it: both maps are consumed BY TRUTHINESS PER ID — `if
+         * !$scope.folds[status.id]` at main.coffee:785 and
+         * `!@.foldedSwimlane.get(id.toString())` at :329. A `Promise` in that slot is a
+         * truthy object whose every id lookup is `undefined`, so nothing throws, no
+         * request fails, and every column and swimlane simply renders UNFOLDED — the
+         * user's folds are gone after a reload with no symptom pointing at the cause. A
+         * promise-wrapped getter therefore looks superficially valid and is a data loss.
+         *
+         * The assertions below are the per-id lookups themselves, not just a type check,
+         * because the lookup is the behaviour that breaks.
+         */
+        expect(columns['5']).toBe(true);
+        expect(columns['7']).toBe(false);
+        expect(swimlanes['2']).toBe(true);
+        expect(columns).not.toBeInstanceOf(Promise);
+        expect(Reflect.get(columns, 'then')).toBeUndefined();
+        expect(Reflect.get(swimlanes, 'then')).toBeUndefined();
+    });
+
+    it('keeps STRING keys, which is what the incumbent looks up with', () => {
+        const harness = renderKanbanData();
+
+        harness.resources.getStatusColumnModes.mockReturnValue({ 5: true, 12: false });
+        harness.resources.getSwimlanesModes.mockReturnValue({ 2: true });
+
+        const columns = harness.api.getStatusColumnModes(PROJECT_ID);
+
+        // `id.toString()` at main.coffee:329 is the incumbent's own lookup, so the key
+        // space is strings and a numeric id must find its entry through `String(id)`.
+        expect(Object.keys(columns)).toEqual(['5', '12']);
+        expect(Object.keys(columns).every((key) => typeof key === 'string')).toBe(true);
+        expect(columns[String(12)]).toBe(false);
+        expect(Object.keys(harness.api.getSwimlanesModes(PROJECT_ID))).toEqual(['2']);
+    });
+
     it('never answers nothing, because the incumbent readers default to an empty map', () => {
         const harness = renderKanbanData();
 
@@ -1203,6 +1960,42 @@ describe('the persisted fold maps', () => {
             PROJECT_ID,
             swimlanes,
         );
+
+        // IDENTITY, not equality. Whole-map replacement is the persisted semantics the
+        // incumbent has, so the writer must forward the caller's object rather than a
+        // merge, a clone or a filtered copy — each of which would satisfy `toEqual` here
+        // while changing what lands in storage.
+        expect(callArgsOf(harness.resources.storeStatusColumnModes)[1]).toBe(columns);
+        expect(callArgsOf(harness.resources.storeSwimlanesModes)[1]).toBe(swimlanes);
+    });
+
+    it('hands the storage facades the caller value untouched, all the way down', () => {
+        const facades = spyOnFacades();
+        const harness = renderKanbanData();
+        const columns: KanbanFoldModes = { '5': true };
+
+        harness.api.storeStatusColumnModes(PROJECT_ID, columns);
+
+        expect(callArgsOf(facades.storeStatusColumnModes)).toHaveLength(3);
+        expect(callArgsOf(facades.storeStatusColumnModes)[1]).toBe(PROJECT_ID);
+        expect(callArgsOf(facades.storeStatusColumnModes)[2]).toBe(columns);
+    });
+
+    it('returns synchronously from all four members, with no await anywhere', () => {
+        const harness = renderKanbanData();
+
+        // Every one of the four is called and read in the same expression: if any of them
+        // were promise-returning, the reads below would be reading a promise rather than a
+        // map, and the two writes would be scheduling rather than storing.
+        const before = harness.api.getStatusColumnModes(PROJECT_ID);
+
+        harness.api.storeStatusColumnModes(PROJECT_ID, { ...before, '5': true });
+        harness.api.storeSwimlanesModes(PROJECT_ID, { '2': true });
+
+        expect(harness.resources.storeStatusColumnModes).toHaveBeenCalledTimes(1);
+        expect(harness.resources.storeSwimlanesModes).toHaveBeenCalledTimes(1);
+        expect(harness.api.getSwimlanesModes(PROJECT_ID)).not.toBeInstanceOf(Promise);
+        expect(harness.api.storeSwimlanesModes(PROJECT_ID, {})).toBeUndefined();
     });
 
     it('declares none of the four wrappers async', () => {
@@ -1259,7 +2052,12 @@ describe('refreshProject', () => {
  * ========================================================================== */
 
 describe('the returned API', () => {
-    const EXPECTED_MEMBERS: readonly string[] = [
+    /*
+     * Typed against the API rather than as bare strings, so a renamed member is a
+     * COMPILE error here instead of a run-time expectation mismatch -- and so the two
+     * indexed reads below need no type assertion.
+     */
+    const EXPECTED_MEMBERS: readonly (keyof KanbanDataApi)[] = [
         'loadProject',
         'listUserstories',
         'getUserstoryByRef',
@@ -1295,9 +2093,7 @@ describe('the returned API', () => {
         expect(after).toBe(before);
 
         for (const member of EXPECTED_MEMBERS) {
-            expect(after[member as keyof KanbanDataApi]).toBe(
-                before[member as keyof KanbanDataApi],
-            );
+            expect(after[member]).toBe(before[member]);
         }
     });
 });
@@ -1370,5 +2166,42 @@ describe('the unit source', () => {
 
     it('derives the write parameter types from the facade instead of restating them', () => {
         expect(UNIT_CODE).toContain('Parameters<typeof bulkUpdateKanbanOrder>');
+    });
+
+    it('documents the sync/async seam at the point of the seam', () => {
+        /*
+         * The one gate that reads the PROSE rather than the code, and deliberately so.
+         * Which members are promise-returning and which are synchronous is invisible at a
+         * call site — that is the whole hazard of section 3 — so the file is required to
+         * say it, in the file header and again beside the four wrappers. A future edit
+         * that made a fold getter `async` would have to delete this documentation to pass,
+         * which is a reviewable act rather than an accident.
+         */
+        expect(UNIT_SOURCE).toContain('SYNC/ASYNC');
+        expect(UNIT_SOURCE).toContain('SYNCHRONOUS');
+        expect(UNIT_SOURCE).toContain('UNFOLDED');
+
+        // The declared type carries the asymmetry too, so a consumer sees it without
+        // reading the prose: the four storage members return a map, never a promise.
+        expect(UNIT_SOURCE).toMatch(
+            /getStatusColumnModes:\s*\(projectId:\s*number\)\s*=>\s*KanbanFoldModes/,
+        );
+        expect(UNIT_SOURCE).toMatch(
+            /getSwimlanesModes:\s*\(projectId:\s*number\)\s*=>\s*KanbanFoldModes/,
+        );
+    });
+
+    it('names every legacy locator it reproduces, so the parity is checkable', () => {
+        // Behaviour this file copies is cited at the line it was copied from; without the
+        // citations, "is this still what AngularJS does?" is unanswerable and the parity
+        // silently rots. These four are the load-bearing ones.
+        for (const locator of [
+            'main.coffee:423-436',
+            'main.coffee:564-580',
+            'base/model.coffee:48-54',
+            'controllerMixins.coffee:249-290',
+        ]) {
+            expect(UNIT_SOURCE).toContain(locator);
+        }
     });
 });

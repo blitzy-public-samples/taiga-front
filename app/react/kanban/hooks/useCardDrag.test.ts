@@ -20,14 +20,54 @@
  * R-DND-2 is that an off-by-one in the ordering arithmetic SILENTLY PERSISTS A
  * WRONG ORDER — no exception, no failing request, nothing in the logs — so the two
  * ends of a container and a move between containers are asserted explicitly.
+ *
+ * ===========================================================================
+ * THE HARNESS, AND WHY EACH PART OF IT IS THERE
+ * ===========================================================================
+ *   THE BRIDGE SEAM. Every render goes through `withMockInjector(mockInjector())`
+ *       — an EMPTY injector whose `get()` throws for any name — mounted through
+ *       `AngularBridgeProvider`. The hook consumes no AngularJS service, and that
+ *       is precisely what the empty injector proves: it runs at the same seam
+ *       every other React unit runs at, and the moment it reaches for a service
+ *       the wrapper fails the suite with that helper's own diagnostic instead of
+ *       resolving `undefined` quietly. No AngularJS is loaded, here or anywhere.
+ *
+ *   THE OBSERVER STUBS. `IntersectionObserver` and `ResizeObserver` are installed
+ *       on `globalThis` before EVERY test and removed after it. jsdom provides
+ *       neither, the viewport latch this hook is handed is built on the first, and
+ *       a collaborator constructing one must not turn a drag assertion into an
+ *       environment failure.
+ *
+ *   THE LAYOUT STUBS. jsdom lays nothing out: every box is 0×0 and every
+ *       `getBoundingClientRect()` is all zeros, so any geometry-driven assertion
+ *       would pass vacuously. {@link stubElementLayout} therefore gives named
+ *       elements a real box, and the autoscroll specifications drive the shared
+ *       provider's own pure geometry functions against it — which is what makes
+ *       "the band is 100 px, measured on the COLUMNS" a behavioural claim rather
+ *       than a restatement of a literal.
+ *
+ *   ANIMATION EVENTS ARE DISPATCHED EXPLICITLY. jsdom runs no animation, so the
+ *       `animationend` that removes the `new` class never arrives on its own;
+ *       `fireEvent.animationEnd(column)` stands in for it. A specification that
+ *       waited for it would hang, and one that never sent it would not notice a
+ *       class left on the column for ever.
  */
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-import { act, renderHook } from '@testing-library/react';
+import { act, fireEvent, renderHook } from '@testing-library/react';
 
-import { createMultiDrag } from '../../shared/dnd/multiDrag';
+import type { AngularInjector } from '../../bridge/AngularBridgeContext';
+import { mockInjector, withMockInjector } from '../../bridge/mockInjector';
+import {
+    applyAutoScrollDelta,
+    autoScrollTargetEdges,
+    computeAutoScrollDelta,
+    DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED,
+    resolveAutoScrollTarget,
+} from '../../shared/dnd/DndProvider';
+import { createMultiDrag, TRANSIT_CLASS, TRANSIT_MULTI_CLASS } from '../../shared/dnd/multiDrag';
 import type { MultiDragController } from '../../shared/dnd/multiDrag';
 import type { InViewportApi } from '../../shared/useInViewport';
 import { UNCLASSIFIED_SWIMLANE_ID } from '../state/boardReducer';
@@ -35,7 +75,9 @@ import type { CardUserStoryVm } from '../state/types';
 import { KANBAN_US_MOVE_EVENT, useCardDrag } from './useCardDrag';
 import type {
     KanbanBoardRootRef,
+    KanbanCardLookup,
     KanbanDraggableData,
+    KanbanDragProject,
     KanbanDroppableData,
     UseCardDragOptions,
     UseCardDragResult,
@@ -74,12 +116,72 @@ const MAIN_DRAG_CLASS = 'main-drag-item';
 
 const MIRROR_CLASS = 'gu-mirror';
 
+/**
+ * The placeholder class — owned by `../../shared/dnd/DndProvider`, and the one
+ * KANBAN:98-L99 excludes from the neighbour scan with `tg-card:not(.gu-transit)`.
+ * Restated here so a rename in the shared module fails a specification.
+ */
+const TRANSIT_CLASS_NAME = 'gu-transit';
+
+/** `../../shared/dnd/multiDrag`'s reveal for `.card-transit-multi` (`card.scss`). */
+const TRANSIT_MULTI_CLASS_NAME = 'gu-transit-multi';
+
 const ANIMATION_END_EVENT = 'animationend';
 
 const KANBAN_AUTOSCROLL_MARGIN = 100;
 
+/**
+ * The STORY LIST's autoscroll numbers — `{ margin: 20, pixels: 30 }` over
+ * `[window]`, from the annotated backlog reference.
+ *
+ * They appear here only so the board's configuration can be asserted NOT to carry
+ * them. The two screens diverge deliberately and unifying them would change how
+ * the board scrolls, which rule T10 forbids.
+ */
+const STORY_LIST_AUTOSCROLL_MARGIN = 20;
+
+const STORY_LIST_AUTOSCROLL_PIXELS = 30;
+
 /** `card.jade` L45-L55 renders exactly two of these; `../KanbanCard` reproduces it. */
 const FAKE_US_COUNT = 2;
+
+/* ==========================================================================
+ * THE MODULE-LEVEL MOCK REGISTRY
+ * ==========================================================================
+ * `move-to-sprint.controller.spec.coffee` L14 keeps one `mocks = {}` at module
+ * scope and fills it in per test (`mocks.tgLightboxFactory`, L17;
+ * `mocks.tgProjectService`, L24). The same shape is kept here, typed, so that the
+ * four seams this hook is given have ONE declared home and a specification can
+ * reach the current test's doubles without threading them through every helper.
+ *
+ * They are ASSIGNED by {@link renderCardDrag}, never reset by hand:
+ * `jest.config.js` sets `clearMocks` and `restoreMocks`, so Jest clears the
+ * recorded calls before every test itself.
+ */
+interface SpecMocks {
+    /** The frozen move seam — `$rootscope.$broadcast` on the AngularJS side. */
+    emitMove: EmitMoveMock | null;
+
+    /** The multi-selection controller the provider is handed. */
+    multiDrag: MultiDragController | null;
+
+    /** The viewport latch, recording every registration. */
+    inViewport: RecordingInViewport | null;
+
+    /** `kanbanUserstoriesService.usMap.get(...)` — KANBAN:134. */
+    getCard: KanbanCardLookup | null;
+
+    /** The bridge injector every render is mounted under. */
+    injector: AngularInjector | null;
+}
+
+const mocks: SpecMocks = {
+    emitMove: null,
+    multiDrag: null,
+    inViewport: null,
+    getCard: null,
+    injector: null,
+};
 
 /* ==========================================================================
  * PROVIDER EVENT FACTORIES
@@ -131,6 +233,26 @@ interface ColumnSpec {
     readonly statusId: number;
 
     readonly cardIds: readonly number[];
+
+    /**
+     * The ids whose card renders WITHOUT its `.card-inner` wrapper — a card that is
+     * off screen.
+     *
+     * `card.jade` L8 puts the viewport guard on the inner wrapper
+     * (`.card-inner(ng-if="vm.inViewPort")`) while the OUTER custom element carrying
+     * `data-id` always renders, so this is what a virtualised card really looks like
+     * in the DOM. R-DND-3 says such a card must remain a drop target and a
+     * neighbour, and it is asserted as one below.
+     */
+    readonly offScreenCardIds?: readonly number[];
+
+    /**
+     * The ids whose card carries `ui-multisortable-multiple` — the SCREEN's
+     * selection class, rendered from `ctrl.selectedUss` at `kanban-table.jade` L154
+     * and L230. The hook may read it through the shared controller; it may never
+     * add or remove it.
+     */
+    readonly selectedCardIds?: readonly number[];
 }
 
 interface SwimlaneSpec {
@@ -151,35 +273,71 @@ interface MountedBoard {
     card(id: number): HTMLElement;
 }
 
-/** One `.fake-us` ghost block, as the card component renders it. */
+/**
+ * One `.fake-us` ghost block, as the card component renders it — `card.jade`
+ * L46-L50: an `.fake-img` beside a `.column` holding two `.fake-text` lines.
+ */
 function makeFakeUs(): HTMLElement {
     const block = document.createElement('div');
 
     block.className = 'fake-us';
-    block.innerHTML = '';
 
     const image = document.createElement('div');
 
     image.className = 'fake-img';
     block.appendChild(image);
 
+    const column = document.createElement('div');
+
+    column.className = 'column';
+
+    for (let line = 0; line < 2; line += 1) {
+        const text = document.createElement('div');
+
+        text.className = 'fake-text';
+        column.appendChild(text);
+    }
+
+    block.appendChild(column);
+
     return block;
+}
+
+/** How {@link makeCardElement} is asked for a virtualised or a selected card. */
+interface CardElementOptions {
+    /** `false` renders the outer element with NO `.card-inner` — an off-screen card. */
+    readonly inner?: boolean;
+
+    /** `true` adds the screen's `ui-multisortable-multiple` selection class. */
+    readonly selected?: boolean;
 }
 
 /**
  * `kanban-table.jade` L150 / L226: `tg-card.card.ng-animate-disabled(data-id=…)`,
  * carrying the screen-owned multi-drag ghost from `card.jade` L45-L55.
+ *
+ * The ghost is rendered on EVERY card, always with exactly two `.fake-us` blocks,
+ * because that is what the component does and because the hook must be shown never
+ * to create, count or remove it — only to let the shared class lifecycle reveal it.
  */
-function makeCardElement(id: number): HTMLElement {
+function makeCardElement(id: number, options: CardElementOptions = {}): HTMLElement {
     const card = document.createElement(CARD_ELEMENT);
 
     card.className = 'card ng-animate-disabled';
     card.dataset.id = String(id);
 
-    const inner = document.createElement('div');
+    if (options.selected === true) {
+        card.classList.add(MULTIPLE_SORTABLE_CLASS);
+    }
 
-    inner.className = 'card-inner';
-    card.appendChild(inner);
+    // `card.jade` L8: the INNER wrapper is the virtualised half. An off-screen card
+    // omits it while still rendering the outer element that carries `data-id`.
+    if (options.inner !== false) {
+        const inner = document.createElement('div');
+
+        inner.className = 'card-inner';
+        card.appendChild(inner);
+    }
 
     const ghost = document.createElement('div');
 
@@ -216,7 +374,12 @@ function makeColumn(spec: ColumnSpec, swimlaneId?: number): HTMLElement {
     column.appendChild(counter);
 
     for (const cardId of spec.cardIds) {
-        column.appendChild(makeCardElement(cardId));
+        column.appendChild(
+            makeCardElement(cardId, {
+                inner: !(spec.offScreenCardIds ?? []).includes(cardId),
+                selected: (spec.selectedCardIds ?? []).includes(cardId),
+            }),
+        );
     }
 
     return column;
@@ -421,11 +584,50 @@ function makeInViewport(): RecordingInViewport {
 
 type EmitMoveMock = jest.Mock<void, Parameters<UseCardDragOptions['emitMove']>>;
 
+/** An injector that records every name asked of it before refusing it. */
+interface RecordingInjector {
+    readonly injector: AngularInjector;
+
+    /** Every service name the unit under test asked for. Expected to stay empty. */
+    readonly resolved: readonly string[];
+}
+
+/**
+ * The bridge seam, as an EMPTY injector.
+ *
+ * `mockInjector()` with no map refuses every name with its own descriptive error
+ * (`mockInjector.ts` L29-L47), which is exactly the behaviour wanted here: this hook
+ * consumes NO AngularJS service — the move seam, the story lookup, the viewport
+ * latch and the selection controller are all passed to it as options — so any
+ * resolution attempt is a defect, and it should fail loudly rather than yield
+ * `undefined`. The names are recorded as well so a specification can assert the
+ * absence positively instead of relying on nothing having thrown.
+ *
+ * No AngularJS is loaded by this: the injector is a plain object with one method.
+ */
+function makeBridgeInjector(): RecordingInjector {
+    const empty = mockInjector();
+    const resolved: string[] = [];
+
+    return {
+        resolved,
+        injector: {
+            get<T>(name: string): T {
+                resolved.push(name);
+
+                return empty.get<T>(name);
+            },
+        },
+    };
+}
+
 interface Harness {
     readonly api: () => UseCardDragResult;
     readonly emitMove: EmitMoveMock;
     readonly inViewport: RecordingInViewport;
     readonly multiDrag: MultiDragController;
+    /** Every AngularJS service name the hook asked the bridge for — always none. */
+    readonly resolvedServices: readonly string[];
     readonly rerender: (patch: Partial<UseCardDragOptions>) => void;
     readonly unmount: () => void;
 }
@@ -434,6 +636,7 @@ function renderCardDrag(overrides: Partial<UseCardDragOptions> & Pick<UseCardDra
     const emitMove: EmitMoveMock = jest.fn();
     const inViewport = makeInViewport();
     const multiDrag = overrides.multiDrag ?? createMultiDrag();
+    const bridge = makeBridgeInjector();
 
     const initial: UseCardDragOptions = {
         project: { my_permissions: ['modify_us'] },
@@ -445,17 +648,33 @@ function renderCardDrag(overrides: Partial<UseCardDragOptions> & Pick<UseCardDra
         ...overrides,
     };
 
+    /*
+     * THE STANDARD BRIDGE WRAPPER. Every other React unit in this tree is rendered
+     * under `AngularBridgeProvider` through `withMockInjector`
+     * (`Svg.test.tsx` L220, `AngularBridgeContext.test.tsx` L207), and this hook is
+     * rendered the same way even though it resolves nothing: the seam is where the
+     * board mounts it, so exercising it anywhere else would test an arrangement
+     * production never has.
+     */
     const view = renderHook((props: UseCardDragOptions) => useCardDrag(props), {
         initialProps: initial,
+        wrapper: withMockInjector(bridge.injector),
     });
 
     let current = initial;
+
+    mocks.emitMove = emitMove;
+    mocks.multiDrag = multiDrag;
+    mocks.inViewport = inViewport;
+    mocks.getCard = initial.getCard;
+    mocks.injector = bridge.injector;
 
     return {
         api: (): UseCardDragResult => view.result.current,
         emitMove,
         inViewport,
         multiDrag,
+        resolvedServices: bridge.resolved,
         rerender: (patch: Partial<UseCardDragOptions>): void => {
             current = { ...current, ...patch };
             view.rerender(current);
@@ -508,13 +727,266 @@ function beginGesture(harness: Harness, item: HTMLElement): Gesture {
     };
 }
 
+/* ==========================================================================
+ * THE ENVIRONMENT — OBSERVER STUBS AND LAYOUT STUBS
+ * ========================================================================== */
+
+/**
+ * The two observers jsdom does not implement, as one class satisfying both.
+ *
+ * `IntersectionObserver` is what `../../shared/useInViewport` is built on — the port
+ * of `app/js/boards.js`'s `initBoard()` — and `ResizeObserver` is what a board
+ * measuring its own columns would construct. This hook is HANDED the latch rather
+ * than building one, so neither is reached from here; the stubs exist so that a
+ * collaborator constructing one cannot turn a drag assertion into a
+ * `ReferenceError` about the environment.
+ *
+ * Every method the two interfaces declare is implemented, with the real signatures
+ * and no `any`, so a collaborator calling `observe(node)` or reading
+ * `takeRecords()` behaves as it would in a browser rather than crashing on an
+ * absent method.
+ */
+class StubObserver implements IntersectionObserver, ResizeObserver {
+    /* `IntersectionObserver`'s read-only shape, with the values jsdom would report. */
+    readonly root: Element | Document | null = null;
+
+    readonly rootMargin: string = '0px';
+
+    readonly thresholds: readonly number[] = [0];
+
+    observe(): void {
+        return;
+    }
+
+    unobserve(): void {
+        return;
+    }
+
+    disconnect(): void {
+        return;
+    }
+
+    takeRecords(): IntersectionObserverEntry[] {
+        return [];
+    }
+}
+
+/** The `globalThis` slots the two stubs occupy, and what stood there before. */
+type ObserverGlobals = Record<string, unknown>;
+
+const OBSERVER_GLOBAL_NAMES = ['IntersectionObserver', 'ResizeObserver'] as const;
+
+const previousObservers = new Map<string, unknown>();
+
+/**
+ * A box for one element, in the four numbers a drag cares about.
+ *
+ * `width`/`height` also feed `offsetWidth`/`offsetHeight`, which is what a
+ * collision strategy reads when it measures a droppable without a rect.
+ */
+interface StubbedBox {
+    readonly top: number;
+
+    readonly left: number;
+
+    readonly width: number;
+
+    readonly height: number;
+}
+
+/**
+ * Gives ONE element a real box, because jsdom gives every element none.
+ *
+ * ⚠️ WITHOUT THIS EVERY GEOMETRY ASSERTION PASSES VACUOUSLY. jsdom implements no
+ * layout: `getBoundingClientRect()` returns all zeros, `offsetWidth` and
+ * `offsetHeight` are 0, and `scrollHeight`/`clientHeight` are 0 — so a pointer test
+ * against an unstubbed element is false for every point, an autoscroll band of 100 px
+ * and one of 20 px behave identically, and a specification that "proves" the band
+ * would prove nothing at all.
+ *
+ * Each override is deliberate and is applied PER ELEMENT rather than globally:
+ *
+ *   `getBoundingClientRect` — read by `autoScrollTargetEdges` to find a target's
+ *       viewport-relative edges, and by the collision strategies to place a
+ *       droppable. It returns the full `DOMRect` shape, `toJSON` included, because
+ *       that is what the interface declares.
+ *   `offsetWidth` / `offsetHeight` — the non-rect fallback a measurement helper
+ *       reaches for; left consistent with the rect so the two can never disagree.
+ *   `scrollTop` / `scrollLeft` — WRITABLE, because `applyAutoScrollDelta` scrolls an
+ *       element by assigning to them (`+=`). jsdom keeps assignments to these
+ *       properties, but only within the stub's own storage here, so a scroll is
+ *       observable without a real layout.
+ *   `scrollHeight` / `scrollWidth` / `clientHeight` / `clientWidth` — the overflow
+ *       metrics that decide whether an element CAN scroll at all; a column that
+ *       reports no overflow would never be chosen as a scroll target.
+ */
+function stubElementLayout(element: HTMLElement, box: StubbedBox): void {
+    const rect: DOMRect = {
+        x: box.left,
+        y: box.top,
+        top: box.top,
+        left: box.left,
+        right: box.left + box.width,
+        bottom: box.top + box.height,
+        width: box.width,
+        height: box.height,
+        toJSON: (): unknown => ({ ...box }),
+    };
+
+    element.getBoundingClientRect = (): DOMRect => rect;
+
+    let scrollTop = 0;
+    let scrollLeft = 0;
+
+    Object.defineProperties(element, {
+        offsetWidth: { configurable: true, get: (): number => box.width },
+        offsetHeight: { configurable: true, get: (): number => box.height },
+        clientWidth: { configurable: true, get: (): number => box.width },
+        clientHeight: { configurable: true, get: (): number => box.height },
+        // Twice the visible height, so the element reports vertical overflow and is
+        // therefore a legitimate scroll target.
+        scrollHeight: { configurable: true, get: (): number => box.height * 2 },
+        scrollWidth: { configurable: true, get: (): number => box.width * 2 },
+        scrollTop: {
+            configurable: true,
+            get: (): number => scrollTop,
+            set: (value: number): void => {
+                scrollTop = value;
+            },
+        },
+        scrollLeft: {
+            configurable: true,
+            get: (): number => scrollLeft,
+            set: (value: number): void => {
+                scrollLeft = value;
+            },
+        },
+    });
+}
+
+beforeEach(() => {
+    const globals = globalThis as ObserverGlobals;
+
+    for (const name of OBSERVER_GLOBAL_NAMES) {
+        previousObservers.set(name, globals[name]);
+        globals[name] = StubObserver;
+    }
+});
+
 afterEach(() => {
+    const globals = globalThis as ObserverGlobals;
+
+    for (const name of OBSERVER_GLOBAL_NAMES) {
+        if (previousObservers.get(name) === undefined) {
+            delete globals[name];
+        } else {
+            globals[name] = previousObservers.get(name);
+        }
+    }
+
+    previousObservers.clear();
+
+    // The fixture is attached to the document, so it is detached again rather than
+    // left for the next test to trip over. This is the one `innerHTML` in the file
+    // and it writes an empty string.
     document.body.innerHTML = '';
+
+    mocks.emitMove = null;
+    mocks.multiDrag = null;
+    mocks.inViewport = null;
+    mocks.getCard = null;
+    mocks.injector = null;
 });
 
 /* ==========================================================================
  * THE SPECIFICATIONS
  * ========================================================================== */
+
+describe('useCardDrag — the bridge seam', () => {
+    it('mounts under the AngularJS bridge provider and resolves NO service through it', () => {
+        const board = mountBoard({ flat: [{ statusId: 1, cardIds: [11] }] });
+        const harness = renderCardDrag({ rootRef: board.rootRef });
+
+        // The hook rendered — so the provider above it did too — and it registered
+        // its container without asking the injector for anything.
+        expect(harness.api().getContainers()).toEqual([board.column(1)]);
+        expect(harness.resolvedServices).toEqual([]);
+    });
+
+    it('drives an entire gesture without reaching the injector once', () => {
+        const board = mountBoard({
+            flat: [
+                { statusId: 1, cardIds: [11, 12] },
+                { statusId: 2, cardIds: [] },
+            ],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([makeCardVm(11, 1, null), makeCardVm(12, 1, null)]),
+        });
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1));
+        gesture.over(board.column(2));
+        gesture.end();
+
+        act(() => {
+            harness.unmount();
+        });
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        expect(harness.resolvedServices).toEqual([]);
+    });
+
+    it('records the four seams the hook is given, so every specification reaches the same doubles', () => {
+        const board = mountBoard({
+            flat: [
+                { statusId: 1, cardIds: [11, 12] },
+                { statusId: 2, cardIds: [] },
+            ],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([makeCardVm(11, 1, null), makeCardVm(12, 1, null)]),
+        });
+
+        // The move seam, the selection controller and the viewport latch reach the
+        // provider and the result exactly as they were handed over — nothing is
+        // wrapped, copied or re-created in between.
+        expect(mocks.emitMove).toBe(harness.emitMove);
+        expect(mocks.multiDrag).toBe(harness.api().dndProviderProps.multiDrag);
+        expect(mocks.inViewport).toBe(harness.inViewport);
+        expect(harness.api().visibleIds).toBe(harness.inViewport.visibleIds);
+
+        // And the story lookup is the one consulted at drag end: the double knows
+        // both cards, so the move is written rather than refused.
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1));
+        gesture.over(board.column(2));
+        gesture.end();
+
+        expect(mocks.getCard?.(11)?.model.status).toBe(1);
+        expect(mocks.emitMove).toHaveBeenCalledTimes(1);
+    });
+
+    it('would fail loudly rather than quietly if a service were ever asked for', () => {
+        const board = mountBoard({ flat: [{ statusId: 1, cardIds: [] }] });
+
+        renderCardDrag({ rootRef: board.rootRef });
+
+        const injector = mocks.injector;
+
+        if (injector === null) {
+            throw new Error('the harness did not record the bridge injector');
+        }
+
+        // The seam is a REQUIRED injector, not a permissive stub: an unsupplied name
+        // raises `mockInjector`'s own diagnostic instead of resolving `undefined`.
+        expect(() => injector.get('$tgResources')).toThrow(/mockInjector/);
+        expect(() => injector.get('$tgResources')).toThrow(/\$tgResources/);
+    });
+});
 
 describe('useCardDrag — permission gates', () => {
     it('returns without registering anything when `modify_us` is absent', () => {
@@ -572,9 +1044,132 @@ describe('useCardDrag — permission gates', () => {
 
         expect(harness.api().dndProviderProps.disabled).toBe(true);
     });
+
+    it('reads the RAW `my_permissions` array off the project it was given', () => {
+        /*
+         * KANBAN:37 is `$scope.project.my_permissions.indexOf("modify_us") > -1`, and
+         * the `tg-check-permission` directives read the same array. So the assertion
+         * is not merely "the gate opened": it is that THE ARRAY THE BOARD PASSED is
+         * the thing consulted, with no permission service, no derived permission
+         * model and no cached copy in between. The accessor records every read and
+         * hands back the same array instance every time, so both halves can be
+         * asserted.
+         */
+        const permissions: readonly string[] = ['view_us', 'modify_us', 'modify_task'];
+        const reads: (readonly string[])[] = [];
+        const project: KanbanDragProject = {
+            get my_permissions(): readonly string[] {
+                reads.push(permissions);
+
+                return permissions;
+            },
+        };
+        const board = mountBoard({
+            swimlanes: [{ swimlaneId: 7, columns: [{ statusId: 1, cardIds: [] }] }],
+        });
+        const harness = renderCardDrag({ rootRef: board.rootRef, project });
+
+        harness.api().openSwimlane(7);
+
+        expect(reads.length).toBeGreaterThan(0);
+
+        for (const seen of reads) {
+            expect(seen).toBe(permissions);
+        }
+
+        expect(harness.api().dndProviderProps.disabled).toBe(false);
+        expect(harness.api().getContainers()).toEqual([board.column(1, 7)]);
+
+        // And nothing was resolved through the bridge: there is no permission service.
+        expect(harness.resolvedServices).toEqual([]);
+    });
+
+    it('tests the exact `modify_us` string, so a neighbouring permission does not open the gate', () => {
+        const board = mountBoard({
+            swimlanes: [{ swimlaneId: 7, columns: [{ statusId: 1, cardIds: [] }] }],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            // `modify_task` is the CARD-level permission of `kanban-table.jade` L155,
+            // and `modify_us_1` would satisfy a substring test. Neither is this gate.
+            project: { my_permissions: ['modify_task', 'view_us', 'modify_us_1'] },
+        });
+
+        harness.api().openSwimlane(7);
+
+        expect(harness.api().dndProviderProps.disabled).toBe(true);
+        expect(harness.api().getContainers()).toHaveLength(0);
+    });
+
+    it('honours a permission granted after mount, from that same raw array', () => {
+        const board = mountBoard({
+            swimlanes: [{ swimlaneId: 7, columns: [{ statusId: 1, cardIds: [] }] }],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            project: { my_permissions: [] },
+        });
+
+        harness.api().openSwimlane(7);
+
+        expect(harness.api().getContainers()).toHaveLength(0);
+
+        act(() => {
+            harness.rerender({ project: { my_permissions: ['modify_us'] } });
+        });
+
+        harness.api().openSwimlane(7);
+
+        expect(harness.api().dndProviderProps.disabled).toBe(false);
+        expect(harness.api().getContainers()).toEqual([board.column(1, 7)]);
+    });
 });
 
 describe('useCardDrag — container registration', () => {
+    it('registers the match set of KANBAN:31\'s selector, character for character', () => {
+        /*
+         * KANBAN:31 is
+         *
+         *     $('.kanban-swimlane[data-swimlane="' + id + '"] .taskboard-column')
+         *
+         * so the assertion evaluates that selector INDEPENDENTLY, with the id the hook
+         * was given, and requires the registration to be exactly its match set in
+         * document order. A selector that drifted — a different attribute, a different
+         * descendant, a missing space — would register the wrong columns, and every
+         * drop would then land in a column the user was not pointing at.
+         */
+        const board = mountBoard({
+            swimlanes: [
+                {
+                    swimlaneId: 3,
+                    columns: [
+                        { statusId: 7, cardIds: [11] },
+                        { statusId: 8, cardIds: [] },
+                    ],
+                },
+                { swimlaneId: 4, columns: [{ statusId: 7, cardIds: [] }] },
+            ],
+        });
+        const harness = renderCardDrag({ rootRef: board.rootRef });
+
+        harness.api().openSwimlane(3);
+
+        const expected = [
+            ...board.root.querySelectorAll('.kanban-swimlane[data-swimlane="3"] .taskboard-column'),
+        ];
+
+        expect(expected).toHaveLength(2);
+        expect(harness.api().getContainers()).toEqual(expected);
+
+        // The column really does carry both attributes in swimlane mode —
+        // `kanban-table.jade` L112-L121.
+        const column = board.column(7, 3);
+
+        expect(column.dataset.status).toBe('7');
+        expect(column.dataset.swimlane).toBe('3');
+        expect(harness.api().getContainers()).not.toContain(board.column(7, 4));
+    });
+
     it('registers exactly the requested swimlane, by the exact selector', () => {
         const board = mountBoard({
             swimlanes: [
@@ -756,6 +1351,25 @@ describe('useCardDrag — the moves predicate', () => {
         expect(canMove('tg-card')).toBe(false);
     });
 
+    it('rejects a `div.card` carrying a story id — the predicate is the ELEMENT NAME', () => {
+        const board = mountBoard({ flat: [{ statusId: 1, cardIds: [11] }] });
+        const harness = renderCardDrag({ rootRef: board.rootRef });
+        const impostor = document.createElement('div');
+
+        /*
+         * KANBAN:60 is `$(item).is('tg-card')`. `.card` is on other things — the
+         * placeholder, the ghost, the taskboard's own rows — and a `data-id` probe
+         * would match the rows of a different screen, so neither is the test.
+         */
+        impostor.className = 'card ng-animate-disabled';
+        impostor.dataset.id = '11';
+        board.column(1).appendChild(impostor);
+
+        expect(harness.api().canMove(impostor)).toBe(false);
+        expect(harness.api().canMove(board.card(11))).toBe(true);
+        expect(board.card(11).localName).toBe(CARD_ELEMENT);
+    });
+
     it('tracks no gesture whose subject is not a card, and emits nothing for it', () => {
         const board = mountBoard({ flat: [{ statusId: 1, cardIds: [11, 12] }] });
         const harness = renderCardDrag({
@@ -874,6 +1488,104 @@ describe('useCardDrag — multi-selection integration', () => {
         ]);
     });
 
+    it('captures the start index for the PRIMARY of the selection, not for the grabbed card', () => {
+        /*
+         * KANBAN:84-L85 measures `dragMultipleItems[0]` INSIDE the grabbed card's
+         * column:
+         *
+         *     parentEl = item.parentNode
+         *     oldIndex = $(parentEl).find('tg-card').index(firstElement)
+         *
+         * and KANBAN:120 measures the same element again at drag end. The two
+         * arguments are NOT interchangeable, and this is the case that proves it: card
+         * 11 is the first SELECTED card and card 13 is the one GRABBED, so the index
+         * both times is card 11's. Card 13 is dropped ahead of card 12, which changes
+         * the arrangement — yet card 11 has not moved, so the index is unchanged, the
+         * container is the same, and KANBAN:124's guard suppresses the write.
+         *
+         * A hook that re-derived the index for the grabbed card would measure 1 against
+         * a captured 0 and would emit here. That is the duplicated arithmetic R-DND-2
+         * forbids, and this specification is what catches it.
+         */
+        const board = mountBoard({
+            swimlanes: [
+                {
+                    swimlaneId: 7,
+                    columns: [{ statusId: 1, cardIds: [11, 12, 13], selectedCardIds: [11, 13] }],
+                },
+            ],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([
+                makeCardVm(11, 1, 7),
+                makeCardVm(12, 1, 7),
+                makeCardVm(13, 1, 7),
+            ]),
+        });
+
+        harness.api().openSwimlane(7);
+
+        const primary = board.card(11);
+        const grabbed = board.card(13);
+        const gesture = beginGesture(harness, grabbed);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(12));
+
+        expect(cardIdsIn(board.column(1, 7))).toEqual(['11', '13', '12']);
+
+        gesture.end([primary, grabbed]);
+
+        expect(harness.emitMove).not.toHaveBeenCalled();
+    });
+
+    it('measures the anchors for the GRABBED card while the index tracks the primary', () => {
+        const board = mountBoard({
+            swimlanes: [
+                {
+                    swimlaneId: 7,
+                    columns: [{ statusId: 1, cardIds: [11, 12, 13], selectedCardIds: [11, 13] }],
+                },
+            ],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([
+                makeCardVm(11, 1, 7),
+                makeCardVm(12, 1, 7),
+                makeCardVm(13, 1, 7),
+            ]),
+        });
+
+        harness.api().openSwimlane(7);
+
+        const primary = board.card(11);
+        const grabbed = board.card(13);
+        const gesture = beginGesture(harness, grabbed);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(primary);
+
+        expect(cardIdsIn(board.column(1, 7))).toEqual(['13', '11', '12']);
+
+        gesture.end([primary, grabbed]);
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        // The index is card 11's — now second, so 1 — while the anchors are card 13's:
+        // nothing precedes it, and card 11 follows it. Two different elements measured
+        // in one emission, exactly as KANBAN:98-L99 and KANBAN:120 do.
+        expect(call[4]).toBe(1);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(11);
+        expect(call[1]).toEqual([
+            { id: 11, oldStatusId: 1, oldSwimlaneId: 7 },
+            { id: 13, oldStatusId: 1, oldSwimlaneId: 7 },
+        ]);
+    });
+
     it('hands the FULL registered container list to the draggable data', () => {
         const board = mountBoard({
             swimlanes: [
@@ -969,6 +1681,187 @@ describe('useCardDrag — multi-selection integration', () => {
 });
 
 /* --------------------------------------------------------------------------
+ * CLASS BOOKKEEPING — for the ownership specifications below.
+ * -------------------------------------------------------------------------- */
+
+/** Every element inside `root`, with the classes it carries right now. */
+function snapshotClasses(root: HTMLElement): Map<Element, ReadonlySet<string>> {
+    const snapshot = new Map<Element, ReadonlySet<string>>();
+
+    snapshot.set(root, new Set<string>(root.classList));
+
+    for (const element of root.querySelectorAll('*')) {
+        snapshot.set(element, new Set<string>(element.classList));
+    }
+
+    return snapshot;
+}
+
+/**
+ * What has been ADDED to each still-connected element since the snapshot.
+ *
+ * The whole point of rule T9's ownership map is that a class added by the wrong
+ * layer is invisible: nothing throws and nothing warns, the board simply stops
+ * looking right. So the assertion is made exhaustive rather than element by element
+ * — anything this hook writes anywhere in the board shows up here.
+ */
+function classesAddedSince(
+    snapshot: Map<Element, ReadonlySet<string>>,
+): (readonly [Element, readonly string[]])[] {
+    const added: (readonly [Element, readonly string[]])[] = [];
+
+    for (const [element, before] of snapshot) {
+        if (!element.isConnected) {
+            continue;
+        }
+
+        const now = [...element.classList].filter((name) => !before.has(name)).sort();
+
+        if (now.length > 0) {
+            added.push([element, now]);
+        }
+    }
+
+    return added;
+}
+
+describe('useCardDrag — the class contract (T9)', () => {
+    it('agrees with the shared modules on the two classes it must never write', () => {
+        // Restated locally AND compared, so a rename on either side fails here rather
+        // than removing a visual from the board in silence.
+        expect(TRANSIT_CLASS).toBe(TRANSIT_CLASS_NAME);
+        expect(TRANSIT_MULTI_CLASS).toBe(TRANSIT_MULTI_CLASS_NAME);
+    });
+
+    it('adds `target-drop` to the hovered column, and nothing else anywhere', () => {
+        const { board, harness } = mountOrderingFixture();
+        const destination = board.column(2, 7);
+        const before = snapshotClasses(board.wrapper);
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(destination);
+
+        expect(classesAddedSince(before)).toEqual([[destination, [TARGET_DROP_CLASS]]]);
+    });
+
+    it('adds `new` to the destination column at drag end, and nothing else anywhere', () => {
+        const { board, harness } = mountOrderingFixture();
+        const destination = board.column(2, 7);
+        const before = snapshotClasses(board.wrapper);
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(destination);
+        gesture.end();
+
+        // `target-drop` is swept at drag end, exactly as the retired library's final
+        // `out` swept it, so the flash is the only class left standing.
+        expect(classesAddedSince(before)).toEqual([[destination, [NEW_COLUMN_CLASS]]]);
+
+        fireEvent.animationEnd(destination);
+
+        expect(classesAddedSince(before)).toEqual([]);
+    });
+
+    it('never writes the placeholder class the drag context owns', () => {
+        const { board, harness } = mountOrderingFixture();
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+
+        expect(board.wrapper.querySelectorAll(`.${TRANSIT_CLASS_NAME}`)).toHaveLength(0);
+
+        gesture.over(board.column(2, 7));
+        gesture.end();
+
+        expect(board.wrapper.querySelectorAll(`.${TRANSIT_CLASS_NAME}`)).toHaveLength(0);
+    });
+
+    it('never writes either mirror class — the drag context and the selection own them', () => {
+        const { board, harness } = mountOrderingFixture();
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.column(2, 7));
+        gesture.end();
+
+        for (const owned of [
+            MIRROR_CLASS,
+            MULTIPLE_DRAG_MIRROR_CLASS,
+            TG_MULTIPLE_DRAG_MIRROR_CLASS,
+            TG_MULTIPLE_DRAG_DRAGGING_CLASS,
+            MAIN_DRAG_CLASS,
+        ]) {
+            expect(document.querySelectorAll(`.${owned}`)).toHaveLength(0);
+        }
+    });
+
+    it('reveals the screen-owned ghost through the shared transit-multi class only', () => {
+        const board = mountBoard({
+            flat: [{ statusId: 1, cardIds: [11, 12], selectedCardIds: [11, 12] }],
+        });
+        const controller = createMultiDrag();
+        const harness = renderCardDrag({ rootRef: board.rootRef, multiDrag: controller });
+        const main = board.card(11);
+
+        // The placeholder is the DRAG CONTEXT's: the specification puts it on the
+        // source node in the provider's stead, which is the only way the shared
+        // multi-drag controller can find something to reveal.
+        main.classList.add(TRANSIT_CLASS_NAME);
+
+        const mirror = document.createElement('div');
+
+        mirror.className = MIRROR_CLASS;
+        document.body.appendChild(mirror);
+
+        const gesture = beginGesture(harness, main);
+
+        controller.start(main, harness.api().getContainers());
+        document.documentElement.dispatchEvent(new Event('mousemove'));
+
+        expect(main.classList.contains(TRANSIT_MULTI_CLASS_NAME)).toBe(true);
+        expect(main.querySelectorAll('.card-transit-multi')).toHaveLength(1);
+        expect(main.querySelectorAll('.card-transit-multi > .fake-us')).toHaveLength(
+            FAKE_US_COUNT,
+        );
+
+        gesture.end(controller.stop());
+
+        // The reveal is undone by the shared controller; the ghost MARKUP is the
+        // screen's and is neither created nor removed by any of this.
+        expect(main.classList.contains(TRANSIT_MULTI_CLASS_NAME)).toBe(false);
+        expect(main.classList.contains(TRANSIT_CLASS_NAME)).toBe(true);
+        expect(main.querySelectorAll('.card-transit-multi > .fake-us')).toHaveLength(
+            FAKE_US_COUNT,
+        );
+    });
+
+    it('leaves the ghost markup untouched before, during and after a plain drag', () => {
+        const { board, harness } = mountOrderingFixture();
+        const card = board.card(13);
+
+        expect(card.querySelectorAll('.card-transit-multi > .fake-us')).toHaveLength(
+            FAKE_US_COUNT,
+        );
+
+        const gesture = beginGesture(harness, card);
+
+        gesture.over(board.card(11));
+
+        expect(card.querySelectorAll('.card-transit-multi > .fake-us')).toHaveLength(
+            FAKE_US_COUNT,
+        );
+
+        gesture.end();
+
+        expect(card.querySelectorAll('.card-transit-multi > .fake-us')).toHaveLength(
+            FAKE_US_COUNT,
+        );
+    });
+});
+
+/* --------------------------------------------------------------------------
  * A three-column, two-swimlane fixture reused by the ordering specifications.
  * -------------------------------------------------------------------------- */
 
@@ -1003,6 +1896,57 @@ function mountOrderingFixture(): OrderingFixture {
             makeCardVm(12, 1, 7),
             makeCardVm(13, 1, 7),
             makeCardVm(21, 1, 8),
+        ]),
+    });
+
+    harness.api().openSwimlane(7);
+    harness.api().openSwimlane(8);
+
+    return { board, harness };
+}
+
+/**
+ * A two-swimlane, two-status board whose FOUR columns are all populated.
+ *
+ * The ordering fixture above leaves the destination columns empty, which cannot
+ * distinguish "no anchor because the column is empty" from "no anchor because the
+ * arithmetic looked in the wrong column". Every destination here already holds
+ * cards, so each of the three mandatory CROSS-CONTAINER cases asserts a real
+ * neighbour taken from the DESTINATION:
+ *
+ *   swimlane 7 · status 1 → 11, 12, 13     swimlane 7 · status 2 → 31, 32
+ *   swimlane 8 · status 1 → 21, 22         swimlane 8 · status 2 → 41
+ */
+function mountCrossContainerFixture(): OrderingFixture {
+    const board = mountBoard({
+        swimlanes: [
+            {
+                swimlaneId: 7,
+                columns: [
+                    { statusId: 1, cardIds: [11, 12, 13] },
+                    { statusId: 2, cardIds: [31, 32] },
+                ],
+            },
+            {
+                swimlaneId: 8,
+                columns: [
+                    { statusId: 1, cardIds: [21, 22] },
+                    { statusId: 2, cardIds: [41] },
+                ],
+            },
+        ],
+    });
+    const harness = renderCardDrag({
+        rootRef: board.rootRef,
+        getCard: makeCardLookup([
+            makeCardVm(11, 1, 7),
+            makeCardVm(12, 1, 7),
+            makeCardVm(13, 1, 7),
+            makeCardVm(31, 2, 7),
+            makeCardVm(32, 2, 7),
+            makeCardVm(21, 1, 8),
+            makeCardVm(22, 1, 8),
+            makeCardVm(41, 2, 8),
         ]),
     });
 
@@ -1158,6 +2102,288 @@ describe('useCardDrag — R-DND-2 ordering', () => {
         expect(call[6]).toBe(21);
     });
 
+    it('CROSS-CONTAINER (cross-status, same swimlane): reports the destination status and its neighbour', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const card = board.card(11);
+        const destination = board.column(2, 7);
+        const gesture = beginGesture(harness, card);
+
+        // The retired library emitted `over` for the source column immediately after
+        // the drag began (KANBAN:63-L67), so the source is hovered first here too.
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(31));
+
+        expect(cardIdsIn(destination)).toEqual(['11', '31', '32']);
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        expect(call).toHaveLength(7);
+        expect(call[1]).toEqual([{ id: 11, oldStatusId: 1, oldSwimlaneId: 7 }]);
+        expect(call[2]).toBe(2);
+        expect(call[3]).toBe(7);
+        expect(call[4]).toBe(0);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(31);
+
+        // KANBAN:147-L151 — the status changed, so the element is removed and the
+        // destination flashes.
+        expect(card.isConnected).toBe(false);
+        expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
+    });
+
+    it('CROSS-CONTAINER (same status, cross-swimlane): reports the destination swimlane and its neighbour', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const card = board.card(11);
+        const destination = board.column(1, 8);
+        const gesture = beginGesture(harness, card);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(22));
+
+        expect(cardIdsIn(destination)).toEqual(['21', '11', '22']);
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        expect(call[1]).toEqual([{ id: 11, oldStatusId: 1, oldSwimlaneId: 7 }]);
+        // The status is UNCHANGED and the swimlane is not: the sameness test at
+        // KANBAN:147 is a conjunction, so this still counts as a changed container.
+        expect(call[2]).toBe(1);
+        expect(call[3]).toBe(8);
+        expect(call[4]).toBe(1);
+        expect(call[5]).toBe(21);
+        expect(call[6]).toBeNull();
+        expect(card.isConnected).toBe(false);
+        expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
+    });
+
+    it('CROSS-CONTAINER (cross-status AND cross-swimlane): reports both, with the destination anchor', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const card = board.card(11);
+        const destination = board.column(2, 8);
+        const gesture = beginGesture(harness, card);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(destination);
+
+        expect(cardIdsIn(destination)).toEqual(['41', '11']);
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        expect(call[1]).toEqual([{ id: 11, oldStatusId: 1, oldSwimlaneId: 7 }]);
+        expect(call[2]).toBe(2);
+        expect(call[3]).toBe(8);
+        expect(call[4]).toBe(1);
+        expect(call[5]).toBe(41);
+        expect(call[6]).toBeNull();
+        expect(card.isConnected).toBe(false);
+        expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
+    });
+
+    it('CROSS-CONTAINER: emits at the SAME index when only the container changed', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const card = board.card(11);
+        const gesture = beginGesture(harness, card);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(21));
+
+        // Index 0 in the destination is the index it already had in the source, so
+        // the guard's FIRST half holds and only its second half — the container
+        // identity test of KANBAN:124 — keeps this drop alive.
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+        expect(call[3]).toBe(8);
+        expect(call[4]).toBe(0);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(21);
+    });
+
+    it('FIRST-POSITION: keeps a multi-card selection in dragged order at index 0', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const first = board.card(12);
+        const second = board.card(13);
+        const gesture = beginGesture(harness, first);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(11));
+        gesture.end([first, second]);
+
+        const call = harness.emitMove.mock.calls[0];
+
+        // The anchors are measured for the PRIMARY of the selection — KANBAN:117-L120
+        // measures `dragMultipleItems[0]` — and the payload keeps the dragged order.
+        expect(call[1]).toEqual([
+            { id: 12, oldStatusId: 1, oldSwimlaneId: 7 },
+            { id: 13, oldStatusId: 1, oldSwimlaneId: 7 },
+        ]);
+        expect(call[4]).toBe(0);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(11);
+    });
+
+    it('excludes a `gu-transit` sibling from the neighbour scan while still counting it in the index', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const placeholder = board.card(12);
+
+        // The drag context puts this class on the source node; the specification does
+        // it here in the provider's stead. KANBAN:98-L99 scans
+        // `tg-card:not(.gu-transit)`, while KANBAN:120's index expression carries NO
+        // such exclusion — an asymmetry that is in the incumbent and is preserved.
+        placeholder.classList.add(TRANSIT_CLASS_NAME);
+
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(13));
+
+        expect(cardIdsIn(board.column(1, 7))).toEqual(['12', '11', '13']);
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        // Index 1 PROVES the placeholder was counted; a previous anchor of `null`
+        // PROVES it was skipped as a neighbour. Reporting 12 here would order the
+        // write against a placeholder, and index 0 would be an off-by-one.
+        expect(call[4]).toBe(1);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(13);
+    });
+
+    it('never turns a neighbour with no `data-id` into a not-a-number anchor', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const column = board.column(1, 7);
+        const idless = document.createElement(CARD_ELEMENT);
+
+        idless.className = 'card';
+        column.insertBefore(idless, board.card(13));
+
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(column);
+        gesture.over(board.card(13));
+
+        expect(cardIdsIn(column)).toEqual(['12', '11', '13']);
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        // KANBAN:102's guard is `prev.length && prev[0].dataset.id`: an id-less
+        // neighbour leaves the anchor null rather than becoming `Number(undefined)`.
+        // A not-a-number anchor would be serialised as an ABSENT field and the server
+        // would reorder the board around it, with no error anywhere.
+        expect(call[5]).toBeNull();
+        expect(Number.isNaN(call[5])).toBe(false);
+        // Because the previous anchor is falsy, the next one is computed — TRAP 2.
+        expect(call[6]).toBe(13);
+    });
+
+    it('never turns a neighbour with an EMPTY `data-id` into an anchor either', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const column = board.column(1, 7);
+        const blank = board.card(12);
+
+        blank.dataset.id = '';
+
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(column);
+        gesture.over(board.card(13));
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(13);
+    });
+
+    it('treats a `0` neighbour as no anchor, keeping the shared previous-wins semantics', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const column = board.column(1, 7);
+        const zero = board.card(12);
+
+        zero.dataset.id = '0';
+
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(column);
+        gesture.over(board.card(13));
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        /*
+         * Zero is not a valid identifier — server keys start at 1 — and the anchor
+         * test downstream is FALSY (`!previousId`), so a `0` anchor would read as
+         * present in one place and absent in another. It stays `null`, and because
+         * that is falsy the next anchor is computed, which is TRAP 3 preserved rather
+         * than "fixed".
+         */
+        expect(call[5]).not.toBe(0);
+        expect(call[5]).toBeNull();
+        expect(call[6]).toBe(13);
+    });
+
+    it('counts a hidden, virtualised card as a neighbour, because registration ignores visibility', () => {
+        const board = mountBoard({
+            swimlanes: [
+                {
+                    swimlaneId: 7,
+                    columns: [
+                        { statusId: 1, cardIds: [11, 12, 13], offScreenCardIds: [12] },
+                        { statusId: 2, cardIds: [] },
+                    ],
+                },
+            ],
+        });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([
+                makeCardVm(11, 1, 7),
+                makeCardVm(12, 1, 7),
+                makeCardVm(13, 1, 7),
+            ]),
+        });
+
+        harness.api().openSwimlane(7);
+
+        const hidden = board.card(12);
+
+        // Off screen in both senses the board can express it: no inner wrapper, and
+        // no box. R-DND-3 says neither may remove it from the arrangement.
+        hidden.style.display = 'none';
+
+        expect(hidden.querySelector('.card-inner')).toBeNull();
+
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(13));
+
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        expect(call[4]).toBe(1);
+        expect(call[5]).toBe(12);
+        expect(call[6]).toBeNull();
+    });
+
     it('emits nothing at all for a drop that changed neither index nor container', () => {
         const { board, harness } = mountOrderingFixture();
         const gesture = beginGesture(harness, board.card(11));
@@ -1228,6 +2454,22 @@ describe('useCardDrag — the destination column', () => {
     });
 
     it('reports a not-a-number swimlane on a FLAT board, because the column carries none', () => {
+        /*
+         * `useCardDrag.ts`'s `readColumnSwimlaneId` is `Number(column.dataset.swimlane)`
+         * WITH NO DEFAULT — the port of KANBAN:122 — and a flat column carries no
+         * `data-swimlane` at all: `kanban-table.jade` L189-L197 renders `data-status`
+         * and nothing else, while the swimlane-mode column at L112-L121 renders both.
+         *
+         * So the value really is `Number(undefined)`, i.e. not-a-number, and the
+         * quirk is PINNED here rather than smoothed over. Defaulting it to `0`, `-1`
+         * or `null` would make two different flat columns compare EQUAL at KANBAN:147
+         * and the removal guard would start firing where the incumbent never lets it;
+         * reading the attribute with `getAttribute` would do the same by accident,
+         * because `Number(null)` is zero. The retained controller and the api facade
+         * already gate the swimlane on truthiness
+         * (`resources/userstories.coffee` L126-L127), which is why a not-a-number value
+         * never reaches the wire as a swimlane id.
+         */
         const board = mountBoard({
             flat: [
                 { statusId: 1, cardIds: [11, 12] },
@@ -1240,6 +2482,7 @@ describe('useCardDrag — the destination column', () => {
         });
 
         expect(board.column(2).dataset.swimlane).toBeUndefined();
+        expect(board.column(2).getAttribute('data-swimlane')).toBeNull();
 
         const gesture = beginGesture(harness, board.card(11));
 
@@ -1264,12 +2507,12 @@ describe('useCardDrag — the destination column', () => {
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
 
-        destination.dispatchEvent(new Event(ANIMATION_END_EVENT));
+        fireEvent.animationEnd(destination);
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(false);
 
         destination.classList.add(NEW_COLUMN_CLASS);
-        destination.dispatchEvent(new Event(ANIMATION_END_EVENT));
+        fireEvent.animationEnd(destination);
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
     });
@@ -1421,6 +2664,80 @@ describe('useCardDrag — the frozen emission', () => {
         expect(call[6]).toBe(21);
     });
 
+    it('never collapses the six payloads into a single options object', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(31));
+        gesture.end();
+
+        const call = harness.emitMove.mock.calls[0];
+
+        /*
+         * The retained listener is `@.moveUs`, whose signature is POSITIONAL
+         * (`ctx, usList, newStatusId, newSwimlaneId, index, previousCard, nextCard`)
+         * and whose write is position-relative. An object-shaped payload would be
+         * accepted by a JavaScript listener without complaint and would then reorder
+         * the board around `undefined` anchors, so the shape is asserted rather than
+         * assumed: seven arguments, one string, one array, three numbers and two
+         * nullable numbers — and NOT ONE plain object anywhere among them.
+         */
+        expect(call).toHaveLength(7);
+        expect(typeof call[0]).toBe('string');
+        expect(Array.isArray(call[1])).toBe(true);
+        expect(typeof call[2]).toBe('number');
+        expect(typeof call[3]).toBe('number');
+        expect(typeof call[4]).toBe('number');
+        expect(
+            call.filter(
+                (argument: unknown): boolean =>
+                    typeof argument === 'object' && argument !== null && !Array.isArray(argument),
+            ),
+        ).toEqual([]);
+
+        // Each moved story carries EXACTLY the three fields KANBAN:137-L141 builds.
+        expect(Object.keys(call[1][0]).sort()).toEqual(['id', 'oldStatusId', 'oldSwimlaneId']);
+    });
+
+    it('removes a card natively, detaching nothing the screen attached to it', () => {
+        const { board, harness } = mountCrossContainerFixture();
+        const card = board.card(11);
+        const clicks: string[] = [];
+
+        card.addEventListener('click', (): void => {
+            clicks.push('screen');
+        });
+
+        /*
+         * KANBAN:52-L54's `deleteElement` was `itemEl.off(); itemEl.remove()`, and
+         * `off()` detached EVERY jQuery handler on the node. This hook attaches no
+         * handler to a card — its only listener is the one-shot `animationend` on a
+         * COLUMN — so the faithful native equivalent removes the element and touches
+         * nobody else's listeners. A probe that throws if the AngularJS scope accessor
+         * is ever reached for stands in for the story list's `scope().$destroy()`,
+         * which this screen deliberately does NOT do.
+         */
+        Object.defineProperty(card, 'scope', {
+            configurable: true,
+            value: (): never => {
+                throw new Error('useCardDrag reached for an AngularJS scope');
+            },
+        });
+
+        const gesture = beginGesture(harness, card);
+
+        gesture.over(board.column(1, 7));
+        gesture.over(board.card(31));
+        gesture.end();
+
+        expect(card.isConnected).toBe(false);
+
+        card.dispatchEvent(new Event('click'));
+
+        expect(clicks).toEqual(['screen']);
+    });
+
     it('emits after the elements that changed container have been removed', () => {
         const { board, harness } = mountOrderingFixture();
         const card = board.card(11);
@@ -1492,7 +2809,7 @@ describe('useCardDrag — cancellation and teardown', () => {
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(false);
 
         destination.classList.add(NEW_COLUMN_CLASS);
-        destination.dispatchEvent(new Event(ANIMATION_END_EVENT));
+        fireEvent.animationEnd(destination);
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
     });
@@ -1524,6 +2841,78 @@ describe('useCardDrag — cancellation and teardown', () => {
         expect(harness.emitMove).not.toHaveBeenCalled();
     });
 
+    it('accumulates nothing across repeated mount, open, drag and unmount cycles', () => {
+        const board = mountBoard({
+            swimlanes: [
+                {
+                    swimlaneId: 7,
+                    columns: [
+                        { statusId: 1, cardIds: [11, 12, 13] },
+                        { statusId: 2, cardIds: [] },
+                    ],
+                },
+            ],
+        });
+        const cards = makeCardLookup([
+            makeCardVm(11, 1, 7),
+            makeCardVm(12, 1, 7),
+            makeCardVm(13, 1, 7),
+        ]);
+        const destination = board.column(2, 7);
+        const attached = jest.spyOn(destination, 'addEventListener');
+        const detached = jest.spyOn(destination, 'removeEventListener');
+
+        /*
+         * The board mounts and unmounts this hook every time the user navigates away
+         * and back, and a swimlane opens on every table-body load. Each cycle below is
+         * a complete life: register, drag across containers, tear down. Nothing may
+         * survive a cycle — not a container, not a class, not a listener — because a
+         * leak here is silent and only shows up as a column that has stopped
+         * flashing, or one that flashes twice.
+         */
+        for (let cycle = 0; cycle < 3; cycle += 1) {
+            const harness = renderCardDrag({ rootRef: board.rootRef, getCard: cards });
+
+            harness.api().openSwimlane(7);
+
+            expect(harness.api().getContainers()).toEqual([board.column(1, 7), destination]);
+
+            const gesture = beginGesture(harness, board.card(11));
+
+            gesture.over(board.column(1, 7));
+            gesture.over(destination);
+            gesture.end();
+
+            expect(harness.emitMove).toHaveBeenCalledTimes(1);
+            expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
+
+            act(() => {
+                harness.unmount();
+            });
+
+            expect(harness.api().getContainers()).toHaveLength(0);
+            expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(false);
+
+            // The card that changed container was removed, so it is put back for the
+            // next cycle. This is the SCREEN's job in production: React re-renders the
+            // card into its new column from the state the emission updated.
+            board.column(1, 7).insertBefore(makeCardElement(11), board.card(12));
+        }
+
+        const animationListeners = (calls: [string, ...unknown[]][]): number =>
+            calls.filter(([name]) => name === ANIMATION_END_EVENT).length;
+
+        expect(animationListeners(attached.mock.calls as [string, ...unknown[]][])).toBe(3);
+        expect(animationListeners(detached.mock.calls as [string, ...unknown[]][])).toBe(3);
+
+        // And no listener from any cycle is still armed: a class added by hand now
+        // survives an animation end, because nothing is listening for it any more.
+        destination.classList.add(NEW_COLUMN_CLASS);
+        fireEvent.animationEnd(destination);
+
+        expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
+    });
+
     it('re-opening a swimlane after a cancelled gesture leaks no duplicate container', () => {
         const { board, harness } = mountOrderingFixture();
         const gesture = beginGesture(harness, board.card(11));
@@ -1542,6 +2931,12 @@ describe('useCardDrag — autoscroll', () => {
         const { board, harness } = mountOrderingFixture();
         const { autoScroll } = harness.api().dndProviderProps;
 
+        // KANBAN:155-L160's option object, in full and with nothing else in it.
+        expect({
+            enabled: autoScroll.enabled,
+            margin: autoScroll.margin,
+            scrollWhenOutside: autoScroll.scrollWhenOutside,
+        }).toEqual({ enabled: true, margin: KANBAN_AUTOSCROLL_MARGIN, scrollWhenOutside: true });
         expect(autoScroll.enabled).toBe(true);
         expect(autoScroll.margin).toBe(KANBAN_AUTOSCROLL_MARGIN);
         expect(autoScroll.scrollWhenOutside).toBe(true);
@@ -1582,6 +2977,110 @@ describe('useCardDrag — autoscroll', () => {
         expect(harness.api().dndProviderProps.autoScroll).toBe(before);
     });
 
+    it('never carries the story list\'s numbers', () => {
+        const { harness } = mountOrderingFixture();
+        const { autoScroll } = harness.api().dndProviderProps;
+
+        /*
+         * ⚠️ THE TWO SCREENS DIVERGE AND MUST NOT BE UNIFIED. The story list passes
+         * `{ margin: 20, pixels: 30 }` over `[window]`; the board passes `margin: 100`
+         * over its COLUMNS and no `pixels` at all. `pixels` was never read by the
+         * installed library, so implementing it would speed the story list up seven and
+         * a half fold — a functional change dressed as a bug fix.
+         */
+        expect(autoScroll.margin).not.toBe(STORY_LIST_AUTOSCROLL_MARGIN);
+        expect(autoScroll.margin).toBe(KANBAN_AUTOSCROLL_MARGIN);
+        expect(autoScroll.pixels).not.toBe(STORY_LIST_AUTOSCROLL_PIXELS);
+        expect('pixels' in autoScroll).toBe(false);
+    });
+
+    it('measures the board\'s 100px band on the COLUMNS, not on the window', () => {
+        const { board, harness } = mountOrderingFixture();
+        const { autoScroll } = harness.api().dndProviderProps;
+        const column = board.column(1, 7);
+
+        // jsdom lays nothing out, so the column is given a real box before any
+        // geometry is asserted — see `stubElementLayout`. 600×800 at (200, 100).
+        stubElementLayout(column, { top: 100, left: 200, width: 600, height: 800 });
+
+        const edges = autoScrollTargetEdges(column);
+
+        expect(edges).toEqual({ top: 100, left: 200, right: 800, bottom: 900 });
+
+        // One pixel inside the band's inner lip scrolls: `floor(-0.01 × 4) = -1`, so
+        // the band has no dead zone. This is the shared provider's own arithmetic,
+        // driven with the margin THIS hook supplies.
+        const insideBand = computeAutoScrollDelta(
+            { x: 500, y: edges.bottom - KANBAN_AUTOSCROLL_MARGIN + 1 },
+            edges,
+            autoScroll.margin,
+        );
+
+        expect(insideBand.y).toBeGreaterThan(0);
+
+        // Exactly `margin` pixels in is OUTSIDE the band — the tests are strict.
+        expect(
+            computeAutoScrollDelta(
+                { x: 500, y: edges.bottom - KANBAN_AUTOSCROLL_MARGIN },
+                edges,
+                autoScroll.margin,
+            ).y,
+        ).toBe(0);
+
+        // And the story list's 20px band would NOT scroll at the same point, which is
+        // what makes the board's number load-bearing rather than decorative.
+        expect(
+            computeAutoScrollDelta(
+                { x: 500, y: edges.bottom - KANBAN_AUTOSCROLL_MARGIN + 1 },
+                edges,
+                STORY_LIST_AUTOSCROLL_MARGIN,
+            ).y,
+        ).toBe(0);
+
+        // The magnitude is clamped to the library's default maximum speed, because
+        // neither screen passes `maxSpeed`.
+        expect(autoScroll.maxSpeed).toBeUndefined();
+        expect(
+            computeAutoScrollDelta({ x: 500, y: edges.bottom + 5000 }, edges, autoScroll.margin).y,
+        ).toBe(DOM_AUTOSCROLLER_DEFAULT_MAX_SPEED);
+    });
+
+    it('retains a target the pointer has left, and scrolls the column rather than the page', () => {
+        const { board, harness } = mountOrderingFixture();
+        const { autoScroll } = harness.api().dndProviderProps;
+        const column = board.column(1, 7);
+        const other = board.column(2, 7);
+
+        stubElementLayout(column, { top: 0, left: 0, width: 300, height: 800 });
+        stubElementLayout(other, { top: 0, left: 400, width: 300, height: 800 });
+
+        const targets = autoScroll.getTargets().filter((target): target is Element =>
+            target instanceof Element,
+        );
+        const inside = { x: 150, y: 400 };
+        const outside = { x: 2000, y: 400 };
+
+        expect(resolveAutoScrollTarget(inside, targets, null, autoScroll.scrollWhenOutside)).toBe(
+            column,
+        );
+
+        // `scrollWhenOutside: true` is why the column is still scrolled once the
+        // pointer has been dragged clear of every column.
+        expect(resolveAutoScrollTarget(outside, targets, column, autoScroll.scrollWhenOutside)).toBe(
+            column,
+        );
+        expect(resolveAutoScrollTarget(outside, targets, column, false)).toBeNull();
+
+        const pageBefore = window.scrollY;
+
+        applyAutoScrollDelta(column, { x: 0, y: 4 });
+
+        // The COLUMN scrolled; the page did not. Handing the loop `[window]` — the
+        // story list's target — would scroll the page while the column stood still.
+        expect(column.scrollTop).toBe(4);
+        expect(window.scrollY).toBe(pageBefore);
+    });
+
     it('resolves its targets live, so a swimlane opened later is scrollable', () => {
         const board = mountBoard({
             swimlanes: [
@@ -1610,6 +3109,30 @@ describe('useCardDrag — droppable and draggable data', () => {
 
         expect(harness.api().getDroppableData(board.column(1, 7))).toEqual({
             containerNode: board.column(1, 7),
+        });
+    });
+
+    it('yields a card that sits in no column with no container at all', () => {
+        const { board, harness } = mountOrderingFixture();
+        const orphan = makeCardElement(99);
+
+        // A card outside every `.taskboard-column` — the shape a card has for the
+        // instant between being created and being attached. The container field is
+        // reported ABSENT rather than as a null, because the drop resolver treats an
+        // absent container as "look at the item instead" and a null one identically;
+        // reporting the node itself would place a drop into nothing.
+        expect(harness.api().getDroppableData(orphan)).toEqual({
+            containerNode: undefined,
+            itemNode: orphan,
+        });
+
+        // The same card inside a column reports that column, so the two cases differ by
+        // the arrangement alone.
+        board.column(1, 7).appendChild(orphan);
+
+        expect(harness.api().getDroppableData(orphan)).toEqual({
+            containerNode: board.column(1, 7),
+            itemNode: orphan,
         });
     });
 
@@ -1805,12 +3328,12 @@ describe('useCardDrag — defensive paths', () => {
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
 
-        destination.dispatchEvent(new Event(ANIMATION_END_EVENT));
+        fireEvent.animationEnd(destination);
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(false);
 
         destination.classList.add(NEW_COLUMN_CLASS);
-        destination.dispatchEvent(new Event(ANIMATION_END_EVENT));
+        fireEvent.animationEnd(destination);
 
         expect(destination.classList.contains(NEW_COLUMN_CLASS)).toBe(true);
     });
@@ -1946,6 +3469,38 @@ describe('useCardDrag — defensive paths', () => {
         expect(harness.emitMove).not.toHaveBeenCalled();
     });
 
+    it('leaves a card that had nowhere to return to where the drop put it', () => {
+        /*
+         * A card whose element is not in the tree when the gesture begins — the shape a
+         * re-render mid-drag can leave behind — has no origin anchor to capture, so an
+         * abandoned gesture has nothing to undo. The element stays where the drop put
+         * it and nothing throws: `insertBefore` against a parent that was never
+         * recorded would, and a cancelled drag must never take the board down.
+         */
+        const { board, harness } = mountOrderingFixture();
+        const detached = makeCardElement(99);
+        const destination = board.column(2, 7);
+
+        expect(detached.parentElement).toBeNull();
+
+        const gesture = beginGesture(harness, detached);
+
+        gesture.over(board.column(1, 7));
+
+        expect(detached.parentElement).toBe(board.column(1, 7));
+
+        gesture.over(destination);
+
+        expect(detached.parentElement).toBe(destination);
+
+        expect(() => {
+            gesture.cancel();
+        }).not.toThrow();
+
+        expect(detached.parentElement).toBe(destination);
+        expect(harness.emitMove).not.toHaveBeenCalled();
+    });
+
     it('restores a displaced element even when its remembered sibling has gone', () => {
         const { board, harness } = mountOrderingFixture();
         const gesture = beginGesture(harness, board.card(11));
@@ -2008,6 +3563,19 @@ describe('useCardDrag — static gates', () => {
         ['the story list autoscroll knob', 'pixels'],
         ['deferred work', 'TODO'],
         ['a known defect marker', 'FIXME'],
+        ['a digest request', '$apply'],
+        ['the AngularJS promise service', '$q'],
+        ['an AngularJS module registration', 'angular.'],
+        ['the retired collection library', 'Immutable'],
+        ['a deep immutable read', 'getIn('],
+        ['an immutable size probe', '.size'],
+        ['a flattening call', '.toJS('],
+        ['the end-to-end runner', 'playwright'],
+        ['a snapshot assertion', 'toMatchSnapshot'],
+        ['markup assembled as a string', 'innerHTML'],
+        ['a shadow root query', 'shadowRoot'],
+        ['a resource facade', '$tgResources'],
+        ['a repository facade', '$tgRepo'],
     ])('contains no %s', (_description: string, token: string) => {
         expect(code).not.toContain(token);
     });
@@ -2045,6 +3613,45 @@ describe('useCardDrag — static gates', () => {
         expect(code).toContain(`'${NEW_COLUMN_CLASS}'`);
         expect(code).toContain(`'${CARD_ELEMENT}'`);
         expect(code).toContain(`'${COLUMN_SELECTOR}'`);
+        expect(code).toContain(`'${ANIMATION_END_EVENT}'`);
+    });
+
+    it('delegates every index and neighbour computation, keeping no second algorithm', () => {
+        /*
+         * R-DND-2: only the drag core is pinned, so ordering is computed by hand — and
+         * combined with a POSITION-RELATIVE write API an off-by-one silently persists a
+         * wrong order. The mitigation is that the arithmetic exists in exactly ONE
+         * place, so these gates assert both halves: the three shared calls are made and
+         * their results are what travel into the emission, and none of the sibling
+         * scanning or id parsing they own is spelled here a second time.
+         */
+        expect(code).toContain('sortable.beginDrag(item, dragged)');
+        expect(code).toContain('sortable.recordNeighbours(item)');
+        expect(code).toContain('sortable.endDrag(item, dragged, parentEl)');
+        expect(code).toContain('result.index');
+        expect(code).toContain('result.previousId');
+        expect(code).toContain('result.nextId');
+
+        for (const spelling of [
+            'previousElementSibling',
+            'prevAll',
+            'nextAll',
+            'computeNeighbours',
+            'indexWithinContainer',
+            'parseItemId',
+            'readDatasetIds',
+        ]) {
+            expect(code).not.toContain(spelling);
+        }
+    });
+
+    it('writes NEITHER of the two classes the shared modules own', () => {
+        // The runtime specifications above prove it behaviourally; this proves the
+        // literals are not even present, so no future branch can start writing them.
+        expect(code).not.toContain(`'${TRANSIT_CLASS_NAME}'`);
+        expect(code).not.toContain(`'${TRANSIT_MULTI_CLASS_NAME}'`);
+        expect(code).not.toContain(`'${MIRROR_CLASS}'`);
+        expect(code).not.toContain(`'${MULTIPLE_SORTABLE_CLASS}'`);
     });
 
     it('never spells the unclassified sentinel as a bare number', () => {
@@ -2058,55 +3665,187 @@ describe('useCardDrag — static gates', () => {
 });
 
 /* ==========================================================================
- * OBSERVER STUBS
+ * THE DOCUMENTATION GATES — RULE T9
  * ==========================================================================
- * Neither observer is reached by this hook — the viewport latch is injected — but
- * the stubs are installed so that a specification exercising a collaborator which
- * DOES construct one cannot fall over in an environment that provides neither.
+ * T9 requires every technology-specific change to be commented AT THE POINT OF
+ * CHANGE, and the seam between AngularJS and React most of all. These read the
+ * source WITH its comments — the gates above strip them — and assert that the four
+ * facts a maintainer cannot recover from the code alone are actually written down:
+ * the frozen event name, the six positional arguments, the board's own autoscroll
+ * band, and who owns each lifecycle class. Each of them is a contract with code
+ * this migration does not touch, so losing the note is how the next change breaks
+ * something invisible.
  */
 
-describe('useCardDrag — environment stubs', () => {
-    it('runs with stubbed intersection and resize observers installed', () => {
-        class StubObserver {
-            observe(): void {
-                return;
-            }
+/** Every lifecycle class, with the module the header must name as its owner. */
+const CLASS_OWNERSHIP: readonly (readonly [string, string])[] = [
+    [TRANSIT_CLASS_NAME, './DndProvider'],
+    [MIRROR_CLASS, './DndProvider'],
+    [TRANSIT_MULTI_CLASS_NAME, './multiDrag'],
+    [MULTIPLE_DRAG_MIRROR_CLASS, './multiDrag'],
+    [TG_MULTIPLE_DRAG_MIRROR_CLASS, './multiDrag'],
+    [TG_MULTIPLE_DRAG_DRAGGING_CLASS, './multiDrag'],
+    [MAIN_DRAG_CLASS, './multiDrag'],
+    [TARGET_DROP_CLASS, 'THIS HOOK'],
+    [NEW_COLUMN_CLASS, 'THIS HOOK'],
+    [MULTIPLE_SORTABLE_CLASS, 'THE SCREEN'],
+];
 
-            unobserve(): void {
-                return;
-            }
+describe('useCardDrag — documentation gates (T9)', () => {
+    const documentation = readHookSource();
 
-            disconnect(): void {
-                return;
-            }
+    it('documents the frozen emission: the event name, its origin and its six arguments in order', () => {
+        expect(documentation).toContain(`"${KANBAN_US_MOVE_EVENT}"`);
+        expect(documentation).toContain('KANBAN:153');
 
-            takeRecords(): [] {
-                return [];
-            }
+        const seam = documentation.slice(documentation.indexOf('KanbanMoveEmitter = ('));
+        const positions = [
+            'finalUsList',
+            'newStatus',
+            'newSwimlane',
+            'index',
+            'previousCard',
+            'nextCard',
+        ];
+        const offsets = positions.map((name) => seam.indexOf(name));
+
+        // Every argument is declared, and each one AFTER the previous: the retained
+        // listener's signature is positional and its write is position-relative.
+        for (const offset of offsets) {
+            expect(offset).toBeGreaterThan(-1);
         }
 
-        const globals = globalThis as unknown as Record<string, unknown>;
-        const previousIntersection = globals['IntersectionObserver'];
-        const previousResize = globals['ResizeObserver'];
+        expect([...offsets].sort((left, right) => left - right)).toEqual(offsets);
+    });
 
-        globals['IntersectionObserver'] = StubObserver;
-        globals['ResizeObserver'] = StubObserver;
+    it('documents the board autoscroll band, and the story list divergence it must not adopt', () => {
+        expect(documentation).toContain(`margin: ${String(KANBAN_AUTOSCROLL_MARGIN)}`);
+        expect(documentation).toContain('scrollWhenOutside');
+        expect(documentation).toContain(
+            `margin: ${String(STORY_LIST_AUTOSCROLL_MARGIN)}, pixels: ${String(
+                STORY_LIST_AUTOSCROLL_PIXELS,
+            )}`,
+        );
+        expect(documentation).toContain('MUST NOT BE UNIFIED');
+    });
 
-        try {
-            const board = mountBoard({ flat: [{ statusId: 1, cardIds: [11, 12] }] });
-            const harness = renderCardDrag({
-                rootRef: board.rootRef,
-                getCard: makeCardLookup([makeCardVm(11, 1, null), makeCardVm(12, 1, null)]),
-            });
-            const gesture = beginGesture(harness, board.card(11));
+    /**
+     * The ownership map itself, isolated from the prose around it.
+     *
+     * Slicing the block first is what makes the per-class assertions below exact: the
+     * header mentions several of these classes in passing while explaining the scope
+     * split, and a search across the whole file would happily match one of those
+     * sentences and report a map that no longer exists.
+     */
+    const ownershipMap = ((): string => {
+        const start = documentation.indexOf('The complete map:');
+        const end = documentation.indexOf('The ghost markup itself', start);
 
-            gesture.over(board.column(1));
-            gesture.end();
-
-            expect(harness.emitMove).toHaveBeenCalledTimes(1);
-        } finally {
-            globals['IntersectionObserver'] = previousIntersection;
-            globals['ResizeObserver'] = previousResize;
+        if (start === -1 || end <= start) {
+            throw new Error('useCardDrag.ts no longer documents the class-ownership map');
         }
+
+        return documentation.slice(start, end);
+    })();
+
+    it.each(CLASS_OWNERSHIP)('names %s as owned by %s', (className: string, owner: string) => {
+        const line = ownershipMap
+            .split('\n')
+            .find((candidate) => new RegExp(`^\\s*\\*\\s+\`${className}\``).test(candidate));
+
+        expect(line).toBeDefined();
+        expect(line).toContain(owner);
+    });
+
+    it('documents the flat-column swimlane quirk rather than leaving it to be discovered', () => {
+        expect(documentation).toContain('NO `data-swimlane`');
+        expect(documentation).toContain('L189-L197');
+        expect(documentation).toContain('NaN');
+    });
+});
+
+/* ==========================================================================
+ * THE ENVIRONMENT, ASSERTED
+ * ==========================================================================
+ * Neither observer is reached by this hook — the viewport latch is injected — but
+ * both are installed before every test so that a collaborator which DOES construct
+ * one cannot fall over in an environment that provides neither, and both are
+ * removed afterwards so no other specification inherits them. jsdom's zero layout
+ * is stubbed the same way, per element. These specifications assert that the
+ * harness really is in place, because a stub that silently stopped being installed
+ * would leave the geometry assertions passing vacuously again.
+ */
+
+describe('useCardDrag — the environment harness', () => {
+    it('installs both observers on globalThis, with every method the interfaces declare', () => {
+        const globals = globalThis as ObserverGlobals;
+
+        for (const name of OBSERVER_GLOBAL_NAMES) {
+            expect(globals[name]).toBe(StubObserver);
+        }
+
+        const target = document.createElement('div');
+        const intersection = new IntersectionObserver(() => undefined);
+        const resize = new ResizeObserver(() => undefined);
+
+        intersection.observe(target);
+        intersection.unobserve(target);
+        resize.observe(target);
+        resize.unobserve(target);
+
+        expect(intersection.takeRecords()).toEqual([]);
+        expect(intersection.root).toBeNull();
+        expect(intersection.rootMargin).toBe('0px');
+        expect(intersection.thresholds).toEqual([0]);
+        expect(() => {
+            intersection.disconnect();
+            resize.disconnect();
+        }).not.toThrow();
+    });
+
+    it('drives a whole gesture with the stubs installed', () => {
+        const board = mountBoard({ flat: [{ statusId: 1, cardIds: [11, 12] }] });
+        const harness = renderCardDrag({
+            rootRef: board.rootRef,
+            getCard: makeCardLookup([makeCardVm(11, 1, null), makeCardVm(12, 1, null)]),
+        });
+        const gesture = beginGesture(harness, board.card(11));
+
+        gesture.over(board.column(1));
+        gesture.end();
+
+        expect(harness.emitMove).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives a stubbed element a real box, which jsdom never does on its own', () => {
+        const plain = document.createElement('div');
+        const stubbed = document.createElement('div');
+
+        document.body.append(plain, stubbed);
+
+        // The control: jsdom lays nothing out, so every number is zero and any
+        // geometry assertion made against it would hold for any configuration.
+        expect(plain.getBoundingClientRect().width).toBe(0);
+        expect(plain.offsetHeight).toBe(0);
+
+        stubElementLayout(stubbed, { top: 10, left: 20, width: 300, height: 400 });
+
+        const rect = stubbed.getBoundingClientRect();
+
+        expect([rect.top, rect.left, rect.right, rect.bottom]).toEqual([10, 20, 320, 410]);
+        expect([rect.x, rect.y, rect.width, rect.height]).toEqual([20, 10, 300, 400]);
+        expect(rect.toJSON()).toEqual({ top: 10, left: 20, width: 300, height: 400 });
+        expect([stubbed.offsetWidth, stubbed.offsetHeight]).toEqual([300, 400]);
+        expect([stubbed.clientWidth, stubbed.clientHeight]).toEqual([300, 400]);
+
+        // Overflow is reported, so the element is a legitimate scroll target, and the
+        // scroll offsets are writable because that is how a scroll is applied.
+        expect(stubbed.scrollHeight).toBeGreaterThan(stubbed.clientHeight);
+        expect(stubbed.scrollWidth).toBeGreaterThan(stubbed.clientWidth);
+
+        stubbed.scrollTop = 25;
+        stubbed.scrollLeft = 35;
+
+        expect([stubbed.scrollTop, stubbed.scrollLeft]).toEqual([25, 35]);
     });
 });

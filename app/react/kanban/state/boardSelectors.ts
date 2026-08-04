@@ -632,7 +632,8 @@ const EMPTY_COLUMN: ColumnCards = { cardIds: [], count: 0 };
  * swimlane's negative sentinel routes to the swimlane grouping while zero, `null` and
  * `undefined` all route to the flat one.
  *
- * A STORY-LESS STATUS REPORTS ZERO, WHICH IS A DELIBERATE, DOCUMENTED DEPARTURE.
+ * A STORY-LESS STATUS REPORTS ZERO, WHICH IS A DELIBERATE AND DOCUMENTED NORMALISATION
+ * OF THE DERIVED VALUE -- AND NOT A CHANGE TO WHAT THE USER SEES.
  * In the source that case produced `undefined`, by this route: the board pre-created an
  * empty bucket for every status it had seen
  * [kanban-usertories.coffee:L53-L58, called from main.coffee:L403], but the refresh pass
@@ -641,15 +642,25 @@ const EMPTY_COLUMN: ColumnCards = { cardIds: [], count: 0 };
  * read came back `undefined`, and the template's length reads at
  * [kanban-table.jade:L204/L211] are UNGUARDED -- they survived only because the expression
  * evaluator behind those bindings is forgiving of a missing intermediate and yields
- * `undefined` instead of throwing, which renders as a blank badge.
+ * `undefined` instead of throwing.
  *
- * Zero is returned instead, for two independent reasons. The column components declare the
- * count as a NON-OPTIONAL number -- `../ArchivedColumn.tsx` does so today and
- * `../StatusColumn.tsx` is specified the same way -- so `undefined` would not type-check
- * at the consumer. And the board's design reference
- * (`design-reference/kanban-screen.png`, node 1:7) shows a bare zero on story-less
- * columns, so zero is also the rendering that was observed. `../TaskCounter.tsx` tolerates
- * either, so it does not decide the question.
+ * THE BADGE STILL RENDERED A LITERAL ZERO, because the counter component the two bindings
+ * feed falls back on exactly that: `{{ renderCount.current || 0 }}` at
+ * [app/modules/components/animated-counter/animated-counter.directive.coffee:L22]. Both
+ * `undefined` and `0` are falsy, so the fallback emits the digit either way -- the badge is
+ * structurally incapable of rendering blank. Confirmed at run time on the deployed
+ * AngularJS build (`project-1`, whose DONE and ARCHIVED statuses hold no stories anywhere):
+ * every such badge renders the single character `0`.
+ *
+ * Returning zero therefore preserves the RENDERED behaviour exactly while giving the
+ * consumers the type they declare. The column components declare the count as a
+ * NON-OPTIONAL number -- `../ArchivedColumn.tsx` does so today and `../StatusColumn.tsx` is
+ * specified the same way -- so `undefined` would not type-check at the consumer. And the
+ * board's design reference (`design-reference/kanban-screen.png`, node 1:7) shows a bare
+ * zero on story-less columns, agreeing with the live build. `../TaskCounter.tsx` tolerates
+ * either, so it does not decide the question; what it must NOT do is drop the fallback,
+ * because a column whose count arrived as `undefined` from anywhere else still has to
+ * render `0`.
  *
  * This paragraph is the point of the change, not a footnote to it: without it the next
  * reader sees a normalisation that looks accidental, restores `undefined`, and breaks the
